@@ -1,0 +1,38 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.air
+*.metallib
+
+# CUDA
+*.ptx
+*.cubin
+*.fatbin
+
+# macOS
+.DS_Store
+*.xcodeproj/
+xcuserdata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Compiled binaries
+/examples/*.out
+/tests/*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+dist/
+*.egg
+.eggs/
+python/spikecorec/_spikecorec*.so
+python/spikecorec/_spikecorec*.pyd

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "pybind11>=2.12"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "spikecorec"
+version = "0.1.0"
+description = "spikecorec — C++/CUDA/Metal library with Python bindings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "numpy"]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+"spikecorec" = ["*.so", "*.pyd"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
