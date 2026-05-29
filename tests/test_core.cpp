@@ -1,4 +1,4 @@
-#include "spikecorec/core/types.hpp"
+#include "spikecorec/core/types.h"
 #include <cassert>
 #include <cstdio>
 

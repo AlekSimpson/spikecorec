@@ -1,6 +1,6 @@
 #pragma once
 
-#include "spikecorec/core/types.hpp"
+#include "spikecorec/core/types.h"
 #include <cuda_runtime.h>
 
 namespace spikecorec::cuda {

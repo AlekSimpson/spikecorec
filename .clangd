@@ -1,0 +1,14 @@
+CompileFlags:
+  Compiler: clang++
+  Add:
+    - "-std=c++17"
+    - "-Iinclude"
+    - "-Ithird_party/metal-cpp"
+    - "-DSPIKECOREC_METAL"
+    - "-DSPIKECOREC_CUDA"
+
+Diagnostics:
+  UnusedIncludes: None
+
+Index:
+  Background: Build

@@ -1,6 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include "spikecorec/core/types.hpp"
+#include "spikecorec/core/types.h"
 
 namespace py = pybind11;
 

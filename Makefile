@@ -40,14 +40,16 @@ CUDA_PATH  ?= /usr/local/cuda
 HAS_NVCC   := $(shell command -v nvcc 2>/dev/null && echo yes || echo no)
 
 ifeq ($(UNAME_S),Darwin)
-  HAS_METAL  := yes
-  CXX        := clang++
-  METALC     := xcrun -sdk macosx metal
-  METALLIB   := xcrun -sdk macosx metallib
-  METALFLAGS := -O2
+  HAS_METAL     := yes
+  CXX           := clang++
+  METALC        := xcrun -sdk macosx metal
+  METALLIB      := xcrun -sdk macosx metallib
+  METALFLAGS    := -O2
   METAL_LDFLAGS := -framework Metal -framework Foundation -framework QuartzCore
+  CXXFLAGS      += -Ithird_party/metal-cpp -DSPIKECOREC_METAL
 else
   HAS_METAL  := no
+  CXXFLAGS   += -DSPIKECOREC_CUDA
 endif
 
 # Auto-select default backend
@@ -60,8 +62,8 @@ endif
 # ── Source files ─────────────────────────────────────────────
 CORE_SRCS      := $(wildcard $(SRC_DIR)/core/*.cpp)
 CUDA_SRCS      := $(wildcard $(SRC_DIR)/cuda/*.cu)
-METAL_SRCS     := $(wildcard $(SRC_DIR)/metal/*.mm)
-METAL_SHADERS  := $(wildcard $(SRC_DIR)/metal/shaders/*.metal)
+METAL_SRCS     := $(wildcard $(SRC_DIR)/metal/*.cpp)
+METAL_SHADERS  := $(wildcard $(SRC_DIR)/metal/*.metal)
 
 TEST_CORE_SRCS  := $(wildcard $(TEST_DIR)/*.cpp)
 TEST_CUDA_SRCS  := $(wildcard $(TEST_DIR)/cuda/*.cpp)
@@ -72,9 +74,9 @@ EX_SRCS        := $(wildcard $(EX_DIR)/*.cpp)
 # ── Object / artifact paths ──────────────────────────────────
 CORE_OBJS   := $(patsubst $(SRC_DIR)/%.cpp,  $(BUILD_DIR)/%.o,   $(CORE_SRCS))
 CUDA_OBJS   := $(patsubst $(SRC_DIR)/%.cu,   $(BUILD_DIR)/%.o,   $(CUDA_SRCS))
-METAL_OBJS  := $(patsubst $(SRC_DIR)/%.mm,   $(BUILD_DIR)/%.o,   $(METAL_SRCS))
-AIR_FILES   := $(patsubst $(SRC_DIR)/metal/shaders/%.metal, \
-                           $(BUILD_DIR)/metal/shaders/%.air, $(METAL_SHADERS))
+METAL_OBJS  := $(patsubst $(SRC_DIR)/%.cpp,  $(BUILD_DIR)/%.o,   $(METAL_SRCS))
+AIR_FILES   := $(patsubst $(SRC_DIR)/metal/%.metal, \
+                           $(BUILD_DIR)/metal/%.air, $(METAL_SHADERS))
 
 CUDA_LIB    := $(BUILD_DIR)/lib$(PROJECT)_cuda.a
 METAL_LIB   := $(BUILD_DIR)/lib$(PROJECT)_metal.a
@@ -125,13 +127,13 @@ $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-# ── Metal objects (.mm) ──────────────────────────────────────
-$(BUILD_DIR)/metal/%.o: $(SRC_DIR)/metal/%.mm
+# ── Metal objects (.cpp via metal-cpp) ───────────────────────
+$(BUILD_DIR)/metal/%.o: $(SRC_DIR)/metal/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -fobjc-arc $(METAL_LDFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ── Metal shaders (.metal → .air → .metallib) ────────────────
-$(BUILD_DIR)/metal/shaders/%.air: $(SRC_DIR)/metal/shaders/%.metal
+$(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal
 	@mkdir -p $(@D)
 	$(METALC) $(METALFLAGS) -c $< -o $@
 
@@ -164,7 +166,7 @@ test-cuda: check-cuda $(CUDA_LIB)
 	$(BUILD_DIR)/test_runner_cuda
 
 test-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) -fobjc-arc $(TEST_CORE_SRCS) $(TEST_METAL_SRCS) \
+	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(TEST_METAL_SRCS) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
 	    -o $(BUILD_DIR)/test_runner_metal
 	$(BUILD_DIR)/test_runner_metal
@@ -178,7 +180,7 @@ examples-cuda: check-cuda $(CUDA_LIB)
 	    -o $(BUILD_DIR)/cuda_example
 
 examples-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) -fobjc-arc $(EX_DIR)/metal_example.mm \
+	$(CXX) $(CXXFLAGS) $(EX_DIR)/metal_example.cpp \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
 	    -o $(BUILD_DIR)/metal_example
 
@@ -189,6 +191,10 @@ info:
 	@echo "Metal found: $(HAS_METAL)"
 	@echo "Backend    : $(BACKEND)"
 	@echo "CXX        : $(CXX)"
+
+compdb:
+	bear -- make $(BACKEND) 2>/dev/null; true
+	@echo "[spikecorec] compile_commands.json updated"
 
 clean:
 	rm -rf $(BUILD_DIR)
