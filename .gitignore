@@ -35,5 +35,6 @@ __pycache__/
 dist/
 *.egg
 .eggs/
+.cache/
 python/spikecorec/_spikecorec*.so
 python/spikecorec/_spikecorec*.pyd
