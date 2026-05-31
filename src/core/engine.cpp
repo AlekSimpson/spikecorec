@@ -3,21 +3,19 @@
 
 namespace spikecorec {
 
-Engine::Engine() = default;
-Engine::~Engine() { if (running_) shutdown(); }
+SpikeEngine::SpikeEngine() = default;
+SpikeEngine::~SpikeEngine() { if (running) shutdown(); }
 
-void Engine::init() {
-    this->running_ = true;
+void SpikeEngine::init() {
 }
 
-void Engine::step() {
+void SpikeEngine::step() {
     // Drive the GPU backend each tick.
     // Replace with actual kernel dispatches, e.g.:
     //   backend::run_step(input_buf_, output_buf_, n_);
 }
 
-void Engine::shutdown() {
-    this->running_ = false;
+void SpikeEngine::shutdown() {
 }
 
 } // namespace spikecorec

@@ -1,26 +1,46 @@
 #pragma once
 
-#include "spikecorec/core/types.h"
+#include <vector>
 
+#include "spikecorec/core/types.h"
+#include "spikecorec/core/weight_matrix.h"
+
+using namespace std;
 namespace spikecorec {
 
-// CPU-side main loop. Owns program state and drives the backend.
-class Engine {
-public:
-    Engine();
-    ~Engine();
+    class SpikeEngine {
+    public:
+        WeightMatrix weights;
 
-    // Initializes the GPU backend and any CPU-side state.
-    void init();
+        s64 *last_tick_updated;
+        s64 *probe_neuron_ids;
+        f64 *network_inputs;
+        f32 *membrane_potentials;
 
-    // Runs one iteration of the main loop.
-    void step();
+        s64 neuron_count;
+        s64 compartment_count;
+        s64 lifetime;
+        s64 RANK = 1;
+        const f64 RESTING_MEMBRANE_POTENTIAL = 0.0;
+        const f64 DECAY_RATE = 0.01;
+        const f64 LEARNING_RATE = 0.00222;
+        const s32 SPIKE_PERIOD = 1;
+        s32 spike_threshold = 1;
 
-    // Tears down the backend cleanly.
-    void shutdown();
+        bool running = false;
 
-private:
-    bool running_ = false;
-};
+        SpikeEngine(vector<vector<s64>> &network, vector<s64> &shape, s64 lifetime, vector<s64> &probe_neuron_ids);
+        SpikeEngine();
+        ~SpikeEngine();
 
-} // namespace spikecorec
+        bool is_alive();
+
+        void init();
+
+        void step();
+
+        void shutdown();
+
+    };
+}
+

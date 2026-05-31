@@ -9,6 +9,8 @@ CompileFlags:
 
 Diagnostics:
   UnusedIncludes: None
+  Suppress:
+    - "pp_file_not_found"
 
 Index:
   Background: Build
