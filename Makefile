@@ -152,6 +152,10 @@ ifeq ($(PYBIND_INC),)
 	$(error pybind11 not found. Run: pip install pybind11)
 endif
 	SPIKECOREC_BACKEND=$(BACKEND) $(PYTHON) -m pip install -e . --no-build-isolation -q
+ifeq ($(BACKEND),metal)
+	$(MAKE) $(BUILD_DIR)/default.metallib
+	cp $(BUILD_DIR)/default.metallib python/spikecorec/default.metallib
+endif
 	@echo "[spikecorec] Python extension installed (backend=$(BACKEND))"
 
 # ── Tests ────────────────────────────────────────────────────

@@ -9,6 +9,12 @@
 #include <fstream>
 #include <cstdio>
 
+#ifdef SPIKECOREC_CUDA
+#include <cuda_runtime.h>
+#elif defined(SPIKECOREC_METAL)
+#include <Metal/Metal.hpp>
+#endif
+
 #include "spikecorec/core/k2tree.h"
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/backend.h"
@@ -42,6 +48,56 @@ static s32 rank1_exclusive(const u32 *internal_node_words, const u32 *superblock
     u32 partial_word_mask = (bit_offset == 0) ? 0u : ((1u << bit_offset) - 1u);
     u32 partial_word_popcount = (u32) __builtin_popcount(internal_node_words[word_index] & partial_word_mask);
     return (s32) (superblock_base + subblock_base + partial_word_popcount);
+}
+
+// Recursive row-walk: collects up to max_neighbor_count neighbor indices of row `u`
+// into output_buffer, descending only into subtrees that intersect u's row and have
+// at least one bit set. Mirrors K2Tree::adjacent's bit-position bookkeeping, but
+// explores every column branch at each level instead of following a fixed `v`.
+static void collect_row_neighbors(
+    const u32 *internal_words, const u32 *leaf_words,
+    const u32 *superblock_data, const u16 *subblock_data,
+    s32 branching_factor, s32 superblock_size_words,
+    s32 node_count, s32 tree_height, s32 internal_bit_count,
+    s32 level, s32 row_base, s32 col_base, s32 block_size, s32 level_bit_offset,
+    s32 u, s32 *output_buffer, s64 max_neighbor_count, s64 &neighbors_found
+) {
+    if (neighbors_found >= max_neighbor_count) return;
+
+    s32 branching_factor_squared = branching_factor * branching_factor;
+    s32 child_block_size = block_size / branching_factor;
+    s32 row_offset = (u - row_base) / child_block_size;
+
+    for (s32 col_offset = 0; col_offset < branching_factor; col_offset++) {
+        if (neighbors_found >= max_neighbor_count) return;
+
+        s32 child_flat_index = row_offset * branching_factor + col_offset;
+        s32 bit_position = level_bit_offset + child_flat_index;
+
+        if (level == tree_height - 1) {
+            if (get_bit(leaf_words, bit_position)) {
+                s32 v = col_base + col_offset;
+                if (v < node_count)
+                    output_buffer[neighbors_found++] = v;
+            }
+        } else if (get_bit(internal_words, bit_position)) {
+            s32 rank_inclusive = rank1_exclusive(internal_words, superblock_data, subblock_data,
+                                                  bit_position, superblock_size_words) + 1;
+            s32 raw_offset = branching_factor_squared * rank_inclusive;
+            s32 child_level_bit_offset = (level + 1 == tree_height - 1)
+                ? (raw_offset - internal_bit_count)
+                : raw_offset;
+            collect_row_neighbors(
+                internal_words, leaf_words, superblock_data, subblock_data,
+                branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
+                level + 1,
+                row_base + row_offset * child_block_size,
+                col_base + col_offset * child_block_size,
+                child_block_size, child_level_bit_offset,
+                u, output_buffer, max_neighbor_count, neighbors_found
+            );
+        }
+    }
 }
 
 static vector<u32> pack_bits_to_words(const vector<s32> &bits) {
@@ -402,17 +458,67 @@ s32 K2Tree::adjacent(s32 u, s32 v) const {
     return (s32) get_bit(leaf_words, leaf_bit_offset + u * branching_factor + v);
 }
 
+s64 K2Tree::get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const {
+    if (max_neighbor_count <= 0) return 0;
+    if (node_index < 0 || node_index >= node_count || tree_height == 0) return 0;
+
+    const u32 *internal_words = internal_node_words.get_contents();
+    const u32 *leaf_words = leaf_node_words.get_contents();
+    const u32 *superblock_data = rank_superblock_table.get_contents();
+    const u16 *subblock_data = rank_subblock_table.get_contents();
+
+    s64 neighbors_found = 0;
+    collect_row_neighbors(
+        internal_words, leaf_words, superblock_data, subblock_data,
+        branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
+        0, 0, 0, padded_node_count, 0,
+        node_index, output_buffer, max_neighbor_count, neighbors_found
+    );
+    return neighbors_found;
+}
+
 void K2Tree::adjacent_batch(
     const s32 *source_indices,
     const s32 *target_indices,
     uint8_t *output_buffer,
     s32 query_count
 ) const {
-    (void) source_indices;
-    (void) target_indices;
-    (void) output_buffer;
-    (void) query_count;
-    // TODO: dispatch GPU kernel via backend::dispatch() using the compiled k2tree adjacency KernelHandle
+    if (query_count <= 0) return;
+
+    // source_indices/target_indices/output_buffer are caller-owned host memory
+    // (mirrors the plain s32 u/v of the single-query `adjacent`) — not GPU-visible —
+    // so queries are staged into unified-memory scratch buffers, the kernel writes
+    // results into a scratch output buffer, and we copy the results back once done.
+    GpuPointer<s32> device_source = allocate<s32>((usize)query_count * sizeof(s32));
+    GpuPointer<s32> device_target = allocate<s32>((usize)query_count * sizeof(s32));
+    GpuPointer<uint8_t> device_output = allocate<uint8_t>((usize)query_count * sizeof(uint8_t));
+
+    memcpy(device_source.get_contents(), source_indices, (usize)query_count * sizeof(s32));
+    memcpy(device_target.get_contents(), target_indices, (usize)query_count * sizeof(s32));
+
+    gpu_k2tree_adjacent_batch(
+        internal_node_words.get_contents(),
+        leaf_node_words.get_contents(),
+        rank_superblock_table.get_contents(),
+        rank_subblock_table.get_contents(),
+        branching_factor,
+        superblock_size_words,
+        node_count,
+        padded_node_count,
+        tree_height,
+        internal_bit_count,
+        device_source.get_contents(),
+        device_target.get_contents(),
+        device_output.get_contents(),
+        query_count
+    );
+    synchronize_gpu_work();
+
+    memcpy(output_buffer, device_output.get_contents(), (usize)query_count * sizeof(uint8_t));
+
+    deallocate(std::move(device_source));
+    deallocate(std::move(device_target));
+    deallocate(std::move(device_output));
 }
 
 // ── debug ─────────────────────────────────────────────────────────────────────

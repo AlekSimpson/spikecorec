@@ -105,6 +105,10 @@ import spikecorec
 print(spikecorec.__version__)
 ```
 
+See **[`python/README.md`](python/README.md)** for full Python API documentation
+and usage examples (`SpikeEngine`, topology generators, `WeightMatrix`, reservoir
+features, weight scaling, etc.).
+
 ---
 
 ## Tests

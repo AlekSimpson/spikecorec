@@ -6,8 +6,15 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <vector>
+
+#ifdef SPIKECOREC_CUDA
+#include <cuda_runtime.h>
+#elif defined(SPIKECOREC_METAL)
+#include <Metal/Metal.hpp>
+#endif
 
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/backend.h"
@@ -16,18 +23,17 @@ using namespace std;
 using namespace spikecorec;
 
 static constexpr s64 DEFAULT_WEIGHT_RANK = 64;
-static constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5458; // "WMTX"
-
-// ── constructor / destructor ──────────────────────────────────────────────────
+static constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5458;
 
 WeightMatrix::WeightMatrix(
     vector<vector<s32>>& network,
     s64 rank,
-    bool check_indexing
+    bool check_indexing,
+    s64 max_neighbor_count
 )
     : k2tree(K2Tree::from_adjacency_list(network, (s32)network.size()))
     , node_count((s64)network.size())
-    , neighbor_count(0)
+    , max_neighbor_count(0)
     , rank(0)
     , rank_float4_stride(0)
     , constant_weight(0.0f)
@@ -37,28 +43,17 @@ WeightMatrix::WeightMatrix(
     if (node_count <= 0)
         throw invalid_argument("Network must have at least one neuron.");
 
-    // validate uniform neighbor count
-    s64 first_node_neighbor_count = (s64)network[0].size();
-    for (s64 node_index = 1; node_index < node_count; node_index++) {
-        if ((s64)network[node_index].size() != first_node_neighbor_count)
-            throw invalid_argument(
-                "Inconsistent neighbor count: all neurons must have the same number of neighbors."
-            );
+    if (max_neighbor_count > 0) {
+        this->max_neighbor_count = max_neighbor_count;
+    } else {
+        s64 longest_row = 0;
+        for (s64 node_index = 0; node_index < node_count; node_index++)
+            longest_row = max(longest_row, (s64)network[node_index].size());
+        this->max_neighbor_count = longest_row;
     }
-    neighbor_count = first_node_neighbor_count;
 
     this->rank = (rank > 0) ? rank : min(DEFAULT_WEIGHT_RANK, node_count);
     rank_float4_stride = (this->rank + 3) / 4;
-
-    // build flat neighbor index array in unified memory — shape [node_count * neighbor_count]
-    neighbor_indices = allocate<s32>((usize)node_count * (usize)neighbor_count * sizeof(s32));
-    s32* flat_neighbors = neighbor_indices.get_contents();
-    for (s64 source_node = 0; source_node < node_count; source_node++) {
-        for (s64 neighbor_slot = 0; neighbor_slot < neighbor_count; neighbor_slot++) {
-            flat_neighbors[source_node * neighbor_count + neighbor_slot] =
-                network[source_node][neighbor_slot];
-        }
-    }
 
     // allocate U and V in unified memory — shape [node_count][rank_float4_stride]
     usize matrix_byte_size = (usize)node_count * (usize)rank_float4_stride * sizeof(float4);
@@ -78,18 +73,13 @@ WeightMatrix::WeightMatrix(
 }
 
 WeightMatrix::~WeightMatrix() {
-    deallocate(std::move(neighbor_indices));
     deallocate(std::move(U_matrix));
     deallocate(std::move(V_matrix));
 }
 
-// ── neighbor access ───────────────────────────────────────────────────────────
-
-const s32* WeightMatrix::get_neighbors(s64 node_index) const {
-    return neighbor_indices.get_contents() + node_index * neighbor_count;
+s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
+    return k2tree.get_neighbors((s32)node_index, output_buffer, max_neighbor_count);
 }
-
-// ── weight initialization ─────────────────────────────────────────────────────
 
 void WeightMatrix::set_constant_weight(f32 value) {
     // U filled with sqrt(|val|/rank), V filled with ±same based on sign of val
@@ -109,8 +99,6 @@ void WeightMatrix::set_constant_weight(f32 value) {
     using_constant_weight = true;
 }
 
-// ── weight queries ────────────────────────────────────────────────────────────
-
 f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
     const float4 *u_row = U_matrix.get_contents() + source_node * rank_float4_stride;
     const float4 *v_row = V_matrix.get_contents() + target_node * rank_float4_stride;
@@ -125,29 +113,37 @@ f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
 }
 
 void WeightMatrix::neighbor_weights(f32 *output_weights) const {
-    // TODO: dispatch GPU kernel for parallel dot products over all (source_node, neighbor) pairs
-    const float4 *u_data = U_matrix.get_contents();
-    const float4 *v_data = V_matrix.get_contents();
-    const s32 *flat_neighbors = neighbor_indices.get_contents();
-    // for (s64 source_node = 0; source_node < node_count; ++source_node) {
-    //     const float4 *u_row = u_data + source_node * rank_float4_stride;
-    //     for (s64 neighbor_slot = 0; neighbor_slot < neighbor_count; neighbor_slot++) {
-    //         s32 target_node = flat_neighbors[source_node * neighbor_count + neighbor_slot];
-    //         const float4* v_row = v_data + (s64)target_node * rank_float4_stride;
-    //         f32 dot_product = 0.0f;
-    //         for (s64 float4_index = 0; float4_index < rank_float4_stride; float4_index++) {
-    //             dot_product += u_row[float4_index].x * v_row[float4_index].x
-    //                          + u_row[float4_index].y * v_row[float4_index].y
-    //                          + u_row[float4_index].z * v_row[float4_index].z
-    //                          + u_row[float4_index].w * v_row[float4_index].w;
-    //         }
-    //         output_weights[source_node * neighbor_count + neighbor_slot] = dot_product;
-    //     }
-    // }
+    s64 total_pair_count = node_count * max_neighbor_count;
+    if (total_pair_count <= 0) return;
+
+    // output_weights is caller-owned host memory (e.g. std::vector::data()) — not
+    // GPU-visible — so the kernel writes into a scratch unified-memory buffer and
+    // we copy the result back once the device is done.
+    GpuPointer<f32> device_weights = allocate<f32>((usize)total_pair_count * sizeof(f32));
+    gpu_neighbor_weights(
+        U_matrix.get_contents(),
+        V_matrix.get_contents(),
+        k2tree.internal_node_words.get_contents(),
+        k2tree.leaf_node_words.get_contents(),
+        k2tree.rank_superblock_table.get_contents(),
+        k2tree.rank_subblock_table.get_contents(),
+        k2tree.branching_factor,
+        k2tree.superblock_size_words,
+        k2tree.padded_node_count,
+        k2tree.tree_height,
+        k2tree.internal_bit_count,
+        node_count,
+        max_neighbor_count,
+        rank_float4_stride,
+        device_weights.get_contents()
+    );
+    synchronize_gpu_work();
+    memcpy(output_weights, device_weights.get_contents(), (usize)total_pair_count * sizeof(f32));
+    deallocate(std::move(device_weights));
 }
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {
-    s64 total_pair_count = node_count * neighbor_count;
+    s64 total_pair_count = node_count * max_neighbor_count;
     vector<f32> weight_buffer((usize)total_pair_count);
     neighbor_weights(weight_buffer.data());
 
@@ -169,8 +165,6 @@ WeightStats WeightMatrix::neighbor_weight_stats() const {
     return {mean, standard_deviation, root_mean_square, min_weight, max_weight};
 }
 
-// ── weight scaling ────────────────────────────────────────────────────────────
-
 ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
     f32 target_root_mean_square,
     f32 epsilon
@@ -179,33 +173,20 @@ ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
         throw invalid_argument("target_root_mean_square must be non-negative.");
 
     WeightStats stats_before = neighbor_weight_stats();
-    f32 current_root_mean_square = max(stats_before.rms, epsilon);
+    f32 current_root_mean_square = max(stats_before.root_mean_square, epsilon);
     f32 scale_factor = (target_root_mean_square > 0.0f)
         ? sqrtf(target_root_mean_square / current_root_mean_square)
         : 0.0f;
 
-    // TODO: dispatch GPU kernel for in-place element-wise scaling of U and V
-    // float4* u_data = U_matrix.get_contents();
-    // float4* v_data = V_matrix.get_contents();
-    // s64 total_float4_element_count = node_count * rank_float4_stride;
-    // for (s64 index = 0; index < total_float4_element_count; ++index) {
-    //     u_data[index].x *= scale_factor;
-    //     u_data[index].y *= scale_factor;
-    //     u_data[index].z *= scale_factor;
-    //     u_data[index].w *= scale_factor;
-    //     v_data[index].x *= scale_factor;
-    //     v_data[index].y *= scale_factor;
-    //     v_data[index].z *= scale_factor;
-    //     v_data[index].w *= scale_factor;
-    // }
-    // constant_weight = 0.0f;
-    // using_constant_weight = false;
+    s64 total_float4_element_count = node_count * rank_float4_stride;
+    gpu_scale_uv(U_matrix.get_contents(), V_matrix.get_contents(), total_float4_element_count, scale_factor);
+    synchronize_gpu_work();
+    constant_weight = 0.0f;
+    using_constant_weight = false;
 
     WeightStats stats_after = neighbor_weight_stats();
     return {target_root_mean_square, scale_factor, stats_before, stats_after};
 }
-
-// ── learning ──────────────────────────────────────────────────────────────────
 
 void WeightMatrix::update(
     s32 source_node,
@@ -215,12 +196,19 @@ void WeightMatrix::update(
     f32 l2_regularization,
     s32 iterations
 ) {
-    // TODO: dispatch GPU kernel (see update_kernel in weights_cuda.py)
-    (void)source_node; (void)target_node; (void)delta;
-    (void)learning_rate; (void)l2_regularization; (void)iterations;
+    gpu_weight_update(
+        U_matrix.get_contents(),
+        V_matrix.get_contents(),
+        rank_float4_stride,
+        source_node,
+        target_node,
+        delta,
+        learning_rate,
+        l2_regularization,
+        iterations
+    );
+    synchronize_gpu_work();
 }
-
-// ── serialization ─────────────────────────────────────────────────────────────
 
 void WeightMatrix::save(const char *filepath) const {
     ofstream file(filepath, ios::binary);

@@ -22,7 +22,15 @@ if BACKEND not in ("cuda", "metal"):
 
 # ── Common settings ──────────────────────────────────────────
 INC = ["include", pybind11.get_include()]
-SRCS = ["src/bindings/bindings.cpp", "src/core/core.cpp"]
+SRCS = [
+    "src/bindings/bindings.cpp",
+    "src/core/backend.cpp",
+    "src/core/engine.cpp",
+    "src/core/k2tree.cpp",
+    "src/core/topologies.cpp",
+    "src/core/types.cpp",
+    "src/core/weight_matrix.cpp",
+]
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
 EXTRA_LINK_ARGS = []
 DEFINE_MACROS = []
@@ -39,8 +47,8 @@ if BACKEND == "cuda":
 elif BACKEND == "metal":
     if not _is_mac:
         raise RuntimeError("Metal backend requires macOS.")
-    SRCS.append("src/metal/kernels.mm")
-    EXTRA_COMPILE_ARGS += ["-fobjc-arc"]
+    SRCS.append("src/metal/metal_cpp_impl.cpp")
+    INC.append("third_party/metal-cpp")
     EXTRA_LINK_ARGS += [
         "-framework", "Metal",
         "-framework", "Foundation",

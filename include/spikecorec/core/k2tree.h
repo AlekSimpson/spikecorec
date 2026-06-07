@@ -87,6 +87,12 @@ namespace spikecorec {
         // single edge query: returns 1 if edge (u,v) exists, 0 otherwise
         [[nodiscard]] s32 adjacent(s32 u, s32 v) const;
 
+        // row enumeration: writes up to max_neighbor_count neighbor indices of `node_index`
+        // into output_buffer (caller-allocated, at least max_neighbor_count elements), in
+        // tree-traversal order. Returns the number of neighbors written (<= max_neighbor_count).
+        // Walks only the populated subtrees of the row — never touches unrelated regions.
+        [[nodiscard]] s64 get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const;
+
         // batched edge query: writes 0 or 1 into output_buffer[i] for each (source_indices[i], target_indices[i])
         void adjacent_batch(
             const s32 *source_indices,

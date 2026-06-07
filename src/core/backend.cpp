@@ -5,8 +5,10 @@
 #ifdef SPIKECOREC_CUDA
 #include <cuda.h>
 #include <nvrtc.h>
+#include "spikecorec/cuda/kernels.cuh"
 #elif defined(SPIKECOREC_METAL)
 #include <Metal/Metal.hpp>
+#include <dlfcn.h>
 #endif
 
 #include "spikecorec/core/backend.h"
@@ -22,10 +24,31 @@ static CUdevice  g_device  = 0;
 static CUcontext g_context = nullptr;
 
 #elif defined(SPIKECOREC_METAL)
-static MTL::Device*       g_device = nullptr;
-static MTL::CommandQueue* g_queue  = nullptr;
+static MTL::Device*       g_device          = nullptr;
+static MTL::CommandQueue* g_queue           = nullptr;
+static MTL::Library*      g_default_library = nullptr;
 static unordered_map<void*, MTL::Buffer*> g_buffer_map;
-#endif
+
+// The shaders in src/metal/kernels.metal are compiled ahead-of-time by the
+// Makefile into default.metallib, placed alongside the build artifacts. Command
+// line tools have no app bundle for newDefaultLibrary() to search, so locate the
+// metallib next to the loaded binary (via dladdr) and load it explicitly.
+static MTL::Library* load_default_metal_library(MTL::Device* device) {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&load_default_metal_library), &info) && info.dli_fname) {
+        string binary_path(info.dli_fname);
+        size_t last_slash = binary_path.find_last_of('/');
+        string directory = (last_slash == string::npos) ? "." : binary_path.substr(0, last_slash);
+        string metallib_path = directory + "/default.metallib";
+
+        NS::String* path_string = NS::String::string(metallib_path.c_str(), NS::UTF8StringEncoding);
+        NS::URL* url = NS::URL::fileURLWithPath(path_string);
+        NS::Error* error = nullptr;
+        if (MTL::Library* library = device->newLibrary(url, &error))
+            return library;
+    }
+    return device->newDefaultLibrary();
+}
 
 // ── KernelHandle ─────────────────────────────────────────────────────────────
 
@@ -38,6 +61,20 @@ struct KernelHandle {
 #endif
 };
 
+// Looks up a kernel function compiled ahead-of-time into default.metallib and
+// builds a pipeline state for it
+static KernelHandle load_precompiled_kernel(const char* function_name) {
+    KernelHandle handle;
+    NS::String* function_name_string = NS::String::string(function_name, NS::UTF8StringEncoding);
+    MTL::Function* function = g_default_library->newFunction(function_name_string);
+
+    NS::Error* error = nullptr;
+    handle.pipeline_state = g_device->newComputePipelineState(function, &error);
+    function->release();
+    return handle;
+}
+#endif
+
 // ── lifecycle ─────────────────────────────────────────────────────────────────
 
 void initialize_gpu_context() {
@@ -47,8 +84,9 @@ void initialize_gpu_context() {
     cuCtxCreate(&g_context, 0, g_device);
 
 #elif defined(SPIKECOREC_METAL)
-    g_device = MTL::CreateSystemDefaultDevice();
-    g_queue  = g_device->newCommandQueue();
+    g_device          = MTL::CreateSystemDefaultDevice();
+    g_queue           = g_device->newCommandQueue();
+    g_default_library = load_default_metal_library(g_device);
 #endif
 }
 
@@ -62,6 +100,7 @@ void release_gpu_resources() {
         buffer->release();
     g_buffer_map.clear();
 
+    if (g_default_library) { g_default_library->release(); g_default_library = nullptr; }
     if (g_queue)  { g_queue->release();  g_queue  = nullptr; }
     if (g_device) { g_device->release(); g_device = nullptr; }
 #endif
@@ -76,7 +115,11 @@ void* allocate_bytes(usize byte_size) {
     return pointer;
 
 #elif defined(SPIKECOREC_METAL)
-    return g_device->newBuffer(byte_size, MTL::ResourceStorageModeShared);
+    MTL::Buffer* buffer = g_device->newBuffer(byte_size, MTL::ResourceStorageModeShared);
+    // index by the unified-memory data pointer — that's what callers pass around
+    // (GpuPointer::get_contents()), and what dispatch() must resolve back to a buffer
+    g_buffer_map[buffer->contents()] = buffer;
+    return buffer;
 
 #else
     return nullptr;
@@ -90,7 +133,9 @@ void deallocate_bytes(void* platform_handle) {
     cudaFree(platform_handle);
 
 #elif defined(SPIKECOREC_METAL)
-    static_cast<MTL::Buffer*>(platform_handle)->release();
+    auto* buffer = static_cast<MTL::Buffer*>(platform_handle);
+    g_buffer_map.erase(buffer->contents());
+    buffer->release();
 #endif
 }
 
@@ -178,9 +223,18 @@ void dispatch(
     encoder->setComputePipelineState(handle.pipeline_state);
 
     for (u32 i = 0; i < arg_count; ++i) {
-        auto it = g_buffer_map.find(const_cast<void*>(args[i]));
+        // convention: args[i] always points to the argument's storage (matches
+        // CUDA's cuLaunchKernel kernelParams). For pointer-typed arguments that
+        // storage holds a data pointer — try to resolve it back to its MTLBuffer.
+        // Only attempt this when the slot is pointer-sized, so scalar args (which
+        // may be smaller than sizeof(void*)) are never over-read.
+        void* candidate = nullptr;
+        if (arg_sizes[i] == sizeof(void*)) {
+            candidate = *reinterpret_cast<void* const*>(args[i]);
+        }
+        auto it = candidate ? g_buffer_map.find(candidate) : g_buffer_map.end();
         if (it != g_buffer_map.end()) {
-            // pointer is a unified memory allocation — bind its MTLBuffer
+            // resolved to a unified memory allocation — bind its MTLBuffer
             encoder->setBuffer(it->second, 0, i);
         } else {
             // scalar argument — pass by value
@@ -197,6 +251,455 @@ void dispatch(
     command_buffer->waitUntilCompleted();
     command_buffer->release();
     encoder->release();
+#endif
+}
+
+// ── kernel wrappers: WeightMatrix + K2Tree ───────────────────────────────────
+//
+// All four kernels are defined ahead-of-time in actual kernel source files —
+// src/cuda/kernels.cu (native __global__ kernels, launched via <<<>>> through
+// the launch_*() host wrappers) and src/metal/kernels.metal (compiled by the
+// Makefile into default.metallib and looked up by name via
+// load_precompiled_kernel()). No kernel source is generated or compiled at
+// runtime here; the wrappers below just marshal arguments and invoke the
+// precompiled kernels through the generic dispatch() path on Metal, or call
+// the native launchers directly on CUDA.
+
+void gpu_neighbor_weights(
+    const float4 *U,
+    const float4 *V,
+    const u32    *internal_node_words,
+    const u32    *leaf_node_words,
+    const u32    *rank_superblock_table,
+    const u16    *rank_subblock_table,
+    s32 branching_factor,
+    s32 superblock_size_words,
+    s32 padded_node_count,
+    s32 tree_height,
+    s32 internal_bit_count,
+    s64 node_count,
+    s64 max_neighbor_count,
+    s64 rank_float4_stride,
+    f32 *output_weights
+) {
+    s64 total_pairs = node_count * max_neighbor_count;
+    if (total_pairs <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_neighbor_weights(
+        U, V,
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
+        node_count, max_neighbor_count, rank_float4_stride, output_weights
+    );
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("neighbor_weights_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        static_cast<u32>((total_pairs + threads_per_block - 1) / threads_per_block),
+        threads_per_block
+    };
+    const void *args[] = {
+        &U, &V,
+        &internal_node_words, &leaf_node_words, &rank_superblock_table, &rank_subblock_table,
+        &branching_factor, &superblock_size_words, &padded_node_count, &tree_height, &internal_bit_count,
+        &node_count, &max_neighbor_count, &rank_float4_stride,
+        &output_weights
+    };
+    const usize arg_sizes[] = {
+        sizeof(void*), sizeof(void*),
+        sizeof(void*), sizeof(void*), sizeof(void*), sizeof(void*),
+        sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
+        sizeof(s64), sizeof(s64), sizeof(s64),
+        sizeof(void*)
+    };
+    dispatch(kernel_handle, config, args, arg_sizes, 15);
+#endif
+}
+
+void gpu_scale_uv(
+    float4 *U,
+    float4 *V,
+    s64 total_float4_element_count,
+    f32 scale_factor
+) {
+    if (total_float4_element_count <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_scale_uv(U, V, total_float4_element_count, scale_factor);
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("scale_uv_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        static_cast<u32>((total_float4_element_count + threads_per_block - 1) / threads_per_block),
+        threads_per_block
+    };
+    const void *args[] = { &U, &V, &total_float4_element_count, &scale_factor };
+    const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(s64), sizeof(f32) };
+    dispatch(kernel_handle, config, args, arg_sizes, 4);
+#endif
+}
+
+void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, const f32 *input_values, s64 element_count) {
+    if (element_count <= 0) return;
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_add_network_input(membrane_potentials, input_neuron_indices, input_values, element_count);
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("add_network_input_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        static_cast<u32>((element_count + threads_per_block - 1) / threads_per_block),
+        threads_per_block
+    };
+    const void *args[] = { &membrane_potentials, &input_neuron_indices, &input_values, &element_count };
+    const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(void*), sizeof(s64) };
+    dispatch(kernel_handle, config, args, arg_sizes, 4);
+
+#endif
+}
+
+void gpu_decay_all_neurons(
+    f32 *membrane_potentials,
+    s64 *last_tick_updated,
+    s64  neuron_count,
+    s64  tick,
+    f32  resting_mp,
+    f32  decay_rate
+) {
+    if (neuron_count <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_decay_all_neurons(membrane_potentials, last_tick_updated, neuron_count, tick, resting_mp, decay_rate);
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("decay_all_neurons_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        static_cast<u32>((neuron_count + threads_per_block - 1) / threads_per_block),
+        threads_per_block
+    };
+    const void *args[] = { &membrane_potentials, &last_tick_updated, &neuron_count, &tick, &resting_mp, &decay_rate };
+    const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(s64), sizeof(s64), sizeof(f32), sizeof(f32) };
+    dispatch(kernel_handle, config, args, arg_sizes, 6);
+#endif
+}
+
+void gpu_merge_input_neurons(
+    s32       *active_neuron_indices,
+    s32       *active_neuron_count,
+    const s64 *override_input_neurons,
+    s64        override_count
+) {
+    if (override_count <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_merge_input_neurons(active_neuron_indices, active_neuron_count, override_input_neurons, override_count);
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("merge_input_neurons_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        static_cast<u32>((override_count + threads_per_block - 1) / threads_per_block),
+        threads_per_block
+    };
+    const void *args[] = { &active_neuron_indices, &active_neuron_count, &override_input_neurons, &override_count };
+    const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(void*), sizeof(s64) };
+    dispatch(kernel_handle, config, args, arg_sizes, 4);
+#endif
+}
+
+void gpu_reservoir_features(
+    s64       neuron_count,
+    s64       tick,
+    f32       spike_tau,
+    f32       voltage_scale,
+    f32      *membrane_potentials,
+    const s64*last_spiked,
+    s64      *last_tick_updated,
+    f32       resting_mp,
+    f32       decay_rate,
+    f32      *output_buffer
+) {
+    if (neuron_count <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_reservoir_features(
+        neuron_count, tick, spike_tau, voltage_scale,
+        membrane_potentials, last_spiked, last_tick_updated,
+        resting_mp, decay_rate, output_buffer);
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("reservoir_features_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        static_cast<u32>((neuron_count + threads_per_block - 1) / threads_per_block),
+        threads_per_block
+    };
+    const void *args[] = {
+        &neuron_count, &tick, &spike_tau, &voltage_scale,
+        &membrane_potentials, &last_spiked, &last_tick_updated,
+        &resting_mp, &decay_rate, &output_buffer
+    };
+    const usize arg_sizes[] = {
+        sizeof(s64), sizeof(s64), sizeof(f32), sizeof(f32),
+        sizeof(void*), sizeof(void*), sizeof(void*),
+        sizeof(f32), sizeof(f32), sizeof(void*)
+    };
+    dispatch(kernel_handle, config, args, arg_sizes, 10);
+#endif
+}
+
+//void gpu_vector_add(
+//    f32       *result,
+//    const f32 *a,
+//    const f32 *b,
+//    s64        element_count
+//) {
+//    if (element_count <= 0) return;
+//
+//#ifdef SPIKECOREC_CUDA
+//    cuda::launch_vector_add(result, a, b, element_count);
+//
+//#elif defined(SPIKECOREC_METAL)
+//    static KernelHandle kernel_handle = load_precompiled_kernel("vector_add_kernel");
+//
+//    constexpr u32 threads_per_block = 256;
+//    LaunchConfig config{
+//        static_cast<u32>((element_count + threads_per_block - 1) / threads_per_block),
+//        threads_per_block
+//    };
+//    const void *args[] = { &result, &a, &b, &element_count };
+//    const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(void*), sizeof(s64) };
+//    dispatch(kernel_handle, config, args, arg_sizes, 4);
+//#endif
+//}
+
+void gpu_weight_update(
+    float4 *U,
+    float4 *V,
+    s64 rank_float4_stride,
+    s32 source_node,
+    s32 target_node,
+    f32 delta,
+    f32 learning_rate,
+    f32 l2_regularization,
+    s32 iterations
+) {
+    if (rank_float4_stride <= 0 || iterations <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_weight_update(U, V, rank_float4_stride, source_node, target_node,
+                               delta, learning_rate, l2_regularization, iterations);
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("weight_update_kernel");
+
+    // single threadgroup; rank_float4_stride is always small (e.g. 16 lanes for rank=64),
+    // round up to a multiple of the SIMD width so the reduction covers every active lane
+    u32 threads = 32;
+    while (static_cast<s64>(threads) < rank_float4_stride) threads <<= 1;
+    threads = threads > 1024 ? 1024 : threads;
+
+    LaunchConfig config{1u, threads};
+    const void *args[] = {
+        &U, &V, &rank_float4_stride, &source_node, &target_node,
+        &delta, &learning_rate, &l2_regularization, &iterations
+    };
+    const usize arg_sizes[] = {
+        sizeof(void*), sizeof(void*), sizeof(s64), sizeof(s32), sizeof(s32),
+        sizeof(f32), sizeof(f32), sizeof(f32), sizeof(s32)
+    };
+    dispatch(kernel_handle, config, args, arg_sizes, 9);
+#endif
+}
+
+void gpu_k2tree_adjacent_batch(
+    const u32 *internal_node_words,
+    const u32 *leaf_node_words,
+    const u32 *rank_superblock_table,
+    const u16 *rank_subblock_table,
+    s32 branching_factor,
+    s32 superblock_size_words,
+    s32 node_count,
+    s32 padded_node_count,
+    s32 tree_height,
+    s32 internal_bit_count,
+    const s32 *source_indices,
+    const s32 *target_indices,
+    uint8_t *output_buffer,
+    s32 query_count
+) {
+    if (query_count <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_k2tree_adjacent_batch(
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, node_count, padded_node_count,
+        tree_height, internal_bit_count, source_indices, target_indices,
+        output_buffer, query_count
+    );
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("k2tree_adjacent_batch_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        (static_cast<u32>(query_count) + threads_per_block - 1) / threads_per_block,
+        threads_per_block
+    };
+    const void *args[] = {
+        &internal_node_words, &leaf_node_words, &rank_superblock_table, &rank_subblock_table,
+        &branching_factor, &superblock_size_words, &node_count, &padded_node_count,
+        &tree_height, &internal_bit_count,
+        &source_indices, &target_indices, &output_buffer, &query_count
+    };
+    const usize arg_sizes[] = {
+        sizeof(void*), sizeof(void*), sizeof(void*), sizeof(void*),
+        sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
+        sizeof(s32), sizeof(s32),
+        sizeof(void*), sizeof(void*), sizeof(void*), sizeof(s32)
+    };
+    dispatch(kernel_handle, config, args, arg_sizes, 14);
+#endif
+}
+
+void gpu_k2tree_get_neighbors_batch(
+    const u32 *internal_node_words,
+    const u32 *leaf_node_words,
+    const u32 *rank_superblock_table,
+    const u16 *rank_subblock_table,
+    s32 branching_factor,
+    s32 superblock_size_words,
+    s32 node_count,
+    s32 padded_node_count,
+    s32 tree_height,
+    s32 internal_bit_count,
+    const s32 *source_node_indices,
+    s32 query_count,
+    s32 max_neighbor_count,
+    s32 *output_buffer
+) {
+    s64 total_pairs = static_cast<s64>(query_count) * max_neighbor_count;
+    if (total_pairs <= 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_k2tree_get_neighbors_batch(
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, node_count, padded_node_count,
+        tree_height, internal_bit_count, source_node_indices, query_count,
+        max_neighbor_count, output_buffer
+    );
+
+#elif defined(SPIKECOREC_METAL)
+    static KernelHandle kernel_handle = load_precompiled_kernel("k2tree_get_neighbors_batch_kernel");
+
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        (static_cast<u32>(total_pairs) + threads_per_block - 1) / threads_per_block,
+        threads_per_block
+    };
+    const void *args[] = {
+        &internal_node_words, &leaf_node_words, &rank_superblock_table, &rank_subblock_table,
+        &branching_factor, &superblock_size_words, &node_count, &padded_node_count,
+        &tree_height, &internal_bit_count,
+        &source_node_indices, &query_count, &max_neighbor_count, &output_buffer
+    };
+    const usize arg_sizes[] = {
+        sizeof(void*), sizeof(void*), sizeof(void*), sizeof(void*),
+        sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
+        sizeof(s32), sizeof(s32),
+        sizeof(void*), sizeof(s32), sizeof(s32), sizeof(void*)
+    };
+    dispatch(kernel_handle, config, args, arg_sizes, 14);
+#endif
+}
+
+void gpu_step(
+   s64           tick,
+   s64           next_tick,
+   s32           spike_period,
+   f32           spike_threshold,
+   f32           learning_rate,
+   f32           decay_rate,
+   f32           resting_mp,
+   const float4 *U,
+   const float4 *V,
+   s64           rank_float4_stride,
+   f32           constant_weight,
+   const u32    *internal_node_words,
+   const u32    *leaf_node_words,
+   const u32    *rank_superblock_table,
+   const u16    *rank_subblock_table,
+   s32           branching_factor,
+   s32           superblock_size_words,
+   s32           padded_node_count,
+   s32           tree_height,
+   s32           internal_bit_count,
+   s64           neuron_count,
+   f32          *network_inputs,
+   f32          *membrane_potentials,
+   s64          *last_spiked,
+   s64          *last_tick_updated,
+   const s32    *active_neuron_indices,
+   const s32    *active_neuron_count,
+   s32          *next_active_neuron_indices,
+   s32          *next_active_neuron_count,
+   s32          *active_generation,
+   s32           thread_count_per_block,
+   s32           block_count
+) {
+    if (tick < 0 || next_tick < 0) return;
+
+#ifdef SPIKECOREC_CUDA
+    cuda::launch_step(
+        tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
+        U, V, rank_float4_stride, constant_weight,
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
+        neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
+        active_neuron_indices, active_neuron_count, next_active_neuron_indices, next_active_neuron_count,
+        active_generation, thread_count_per_block, block_count);
+
+#elif defined(SPIKECOREC_METAL)
+    KernelHandle kernel_handle = load_precompiled_kernel("step");
+    constexpr u32 threads_per_block = 256;
+    LaunchConfig config{
+        (static_cast<u32>(neuron_count) + threads_per_block - 1) / threads_per_block,
+        threads_per_block
+    };
+    const void *args[] = {
+       &tick, &next_tick, &spike_period, &spike_threshold,
+       &learning_rate, &decay_rate, &resting_mp, U, V,
+       &rank_float4_stride, &constant_weight, internal_node_words, leaf_node_words,
+       rank_superblock_table, rank_subblock_table, &branching_factor,
+       &superblock_size_words, &padded_node_count, &tree_height,
+       &internal_bit_count, &neuron_count, network_inputs, membrane_potentials,
+       last_spiked, last_tick_updated, active_neuron_indices, active_neuron_count,
+       next_active_neuron_indices, next_active_neuron_count,
+       active_generation, &thread_count_per_block, &block_count
+    };
+    const usize arg_sizes[] = {
+        sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),
+        sizeof(float4 *), sizeof(float4 *), sizeof(s64), sizeof(f32), sizeof(const u32 *), sizeof(const u32 *), sizeof(const u32 *),
+        sizeof(const u16 *), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s64),
+        sizeof(f32 *), sizeof(f32 *), sizeof(s64 *), sizeof(s64 *), sizeof(const s32 *), sizeof(const s32 *),
+        sizeof(s32 *), sizeof(s32 *), sizeof(s32 *),
+        sizeof(s32), sizeof(s32)
+    };
+    // arg_count is 31, not 32 — the step kernel intentionally has no buffer(31)
+    // for block_count (it derives thread index from thread_position_in_grid),
+    // so the trailing &block_count entry in args[]/arg_sizes[] is left unbound.
+    dispatch(kernel_handle, config, args, arg_sizes, 31);
+
 #endif
 }
 
