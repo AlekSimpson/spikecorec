@@ -39,6 +39,30 @@ UNAME_M    := $(shell uname -m)
 CUDA_PATH  ?= /usr/local/cuda
 HAS_NVCC   := $(shell command -v nvcc 2>/dev/null && echo yes || echo no)
 
+# ── Compression library detection (.spire codec — gzip/xz/bz2) ───────────────
+# Mirrors the HAS_NVCC pattern: probe via pkg-config, define SPIKECOREC_HAVE_*
+# and append link flags only when found. Missing libraries degrade gracefully —
+# raw .spire always works; SpireWriter/Reader throw a clear runtime_error for
+# compressed variants whose library wasn't available at build time.
+HAS_ZLIB   := $(shell pkg-config --exists zlib   && echo yes || echo no)
+HAS_LZMA   := $(shell pkg-config --exists liblzma && echo yes || echo no)
+HAS_BZ2    := $(shell pkg-config --exists bzip2  && echo yes || echo no)
+
+COMPRESSION_LIBS :=
+
+ifeq ($(HAS_ZLIB),yes)
+  CXXFLAGS         += -DSPIKECOREC_HAVE_ZLIB $(shell pkg-config --cflags zlib)
+  COMPRESSION_LIBS += $(shell pkg-config --libs zlib)
+endif
+ifeq ($(HAS_LZMA),yes)
+  CXXFLAGS         += -DSPIKECOREC_HAVE_LZMA $(shell pkg-config --cflags liblzma)
+  COMPRESSION_LIBS += $(shell pkg-config --libs liblzma)
+endif
+ifeq ($(HAS_BZ2),yes)
+  CXXFLAGS         += -DSPIKECOREC_HAVE_BZ2 $(shell pkg-config --cflags bzip2)
+  COMPRESSION_LIBS += $(shell pkg-config --libs bzip2)
+endif
+
 ifeq ($(UNAME_S),Darwin)
   HAS_METAL     := yes
   CXX           := clang++
@@ -165,13 +189,13 @@ test: test-$(BACKEND)
 
 test-cuda: check-cuda $(CUDA_LIB)
 	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(TEST_CUDA_SRCS) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda -lcudart -L$(CUDA_PATH)/lib64 \
+	    -L$(BUILD_DIR) -l$(PROJECT)_cuda -lcudart -L$(CUDA_PATH)/lib64 $(COMPRESSION_LIBS) \
 	    -o $(BUILD_DIR)/test_runner_cuda
 	$(BUILD_DIR)/test_runner_cuda
 
 test-metal: check-metal $(METAL_LIB)
 	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(TEST_METAL_SRCS) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) \
 	    -o $(BUILD_DIR)/test_runner_metal
 	$(BUILD_DIR)/test_runner_metal
 
@@ -193,6 +217,9 @@ info:
 	@echo "Platform   : $(UNAME_S) $(UNAME_M)"
 	@echo "CUDA found : $(HAS_NVCC)"
 	@echo "Metal found: $(HAS_METAL)"
+	@echo "zlib found : $(HAS_ZLIB)"
+	@echo "lzma found : $(HAS_LZMA)"
+	@echo "bzip2 found: $(HAS_BZ2)"
 	@echo "Backend    : $(BACKEND)"
 	@echo "CXX        : $(CXX)"
 

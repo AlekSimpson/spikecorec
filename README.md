@@ -10,6 +10,7 @@ A high-performance C++ library with CUDA and Metal GPU backends, importable as a
 | [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) | CUDA backend (`nvcc`) |
 | macOS 13+ with Xcode CLI tools | Metal backend |
 | Python 3.9+ with `pybind11` | Python bindings |
+| `zlib` / `liblzma` / `libbz2` (optional, via `pkg-config`) | gzip/xz/bz2 support for `.spire` recordings — auto-detected at build time (`make info` shows what was found); uncompressed `.spire` always works |
 | `bear` (optional) | Regenerate `compile_commands.json` for IDE tooling |
 
 ```bash
@@ -107,7 +108,7 @@ print(spikecorec.__version__)
 
 See **[`python/README.md`](python/README.md)** for full Python API documentation
 and usage examples (`SpikeEngine`, topology generators, `WeightMatrix`, reservoir
-features, weight scaling, etc.).
+features, weight scaling, simulation recording to `.spire` files, etc.).
 
 ---
 

@@ -12,6 +12,7 @@
 
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/recording.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -216,6 +217,75 @@ void SpikeEngine::step_simulation(
 
     std::swap(active_neuron_indices, next_active_neuron_indices);
     std::swap(active_neuron_count, next_active_neuron_count);
+}
+
+void SpikeEngine::start_static_record(
+    const vector<vector<f32>> &input_spikes,
+    s64 lifetime,
+    const string &filename,
+    bool record_membrane,
+    s64 record_stride,
+    optional<string> compression,
+    optional<int> compression_level,
+    bool full_decay,
+    bool compression_async,
+    usize compression_queue_max,
+    usize compression_chunk_bytes
+) {
+    if (lifetime < 0) throw std::runtime_error("start_static_record: lifetime must be >= 0");
+    if (record_stride < 1) throw std::runtime_error("start_static_record: record_stride must be >= 1");
+    if (input_neuron_count <= 0) throw std::runtime_error("start_static_record: no input neurons configured (call set_input_neurons first)");
+    if ((s64)input_spikes.size() < lifetime) throw std::runtime_error("start_static_record: input_spikes must provide at least `lifetime` ticks");
+
+    // Each tick's input row is positionally matched to input_neuron_indices, so
+    // it must contain exactly input_neuron_count values. A wider row would make
+    // step_simulation's add_network_input kernel read uninitialized
+    // input_neuron_indices slots and write out of bounds; an empty/short row
+    // would silently under-stimulate or throw mid-loop, leaving a truncated
+    // recording. Validate up front (before opening the output file) so bad input
+    // produces no partial file.
+    for (s64 tick = 0; tick < lifetime; ++tick) {
+        if ((s64)input_spikes[(usize)tick].size() != input_neuron_count)
+            throw std::runtime_error("start_static_record: input_spikes[" + std::to_string(tick)
+                + "] has " + std::to_string(input_spikes[(usize)tick].size())
+                + " values but there are " + std::to_string(input_neuron_count) + " input neurons");
+    }
+
+    SimulationRecorder recorder(
+        filename, neuron_count, compression, compression_level,
+        compression_async, compression_queue_max, compression_chunk_bytes);
+
+    // Forces input neurons into the active set every tick regardless of
+    // whether they're already active — mirrors the reference's per-tick
+    // _add_active(self.input_neurons, tick) call (spike_engine_cuda.py:344-345).
+    vector<s64> override_input_neurons((usize)input_neuron_count);
+    const s32 *input_indices = input_neuron_indices.get_contents();
+    for (s64 i = 0; i < input_neuron_count; ++i)
+        override_input_neurons[(usize)i] = (s64)input_indices[i];
+
+    for (s64 tick = 0; tick < lifetime; ++tick) {
+        step_simulation(input_spikes[(usize)tick], tick, override_input_neurons, /*decay_all_neurons=*/false);
+
+        if (record_membrane && tick % record_stride == 0) {
+            // _decay_all(tick) runs after step() and only on recorded ticks,
+            // immediately before the membrane-potential snapshot — a real,
+            // stateful operation (spike_engine_cuda.py:347-352), not a preview.
+            if (full_decay) {
+                gpu_decay_all_neurons(
+                    membrane_potentials.get_contents(),
+                    last_tick_updated.get_contents(),
+                    neuron_count,
+                    tick,
+                    resting_membrane_potential,
+                    decay_rate);
+            }
+
+            synchronize_gpu_work();
+            recorder.record_frame(membrane_potentials.get_contents(), neuron_count);
+        }
+    }
+
+    recorder.finish();
 }
 
 pair<f32, f32> SpikeEngine::estimate_bifurcation_weight(s32 input_period) const {

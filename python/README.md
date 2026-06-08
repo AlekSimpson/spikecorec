@@ -241,6 +241,127 @@ Allocates host-side per-neuron membrane-potential log buffers
 Raises `RuntimeError` if the requested allocation would exceed
 `max_log_bytes`.
 
+## Simulation recording (`.spire` format)
+
+`spikecorec` can record a run's membrane potentials to disk in the same
+`.spire` binary format used by the `spikecore` Python reference — files are
+**byte-for-byte interoperable** between the two implementations (and with
+`gzip`/`xz`/`bzip2`-compressed variants of either).
+
+### Format
+
+```
+offset 0:  u32, big-endian   — neuron_count
+offset 4:  f32[neuron_count] — frame 0 membrane potentials (native byte order)
+offset 4 + neuron_count*4:   — frame 1 ...
+...repeated until EOF
+```
+
+No magic bytes or version marker. The whole byte sequence (header included)
+may optionally be wrapped end-to-end in gzip (`.gz`/`.gzip`), xz/lzma
+(`.xz`/`.lzma`), or bzip2 (`.bz2`) — `spikecorec` auto-detects this from the
+filename extension when `compression="auto"` (the default).
+
+> **Note:** gzip/xz/bz2 support depends on `zlib`/`liblzma`/`libbz2` being
+> available when `spikecorec` was built (the Makefile/`setup.py` probe for
+> them via `pkg-config` and degrade gracefully). Run `make info` to check
+> which were detected (`zlib found`/`lzma found`/`bzip2 found`); uncompressed
+> `.spire` always works regardless. Reading/writing a format whose library
+> wasn't available raises a `RuntimeError` with a clear message.
+
+### Recording a run
+
+```python
+engine.start_static_record(
+    input_spikes, lifetime, filename,
+    record_membrane=True, record_stride=1,
+    compression="auto", compression_level=None,
+    full_decay=True,
+    compression_async=False, compression_queue_max=8,
+    compression_chunk_bytes=4 * 1024 * 1024,
+)
+```
+
+Drives its own tick loop for `lifetime` ticks and writes a `.spire` recording
+to `filename` — a direct port of the `spikecore` reference's
+`start_static_record`:
+
+- `input_spikes` — `list[list[float]]`; `input_spikes[tick][i]` is added to
+  the membrane potential of `input_neuron_indices[i]` (as set via
+  `set_input_neurons`) for that tick. Must provide at least `lifetime` ticks,
+  and each tick's row must contain exactly `input_neuron_count` values — a
+  wrong-width or empty row raises `RuntimeError` before any file is written.
+- Each tick, the configured input neurons are forced into the active set
+  (mirrors the reference's per-tick `_add_active` call) before the step runs.
+- `record_membrane`/`record_stride` — whether/how often (every `record_stride`
+  ticks) to snapshot membrane potentials into the recording.
+- `compression`/`compression_level` — `"auto"` (infer from `filename`'s
+  extension), `"none"`, `"gzip"`, `"xz"`, or `"bz2"`; `compression_level` maps
+  to each codec's native level/preset (1-9 for gzip/bz2, 0-9 for xz; default
+  `6`, matching the reference).
+- `full_decay` — on each *recorded* tick, runs a full decay pass (advancing
+  `last_tick_updated` for every neuron, not just active ones) immediately
+  before the membrane-potential snapshot — exactly mirrors the reference's
+  `_decay_all` timing. This is a real, stateful operation, not a preview.
+- `compression_async`/`compression_queue_max`/`compression_chunk_bytes` —
+  when `compression_async=True`, compression and file I/O run on a background
+  thread fed by a bounded queue (`compression_queue_max` chunks of up to
+  `compression_chunk_bytes` bytes each) so the simulation loop isn't blocked
+  on slow I/O — this call releases the GIL while it runs, so other Python
+  threads keep making progress too. `compression_queue_max=0` makes the queue
+  unbounded (no backpressure), matching Python's `queue.Queue(maxsize=0)`.
+
+```python
+engine.set_input_neurons([0, 1, 2])
+input_spikes = [[2.0, 2.0, 2.0] for _ in range(500)]
+engine.start_static_record(
+    input_spikes, lifetime=500, filename="run.spire.gz",
+    record_stride=2, compression_async=True,
+)
+```
+
+### Reading a recording back
+
+```python
+spikecorec.read_spire_recording(filename) -> np.ndarray[float32]  # (frame_count, neuron_count)
+```
+
+Auto-detects compression from the extension, parses the header, and decodes
+every frame into one contiguous `(frame_count, neuron_count)` array. Raises
+`RuntimeError` if the final frame is truncated.
+
+```python
+recording = spikecorec.read_spire_recording("run.spire.gz")
+print(recording.shape)  # (250, neuron_count)
+```
+
+### `SimulationRecorder` (custom per-tick recording loops)
+
+`start_static_record` is built on top of a standalone `SimulationRecorder` —
+exposed directly for callers who want to drive their own tick loop (e.g.
+mixing in custom stimulus logic between `step_simulation` calls) while still
+producing a `.spire` file:
+
+```python
+recorder = spikecorec.SimulationRecorder(
+    filename, neuron_count,
+    compression="auto", compression_level=None,
+    compression_async=False, queue_max=8, chunk_bytes=4 * 1024 * 1024,
+)
+recorder.record_frame(membrane_potentials)  # float32[neuron_count]
+recorder.finish()                           # flush + close — call exactly once
+
+recorder.neuron_count                       # int, read-only — frame width it expects
+```
+
+`record_frame` appends one frame's worth of bytes to an internal buffer,
+flushing to the (possibly compressed, possibly async) sink once `chunk_bytes`
+is reached; `finish()` flushes any remainder and closes the underlying file.
+The array passed to `record_frame` must have exactly `recorder.neuron_count`
+elements — a wrong-size array raises `RuntimeError` rather than reading out of
+bounds. As with `start_static_record`, `queue_max=0` makes the async queue
+unbounded.
+
 ## `WeightMatrix`
 
 Accessible read-only via `engine.weights`. Wraps a k²-tree-compressed sparse
@@ -298,11 +419,19 @@ print(features.shape)  # (20, 2 * 256 + 1)
 engine.shutdown()
 ```
 
-## Running the test environment
+## Running the tests
 
+The C++ core/codec test suite (topology, k²-tree, weight-matrix, engine, and
+`.spire` recording tests — `tests/test_core.cpp`) builds and runs with:
+
+```bash
+make test          # auto-detects backend (Metal on macOS, CUDA elsewhere)
+make test-metal    # force the Metal build
+```
+
+To build the Python extension itself, point `make python` at your interpreter.
 The project's intended Python environment is the `spike_engine` conda env
-(`numpy`, `pytest`, `pybind11`, etc. already present). Build/test against it
-explicitly with:
+(`numpy`, `pybind11`, etc. already present):
 
 ```bash
 make python PYTHON=/path/to/envs/spike_engine/bin/python

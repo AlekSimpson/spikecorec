@@ -3,6 +3,8 @@
 //
 #pragma once
 
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "spikecorec/core/types.h"
@@ -85,6 +87,29 @@ namespace spikecorec {
             s64 tick,
             const vector<s64> &override_input_neurons = {},
             bool decay_all_neurons = false);
+
+        // Drives its own tick loop for `lifetime` ticks, recording membrane
+        // potentials to a `.spire` file as it goes — a faithful port of the
+        // Python reference's SpikeEngineCUDA.start_static_record. Each tick:
+        // steps the simulation (forcing input neurons into the active set via
+        // override_input_neurons, mirroring the reference's _add_active call),
+        // then — on recorded ticks — optionally runs a full decay pass before
+        // snapshotting membrane_potentials into the recorder.
+        // input_spikes[tick][i] is the value added to input_neuron_indices[i]'s
+        // membrane potential for that tick (positionally matched, like
+        // step_simulation's input_values).
+        void start_static_record(
+            const vector<vector<f32>> &input_spikes,
+            s64 lifetime,
+            const string &filename,
+            bool record_membrane = true,
+            s64 record_stride = 1,
+            optional<string> compression = string("auto"),
+            optional<int> compression_level = nullopt,
+            bool full_decay = true,
+            bool compression_async = false,
+            usize compression_queue_max = 8,
+            usize compression_chunk_bytes = 4 * 1024 * 1024);
 
         // void step(s64 tick);
 

@@ -15,6 +15,7 @@
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/topologies.h"
+#include "spikecorec/core/recording.h"
 
 namespace py = pybind11;
 using namespace spikecorec;
@@ -140,6 +141,22 @@ PYBIND11_MODULE(_spikecorec, m) {
                  deallocate(std::move(output));
                  return result;
              }, py::arg("tick"), py::arg("spike_tau"), py::arg("voltage_scale"))
+        .def("start_static_record", &SpikeEngine::start_static_record,
+             py::arg("input_spikes"), py::arg("lifetime"), py::arg("filename"),
+             py::arg("record_membrane") = true,
+             py::arg("record_stride") = 1,
+             py::arg("compression") = std::optional<std::string>("auto"),
+             py::arg("compression_level") = std::optional<int>{},
+             py::arg("full_decay") = true,
+             py::arg("compression_async") = false,
+             py::arg("compression_queue_max") = static_cast<usize>(8),
+             py::arg("compression_chunk_bytes") = static_cast<usize>(4 * 1024 * 1024),
+             // Long-running call that may spin up a background compression
+             // thread (compression_async=True) — release the GIL so that
+             // thread (and other Python threads) can make progress while the
+             // C++ tick loop runs. This is the *first* GIL release among these
+             // bindings; every other bound method here is short/synchronous.
+             py::call_guard<py::gil_scoped_release>())
         .def("shutdown", &SpikeEngine::shutdown)
 
         // Read-back accessors — copy GPU buffer contents into numpy arrays.
@@ -175,4 +192,44 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readwrite("spike_threshold", &SpikeEngine::spike_threshold)
         .def_readwrite("use_constant_weight", &SpikeEngine::use_constant_weight)
         .def_readonly("running", &SpikeEngine::running);
+
+    // Decodes a `.spire`/`.spire.gz`/`.spire.xz`/`.spire.bz2` recording (as
+    // written by start_static_record / SimulationRecorder, or by the
+    // spikecore Python reference — the format is byte-for-byte compatible)
+    // into a (frame_count, neuron_count) float32 array.
+    m.def("read_spire_recording", [](const string &filename) {
+        SpireRecording recording = read_spire_recording(filename);
+        py::array_t<f32> result({static_cast<py::ssize_t>(recording.frame_count),
+                                 static_cast<py::ssize_t>(recording.neuron_count)});
+        // A header-only file decodes to zero frames — both pointers may be null,
+        // and memcpy(nullptr, nullptr, 0) is undefined, so skip the copy.
+        if (!recording.frames.empty())
+            std::memcpy(result.mutable_data(), recording.frames.data(),
+                        recording.frames.size() * sizeof(f32));
+        return result;
+    }, py::arg("filename"));
+
+    // Standalone buffering/compression/recording layer underlying
+    // start_static_record — exposed for callers who want to drive their own
+    // per-tick recording loops (e.g. mixing in custom stimulus logic between
+    // engine.step_simulation calls) instead of the all-in-one method above.
+    py::class_<SimulationRecorder>(m, "SimulationRecorder")
+        .def(py::init<const string &, s64, std::optional<std::string>, std::optional<int>, bool, usize, usize>(),
+             py::arg("filename"), py::arg("neuron_count"),
+             py::arg("compression") = std::optional<std::string>("auto"),
+             py::arg("compression_level") = std::optional<int>{},
+             // Named `compression_async` (not `async`) on the Python side —
+             // `async` has been a reserved keyword since Python 3.7, so
+             // `SimulationRecorder(..., async=True)` would be a SyntaxError.
+             // Matches start_static_record's naming for the same concept.
+             py::arg("compression_async") = false,
+             py::arg("queue_max") = static_cast<usize>(8),
+             py::arg("chunk_bytes") = static_cast<usize>(4 * 1024 * 1024))
+        .def_property_readonly("neuron_count", &SimulationRecorder::neuron_count)
+        .def("record_frame", [](SimulationRecorder &self, py::array_t<f32, py::array::c_style | py::array::forcecast> membrane_potentials) {
+            // Pass the array length so record_frame can reject a wrongly-sized
+            // array instead of reading out of bounds past membrane_potentials.
+            self.record_frame(membrane_potentials.data(), membrane_potentials.size());
+        }, py::arg("membrane_potentials"))
+        .def("finish", &SimulationRecorder::finish);
 }
