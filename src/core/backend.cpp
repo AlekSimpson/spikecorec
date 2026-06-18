@@ -676,16 +676,24 @@ void gpu_step(
         (static_cast<u32>(neuron_count) + threads_per_block - 1) / threads_per_block,
         threads_per_block
     };
+    // Every entry is the *address* of the argument's storage — for pointer-typed
+    // args that storage is the pointer variable itself (&U, &membrane_potentials,
+    // …), matching the convention dispatch() relies on to recover the data pointer
+    // and resolve it back to its MTLBuffer. Passing the bare pointer (U) instead of
+    // its address would make dispatch() dereference the buffer's *contents*, fail
+    // the buffer-map lookup, and wrongly bind the arg via setBytes — leaving the
+    // step kernel reading garbage for active_neuron_count/indices (no neuron ever
+    // processed, so nothing spikes).
     const void *args[] = {
        &tick, &next_tick, &spike_period, &spike_threshold,
-       &learning_rate, &decay_rate, &resting_mp, U, V,
-       &rank_float4_stride, &constant_weight, internal_node_words, leaf_node_words,
-       rank_superblock_table, rank_subblock_table, &branching_factor,
+       &learning_rate, &decay_rate, &resting_mp, &U, &V,
+       &rank_float4_stride, &constant_weight, &internal_node_words, &leaf_node_words,
+       &rank_superblock_table, &rank_subblock_table, &branching_factor,
        &superblock_size_words, &padded_node_count, &tree_height,
-       &internal_bit_count, &neuron_count, network_inputs, membrane_potentials,
-       last_spiked, last_tick_updated, active_neuron_indices, active_neuron_count,
-       next_active_neuron_indices, next_active_neuron_count,
-       active_generation, &thread_count_per_block, &block_count
+       &internal_bit_count, &neuron_count, &network_inputs, &membrane_potentials,
+       &last_spiked, &last_tick_updated, &active_neuron_indices, &active_neuron_count,
+       &next_active_neuron_indices, &next_active_neuron_count,
+       &active_generation, &thread_count_per_block, &block_count
     };
     const usize arg_sizes[] = {
         sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),

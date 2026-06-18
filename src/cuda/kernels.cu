@@ -666,6 +666,7 @@ __global__ void step_kernel(
         last_spiked[neuron_thread_id] = tick;
     }
 
+    // FLAG: why is there no end conditional defined here? 
     for (s32 neighbor_slot = 0; ; ++neighbor_slot) {
         s32 child = k2t_find_nth_neighbor(
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,

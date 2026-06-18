@@ -16,7 +16,6 @@ using namespace std;
 namespace spikecorec {
     struct ScaledReservoirResult {
         ScaleResult weight_scale_result;
-        f32 target_root_mean_square;
         f32 w_accum;
         f32 w_instant;
     };
@@ -36,7 +35,10 @@ namespace spikecorec {
         GpuPointer<s32> active_generation; // [neuron_count] — generation tag, -1 = inactive
         GpuPointer<s32> input_neuron_indices; // set via set_input_neurons()
 
-        static const s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
+        // constexpr (not plain const) so it is implicitly inline in C++17 — it is
+        // ODR-used as a default-argument value in the pybind11 bindings
+        // (bindings.cpp), which would otherwise require an out-of-line definition.
+        static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
         f32 **mp_logs = nullptr;
 
         s64 lifetime = 0;
@@ -88,16 +90,6 @@ namespace spikecorec {
             const vector<s64> &override_input_neurons = {},
             bool decay_all_neurons = false);
 
-        // Drives its own tick loop for `lifetime` ticks, recording membrane
-        // potentials to a `.spire` file as it goes — a faithful port of the
-        // Python reference's SpikeEngineCUDA.start_static_record. Each tick:
-        // steps the simulation (forcing input neurons into the active set via
-        // override_input_neurons, mirroring the reference's _add_active call),
-        // then — on recorded ticks — optionally runs a full decay pass before
-        // snapshotting membrane_potentials into the recorder.
-        // input_spikes[tick][i] is the value added to input_neuron_indices[i]'s
-        // membrane potential for that tick (positionally matched, like
-        // step_simulation's input_values).
         void start_static_record(
             const vector<vector<f32>> &input_spikes,
             s64 lifetime,
@@ -110,8 +102,6 @@ namespace spikecorec {
             bool compression_async = false,
             usize compression_queue_max = 8,
             usize compression_chunk_bytes = 4 * 1024 * 1024);
-
-        // void step(s64 tick);
 
         [[nodiscard]] bool is_alive() const;
 

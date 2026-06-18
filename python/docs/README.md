@@ -5,6 +5,11 @@ engine in this repo. It exposes the same simulation primitives as the
 `spikecore` Python reference (`SpikeEngine`, topology generators, weight
 inspection) while running the actual step loop on the GPU.
 
+> **Looking for a quick parameter/method lookup while developing?** See
+> [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for a complete,
+> table-based reference of every function, class, method, property, and
+> default. This README focuses on tutorials and explanations.
+
 ## Installation
 
 Build and install the extension as an editable package (auto-detects the
@@ -212,8 +217,7 @@ weights so their RMS matches `target = abs(w_accum * scale)`. Returns a
 
 | field | meaning |
 |---|---|
-| `weight_scale_result` | `ScaleResult` — before/after `WeightStats` and the applied `scale_factor` |
-| `target_root_mean_square` | the RMS value weights were scaled toward |
+| `weight_scale_result` | `ScaleResult` — before/after `WeightStats`, the applied `scale_factor`, and `target_root_mean_square` (the RMS value weights were scaled toward) |
 | `w_accum`, `w_instant` | the underlying bifurcation-weight estimates |
 
 ### Properties

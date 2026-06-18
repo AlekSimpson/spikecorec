@@ -906,7 +906,7 @@ void test_scale_randomized_near_bifurcation() {
         engine.scale_randomized_weights_near_bifurcation(/*input_period=*/1, /*scale=*/1.2f, /*freeze_learning=*/true);
 
     f32 expected_target = std::fabs(result.w_accum * 1.2f);
-    assert(approx(result.target_root_mean_square, expected_target, 1e-5f));
+    assert(approx(result.weight_scale_result.target_root_mean_square, expected_target, 1e-5f));
     assert(approx(result.weight_scale_result.after.root_mean_square, expected_target, 1e-2f));
     assert(!engine.use_constant_weight);
     assert(engine.learning_rate == 0.0f);

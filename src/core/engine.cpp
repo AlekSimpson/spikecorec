@@ -155,15 +155,18 @@ void SpikeEngine::step_simulation(
     // input_values/override_input_neurons are host-side vectors — the GPU kernels
     // need them in GPU-visible memory (mirrors the Python reference's per-step
     // cp.asarray(input_values) transfer), so stage transient copies here.
+    // FLAG: ya idk if this is true since we are assuming unified memory hardware? wouldn't this essentially be a no-op
     GpuPointer<f32> staged_input_values = allocate<f32>(input_values.size() * sizeof(f32));
     memcpy(staged_input_values.get_contents(), input_values.data(), input_values.size() * sizeof(f32));
 
+    // FLAG: also doesn't this happen in the gpu_step wrapper kernel? we are we doing it in a completely separate kernel?
     gpu_add_network_input(
         membrane_potentials.get_contents(),
         input_neuron_indices.get_contents(),
         staged_input_values.get_contents(),
         (s64)input_values.size());
 
+    // FLAG: why are we deallocating? can't we just keep the input buffer for the next step? 
     deallocate(std::move(staged_input_values));
 
     next_active_neuron_count.get_contents()[0] = 0;
@@ -320,7 +323,7 @@ ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(s32
     if (freeze_learning) {
         learning_rate = 0.0f;
     }
-    return ScaledReservoirResult{result,target,w_accum,w_instant};
+    return ScaledReservoirResult{result,w_accum,w_instant};
 }
 
 void SpikeEngine::get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 voltage_scale, GpuPointer<f32> output_buffer) {

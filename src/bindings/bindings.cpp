@@ -64,7 +64,6 @@ PYBIND11_MODULE(_spikecorec, m) {
 
     py::class_<ScaledReservoirResult>(m, "ScaledReservoirResult")
         .def_readonly("weight_scale_result", &ScaledReservoirResult::weight_scale_result)
-        .def_readonly("target_root_mean_square", &ScaledReservoirResult::target_root_mean_square)
         .def_readonly("w_accum", &ScaledReservoirResult::w_accum)
         .def_readonly("w_instant", &ScaledReservoirResult::w_instant);
 
