@@ -49,8 +49,12 @@ static MTL::Library* load_default_metal_library(MTL::Device* device) {
     }
     return device->newDefaultLibrary();
 }
+#endif
 
 // ── KernelHandle ─────────────────────────────────────────────────────────────
+// Defined for both backends (must be a complete type wherever compile_kernel /
+// dispatch / release_kernel are compiled). The Metal-only helper below stays
+// guarded since it touches MTL types.
 
 struct KernelHandle {
 #ifdef SPIKECOREC_CUDA
@@ -61,6 +65,7 @@ struct KernelHandle {
 #endif
 };
 
+#ifdef SPIKECOREC_METAL
 // Looks up a kernel function compiled ahead-of-time into default.metallib and
 // builds a pipeline state for it
 static KernelHandle load_precompiled_kernel(const char* function_name) {
@@ -292,6 +297,7 @@ void gpu_neighbor_weights(
         branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
         node_count, max_neighbor_count, rank_float4_stride, output_weights
     );
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("neighbor_weights_kernel");
@@ -329,6 +335,7 @@ void gpu_scale_uv(
 
 #ifdef SPIKECOREC_CUDA
     cuda::launch_scale_uv(U, V, total_float4_element_count, scale_factor);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("scale_uv_kernel");
@@ -348,6 +355,7 @@ void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, 
     if (element_count <= 0) return;
 #ifdef SPIKECOREC_CUDA
     cuda::launch_add_network_input(membrane_potentials, input_neuron_indices, input_values, element_count);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("add_network_input_kernel");
@@ -376,6 +384,7 @@ void gpu_decay_all_neurons(
 
 #ifdef SPIKECOREC_CUDA
     cuda::launch_decay_all_neurons(membrane_potentials, last_tick_updated, neuron_count, tick, resting_mp, decay_rate);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("decay_all_neurons_kernel");
@@ -401,6 +410,7 @@ void gpu_merge_input_neurons(
 
 #ifdef SPIKECOREC_CUDA
     cuda::launch_merge_input_neurons(active_neuron_indices, active_neuron_count, override_input_neurons, override_count);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("merge_input_neurons_kernel");
@@ -435,6 +445,7 @@ void gpu_reservoir_features(
         neuron_count, tick, spike_tau, voltage_scale,
         membrane_potentials, last_spiked, last_tick_updated,
         resting_mp, decay_rate, output_buffer);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("reservoir_features_kernel");
@@ -499,6 +510,7 @@ void gpu_weight_update(
 #ifdef SPIKECOREC_CUDA
     cuda::launch_weight_update(U, V, rank_float4_stride, source_node, target_node,
                                delta, learning_rate, l2_regularization, iterations);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("weight_update_kernel");
@@ -547,6 +559,7 @@ void gpu_k2tree_adjacent_batch(
         tree_height, internal_bit_count, source_indices, target_indices,
         output_buffer, query_count
     );
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("k2tree_adjacent_batch_kernel");
@@ -598,6 +611,7 @@ void gpu_k2tree_get_neighbors_batch(
         tree_height, internal_bit_count, source_node_indices, query_count,
         max_neighbor_count, output_buffer
     );
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     static KernelHandle kernel_handle = load_precompiled_kernel("k2tree_get_neighbors_batch_kernel");
@@ -660,14 +674,17 @@ void gpu_step(
     if (tick < 0 || next_tick < 0) return;
 
 #ifdef SPIKECOREC_CUDA
+    // launch_step takes float4* (the step kernel writes U/V during the Hebbian
+    // update); gpu_step's signature is const, so cast away const for the call.
     cuda::launch_step(
         tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
-        U, V, rank_float4_stride, constant_weight,
+        const_cast<float4*>(U), const_cast<float4*>(V), rank_float4_stride, constant_weight,
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
         neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
         active_neuron_indices, active_neuron_count, next_active_neuron_indices, next_active_neuron_count,
         active_generation, thread_count_per_block, block_count);
+    synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
     KernelHandle kernel_handle = load_precompiled_kernel("step");

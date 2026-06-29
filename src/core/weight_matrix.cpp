@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -60,8 +61,16 @@ WeightMatrix::WeightMatrix(
     U_matrix = allocate<float4>(matrix_byte_size);
     V_matrix = allocate<float4>(matrix_byte_size);
 
-    // initialize with independent random normal values (mean=0, std=1)
-    mt19937 rng(random_device{}());
+    // initialize with independent random normal values (mean=0, std=1).
+    // Seed from SPIKECOREC_WEIGHT_SEED when set (reproducible weights — needed
+    // for deterministic runs/tests); otherwise fall back to a nondeterministic
+    // hardware-entropy seed as before.
+    unsigned weight_seed;
+    if (const char* seed_env = std::getenv("SPIKECOREC_WEIGHT_SEED"))
+        weight_seed = static_cast<unsigned>(std::strtoul(seed_env, nullptr, 10));
+    else
+        weight_seed = random_device{}();
+    mt19937 rng(weight_seed);
     normal_distribution<f32> normal_dist(0.0f, 1.0f);
     float4* u_data = U_matrix.get_contents();
     float4* v_data = V_matrix.get_contents();

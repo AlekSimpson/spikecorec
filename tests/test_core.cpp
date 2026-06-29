@@ -571,8 +571,10 @@ void test_types_layout() {
     assert(sizeof(u8) == 1 && sizeof(u16) == 2 && sizeof(u32) == 4 && sizeof(u64) == 8);
     assert(sizeof(s32) == 4 && sizeof(s64) == 8);
     assert(sizeof(f32) == 4 && sizeof(f64) == 8);
-    assert(sizeof(float4) == 16 && "float4 must be tightly packed");
-    assert(alignof(float4) == 16 && "float4 must be 16-byte aligned for GPU layout");
+    // Qualify explicitly: on the CUDA backend <cuda_runtime.h> also defines a
+    // global ::float4, so an unqualified `float4` is ambiguous here.
+    assert(sizeof(spikecorec::float4) == 16 && "float4 must be tightly packed");
+    assert(alignof(spikecorec::float4) == 16 && "float4 must be 16-byte aligned for GPU layout");
     printf("  types_layout: ok\n");
 }
 

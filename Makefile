@@ -73,7 +73,9 @@ ifeq ($(UNAME_S),Darwin)
   CXXFLAGS      += -Ithird_party/metal-cpp -DSPIKECOREC_METAL
 else
   HAS_METAL  := no
-  CXXFLAGS   += -DSPIKECOREC_CUDA
+  # Core .cpp files (compiled with g++) include <cuda_runtime.h>/<cuda.h>, so the
+  # CUDA headers must be on the include path for the host compiler too — not just nvcc.
+  CXXFLAGS   += -DSPIKECOREC_CUDA -I$(CUDA_PATH)/include
 endif
 
 # Auto-select default backend
@@ -187,17 +189,30 @@ endif
 
 test: test-$(BACKEND)
 
+# test_core.cpp and the per-backend smoke tests (tests/cuda/test_cuda.cpp,
+# tests/metal/test_metal.mm) each define their own main(), so they must be built
+# as separate binaries rather than linked together.
+CUDA_LINK := -L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc
+
 test-cuda: check-cuda $(CUDA_LIB)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(TEST_CUDA_SRCS) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda -lcudart -L$(CUDA_PATH)/lib64 $(COMPRESSION_LIBS) \
+	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) \
+	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_cuda
+	$(CXX) $(CXXFLAGS) $(TEST_CUDA_SRCS) \
+	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) -lpthread \
+	    -o $(BUILD_DIR)/test_smoke_cuda
 	$(BUILD_DIR)/test_runner_cuda
+	$(BUILD_DIR)/test_smoke_cuda
 
 test-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(TEST_METAL_SRCS) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) \
+	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_metal
+	$(CXX) $(CXXFLAGS) $(TEST_METAL_SRCS) \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) -lpthread \
+	    -o $(BUILD_DIR)/test_smoke_metal
 	$(BUILD_DIR)/test_runner_metal
+	$(BUILD_DIR)/test_smoke_metal
 
 # ── Examples ─────────────────────────────────────────────────
 examples: examples-$(BACKEND)
@@ -205,6 +220,7 @@ examples: examples-$(BACKEND)
 examples-cuda: check-cuda $(CUDA_LIB)
 	$(NVCC) $(NVCCFLAGS) $(EX_DIR)/cuda_example.cpp \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda \
+	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) \
 	    -o $(BUILD_DIR)/cuda_example
 
 examples-metal: check-metal $(METAL_LIB)

@@ -3,6 +3,7 @@
 //
 
 #include <cstring>
+#include <cmath>
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda_runtime.h>
