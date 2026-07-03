@@ -89,19 +89,14 @@ WeightMatrix::~WeightMatrix() {
     deallocate(std::move(V_matrix));
 }
 
-bool can_safely_cast_s64_to_s32(s64 value) {
-    if (value > std::numeric_limits<s32>::max() ||
-        value < std::numeric_limits<s32>::min()) {
-        return false;
-    }
-
-    return value < static_cast<s32>(value);
-
+bool spikecorec::can_safely_cast_s64_to_s32(s64 value) {
+    return value >= std::numeric_limits<s32>::min() &&
+           value <= std::numeric_limits<s32>::max();
 }
 
 s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
-    if (check_index_inbounds(node_index) ||
-        !can_safely_cast_s64_to_s32(node_index)) {
+    if (!can_safely_cast_s64_to_s32(node_index) ||
+        !check_index_inbounds((s32)node_index)) {
         return 0;
     }
 
@@ -126,7 +121,12 @@ void WeightMatrix::set_constant_weight(f32 value) {
     using_constant_weight = true;
 }
 
-bool WeightMatrix::check_index_inbounds(s32, source, s32, target) {
+bool WeightMatrix::check_index_inbounds(s32 node_index) const {
+    return (check_indexing &&
+            node_index >= 0 && node_index < node_count);
+}
+
+bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
     return (check_indexing &&
             source >= 0 && source < node_count &&
             target >= 0 && target < node_count);
@@ -233,7 +233,7 @@ void WeightMatrix::update(
     f32 l2_regularization,
     s32 iterations
 ) {
-    if (check_index_inbounds(source_node, target_node)) {
+    if (!check_index_inbounds(source_node, target_node)) {
         return;
     }
 

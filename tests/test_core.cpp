@@ -831,45 +831,63 @@ void test_weight_matrix_stats_and_scale() {
 void test_weight_matrix_get_neighbors() {
     auto net = square_torus(4);
     WeightMatrix wm(net, /*rank=*/8);
-    // TODO
+
+    vector<s32> buf((usize)wm.max_neighbor_count);
+    for (s64 node = 0; node < wm.node_count; ++node) {
+        s64 count = wm.get_neighbors(node, buf.data());
+        unordered_set<s32> got(buf.begin(), buf.begin() + count);
+        unordered_set<s32> expected(net[(usize)node].begin(), net[(usize)node].end());
+        assert(got == expected && "WeightMatrix::get_neighbors must match the source adjacency");
+    }
+    printf("  weight_matrix_get_neighbors: ok\n");
 }
 
 void test_weight_matrix_get_neighbors_out_of_bounds() {
     auto network = square_torus(4);
-    WeightMatrix martix(network, /*rank=*/8);
+    WeightMatrix matrix(network, /*rank=*/8);
 
     vector<s32> buffer((usize)matrix.max_neighbor_count);
     s64 neighbor_count;
 
-    neighbor_count = matrix.get_neighbors(-1, buffer);
+    neighbor_count = matrix.get_neighbors(-1, buffer.data());
     assert(neighbor_count == 0);
 
-    neighbor_count = matrix.get_neighbors(16, buffer);
+    neighbor_count = matrix.get_neighbors(16, buffer.data());
     assert(neighbor_count == 0);
 
-    neighbor_count = matrix.get_neighbors(17, buffer);
+    neighbor_count = matrix.get_neighbors(17, buffer.data());
     assert(neighbor_count == 0);
 
-    neighbor_count = matrix.get_neighbors(4590, buffer);
+    neighbor_count = matrix.get_neighbors(4590, buffer.data());
     assert(neighbor_count == 0);
+
+    printf("  weight_matrix_get_neighbors_out_of_bounds: ok\n");
 }
 
 void test_weight_matrix_get_out_of_bounds() {
     auto network = square_torus(4);
     WeightMatrix matrix(network, 8);
 
-    f32 result = matrix.get(-1, 10);
-    assert(result == 0.0);
+    f32 result_negative_index = matrix.get(-1, 10);
+    assert(result_negative_index == 0.0);
 
-    f32 result = matrix.get(3, 50);
-    assert(result == 0.0);
+    f32 result_high_index = matrix.get(3, 50);
+    assert(result_high_index == 0.0);
+
+    printf("  weight_matrix_get_out_of_bounds: ok\n");
 }
 
 void test_weight_matrix_update_out_of_bounds() {
     auto network = square_torus(4);
     WeightMatrix matrix(network, /*rank=*/8);
 
-    // TODO: need to add logging for the assert condition here
+    f32 before = matrix.get(0, 1);
+    matrix.update(-1, 1, 1.0f);
+    matrix.update(0, 4590, 1.0f);
+    f32 after = matrix.get(0, 1);
+    assert(approx(before, after) && "out-of-bounds update() calls must be no-ops");
+
+    printf("  weight_matrix_update_out_of_bounds: ok\n");
 }
 
 void test_weight_matrix_update() {
@@ -1402,6 +1420,9 @@ int main() {
     test_weight_matrix_constant_weight();
     test_weight_matrix_stats_and_scale();
     test_weight_matrix_get_neighbors();
+    test_weight_matrix_get_neighbors_out_of_bounds();
+    test_weight_matrix_get_out_of_bounds();
+    test_weight_matrix_update_out_of_bounds();
     test_weight_matrix_update();
     test_weight_matrix_save_load();
 
