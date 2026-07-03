@@ -670,10 +670,17 @@ void test_random_fixed_outdegree_edge_cases() {
 
 // ── k2tree tests ─────────────────────────────────────────────────────────────
 
+void test_k2tree_from_adjacency_list_invalid_branching_factor() {
+    auto list = k2_reference_adjacency();
+    const s32 node_count = 8;
+    auto result = K2Tree::from_adjacency_list(list, node_count);
+    assert(!result.has_value());
+}
+
 void test_k2tree_adjacent_and_neighbors() {
     auto adj = k2_reference_adjacency();
     const s32 n = 8;
-    K2Tree tree = K2Tree::from_adjacency_list(adj, n);
+    K2Tree tree = *K2Tree::from_adjacency_list(adj, n);
 
     // adjacent(u,v) must agree with the reference adjacency for ALL pairs.
     for (s32 u = 0; u < n; ++u) {
@@ -699,7 +706,7 @@ void test_k2tree_adjacent_and_neighbors() {
 void test_k2tree_adjacent_batch() {
     auto adj = k2_reference_adjacency();
     const s32 n = 8;
-    K2Tree tree = K2Tree::from_adjacency_list(adj, n);
+    K2Tree tree = *K2Tree::from_adjacency_list(adj, n);
 
     vector<s32> src, tgt;
     for (s32 u = 0; u < n; ++u)
@@ -717,14 +724,14 @@ void test_k2tree_adjacent_batch() {
 void test_k2tree_single_node_and_bounds() {
     // node_count == 1 → tree_height 0; every query returns 0 (even a self-loop edge).
     vector<vector<s32>> single = {{0}};
-    K2Tree one = K2Tree::from_adjacency_list(single, 1);
+    K2Tree one = *K2Tree::from_adjacency_list(single, 1);
     assert(one.tree_height == 0);
     vector<s32> buf(4);
     assert(one.adjacent(0, 0) == 0);
     assert(one.get_neighbors(0, buf.data(), 4) == 0);
 
     // Out-of-bounds / degenerate queries on a normal tree return 0.
-    K2Tree tree = K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
+    K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
     assert(tree.adjacent(-1, 0) == 0 && tree.adjacent(0, 8) == 0 && tree.adjacent(8, 0) == 0);
     assert(tree.get_neighbors(-1, buf.data(), 4) == 0);
     assert(tree.get_neighbors(8, buf.data(), 4) == 0);
@@ -736,7 +743,7 @@ void test_k2tree_single_node_and_bounds() {
 void test_k2tree_save_load() {
     auto adj = k2_reference_adjacency();
     const s32 n = 8;
-    K2Tree tree = K2Tree::from_adjacency_list(adj, n);
+    K2Tree tree = *K2Tree::from_adjacency_list(adj, n);
 
     const char *path = "/tmp/spikecorec_test_k2tree.bin";
     tree.save(path);
@@ -773,6 +780,8 @@ void test_weight_matrix_construction() {
 
     printf("  weight_matrix_construction: ok\n");
 }
+
+
 
 void test_weight_matrix_constant_weight() {
     auto net = square_torus(4);
@@ -831,6 +840,54 @@ void test_weight_matrix_get_neighbors() {
         assert(got == expected && "WeightMatrix::get_neighbors must match the source adjacency");
     }
     printf("  weight_matrix_get_neighbors: ok\n");
+}
+
+void test_weight_matrix_get_neighbors_out_of_bounds() {
+    auto network = square_torus(4);
+    WeightMatrix matrix(network, /*rank=*/8);
+
+    vector<s32> buffer((usize)matrix.max_neighbor_count);
+    s64 neighbor_count;
+
+    neighbor_count = matrix.get_neighbors(-1, buffer.data());
+    assert(neighbor_count == 0);
+
+    neighbor_count = matrix.get_neighbors(16, buffer.data());
+    assert(neighbor_count == 0);
+
+    neighbor_count = matrix.get_neighbors(17, buffer.data());
+    assert(neighbor_count == 0);
+
+    neighbor_count = matrix.get_neighbors(4590, buffer.data());
+    assert(neighbor_count == 0);
+
+    printf("  weight_matrix_get_neighbors_out_of_bounds: ok\n");
+}
+
+void test_weight_matrix_get_out_of_bounds() {
+    auto network = square_torus(4);
+    WeightMatrix matrix(network, 8);
+
+    f32 result_negative_index = matrix.get(-1, 10);
+    assert(result_negative_index == 0.0);
+
+    f32 result_high_index = matrix.get(3, 50);
+    assert(result_high_index == 0.0);
+
+    printf("  weight_matrix_get_out_of_bounds: ok\n");
+}
+
+void test_weight_matrix_update_out_of_bounds() {
+    auto network = square_torus(4);
+    WeightMatrix matrix(network, /*rank=*/8);
+
+    f32 before = matrix.get(0, 1);
+    matrix.update(-1, 1, 1.0f);
+    matrix.update(0, 4590, 1.0f);
+    f32 after = matrix.get(0, 1);
+    assert(approx(before, after) && "out-of-bounds update() calls must be no-ops");
+
+    printf("  weight_matrix_update_out_of_bounds: ok\n");
 }
 
 void test_weight_matrix_update() {
@@ -1049,14 +1106,34 @@ void test_k2tree_from_edges() {
     for (s32 u = 0; u < n; ++u)
         for (s32 v : adj[(usize)u]) { src.push_back(u); tgt.push_back(v); }
 
-    K2Tree from_edge_list = K2Tree::from_edges(src.data(), tgt.data(), (s32)src.size(), n);
-    K2Tree from_adj = K2Tree::from_adjacency_list(adj, n);
+    K2Tree from_edge_list = *K2Tree::from_edges(src.data(), tgt.data(), (s32)src.size(), n);
+    K2Tree from_adj = *K2Tree::from_adjacency_list(adj, n);
     for (s32 u = 0; u < n; ++u)
         for (s32 v = 0; v < n; ++v)
             assert(from_edge_list.adjacent(u, v) == from_adj.adjacent(u, v)
                    && "from_edges must build the same tree as from_adjacency_list");
 
     printf("  k2tree_from_edges: ok\n");
+}
+
+void test_k2tree_from_edges_invalid_branching_factor() {
+    // The same graph as a flat edge list must build an identical tree.
+    auto list = k2_reference_adjacency();
+    const s32 node_count = 8;
+    vector<s32> source, target;
+    for (usize u = 0; u < node_count; ++u) {
+        for (s32 v : list[u]) { 
+            source.push_back(u); 
+            target.push_back(v); 
+        }
+    }
+
+
+    auto result = K2Tree::from_edges(source.data(), target.data(), (s32)source.size(), node_count, 10);
+    assert(!result.has_value());
+
+    result = K2Tree::from_edges(source.data(), target.data(), (s32)source.size(), node_count, -1);
+    assert(!result.has_value());
 }
 
 void test_step_simulation_decay_path() {
@@ -1079,6 +1156,236 @@ void test_step_simulation_decay_path() {
 
     engine.shutdown();
     printf("  step_simulation_decay_path: ok\n");
+}
+
+// ── engine: deterministic spike-propagation / end-to-end tests ────────────────
+//
+// These pin down the *core dynamics* — threshold crossing, weight delivery,
+// refractory gating, fan-out, and multi-hop wave propagation — on hand-built
+// graphs where every spike time is known in advance. They run with plasticity
+// frozen (learning_rate = 0) and a constant synaptic weight chosen so that a
+// single upstream spike drives its downstream neighbor exactly one threshold
+// crossing per tick, giving a fully deterministic spike schedule.
+//
+// last_spiked is initialised to 0 by the constructor, which doubles as the
+// "never spiked" sentinel; with spike_period = 1 that makes (tick - last_spiked)
+// == spike_period at tick 1, spuriously tripping the refractory branch for a
+// never-fired neuron. The reference usage seeds last_spiked to a large negative
+// value so a neuron's first spike is governed purely by its membrane potential;
+// these tests do the same via seed_never_spiked() below.
+void seed_never_spiked(SpikeEngine &engine, s64 sentinel = -1000) {
+    s64 *last_spiked = engine.last_spiked.get_contents();
+    for (s64 i = 0; i < engine.neuron_count; ++i) last_spiked[i] = sentinel;
+}
+
+// Configure an engine for a deterministic, plasticity-free propagation test:
+// constant synaptic weight `w` (> spike_threshold - resting so one presynaptic
+// spike drives the postsynaptic neuron over threshold in a single tick).
+void configure_deterministic(SpikeEngine &engine, f32 w = 2.0f) {
+    engine.spike_threshold = 1.0f;
+    engine.spike_period = 1;
+    engine.learning_rate = 0.0f;               // freeze plasticity
+    engine.use_constant_weight = true;
+    engine.weights.set_constant_weight(w);
+    seed_never_spiked(engine);
+}
+
+// A single spike must (a) mark the firing neuron's spike time, (b) deliver the
+// synaptic weight into each downstream neighbor's input accumulator, and
+// (c) schedule those neighbors into the next-tick active set.
+void test_spike_single_hop() {
+    vector<vector<s32>> net = {{1}, {}};       // 0 -> 1
+    SpikeEngine engine(&net, {2, 1}, /*rank=*/4);
+    configure_deterministic(engine, /*w=*/2.0f);
+    engine.set_input_neurons({0});
+
+    // Drive neuron 0 over threshold at tick 0 (0.1 resting + 2.0 input = 2.1 > 1.0).
+    engine.step_simulation({2.0f}, /*tick=*/0, /*override_input_neurons=*/{0});
+
+    const s64 *last_spiked = engine.last_spiked.get_contents();
+    assert(last_spiked[0] == 0 && "neuron 0 must record a spike at tick 0");
+
+    // The weight must have landed in neuron 1's input accumulator (consumed next tick).
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    assert(approx(network_inputs[1], 2.0f) && "spike must deliver constant_weight to the downstream neighbor");
+
+    // Neuron 1 must be scheduled for the next tick (post-swap active set).
+    s32 active_count = engine.active_neuron_count.get_contents()[0];
+    const s32 *active = engine.active_neuron_indices.get_contents();
+    bool neighbor_scheduled = false;
+    for (s32 i = 0; i < active_count; ++i) if (active[i] == 1) neighbor_scheduled = true;
+    assert(neighbor_scheduled && "downstream neighbor must be enqueued into the next active set");
+
+    engine.shutdown();
+    printf("  spike_single_hop: ok\n");
+}
+
+// Sub-threshold input must NOT spike: no neuron records a spike, nothing propagates.
+void test_spike_subthreshold_no_fire() {
+    vector<vector<s32>> net = {{1}, {}};
+    SpikeEngine engine(&net, {2, 1}, /*rank=*/4);
+    configure_deterministic(engine, /*w=*/2.0f);
+    engine.set_input_neurons({0});
+
+    // 0.1 resting + 0.5 input = 0.6 < 1.0 threshold → no spike.
+    engine.step_simulation({0.5f}, /*tick=*/0, /*override_input_neurons=*/{0});
+
+    const s64 *last_spiked = engine.last_spiked.get_contents();
+    for (s64 i = 0; i < engine.neuron_count; ++i)
+        assert(last_spiked[i] == -1000 && "sub-threshold stimulation must not produce any spike");
+
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    for (s64 i = 0; i < engine.neuron_count; ++i)
+        assert(network_inputs[i] == 0.0f && "no spike → no synaptic weight delivered");
+
+    engine.shutdown();
+    printf("  spike_subthreshold_no_fire: ok\n");
+}
+
+// A neuron that spikes at tick t must be refractory at t + spike_period: reset to
+// resting, no re-spike, no further propagation on that tick.
+void test_spike_refractory_period() {
+    vector<vector<s32>> net = {{1}, {}};
+    SpikeEngine engine(&net, {2, 1}, /*rank=*/4);
+    configure_deterministic(engine, /*w=*/2.0f);   // spike_period == 1
+    engine.set_input_neurons({0});
+
+    // tick 0: neuron 0 spikes (last_spiked[0] = 0) and re-enqueues itself.
+    engine.step_simulation({2.0f}, /*tick=*/0, /*override_input_neurons=*/{0});
+    assert(engine.last_spiked.get_contents()[0] == 0);
+
+    // tick 1: neuron 0 is one tick past its spike (1 - 0 == spike_period) → refractory:
+    // it must reset to resting and NOT re-spike (last_spiked stays 0).
+    engine.step_simulation({0.0f}, /*tick=*/1);
+    const s64 *last_spiked = engine.last_spiked.get_contents();
+    const f32 *mp = engine.membrane_potentials.get_contents();
+    assert(last_spiked[0] == 0 && "refractory neuron must not re-spike at tick == last_spike + spike_period");
+    assert(approx(mp[0], engine.resting_membrane_potential) && "refractory neuron must reset to resting potential");
+
+    engine.shutdown();
+    printf("  spike_refractory_period: ok\n");
+}
+
+// Fan-out: one spike into a node with several out-edges must drive ALL of them —
+// every neighbor receives the weight and fires on the next tick.
+void test_spike_fanout() {
+    vector<vector<s32>> net = {{1, 2, 3}, {}, {}, {}};   // 0 -> {1,2,3}
+    SpikeEngine engine(&net, {4, 1}, /*rank=*/4);
+    configure_deterministic(engine, /*w=*/2.0f);
+    engine.set_input_neurons({0});
+
+    // tick 0: neuron 0 fires; all three neighbors must receive the weight.
+    engine.step_simulation({2.0f}, /*tick=*/0, /*override_input_neurons=*/{0});
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    for (s32 n : {1, 2, 3})
+        assert(approx(network_inputs[n], 2.0f) && "every fan-out neighbor must receive the synaptic weight");
+
+    // tick 1: all three neighbors cross threshold and spike simultaneously.
+    engine.step_simulation({0.0f}, /*tick=*/1);
+    const s64 *last_spiked = engine.last_spiked.get_contents();
+    for (s32 n : {1, 2, 3})
+        assert(last_spiked[n] == 1 && "every fan-out neighbor must spike on the tick after the source");
+    assert(last_spiked[0] == 0 && "source neuron keeps its original spike time");
+
+    engine.shutdown();
+    printf("  spike_fanout: ok\n");
+}
+
+// End-to-end: a directed chain 0->1->2->3->4 must carry a single stimulus as a
+// travelling wave, exactly one hop per tick — neuron k fires precisely at tick k.
+void test_spike_propagation_chain_e2e() {
+    const s32 chain_length = 5;
+    vector<vector<s32>> net(chain_length);
+    for (s32 i = 0; i + 1 < chain_length; ++i) net[i] = {i + 1};   // i -> i+1
+    net[chain_length - 1] = {};                                     // tail has no out-edge
+
+    SpikeEngine engine(&net, {chain_length, 1}, /*rank=*/4);
+    configure_deterministic(engine, /*w=*/2.0f);
+    engine.set_input_neurons({0});
+
+    // Stimulate the head once at tick 0; every later hop is driven purely by
+    // upstream propagation.
+    for (s64 tick = 0; tick < chain_length; ++tick) {
+        vector<f32> input = (tick == 0) ? vector<f32>{2.0f} : vector<f32>{0.0f};
+        vector<s64> override_neurons = (tick == 0) ? vector<s64>{0} : vector<s64>{};
+        engine.step_simulation(input, tick, override_neurons);
+
+        const f32 *mp = engine.membrane_potentials.get_contents();
+        for (s64 i = 0; i < engine.neuron_count; ++i) assert(std::isfinite(mp[i]));
+    }
+
+    // The wavefront: neuron k first (and, within this window, only) spikes at tick k.
+    const s64 *last_spiked = engine.last_spiked.get_contents();
+    for (s32 k = 0; k < chain_length; ++k)
+        assert(last_spiked[k] == k && "spike wave must advance exactly one neuron per tick along the chain");
+
+    engine.shutdown();
+    printf("  spike_propagation_chain_e2e: ok\n");
+}
+
+// End-to-end plasticity: with a nonzero learning_rate, a spike that reaches a
+// recently-fired postsynaptic neuron must run the in-step STDP update and change
+// U*V for that edge; with learning frozen the same scenario leaves it untouched.
+void test_engine_plasticity_end_to_end() {
+    auto run_edge_update = [](f32 learning_rate) -> pair<f32, f32> {
+        vector<vector<s32>> net = {{1}, {}};       // 0 -> 1
+        SpikeEngine engine(&net, {2, 1}, /*rank=*/8);
+        engine.spike_threshold = 1.0f;
+        engine.spike_period = 1;
+        engine.learning_rate = learning_rate;
+        engine.use_constant_weight = false;        // weight = U[0]·V[1] (mutable rows)
+        engine.set_input_neurons({0});
+
+        // Seed: neuron 0 free to spike; neuron 1 "spiked recently" (tick 1) so the
+        // STDP branch (child_last_spiked not in {0, current tick}) fires on delivery.
+        s64 *last_spiked = engine.last_spiked.get_contents();
+        last_spiked[0] = -1000;
+        last_spiked[1] = 1;
+
+        f32 before = engine.weights.get(0, 1);
+        // Strong stimulus at tick 3 → neuron 0 fires and propagates to neuron 1.
+        engine.step_simulation({5.0f}, /*tick=*/3, /*override_input_neurons=*/{0});
+        f32 after = engine.weights.get(0, 1);
+
+        engine.shutdown();
+        return {before, after};
+    };
+
+    auto [frozen_before, frozen_after] = run_edge_update(/*learning_rate=*/0.0f);
+    assert(approx(frozen_before, frozen_after, 1e-6f) && "frozen learning must leave U*V unchanged");
+
+    auto [live_before, live_after] = run_edge_update(/*learning_rate=*/0.5f);
+    assert(std::fabs(live_after - live_before) > 1e-6f
+           && "a nonzero learning_rate must apply the in-step STDP update to the active edge");
+
+    printf("  engine_plasticity_end_to_end: ok\n");
+}
+
+// Cross-check the GPU neighbor_weights dot-product path against the CPU get():
+// for random (non-constant) weights, each populated slot of neighbor_weights must
+// equal U[source]·V[neighbor], and padding slots beyond a node's degree must be 0.
+void test_weight_matrix_neighbor_weights_values() {
+    auto net = square_torus(4);                    // 16 nodes, out-degree 4, no padding
+    WeightMatrix wm(net, /*rank=*/8);              // random-initialised U/V
+
+    vector<f32> weights((usize)(wm.node_count * wm.max_neighbor_count));
+    wm.neighbor_weights(weights.data());
+
+    vector<s32> neighbor_buf((usize)wm.max_neighbor_count);
+    for (s64 node = 0; node < wm.node_count; ++node) {
+        s64 degree = wm.get_neighbors(node, neighbor_buf.data());
+        for (s64 slot = 0; slot < wm.max_neighbor_count; ++slot) {
+            f32 got = weights[(usize)(node * wm.max_neighbor_count + slot)];
+            if (slot < degree) {
+                f32 expected = wm.get((s32)node, neighbor_buf[(usize)slot]);
+                assert(approx(got, expected, 1e-3f)
+                       && "GPU neighbor_weights must equal CPU U*V for each real neighbor");
+            } else {
+                assert(got == 0.0f && "padding slots beyond a node's degree must be sentinel-zero");
+            }
+        }
+    }
+    printf("  weight_matrix_neighbor_weights_values: ok\n");
 }
 
 } // namespace
@@ -1113,6 +1420,9 @@ int main() {
     test_weight_matrix_constant_weight();
     test_weight_matrix_stats_and_scale();
     test_weight_matrix_get_neighbors();
+    test_weight_matrix_get_neighbors_out_of_bounds();
+    test_weight_matrix_get_out_of_bounds();
+    test_weight_matrix_update_out_of_bounds();
     test_weight_matrix_update();
     test_weight_matrix_save_load();
 
@@ -1131,6 +1441,13 @@ int main() {
     test_reservoir_features_guard();
     test_step_simulation_decay_path();
     test_start_static_record_variants();
+    test_spike_single_hop();
+    test_spike_subthreshold_no_fire();
+    test_spike_refractory_period();
+    test_spike_fanout();
+    test_spike_propagation_chain_e2e();
+    test_engine_plasticity_end_to_end();
+    test_weight_matrix_neighbor_weights_values();
 
     printf("recording tests:\n");
     test_spire_raw_roundtrip();

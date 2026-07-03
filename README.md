@@ -63,6 +63,8 @@ spikecorec/
 ## Build
 
 The Makefile auto-detects the platform (Metal on macOS, CUDA elsewhere).
+See **[`BUILDME.md`](BUILDME.md)** for the full list of build commands
+(libraries, tests, examples, Python extension, direct pip/setuptools builds).
 
 ```bash
 make              # auto-detect backend

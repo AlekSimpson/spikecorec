@@ -190,7 +190,7 @@ endif
 test: test-$(BACKEND)
 
 # test_core.cpp and the per-backend smoke tests (tests/cuda/test_cuda.cpp,
-# tests/metal/test_metal.mm) each define their own main(), so they must be built
+# tests/metal/test_metal.cpp) each define their own main(), so they must be built
 # as separate binaries rather than linked together.
 CUDA_LINK := -L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc
 
@@ -204,7 +204,7 @@ test-cuda: check-cuda $(CUDA_LIB)
 	$(BUILD_DIR)/test_runner_cuda
 	$(BUILD_DIR)/test_smoke_cuda
 
-test-metal: check-metal $(METAL_LIB)
+test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib
 	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_metal
