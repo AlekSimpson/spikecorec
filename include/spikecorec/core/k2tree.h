@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <optional>
 
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/types.h"
@@ -64,7 +65,7 @@ namespace spikecorec {
         ~K2Tree();
 
         // factory: build from an adjacency list (node i -> list of neighbor indices)
-        static K2Tree from_adjacency_list(
+        static optional<K2Tree> from_adjacency_list(
             const vector<vector<s32> > &adjacency_list,
             s32 node_count = -1,
             s32 branching_factor = DEFAULT_BRANCHING_FACTOR,
@@ -72,7 +73,7 @@ namespace spikecorec {
         );
 
         // factory: build from a flat edge list (parallel source[] and target[] arrays)
-        static K2Tree from_edges(
+        static optional<K2Tree> from_edges(
             const s32 *source_indices,
             const s32 *target_indices,
             s32 edge_count,

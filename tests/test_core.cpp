@@ -670,10 +670,17 @@ void test_random_fixed_outdegree_edge_cases() {
 
 // ── k2tree tests ─────────────────────────────────────────────────────────────
 
+void test_k2tree_from_adjacency_list_invalid_branching_factor() {
+    auto list = k2_reference_adjacency();
+    const s32 node_count = 8;
+    auto result = K2Tree::from_adjacency_list(list, node_count);
+    assert(!result.has_value());
+}
+
 void test_k2tree_adjacent_and_neighbors() {
     auto adj = k2_reference_adjacency();
     const s32 n = 8;
-    K2Tree tree = K2Tree::from_adjacency_list(adj, n);
+    K2Tree tree = *K2Tree::from_adjacency_list(adj, n);
 
     // adjacent(u,v) must agree with the reference adjacency for ALL pairs.
     for (s32 u = 0; u < n; ++u) {
@@ -699,7 +706,7 @@ void test_k2tree_adjacent_and_neighbors() {
 void test_k2tree_adjacent_batch() {
     auto adj = k2_reference_adjacency();
     const s32 n = 8;
-    K2Tree tree = K2Tree::from_adjacency_list(adj, n);
+    K2Tree tree = *K2Tree::from_adjacency_list(adj, n);
 
     vector<s32> src, tgt;
     for (s32 u = 0; u < n; ++u)
@@ -717,14 +724,14 @@ void test_k2tree_adjacent_batch() {
 void test_k2tree_single_node_and_bounds() {
     // node_count == 1 → tree_height 0; every query returns 0 (even a self-loop edge).
     vector<vector<s32>> single = {{0}};
-    K2Tree one = K2Tree::from_adjacency_list(single, 1);
+    K2Tree one = *K2Tree::from_adjacency_list(single, 1);
     assert(one.tree_height == 0);
     vector<s32> buf(4);
     assert(one.adjacent(0, 0) == 0);
     assert(one.get_neighbors(0, buf.data(), 4) == 0);
 
     // Out-of-bounds / degenerate queries on a normal tree return 0.
-    K2Tree tree = K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
+    K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
     assert(tree.adjacent(-1, 0) == 0 && tree.adjacent(0, 8) == 0 && tree.adjacent(8, 0) == 0);
     assert(tree.get_neighbors(-1, buf.data(), 4) == 0);
     assert(tree.get_neighbors(8, buf.data(), 4) == 0);
@@ -736,7 +743,7 @@ void test_k2tree_single_node_and_bounds() {
 void test_k2tree_save_load() {
     auto adj = k2_reference_adjacency();
     const s32 n = 8;
-    K2Tree tree = K2Tree::from_adjacency_list(adj, n);
+    K2Tree tree = *K2Tree::from_adjacency_list(adj, n);
 
     const char *path = "/tmp/spikecorec_test_k2tree.bin";
     tree.save(path);
@@ -1049,14 +1056,34 @@ void test_k2tree_from_edges() {
     for (s32 u = 0; u < n; ++u)
         for (s32 v : adj[(usize)u]) { src.push_back(u); tgt.push_back(v); }
 
-    K2Tree from_edge_list = K2Tree::from_edges(src.data(), tgt.data(), (s32)src.size(), n);
-    K2Tree from_adj = K2Tree::from_adjacency_list(adj, n);
+    K2Tree from_edge_list = *K2Tree::from_edges(src.data(), tgt.data(), (s32)src.size(), n);
+    K2Tree from_adj = *K2Tree::from_adjacency_list(adj, n);
     for (s32 u = 0; u < n; ++u)
         for (s32 v = 0; v < n; ++v)
             assert(from_edge_list.adjacent(u, v) == from_adj.adjacent(u, v)
                    && "from_edges must build the same tree as from_adjacency_list");
 
     printf("  k2tree_from_edges: ok\n");
+}
+
+void test_k2tree_from_edges_invalid_branching_factor() {
+    // The same graph as a flat edge list must build an identical tree.
+    auto list = k2_reference_adjacency();
+    const s32 node_count = 8;
+    vector<s32> source, target;
+    for (usize u = 0; u < node_count; ++u) {
+        for (s32 v : list[u]) { 
+            source.push_back(u); 
+            target.push_back(v); 
+        }
+    }
+
+
+    auto result = K2Tree::from_edges(source.data(), target.data(), (s32)source.size(), node_count, 10);
+    assert(!result.has_value());
+
+    result = K2Tree::from_edges(source.data(), target.data(), (s32)source.size(), node_count, -1);
+    assert(!result.has_value());
 }
 
 void test_step_simulation_decay_path() {

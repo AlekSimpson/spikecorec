@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <cstdio>
+#include <optional>
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda_runtime.h>
@@ -292,12 +293,16 @@ K2Tree::~K2Tree() {
 
 // ── factory methods ───────────────────────────────────────────────────────────
 
-K2Tree K2Tree::from_adjacency_list(
+optional<K2Tree> K2Tree::from_adjacency_list(
     const vector<vector<s32> > &adjacency_list,
     s32 node_count,
     s32 branching_factor,
     s32 superblock_size
 ) {
+    if (branching_factor > 5 || branching_factor < 0) {
+        return nullopt;
+    }
+
     s32 effective_node_count = (node_count >= 0) ? node_count : (s32) adjacency_list.size();
 
     vector<pair<s32, s32> > edges;
@@ -309,7 +314,7 @@ K2Tree K2Tree::from_adjacency_list(
     return make_k2tree_from_arrays(arrays, effective_node_count, branching_factor, superblock_size);
 }
 
-K2Tree K2Tree::from_edges(
+optional<K2Tree> K2Tree::from_edges(
     const s32 *source_indices,
     const s32 *target_indices,
     s32 edge_count,
@@ -317,6 +322,10 @@ K2Tree K2Tree::from_edges(
     s32 branching_factor,
     s32 superblock_size
 ) {
+    if (branching_factor > 5 || branching_factor < 0) {
+        return nullopt;
+    }
+
     vector<pair<s32, s32> > edges;
     edges.reserve((usize) edge_count);
     for (s32 i = 0; i < edge_count; i++)

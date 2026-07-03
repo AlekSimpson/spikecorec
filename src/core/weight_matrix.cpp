@@ -32,7 +32,7 @@ WeightMatrix::WeightMatrix(
     bool check_indexing,
     s64 max_neighbor_count
 )
-    : k2tree(K2Tree::from_adjacency_list(network, (s32)network.size()))
+    : k2tree(*K2Tree::from_adjacency_list(network, (s32)network.size()))
     , node_count((s64)network.size())
     , max_neighbor_count(0)
     , rank(0)
