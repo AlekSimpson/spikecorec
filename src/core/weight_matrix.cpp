@@ -10,6 +10,9 @@
 #include <cstring>
 #include <fstream>
 #include <vector>
+#include <iostream>
+#include <limits>
+#include <cstdint>
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda_runtime.h>
@@ -32,7 +35,7 @@ WeightMatrix::WeightMatrix(
     bool check_indexing,
     s64 max_neighbor_count
 )
-    : k2tree(K2Tree::from_adjacency_list(network, (s32)network.size()))
+    : k2tree(*K2Tree::from_adjacency_list(network, (s32)network.size()))
     , node_count((s64)network.size())
     , max_neighbor_count(0)
     , rank(0)
@@ -86,7 +89,17 @@ WeightMatrix::~WeightMatrix() {
     deallocate(std::move(V_matrix));
 }
 
+bool spikecorec::can_safely_cast_s64_to_s32(s64 value) {
+    return value >= std::numeric_limits<s32>::min() &&
+           value <= std::numeric_limits<s32>::max();
+}
+
 s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
+    if (!can_safely_cast_s64_to_s32(node_index) ||
+        !check_index_inbounds((s32)node_index)) {
+        return 0;
+    }
+
     return k2tree.get_neighbors((s32)node_index, output_buffer, max_neighbor_count);
 }
 
@@ -108,7 +121,22 @@ void WeightMatrix::set_constant_weight(f32 value) {
     using_constant_weight = true;
 }
 
+bool WeightMatrix::check_index_inbounds(s32 node_index) const {
+    return (check_indexing &&
+            node_index >= 0 && node_index < node_count);
+}
+
+bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
+    return (check_indexing &&
+            source >= 0 && source < node_count &&
+            target >= 0 && target < node_count);
+}
+
 f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
+    if (!check_index_inbounds(source_node, target_node)) {
+        return 0.0;
+    }
+
     const float4 *u_row = U_matrix.get_contents() + source_node * rank_float4_stride;
     const float4 *v_row = V_matrix.get_contents() + target_node * rank_float4_stride;
     f32 dot_product = 0.0f;
@@ -205,6 +233,10 @@ void WeightMatrix::update(
     f32 l2_regularization,
     s32 iterations
 ) {
+    if (!check_index_inbounds(source_node, target_node)) {
+        return;
+    }
+
     gpu_weight_update(
         U_matrix.get_contents(),
         V_matrix.get_contents(),

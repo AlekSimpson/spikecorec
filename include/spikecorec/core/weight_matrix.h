@@ -26,6 +26,9 @@ namespace spikecorec {
         WeightStats after;
     };
 
+    bool can_safely_cast_s64_to_s32(s64);
+
+
     class WeightMatrix {
     public:
         K2Tree k2tree;
@@ -63,6 +66,10 @@ namespace spikecorec {
         );
 
         ~WeightMatrix();
+
+
+        bool check_index_inbounds(s32, s32) const;
+        bool check_index_inbounds(s32) const;
 
         // writes up to max_neighbor_count neighbor indices of node_index into output_buffer
         // (caller-allocated, at least max_neighbor_count elements); returns the number of
