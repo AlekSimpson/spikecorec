@@ -17,6 +17,7 @@
 
 using namespace std;
 using namespace spikecorec;
+using namespace spikecorec::log;
 
 // ── constructor / destructor ──────────────────────────────────────────────────
 
@@ -28,7 +29,8 @@ SpikeEngine::SpikeEngine(
     f32 decay_rate,
     f32 learning_rate
 )
-    : weights(*network, rank, true)
+    : logger(make_logger())
+    , weights(*network, rank, true)
     , neuron_count(shape[0] * shape[1])
     , input_neuron_count(0)
     , thread_count_per_block(0)
@@ -80,33 +82,48 @@ SpikeEngine::SpikeEngine(
     s32 *active_generation_data = active_generation.get_contents();
     for (s64 neuron_index = 0; neuron_index < neuron_count; ++neuron_index)
         active_generation_data[neuron_index] = -1;
+
+    logger->debug("SpikeEngine buffers allocated: neuron_f32_byte_size={} neuron_s32_byte_size={} "
+                  "neuron_s64_byte_size={} thread_count_per_block={} block_count={}",
+                  neuron_f32_byte_size, neuron_s32_byte_size, neuron_s64_byte_size,
+                  thread_count_per_block, block_count);
+    logger->info("SpikeEngine constructed: neuron_count={} resting_mp={} decay_rate={} learning_rate={}",
+                  neuron_count, resting_mp, decay_rate, learning_rate);
 }
 
 SpikeEngine::~SpikeEngine() {
+    logger->info("Spike Engine shutting down.");
     if (running) shutdown();
 }
 
 void SpikeEngine::setup_lifetime(int lifetime_, bool allocate_logs, s64 max_log_bytes) {
+    logger->debug("setup_lifetime: lifetime={} allocate_logs={} max_log_bytes={}",
+                  lifetime_, allocate_logs, max_log_bytes);
     lifetime = lifetime_;
-    if (lifetime < 0 || !allocate_logs) return;
+    if (lifetime < 0 || !allocate_logs) {
+        logger->info("Not allocating logs for run data.");
+        return;
+    }
 
     s32 size_of_f32 = 4;
     s64 required_bytes = neuron_count * lifetime * size_of_f32;
     if (max_log_bytes < required_bytes) {
-        throw std::runtime_error(
-            "Refusing to allocate membrane potential log: " +
-            std::to_string(neuron_count) + " neurons x " + std::to_string(lifetime) + " ticks" +
-            " requires " + std::to_string(required_bytes) + " bytes, which exceeds the " +
-            std::to_string(max_log_bytes) + "-byte budget. Pass a larger max_log_bytes to enable recording."
-        );
+        throw_runtime_error(*logger,
+            fmt::format("setup_lifetime: refusing to allocate membrane potential log "
+                        "({} neurons x {} ticks = {} bytes exceeds {}-byte budget; "
+                        "pass a larger max_log_bytes to enable recording)",
+                        neuron_count, lifetime, required_bytes, max_log_bytes));
     }
 
-    mp_logs = new f32*[neuron_count];
+    cell_state_logs = new f32*[neuron_count];
     for (s64 i = 0; i < neuron_count; ++i)
-        mp_logs[i] = new f32[lifetime];
+        cell_state_logs[i] = new f32[lifetime];
+
+    logger->debug("setup_lifetime: allocated cell_state_logs for {} neurons x {} ticks", neuron_count, lifetime);
 }
 
 void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
+    logger->debug("set_input_neurons: input_neuron_count={}", input_neuron_list.size());
     if (input_neuron_list.empty()) return;
 
     s32 s32_byte_size = 4;
@@ -120,6 +137,7 @@ void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
 }
 
 void SpikeEngine::reset_state(s64 last_spiked_value, s32 active_gen_value) {
+    logger->debug("reset_state: last_spiked_value={} active_gen_value={}", last_spiked_value, active_gen_value);
     s32 f32_byte_size = 4;
     usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
     usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
@@ -141,7 +159,12 @@ void SpikeEngine::step_simulation(
     const vector<s64> &override_input_neurons,
     bool decay_all_neurons
 ) {
-    if (input_values.empty()) throw std::runtime_error("input_values is empty");
+    if (input_values.empty()) {
+        log::throw_runtime_error(*logger, fmt::format("step_simulation: input_values is empty (tick={})", tick));
+    }
+
+    logger->trace("step_simulation: tick={} input_values.size={} override_input_neurons.size={} decay_all_neurons={}",
+                  tick, input_values.size(), override_input_neurons.size(), decay_all_neurons);
 
     if (decay_all_neurons) {
         gpu_decay_all_neurons(
@@ -221,6 +244,9 @@ void SpikeEngine::step_simulation(
 
     std::swap(active_neuron_indices, next_active_neuron_indices);
     std::swap(active_neuron_count, next_active_neuron_count);
+
+    logger->trace("step_simulation: tick={} completed, active_neuron_count={}",
+                  tick, active_neuron_count.get_contents()[0]);
 }
 
 void SpikeEngine::start_static_record(
@@ -236,24 +262,39 @@ void SpikeEngine::start_static_record(
     usize compression_queue_max,
     usize compression_chunk_bytes
 ) {
-    if (lifetime < 0) throw std::runtime_error("start_static_record: lifetime must be >= 0");
-    if (record_stride < 1) throw std::runtime_error("start_static_record: record_stride must be >= 1");
-    if (input_neuron_count <= 0) throw std::runtime_error("start_static_record: no input neurons configured (call set_input_neurons first)");
-    if ((s64)input_spikes.size() < lifetime) throw std::runtime_error("start_static_record: input_spikes must provide at least `lifetime` ticks");
+    if (lifetime < 0) {
+        log::throw_runtime_error(*logger, fmt::format("start_static_record: lifetime must be >= 0 (got {})", lifetime));
+    }
+    if (record_stride < 1) {
+        log::throw_runtime_error(*logger,
+            fmt::format("start_static_record: record_stride must be >= 1 (got {})", record_stride));
+    }
+    if (input_neuron_count <= 0) {
+        log::throw_runtime_error(*logger,
+            "start_static_record: no input neurons configured (call set_input_neurons first)");
+    }
+    if ((s64)input_spikes.size() < lifetime) {
+        log::throw_runtime_error(*logger,
+            fmt::format("start_static_record: input_spikes has {} ticks but lifetime requires {}",
+                        input_spikes.size(), lifetime));
+    }
 
     // Each tick's input row is positionally matched to input_neuron_indices, so
     // it must contain exactly input_neuron_count values. A wider row would make
     // step_simulation's add_network_input kernel read uninitialized
     // input_neuron_indices slots and write out of bounds; an empty/short row
-    // would silently under-stimulate or throw mid-loop, leaving a truncated
+    // would silently under-stimulate or fail mid-loop, leaving a truncated
     // recording. Validate up front (before opening the output file) so bad input
     // produces no partial file.
     for (s64 tick = 0; tick < lifetime; ++tick) {
-        if ((s64)input_spikes[(usize)tick].size() != input_neuron_count)
-            throw std::runtime_error("start_static_record: input_spikes[" + std::to_string(tick)
-                + "] has " + std::to_string(input_spikes[(usize)tick].size())
-                + " values but there are " + std::to_string(input_neuron_count) + " input neurons");
+        if ((s64)input_spikes[(usize)tick].size() != input_neuron_count) {
+            log::throw_runtime_error(*logger,
+                fmt::format("start_static_record: input_spikes[{}] has {} values but there are {} input neurons",
+                            tick, input_spikes[(usize)tick].size(), input_neuron_count));
+        }
     }
+
+    logger->info("start_static_record: lifetime={} filename={}", lifetime, filename);
 
     SimulationRecorder recorder(
         filename, neuron_count, compression, compression_level,
@@ -290,6 +331,7 @@ void SpikeEngine::start_static_record(
     }
 
     recorder.finish();
+    logger->info("start_static_record: finished");
 }
 
 pair<f32, f32> SpikeEngine::estimate_bifurcation_weight(s32 input_period) const {
@@ -314,6 +356,10 @@ void SpikeEngine::scale_uniform_weights_near_bifurcation(
     use_constant_weight = use_constant_weight_ != nullptr
         ? *use_constant_weight_
         : freeze_learning;
+
+    logger->debug("scale_uniform_weights_near_bifurcation: input_period={} scale={} target={} "
+                  "w_accum={} w_instant={} use_constant_weight={}",
+                  input_period, scale, *target, *w_accum, *w_instant, use_constant_weight);
 }
 
 ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(s32 input_period, f32 scale, bool freeze_learning) {
@@ -324,14 +370,22 @@ ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(s32
     if (freeze_learning) {
         learning_rate = 0.0f;
     }
+
+    logger->debug("scale_randomized_weights_near_bifurcation: input_period={} scale={} target={} "
+                  "w_accum={} w_instant={}",
+                  input_period, scale, target, w_accum, w_instant);
+
     return ScaledReservoirResult{result,w_accum,w_instant};
 }
 
 void SpikeEngine::get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 voltage_scale, GpuPointer<f32> output_buffer) {
+    logger->trace("get_reservoir_features_vector: tick={} spike_tau={} voltage_scale={}", tick, spike_tau, voltage_scale);
     if (spike_tau <= 0.0f) {
+        logger->warn("get_reservoir_features_vector: spike_tau was <= 0.0. Aborting.");
         return;
     }
     if (voltage_scale <= 0.0f) {
+        logger->warn("get_reservoir_features_vector: voltage_scale was <= 0.0. Aborting.");
         return;
     }
     gpu_reservoir_features(
@@ -354,11 +408,13 @@ bool SpikeEngine::is_alive() const {
 void SpikeEngine::shutdown() {
     if (!running) return;
 
-    if (mp_logs != nullptr) {
+    logger->info("shutdown: releasing GPU buffers");
+
+    if (cell_state_logs != nullptr) {
         for (s64 i = 0; i < neuron_count; ++i)
-            delete[] mp_logs[i];
-        delete[] mp_logs;
-        mp_logs = nullptr;
+            delete[] cell_state_logs[i];
+        delete[] cell_state_logs;
+        cell_state_logs = nullptr;
     }
 
     deallocate(std::move(network_inputs));

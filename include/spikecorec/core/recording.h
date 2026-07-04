@@ -180,7 +180,7 @@ namespace spikecorec {
         void write(vector<u8> chunk);
 
         // Pushes the sentinel, joins the worker thread, and re-raises any
-        // captured exception. Safe to call at most once (asserts otherwise);
+        // captured exception. Safe to call at most once (throws otherwise);
         // the destructor calls this automatically if not already closed.
         void close();
 

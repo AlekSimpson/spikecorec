@@ -58,11 +58,14 @@ namespace spikecorec {
         // rank:              latent factor dimensionality; -1 → min(64, node_count)
         // max_neighbor_count: upper bound on neighbors any single node may have; -1 → derived
         //                     from the longest row in `network`
+        // weight_seed:       seeds U/V initialization for reproducible weights; -1 → seed
+        //                    from std::random_device (non-deterministic)
         WeightMatrix(
             vector<vector<s32> > &network,
             s64 rank = -1,
             bool check_indexing = true,
-            s64 max_neighbor_count = -1
+            s64 max_neighbor_count = -1,
+            s64 weight_seed = -1
         );
 
         ~WeightMatrix();
@@ -70,6 +73,15 @@ namespace spikecorec {
 
         bool check_index_inbounds(s32, s32) const;
         bool check_index_inbounds(s32) const;
+
+    private:
+        // Fatally exits if `network` is empty. Called from the constructor's
+        // initializer list, before k2tree(K2Tree::from_adjacency_list(...)) —
+        // k2tree is the first member and does real GPU work, so this must run
+        // ahead of it rather than as a body-level check after the fact.
+        static vector<vector<s32>> &validate_network(vector<vector<s32>> &network);
+
+    public:
 
         // writes up to max_neighbor_count neighbor indices of node_index into output_buffer
         // (caller-allocated, at least max_neighbor_count elements); returns the number of

@@ -41,3 +41,19 @@ make cuda
 make python       # builds pybind11 Python extension
 make clean
 ```
+
+## GitHub
+
+- Repo: `AlekSimpson/spikecorec` (default branch `main`)
+- Project board: **spikecorec_project_board** — project number `5`, owner `AlekSimpson`
+  (`gh project list --owner AlekSimpson` to re-derive the number if it ever changes)
+- Branches follow `SC-<issue-number>_<short-description>`, e.g. `SC-25_add_branching_factor_bound_checks`
+  is the working branch for issue #25 — the numeric prefix is the GitHub issue number, so
+  `gh issue view <N>` finds the corresponding issue directly.
+- Issue labels: severity (`severity: critical|high|medium|low`) + category
+  (`correctness`, `performance`, `enhancement`, plus the GitHub defaults like `bug`/`documentation`).
+- `gh pr create` does **not** automatically attach the PR to the project board, even with
+  `Closes #N` in the body (that only closes the issue on merge). After creating a PR, attach it explicitly:
+  ```bash
+  gh project item-add 5 --owner AlekSimpson --url <pr-url>
+  ```
