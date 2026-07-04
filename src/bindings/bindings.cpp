@@ -13,6 +13,7 @@
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/engine.h"
+#include "spikecorec/core/log.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/topologies.h"
 #include "spikecorec/core/recording.h"
@@ -42,6 +43,10 @@ PYBIND11_MODULE(_spikecorec, m) {
     // let the OS reclaim GPU resources at process exit, mirroring how CUDA
     // contexts are typically left to the driver in Python extensions.
     initialize_gpu_context();
+
+    m.def("set_log_level", [](const string &level) {
+        spikecorec::log::set_level(spikecorec::log::level_from_string(spikecorec::log::logger(), level));
+    }, py::arg("level"));
 
     m.def("square_torus", &square_torus, py::arg("k"));
     m.def("small_world_torus", &small_world_torus,
@@ -190,7 +195,7 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readwrite("spike_period", &SpikeEngine::spike_period)
         .def_readwrite("spike_threshold", &SpikeEngine::spike_threshold)
         .def_readwrite("use_constant_weight", &SpikeEngine::use_constant_weight)
-        .def_readonly("running", &SpikeEngine::running);
+        .def_readonly("running", &SpikeEngine::running)
 
     // Decodes a `.spire`/`.spire.gz`/`.spire.xz`/`.spire.bz2` recording (as
     // written by start_static_record / SimulationRecorder, or by the

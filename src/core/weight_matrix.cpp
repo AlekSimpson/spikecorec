@@ -3,14 +3,11 @@
 //
 
 #include <random>
-#include <stdexcept>
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <vector>
-#include <iostream>
 #include <limits>
 #include <cstdint>
 
@@ -22,6 +19,7 @@
 
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -29,13 +27,22 @@ using namespace spikecorec;
 static constexpr s64 DEFAULT_WEIGHT_RANK = 64;
 static constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5458;
 
+vector<vector<s32>> &WeightMatrix::validate_network(vector<vector<s32>> &network) {
+    if (network.empty()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix: network must have at least one neuron (got {})", network.size()));
+    }
+    return network;
+}
+
 WeightMatrix::WeightMatrix(
-    vector<vector<s32>>& network,
+    vector<vector<s32>> &network,
     s64 rank,
     bool check_indexing,
-    s64 max_neighbor_count
+    s64 max_neighbor_count,
+    s64 weight_seed
 )
-    : k2tree(*K2Tree::from_adjacency_list(network, (s32)network.size()))
+    : k2tree(*K2Tree::from_adjacency_list(validate_network(network), (s32)network.size()))
     , node_count((s64)network.size())
     , max_neighbor_count(0)
     , rank(0)
@@ -44,15 +51,13 @@ WeightMatrix::WeightMatrix(
     , check_indexing(check_indexing)
     , using_constant_weight(false)
 {
-    if (node_count <= 0)
-        throw invalid_argument("Network must have at least one neuron.");
-
     if (max_neighbor_count > 0) {
         this->max_neighbor_count = max_neighbor_count;
     } else {
         s64 longest_row = 0;
-        for (s64 node_index = 0; node_index < node_count; node_index++)
+        for (s64 node_index = 0; node_index < node_count; node_index++) {
             longest_row = max(longest_row, (s64)network[node_index].size());
+        }
         this->max_neighbor_count = longest_row;
     }
 
@@ -65,15 +70,12 @@ WeightMatrix::WeightMatrix(
     V_matrix = allocate<float4>(matrix_byte_size);
 
     // initialize with independent random normal values (mean=0, std=1).
-    // Seed from SPIKECOREC_WEIGHT_SEED when set (reproducible weights — needed
-    // for deterministic runs/tests); otherwise fall back to a nondeterministic
-    // hardware-entropy seed as before.
-    unsigned weight_seed;
-    if (const char* seed_env = std::getenv("SPIKECOREC_WEIGHT_SEED"))
-        weight_seed = static_cast<unsigned>(std::strtoul(seed_env, nullptr, 10));
-    else
-        weight_seed = random_device{}();
-    mt19937 rng(weight_seed);
+    // weight_seed >= 0 gives reproducible weights (deterministic runs/tests);
+    // weight_seed < 0 falls back to a nondeterministic hardware-entropy seed.
+    unsigned resolved_weight_seed = (weight_seed >= 0)
+        ? static_cast<unsigned>(weight_seed)
+        : random_device{}();
+    mt19937 rng(resolved_weight_seed);
     normal_distribution<f32> normal_dist(0.0f, 1.0f);
     float4* u_data = U_matrix.get_contents();
     float4* v_data = V_matrix.get_contents();
@@ -82,6 +84,11 @@ WeightMatrix::WeightMatrix(
         u_data[element_index] = {normal_dist(rng), normal_dist(rng), normal_dist(rng), normal_dist(rng)};
         v_data[element_index] = {normal_dist(rng), normal_dist(rng), normal_dist(rng), normal_dist(rng)};
     }
+
+    log::logger().debug("WeightMatrix constructed: node_count={} rank={} rank_float4_stride={} "
+                        "max_neighbor_count={} weight_seed={} check_indexing={}",
+                        node_count, this->rank, rank_float4_stride, this->max_neighbor_count,
+                        resolved_weight_seed, check_indexing);
 }
 
 WeightMatrix::~WeightMatrix() {
@@ -104,6 +111,7 @@ s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
 }
 
 void WeightMatrix::set_constant_weight(f32 value) {
+    log::logger().debug("set_constant_weight: value={}", value);
     // U filled with sqrt(|val|/rank), V filled with ±same based on sign of val
     f32 scale = (value != 0.0f) ? sqrtf(fabsf(value) / (f32)rank) : 0.0f;
     float4 u_fill = {scale, scale, scale, scale};
@@ -133,6 +141,7 @@ bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
 }
 
 f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
+    log::logger().trace("get: source_node={} target_node={}", source_node, target_node);
     if (!check_index_inbounds(source_node, target_node)) {
         return 0.0;
     }
@@ -206,8 +215,11 @@ ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
     f32 target_root_mean_square,
     f32 epsilon
 ) {
-    if (target_root_mean_square < 0.0f)
-        throw invalid_argument("target_root_mean_square must be non-negative.");
+    if (target_root_mean_square < 0.0f) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("scale_neighbor_weights_to_root_mean_square: target_root_mean_square "
+                        "must be non-negative (got {})", target_root_mean_square));
+    }
 
     WeightStats stats_before = neighbor_weight_stats();
     f32 current_root_mean_square = max(stats_before.root_mean_square, epsilon);
@@ -222,6 +234,12 @@ ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
     using_constant_weight = false;
 
     WeightStats stats_after = neighbor_weight_stats();
+
+    log::logger().debug("scale_neighbor_weights_to_root_mean_square: target_root_mean_square={} "
+                        "scale_factor={} rms_before={} rms_after={}",
+                        target_root_mean_square, scale_factor,
+                        stats_before.root_mean_square, stats_after.root_mean_square);
+
     return {target_root_mean_square, scale_factor, stats_before, stats_after};
 }
 
@@ -233,6 +251,9 @@ void WeightMatrix::update(
     f32 l2_regularization,
     s32 iterations
 ) {
+    log::logger().trace("update: source_node={} target_node={} delta={} learning_rate={} "
+                        "l2_regularization={} iterations={}",
+                        source_node, target_node, delta, learning_rate, l2_regularization, iterations);
     if (!check_index_inbounds(source_node, target_node)) {
         return;
     }
@@ -252,6 +273,8 @@ void WeightMatrix::update(
 }
 
 void WeightMatrix::save(const char *filepath) const {
+    log::logger().debug("WeightMatrix::save: filepath={} node_count={} rank={} rank_float4_stride={}",
+                        filepath, node_count, rank, rank_float4_stride);
     ofstream file(filepath, ios::binary);
     file.write(reinterpret_cast<const char*>(&WEIGHT_MATRIX_SAVE_MAGIC), sizeof(u32));
     file.write(reinterpret_cast<const char*>(&node_count), sizeof(s64));
@@ -266,6 +289,7 @@ void WeightMatrix::save(const char *filepath) const {
 }
 
 void WeightMatrix::load_from_disk(const char *filepath) {
+    log::logger().debug("WeightMatrix::load_from_disk: filepath={}", filepath);
     ifstream file(filepath, ios::binary);
     u32 magic;
     file.read(reinterpret_cast<char*>(&magic), sizeof(u32));
@@ -276,6 +300,9 @@ void WeightMatrix::load_from_disk(const char *filepath) {
     file.read(reinterpret_cast<char*>(&saved_rank_float4_stride), sizeof(s64));
 
     if (saved_node_count != node_count || saved_rank_float4_stride != rank_float4_stride) {
+        log::logger().debug("WeightMatrix::load_from_disk: reallocating U/V matrix "
+                            "(node_count {} -> {}, rank_float4_stride {} -> {})",
+                            node_count, saved_node_count, rank_float4_stride, saved_rank_float4_stride);
         deallocate(std::move(U_matrix));
         deallocate(std::move(V_matrix));
         usize matrix_byte_size = (usize)saved_node_count * (usize)saved_rank_float4_stride * sizeof(float4);
@@ -290,4 +317,7 @@ void WeightMatrix::load_from_disk(const char *filepath) {
               (streamsize)(node_count * rank_float4_stride * sizeof(float4)));
     file.read(reinterpret_cast<char*>(V_matrix.get_contents()),
               (streamsize)(node_count * rank_float4_stride * sizeof(float4)));
+
+    log::logger().debug("WeightMatrix::load_from_disk: loaded node_count={} rank={} rank_float4_stride={} magic={:#x}",
+                        node_count, rank, rank_float4_stride, magic);
 }

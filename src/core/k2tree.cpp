@@ -19,14 +19,15 @@
 #include "spikecorec/core/k2tree.h"
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
+using namespace spikecorec::log;
 
-// ── internal helpers ──────────────────────────────────────────────────────────
-
-static pair<s32, s32> compute_tree_params(s32 node_count, s32 branching_factor) {
+static pair<s32, s32> compute_tree_parameters(s32 node_count, s32 branching_factor) {
     if (node_count <= 1) return {0, 1};
+
     s32 tree_height = 0, padded_size = 1;
     while (padded_size < node_count) {
         padded_size *= branching_factor;
@@ -55,12 +56,13 @@ static s32 rank1_exclusive(const u32 *internal_node_words, const u32 *superblock
 // into output_buffer, descending only into subtrees that intersect u's row and have
 // at least one bit set. Mirrors K2Tree::adjacent's bit-position bookkeeping, but
 // explores every column branch at each level instead of following a fixed `v`.
+// TODO: leave documentation about what 'u' is 
 static void collect_row_neighbors(
     const u32 *internal_words, const u32 *leaf_words,
     const u32 *superblock_data, const u16 *subblock_data,
     s32 branching_factor, s32 superblock_size_words,
     s32 node_count, s32 tree_height, s32 internal_bit_count,
-    s32 level, s32 row_base, s32 col_base, s32 block_size, s32 level_bit_offset,
+    s32 level, s32 row_base, s32 column_base, s32 block_size, s32 level_bit_offset,
     s32 u, s32 *output_buffer, s64 max_neighbor_count, s64 &neighbors_found
 ) {
     if (neighbors_found >= max_neighbor_count) return;
@@ -77,7 +79,7 @@ static void collect_row_neighbors(
 
         if (level == tree_height - 1) {
             if (get_bit(leaf_words, bit_position)) {
-                s32 v = col_base + col_offset;
+                s32 v = column_base + col_offset;
                 if (v < node_count)
                     output_buffer[neighbors_found++] = v;
             }
@@ -93,7 +95,7 @@ static void collect_row_neighbors(
                 branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
                 level + 1,
                 row_base + row_offset * child_block_size,
-                col_base + col_offset * child_block_size,
+                column_base + col_offset * child_block_size,
                 child_block_size, child_level_bit_offset,
                 u, output_buffer, max_neighbor_count, neighbors_found
             );
@@ -123,7 +125,7 @@ struct TreeArrays {
 
 static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 node_count, s32 branching_factor,
                                     s32 superblock_size) {
-    auto [tree_height, padded_node_count] = compute_tree_params(node_count, branching_factor);
+    auto [tree_height, padded_node_count] = compute_tree_parameters(node_count, branching_factor);
     s32 branching_factor_squared = branching_factor * branching_factor;
 
     if (tree_height == 0)
@@ -132,19 +134,26 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
     // record which children are set at each (level, block_row, block_col)
     map<tuple<s32, s32, s32>, s32> child_masks;
     for (auto [source_node, target_node]: edges) {
-        s32 current_row = source_node, current_col = target_node;
-        if (current_row < 0 || current_row >= node_count || current_col < 0 || current_col >= node_count) continue;
-        s32 block_row = 0, block_col = 0, current_size = padded_node_count;
+        s32 current_row = source_node;
+        s32 current_column = target_node;
+        if (current_row < 0 || current_row >= node_count || 
+            current_column < 0 || current_column >= node_count) {
+            continue;
+        }
+
+        s32 block_row = 0;
+        s32 block_column = 0;
+        s32 current_size = padded_node_count;
         for (s32 level = 0; level < tree_height; level++) {
             s32 block_size = current_size / branching_factor;
             s32 child_row_index = current_row / block_size;
-            s32 child_col_index = current_col / block_size;
-            s32 child_flat_index = child_row_index * branching_factor + child_col_index;
-            child_masks[{level, block_row, block_col}] |= (1 << child_flat_index);
+            s32 child_column_index = current_column / block_size;
+            s32 child_flat_index = child_row_index * branching_factor + child_column_index;
+            child_masks[{level, block_row, block_column}] |= (1 << child_flat_index);
             current_row = current_row % block_size;
-            current_col = current_col % block_size;
+            current_column = current_column % block_size;
             block_row = block_row * branching_factor + child_row_index;
-            block_col = block_col * branching_factor + child_col_index;
+            block_column = block_column * branching_factor + child_column_index;
             current_size = block_size;
         }
     }
@@ -155,8 +164,8 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
 
     for (s32 level = 0; level < tree_height; level++) {
         vector<pair<s32, s32> > next_level_nodes;
-        for (auto [block_row, block_col]: current_level_nodes) {
-            auto it = child_masks.find({level, block_row, block_col});
+        for (auto [block_row, block_column]: current_level_nodes) {
+            auto it = child_masks.find({level, block_row, block_column});
             s32 child_presence_mask = (it != child_masks.end()) ? it->second : 0;
 
             auto &target_bit_array = (level < tree_height - 1) ? internal_bits : leaf_bits;
@@ -169,10 +178,10 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
                     s32 least_significant_bit = remaining_children & -remaining_children;
                     s32 child_flat_index = __builtin_ctz((u32) least_significant_bit);
                     s32 child_row_offset = child_flat_index / branching_factor;
-                    s32 child_col_offset = child_flat_index - child_row_offset * branching_factor;
+                    s32 child_column_offset = child_flat_index - child_row_offset * branching_factor;
                     next_level_nodes.push_back({
                         block_row * branching_factor + child_row_offset,
-                        block_col * branching_factor + child_col_offset
+                        block_column * branching_factor + child_column_offset
                     });
                     remaining_children ^= least_significant_bit;
                 }
@@ -218,23 +227,23 @@ static K2Tree make_k2tree_from_arrays(TreeArrays &arrays, s32 node_count, s32 br
     usize rank_superblock_length = arrays.rank_superblock_table.size();
     usize rank_subblock_length = arrays.rank_subblock_table.size();
 
-    GpuPointer<u32> internal_node_gpu_ptr = allocate<u32>(internal_node_words_length * sizeof(u32));
-    GpuPointer<u32> leaf_node_gpu_ptr = allocate<u32>(leaf_node_words_length * sizeof(u32));
-    GpuPointer<u32> rank_superblock_gpu_ptr = allocate<u32>(rank_superblock_length * sizeof(u32));
-    GpuPointer<u16> rank_subblock_gpu_ptr = allocate<u16>(rank_subblock_length * sizeof(u16));
+    GpuPointer<u32> internal_node_gpu_pointer = allocate<u32>(internal_node_words_length * sizeof(u32));
+    GpuPointer<u32> leaf_node_gpu_pointer = allocate<u32>(leaf_node_words_length * sizeof(u32));
+    GpuPointer<u32> rank_superblock_gpu_pointer = allocate<u32>(rank_superblock_length * sizeof(u32));
+    GpuPointer<u16> rank_subblock_gpu_pointer = allocate<u16>(rank_subblock_length * sizeof(u16));
 
-    memcpy(internal_node_gpu_ptr.get_contents(), arrays.internal_node_words.data(),
+    memcpy(internal_node_gpu_pointer.get_contents(), arrays.internal_node_words.data(),
            internal_node_words_length * sizeof(u32));
-    memcpy(leaf_node_gpu_ptr.get_contents(), arrays.leaf_node_words.data(), leaf_node_words_length * sizeof(u32));
-    memcpy(rank_superblock_gpu_ptr.get_contents(), arrays.rank_superblock_table.data(),
+    memcpy(leaf_node_gpu_pointer.get_contents(), arrays.leaf_node_words.data(), leaf_node_words_length * sizeof(u32));
+    memcpy(rank_superblock_gpu_pointer.get_contents(), arrays.rank_superblock_table.data(),
            rank_superblock_length * sizeof(u32));
-    memcpy(rank_subblock_gpu_ptr.get_contents(), arrays.rank_subblock_table.data(), rank_subblock_length * sizeof(u16));
+    memcpy(rank_subblock_gpu_pointer.get_contents(), arrays.rank_subblock_table.data(), rank_subblock_length * sizeof(u16));
 
     return {
-        std::move(internal_node_gpu_ptr),
-        std::move(leaf_node_gpu_ptr),
-        std::move(rank_superblock_gpu_ptr),
-        std::move(rank_subblock_gpu_ptr),
+        std::move(internal_node_gpu_pointer),
+        std::move(leaf_node_gpu_pointer),
+        std::move(rank_superblock_gpu_pointer),
+        std::move(rank_subblock_gpu_pointer),
         internal_node_words_length,
         leaf_node_words_length,
         rank_superblock_length,
@@ -299,7 +308,11 @@ optional<K2Tree> K2Tree::from_adjacency_list(
     s32 branching_factor,
     s32 superblock_size
 ) {
+    logger().debug("K2Tree::from_adjacency_list: adjacency_list.size={} node_count={} branching_factor={} "
+                   "superblock_size={}", adjacency_list.size(), node_count, branching_factor, superblock_size);
     if (branching_factor > 5 || branching_factor < 0) {
+        logger().warn("K2Tree::from_adjacency_list: rejecting out-of-range branching_factor={} (must be 0-5)",
+                      branching_factor);
         return nullopt;
     }
 
@@ -311,6 +324,9 @@ optional<K2Tree> K2Tree::from_adjacency_list(
             edges.emplace_back(u, v);
 
     auto arrays = build_tree_arrays(edges, effective_node_count, branching_factor, superblock_size);
+    logger().debug("K2Tree::from_adjacency_list: edge_count={} tree_height={} padded_node_count={} "
+                   "internal_bit_count={}", edges.size(), arrays.tree_height, arrays.padded_node_count,
+                   arrays.internal_bit_count);
     return make_k2tree_from_arrays(arrays, effective_node_count, branching_factor, superblock_size);
 }
 
@@ -322,7 +338,11 @@ optional<K2Tree> K2Tree::from_edges(
     s32 branching_factor,
     s32 superblock_size
 ) {
+    logger().debug("K2Tree::from_edges: edge_count={} node_count={} branching_factor={} superblock_size={}",
+                   edge_count, node_count, branching_factor, superblock_size);
     if (branching_factor > 5 || branching_factor < 0) {
+        logger().warn("K2Tree::from_edges: rejecting out-of-range branching_factor={} (must be 0-5)",
+                      branching_factor);
         return nullopt;
     }
 
@@ -332,6 +352,8 @@ optional<K2Tree> K2Tree::from_edges(
         edges.emplace_back(source_indices[i], target_indices[i]);
 
     auto arrays = build_tree_arrays(edges, node_count, branching_factor, superblock_size);
+    logger().debug("K2Tree::from_edges: tree_height={} padded_node_count={} internal_bit_count={}",
+                   arrays.tree_height, arrays.padded_node_count, arrays.internal_bit_count);
     return make_k2tree_from_arrays(arrays, node_count, branching_factor, superblock_size);
 }
 
@@ -340,6 +362,7 @@ optional<K2Tree> K2Tree::from_edges(
 static constexpr u32 SAVE_MAGIC = 0x4B325452; // "K2TR"
 
 K2Tree K2Tree::load(const char *path) {
+    logger().debug("K2Tree::load: path={}", path);
     ifstream file(path, ios::binary);
 
     u32 magic;
@@ -359,25 +382,29 @@ K2Tree K2Tree::load(const char *path) {
     file.read(reinterpret_cast<char *>(&rank_superblock_length), sizeof(usize));
     file.read(reinterpret_cast<char *>(&rank_subblock_length), sizeof(usize));
 
-    GpuPointer<u32> internal_node_gpu_ptr = allocate<u32>(internal_node_words_length * sizeof(u32));
-    GpuPointer<u32> leaf_node_gpu_ptr = allocate<u32>(leaf_node_words_length * sizeof(u32));
-    GpuPointer<u32> rank_superblock_gpu_ptr = allocate<u32>(rank_superblock_length * sizeof(u32));
-    GpuPointer<u16> rank_subblock_gpu_ptr = allocate<u16>(rank_subblock_length * sizeof(u16));
+    GpuPointer<u32> internal_node_gpu_pointer = allocate<u32>(internal_node_words_length * sizeof(u32));
+    GpuPointer<u32> leaf_node_gpu_pointer = allocate<u32>(leaf_node_words_length * sizeof(u32));
+    GpuPointer<u32> rank_superblock_gpu_pointer = allocate<u32>(rank_superblock_length * sizeof(u32));
+    GpuPointer<u16> rank_subblock_gpu_pointer = allocate<u16>(rank_subblock_length * sizeof(u16));
 
-    file.read(reinterpret_cast<char *>(internal_node_gpu_ptr.get_contents()),
+    file.read(reinterpret_cast<char *>(internal_node_gpu_pointer.get_contents()),
               (streamsize) (internal_node_words_length * sizeof(u32)));
-    file.read(reinterpret_cast<char *>(leaf_node_gpu_ptr.get_contents()),
+    file.read(reinterpret_cast<char *>(leaf_node_gpu_pointer.get_contents()),
               (streamsize) (leaf_node_words_length * sizeof(u32)));
-    file.read(reinterpret_cast<char *>(rank_superblock_gpu_ptr.get_contents()),
+    file.read(reinterpret_cast<char *>(rank_superblock_gpu_pointer.get_contents()),
               (streamsize) (rank_superblock_length * sizeof(u32)));
-    file.read(reinterpret_cast<char *>(rank_subblock_gpu_ptr.get_contents()),
+    file.read(reinterpret_cast<char *>(rank_subblock_gpu_pointer.get_contents()),
               (streamsize) (rank_subblock_length * sizeof(u16)));
 
+    logger().debug("K2Tree::load: path={} magic={:#x} node_count={} branching_factor={} tree_height={} "
+                   "padded_node_count={} internal_bit_count={}",
+                   path, magic, node_count, branching_factor, tree_height, padded_node_count, internal_bit_count);
+
     return {
-        std::move(internal_node_gpu_ptr),
-        std::move(leaf_node_gpu_ptr),
-        std::move(rank_superblock_gpu_ptr),
-        std::move(rank_subblock_gpu_ptr),
+        std::move(internal_node_gpu_pointer),
+        std::move(leaf_node_gpu_pointer),
+        std::move(rank_superblock_gpu_pointer),
+        std::move(rank_subblock_gpu_pointer),
         internal_node_words_length,
         leaf_node_words_length,
         rank_superblock_length,
@@ -392,6 +419,9 @@ K2Tree K2Tree::load(const char *path) {
 }
 
 void K2Tree::save(const char *path) const {
+    logger().debug("K2Tree::save: path={} node_count={} branching_factor={} tree_height={} "
+                   "padded_node_count={} internal_bit_count={}",
+                   path, node_count, branching_factor, tree_height, padded_node_count, internal_bit_count);
     ofstream file(path, ios::binary);
 
     file.write(reinterpret_cast<const char *>(&SAVE_MAGIC), sizeof(u32));
@@ -422,6 +452,8 @@ void K2Tree::save(const char *path) const {
 // ── queries ───────────────────────────────────────────────────────────────────
 
 s32 K2Tree::adjacent(s32 u, s32 v) const {
+    // u and v are some nodes in the graph
+
     if (u < 0 || u >= node_count || v < 0 || v >= node_count) return 0;
     if (tree_height == 0) return 0;
 
@@ -494,7 +526,7 @@ void K2Tree::adjacent_batch(
 ) const {
     if (query_count <= 0) return;
 
-    // source_indices/target_indices/output_buffer are caller-owned host memory
+    // note: source_indices/target_indices/output_buffer are caller-owned host memory
     // (mirrors the plain s32 u/v of the single-query `adjacent`) — not GPU-visible —
     // so queries are staged into unified-memory scratch buffers, the kernel writes
     // results into a scratch output buffer, and we copy the results back once done.
@@ -530,18 +562,16 @@ void K2Tree::adjacent_batch(
     deallocate(std::move(device_output));
 }
 
-// ── debug ─────────────────────────────────────────────────────────────────────
-
 s32 K2Tree::trace(s32 u, s32 v) const {
-    printf("TRACE u=%d v=%d  N=%d H=%d Npad=%d k=%d\n", u, v, node_count, tree_height, padded_node_count,
-           branching_factor);
+    logger().trace("u={} v={}  N={} H={} Npad={} k={}",
+                    u, v, node_count, tree_height, padded_node_count, branching_factor);
 
     if (u < 0 || u >= node_count || v < 0 || v >= node_count) {
-        printf("  out of bounds => 0\n");
+        logger().trace("  out of bounds => 0");
         return 0;
     }
     if (tree_height == 0) {
-        printf("  tree_height==0 => 0\n");
+        logger().trace("  tree_height==0 => 0");
         return 0;
     }
 
@@ -556,37 +586,38 @@ s32 K2Tree::trace(s32 u, s32 v) const {
         s32 block_size = padded_node_count / branching_factor;
         s32 child_flat_index = (u / block_size) * branching_factor + (v / block_size);
         s32 leaf_bit = (s32) get_bit(leaf_words, child_flat_index);
-        printf("  tree_height==1: block_size=%d child_flat_index=%d  L[%d]=%d\n", block_size, child_flat_index,
-               child_flat_index, leaf_bit);
+        logger().trace("  tree_height==1: block_size={} child_flat_index={}  L[{}]={}",
+                       block_size, child_flat_index, child_flat_index, leaf_bit);
         return leaf_bit;
     }
 
-    s32 level_bit_offset = 0, current_block_size = padded_node_count, rank_inclusive = 0;
-    s32 row_remainder = 0, col_remainder = 0;
+    s32 level_bit_offset, rank_inclusive = 0; 
+    s32 current_block_size = padded_node_count;
+    s32 row_remainder = 0, column_remainder = 0;
 
     for (s32 level = 0; level < tree_height - 1; level++) {
         s32 block_size = current_block_size / branching_factor;
         s32 row_offset = u / block_size;
-        s32 col_offset = v / block_size;
-        s32 child_bit_position = level_bit_offset + row_offset * branching_factor + col_offset;
+        s32 column_offset = v / block_size;
+        s32 child_bit_position = level_bit_offset + row_offset * branching_factor + column_offset;
         s32 bit_value = (s32) get_bit(internal_words, child_bit_position);
         s32 rank_exclusive = rank1_exclusive(internal_words, superblock_data, subblock_data, child_bit_position,
                                              superblock_size_words);
         rank_inclusive = rank_exclusive + 1;
 
-        printf(
-            "  lvl=%2d block_size=%6d u=%6d v=%6d row_offset=%d col_offset=%d child_bit_pos=%8d T[pos]=%d rank_ex=%d rank_incl=%d\n",
-            level, block_size, u, v, row_offset, col_offset, child_bit_position, bit_value, rank_exclusive,
+        logger().trace(
+            "  lvl={:2d} block_size={:6d} u={:6d} v={:6d} row_offset={} column_offset={} child_bit_pos={:8d} T[pos]={} rank_ex={} rank_incl={}",
+            level, block_size, u, v, row_offset, column_offset, child_bit_position, bit_value, rank_exclusive,
             rank_inclusive);
 
         if (!bit_value) {
-            printf("  stop: T[pos]==0 => 0\n");
+            logger().trace("  stop: T[pos]==0 => 0");
             return 0;
         }
 
         if (level == tree_height - 2) {
             row_remainder = u % block_size;
-            col_remainder = v % block_size;
+            column_remainder = v % block_size;
             break;
         }
 
@@ -597,13 +628,13 @@ s32 K2Tree::trace(s32 u, s32 v) const {
     }
 
     s32 leaf_bit_offset = branching_factor_squared * rank_inclusive - internal_bit_count;
-    s32 leaf_child_index = row_remainder * branching_factor + col_remainder;
+    s32 leaf_child_index = row_remainder * branching_factor + column_remainder;
     s32 leaf_bit_index = leaf_bit_offset + leaf_child_index;
     s32 leaf_bit = (s32) get_bit(leaf_words, leaf_bit_index);
 
-    printf(
-        "  leaf: rank_incl=%d leaf_bit_offset=%d row_remainder=%d col_remainder=%d leaf_child_index=%d -> L[%d]=%d\n",
-        rank_inclusive, leaf_bit_offset, row_remainder, col_remainder, leaf_child_index, leaf_bit_index, leaf_bit);
+    logger().trace(
+        "  leaf: rank_incl={} leaf_bit_offset={} row_remainder={} column_remainder={} leaf_child_index={} -> L[{}]={}",
+        rank_inclusive, leaf_bit_offset, row_remainder, column_remainder, leaf_child_index, leaf_bit_index, leaf_bit);
 
     return leaf_bit;
 }

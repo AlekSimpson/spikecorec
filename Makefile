@@ -63,6 +63,11 @@ ifeq ($(HAS_BZ2),yes)
   COMPRESSION_LIBS += $(shell pkg-config --libs bzip2)
 endif
 
+# ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────
+# Header-only mode is spdlog's default (it self-defines SPDLOG_HEADER_ONLY
+# whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.
+CXXFLAGS += -Ithird_party/spdlog/include -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
+
 ifeq ($(UNAME_S),Darwin)
   HAS_METAL     := yes
   CXX           := clang++

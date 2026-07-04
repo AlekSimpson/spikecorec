@@ -2,7 +2,6 @@
 // Created by Alek Simpson on 6/7/26.
 //
 
-#include <stdexcept>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -18,6 +17,7 @@
 #endif
 
 #include "spikecorec/core/recording.h"
+#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -49,7 +49,8 @@ namespace {
         if (lowered == "gzip" || lowered == "gz") return SpireCompression::Gzip;
         if (lowered == "xz" || lowered == "lzma") return SpireCompression::Xz;
         if (lowered == "bz2" || lowered == "bzip2") return SpireCompression::Bz2;
-        throw std::runtime_error("Unknown .spire compression \"" + name + "\" — expected one of: auto, none, gzip, xz, bz2");
+        log::throw_runtime_error(log::logger(),
+            fmt::format("Unknown .spire compression \"{}\" — expected one of: auto, none, gzip, xz, bz2", name));
     }
 
     // The .spire header is a big-endian u32; native float frames follow as-is.
@@ -69,12 +70,19 @@ namespace {
 pair<SpireCompression, string> spikecorec::resolve_spire_compression(
     const string &filename, optional<string> requested
 ) {
-    if (!requested.has_value()) return {compression_from_extension(filename), filename};
+    pair<SpireCompression, string> result;
+    if (!requested.has_value()) {
+        result = {compression_from_extension(filename), filename};
+    } else {
+        string lowered = lowercase(*requested);
+        result = (lowered == "auto")
+            ? make_pair(compression_from_extension(filename), filename)
+            : make_pair(compression_from_name(lowered), filename);
+    }
 
-    string lowered = lowercase(*requested);
-    if (lowered == "auto") return {compression_from_extension(filename), filename};
-
-    return {compression_from_name(lowered), filename};
+    log::logger().debug("resolve_spire_compression: filename={} requested={} -> compression={}",
+                        filename, requested.value_or("(none)"), (int)result.first);
+    return result;
 }
 
 // ── sink/source factory ──────────────────────────────────────────────────────
@@ -82,13 +90,16 @@ pair<SpireCompression, string> spikecorec::resolve_spire_compression(
 namespace {
 
     [[maybe_unused]] [[noreturn]] void throw_missing_library(const char *codec_name, const char *library_hint) {
-        throw std::runtime_error(string("spikecorec was built without ") + codec_name
-            + " support — rebuild with " + library_hint + " available, or use an uncompressed .spire path");
+        log::throw_runtime_error(log::logger(),
+            fmt::format("spikecorec was built without {} support — rebuild with {} available, "
+                        "or use an uncompressed .spire path", codec_name, library_hint));
     }
 
 } // namespace
 
 unique_ptr<SpireSink> spikecorec::make_spire_sink(const string &filename, SpireCompression compression, [[maybe_unused]] int compression_level) {
+    log::logger().debug("make_spire_sink: filename={} compression={} compression_level={}",
+                        filename, (int)compression, compression_level);
     switch (compression) {
         case SpireCompression::None: return make_unique<RawSink>(filename);
         case SpireCompression::Gzip:
@@ -110,10 +121,11 @@ unique_ptr<SpireSink> spikecorec::make_spire_sink(const string &filename, SpireC
             throw_missing_library("bz2", "libbz2");
 #endif
     }
-    throw std::runtime_error("Unhandled SpireCompression value");
+    log::throw_runtime_error(log::logger(), "Unhandled SpireCompression value");
 }
 
 unique_ptr<SpireSource> spikecorec::make_spire_source(const string &filename, SpireCompression compression) {
+    log::logger().debug("make_spire_source: filename={} compression={}", filename, (int)compression);
     switch (compression) {
         case SpireCompression::None: return make_unique<RawSource>(filename);
         case SpireCompression::Gzip:
@@ -135,13 +147,14 @@ unique_ptr<SpireSource> spikecorec::make_spire_source(const string &filename, Sp
             throw_missing_library("bz2", "libbz2");
 #endif
     }
-    throw std::runtime_error("Unhandled SpireCompression value");
+    log::throw_runtime_error(log::logger(), "Unhandled SpireCompression value");
 }
 
 // ── RawSink / RawSource ──────────────────────────────────────────────────────
 
 RawSink::RawSink(const string &filename) : file_(filename, ios::binary) {
-    if (!file_) throw std::runtime_error("Failed to open file for writing: " + filename);
+    log::logger().debug("RawSink: filename={}", filename);
+    if (!file_) log::throw_runtime_error(log::logger(), fmt::format("Failed to open file for writing: {}", filename));
 }
 
 void RawSink::write(const u8 *data, usize byte_count) {
@@ -153,7 +166,8 @@ void RawSink::close() {
 }
 
 RawSource::RawSource(const string &filename) : file_(filename, ios::binary) {
-    if (!file_) throw std::runtime_error("Failed to open file for reading: " + filename);
+    log::logger().debug("RawSource: filename={}", filename);
+    if (!file_) log::throw_runtime_error(log::logger(), fmt::format("Failed to open file for reading: {}", filename));
 }
 
 usize RawSource::read(u8 *out, usize byte_count) {
@@ -166,10 +180,12 @@ usize RawSource::read(u8 *out, usize byte_count) {
 #ifdef SPIKECOREC_HAVE_ZLIB
 
 GzipSink::GzipSink(const string &filename, int compression_level) {
+    log::logger().debug("GzipSink: filename={} compression_level={}", filename, compression_level);
     char mode[8];
     snprintf(mode, sizeof(mode), "wb%d", compression_level);
     gz_file_ = gzopen(filename.c_str(), mode);
-    if (gz_file_ == nullptr) throw std::runtime_error("Failed to open gzip file for writing: " + filename);
+    if (gz_file_ == nullptr)
+        log::throw_runtime_error(log::logger(), fmt::format("Failed to open gzip file for writing: {}", filename));
 }
 
 GzipSink::~GzipSink() { if (!closed_) close(); }
@@ -183,7 +199,7 @@ void GzipSink::write(const u8 *data, usize byte_count) {
         unsigned slice = (unsigned)std::min(byte_count - offset, MAX_IO);
         int written = gzwrite((gzFile)gz_file_, data + offset, slice);
         if (written <= 0 || (unsigned)written != slice)
-            throw std::runtime_error("gzwrite failed (short write)");
+            log::throw_runtime_error(log::logger(), "gzwrite failed (short write)");
         offset += slice;
     }
 }
@@ -193,12 +209,14 @@ void GzipSink::close() {
     closed_ = true;
     int result = gzclose((gzFile)gz_file_);
     gz_file_ = nullptr;
-    if (result != Z_OK) throw std::runtime_error("gzclose failed");
+    if (result != Z_OK) log::throw_runtime_error(log::logger(), "gzclose failed");
 }
 
 GzipSource::GzipSource(const string &filename) {
+    log::logger().debug("GzipSource: filename={}", filename);
     gz_file_ = gzopen(filename.c_str(), "rb");
-    if (gz_file_ == nullptr) throw std::runtime_error("Failed to open gzip file for reading: " + filename);
+    if (gz_file_ == nullptr)
+        log::throw_runtime_error(log::logger(), fmt::format("Failed to open gzip file for reading: {}", filename));
 }
 
 GzipSource::~GzipSource() {
@@ -207,7 +225,7 @@ GzipSource::~GzipSource() {
 
 usize GzipSource::read(u8 *out, usize byte_count) {
     int result = gzread((gzFile)gz_file_, out, (unsigned)byte_count);
-    if (result < 0) throw std::runtime_error("gzread failed");
+    if (result < 0) log::throw_runtime_error(log::logger(), "gzread failed");
     return (usize)result;
 }
 
@@ -223,7 +241,7 @@ namespace {
     constexpr usize LZMA_CHUNK_SIZE = 64 * 1024;
 
     [[noreturn]] void throw_lzma_error(const char *what, lzma_ret code) {
-        throw std::runtime_error(string(what) + " failed with lzma_ret=" + std::to_string((int)code));
+        log::throw_runtime_error(log::logger(), fmt::format("{} failed with lzma_ret={}", what, (int)code));
     }
 }
 
@@ -231,7 +249,8 @@ XzSink::XzSink(const string &filename, int compression_level)
     : file_(filename, ios::binary)
     , stream_(make_unique<lzma_stream_box>())
 {
-    if (!file_) throw std::runtime_error("Failed to open xz file for writing: " + filename);
+    log::logger().debug("XzSink: filename={} compression_level={}", filename, compression_level);
+    if (!file_) log::throw_runtime_error(log::logger(), fmt::format("Failed to open xz file for writing: {}", filename));
 
     uint32_t preset = (uint32_t)std::clamp(compression_level, 0, 9);
     lzma_ret rc = lzma_easy_encoder(&stream_->stream, preset, LZMA_CHECK_CRC64);
@@ -283,7 +302,8 @@ XzSource::XzSource(const string &filename)
     , stream_(make_unique<lzma_stream_box>())
     , input_buffer_(LZMA_CHUNK_SIZE)
 {
-    if (!file_) throw std::runtime_error("Failed to open xz file for reading: " + filename);
+    log::logger().debug("XzSource: filename={}", filename);
+    if (!file_) log::throw_runtime_error(log::logger(), fmt::format("Failed to open xz file for reading: {}", filename));
 
     lzma_ret rc = lzma_stream_decoder(&stream_->stream, UINT64_MAX, LZMA_CONCATENATED);
     if (rc != LZMA_OK) throw_lzma_error("lzma_stream_decoder", rc);
@@ -325,13 +345,15 @@ usize XzSource::read(u8 *out, usize byte_count) {
 
 namespace {
     [[noreturn]] void throw_bz2_error(const char *what, int code) {
-        throw std::runtime_error(string(what) + " failed with BZ2 error=" + std::to_string(code));
+        log::throw_runtime_error(log::logger(), fmt::format("{} failed with BZ2 error={}", what, code));
     }
 }
 
 Bz2Sink::Bz2Sink(const string &filename, int compression_level) {
+    log::logger().debug("Bz2Sink: filename={} compression_level={}", filename, compression_level);
     file_ = fopen(filename.c_str(), "wb");
-    if (file_ == nullptr) throw std::runtime_error("Failed to open bz2 file for writing: " + filename);
+    if (file_ == nullptr)
+        log::throw_runtime_error(log::logger(), fmt::format("Failed to open bz2 file for writing: {}", filename));
 
     int block_size_100k = std::clamp(compression_level, 1, 9);
     int bz_error = BZ_OK;
@@ -367,8 +389,10 @@ void Bz2Sink::close() {
 }
 
 Bz2Source::Bz2Source(const string &filename) {
+    log::logger().debug("Bz2Source: filename={}", filename);
     file_ = fopen(filename.c_str(), "rb");
-    if (file_ == nullptr) throw std::runtime_error("Failed to open bz2 file for reading: " + filename);
+    if (file_ == nullptr)
+        log::throw_runtime_error(log::logger(), fmt::format("Failed to open bz2 file for reading: {}", filename));
 
     int bz_error = BZ_OK;
     bz_file_ = BZ2_bzReadOpen(&bz_error, file_, /*verbosity=*/0, /*small=*/0, nullptr, 0);
@@ -403,6 +427,7 @@ AsyncSpireWriter::AsyncSpireWriter(unique_ptr<SpireSink> sink, usize max_queued_
     : sink_(std::move(sink))
     , max_queued_chunks_(max_queued_chunks)
 {
+    log::logger().debug("AsyncSpireWriter: max_queued_chunks={}", max_queued_chunks);
     worker_ = thread(&AsyncSpireWriter::run, this);
 }
 
@@ -486,7 +511,8 @@ void AsyncSpireWriter::write(vector<u8> chunk) {
 }
 
 void AsyncSpireWriter::close() {
-    if (closed_) throw std::runtime_error("AsyncSpireWriter::close() called more than once");
+    log::logger().debug("AsyncSpireWriter::close");
+    if (closed_) log::throw_runtime_error(log::logger(), "AsyncSpireWriter::close() called more than once");
     closed_ = true;
 
     {
@@ -510,9 +536,13 @@ SimulationRecorder::SimulationRecorder(
     : neuron_count_(neuron_count)
     , chunk_bytes_(chunk_bytes)
 {
-    if (neuron_count_ < 0 || neuron_count_ > static_cast<s64>(UINT32_MAX))
-        throw std::runtime_error("SimulationRecorder: neuron_count " + std::to_string(neuron_count_)
-            + " does not fit in the .spire format's 32-bit header");
+    log::logger().debug("SimulationRecorder: filename={} neuron_count={} async={} queue_max={} chunk_bytes={}",
+                        filename, neuron_count, async, queue_max, chunk_bytes);
+    if (neuron_count_ < 0 || neuron_count_ > static_cast<s64>(UINT32_MAX)) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("SimulationRecorder: neuron_count {} does not fit in the .spire format's 32-bit header",
+                        neuron_count_));
+    }
 
     auto [resolved_compression, resolved_path] = resolve_spire_compression(filename, compression);
     int level = compression_level.value_or(6);
@@ -540,15 +570,22 @@ void SimulationRecorder::write_bytes(const u8 *data, usize byte_count) {
 
 void SimulationRecorder::flush_buffer() {
     if (buffer_.empty()) return;
+    log::logger().trace("SimulationRecorder::flush_buffer: buffer_size={}", buffer_.size());
     write_bytes(buffer_.data(), buffer_.size());
     buffer_.clear();
 }
 
 void SimulationRecorder::record_frame(const f32 *membrane_potentials, s64 frame_length) {
-    if (finished_) throw std::runtime_error("SimulationRecorder::record_frame called after finish()");
-    if (frame_length != neuron_count_)
-        throw std::runtime_error("SimulationRecorder::record_frame: frame length " + std::to_string(frame_length)
-            + " does not match the recorder's neuron_count " + std::to_string(neuron_count_));
+    if (finished_) {
+        log::throw_runtime_error(log::logger(), "SimulationRecorder::record_frame called after finish()");
+    }
+    if (frame_length != neuron_count_) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("SimulationRecorder::record_frame: frame length {} does not match "
+                        "the recorder's neuron_count {}", frame_length, neuron_count_));
+    }
+
+    log::logger().trace("SimulationRecorder::record_frame: frame_length={}", frame_length);
 
     const u8 *bytes = reinterpret_cast<const u8 *>(membrane_potentials);
     usize frame_bytes = (usize)neuron_count_ * sizeof(f32);
@@ -561,6 +598,7 @@ void SimulationRecorder::finish() {
     if (finished_) return;
     finished_ = true;
 
+    log::logger().debug("SimulationRecorder::finish");
     flush_buffer();
     if (async_writer_) async_writer_->close();
     else               sink_->close();
@@ -572,16 +610,20 @@ SpireWriter::SpireWriter(const string &filename, s64 neuron_count)
     : file_(filename, ios::binary)
     , neuron_count_(neuron_count)
 {
-    if (!file_) throw std::runtime_error("Failed to open .spire file for writing: " + filename);
-    if (neuron_count_ < 0 || neuron_count_ > static_cast<s64>(UINT32_MAX))
-        throw std::runtime_error("SpireWriter: neuron_count " + std::to_string(neuron_count_)
-            + " does not fit in the .spire format's 32-bit header");
+    log::logger().debug("SpireWriter: filename={} neuron_count={}", filename, neuron_count);
+    if (!file_) log::throw_runtime_error(log::logger(), fmt::format("Failed to open .spire file for writing: {}", filename));
+    if (neuron_count_ < 0 || neuron_count_ > static_cast<s64>(UINT32_MAX)) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("SpireWriter: neuron_count {} does not fit in the .spire format's 32-bit header",
+                        neuron_count_));
+    }
 
     u32 header = to_big_endian_u32((u32)neuron_count_);
     file_.write(reinterpret_cast<const char *>(&header), sizeof(u32));
 }
 
 void SpireWriter::write_frame(const f32 *membrane_potentials) {
+    log::logger().trace("SpireWriter::write_frame: neuron_count={}", neuron_count_);
     file_.write(reinterpret_cast<const char *>(membrane_potentials), (streamsize)(neuron_count_ * sizeof(f32)));
 }
 
@@ -591,14 +633,18 @@ SpireReader::SpireReader(const string &filename)
     : file_(filename, ios::binary)
     , neuron_count_(0)
 {
-    if (!file_) throw std::runtime_error("Failed to open .spire file for reading: " + filename);
+    log::logger().debug("SpireReader: filename={}", filename);
+    if (!file_) log::throw_runtime_error(log::logger(), fmt::format("Failed to open .spire file for reading: {}", filename));
 
     u32 header;
     file_.read(reinterpret_cast<char *>(&header), sizeof(u32));
-    if (file_.gcount() != (streamsize)sizeof(u32))
-        throw std::runtime_error(".spire file is too short to contain a neuron_count header: " + filename);
+    if (file_.gcount() != (streamsize)sizeof(u32)) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format(".spire file is too short to contain a neuron_count header: {}", filename));
+    }
 
     neuron_count_ = (s64)from_big_endian_u32(header);
+    log::logger().debug("SpireReader: filename={} neuron_count={}", filename, neuron_count_);
 }
 
 bool SpireReader::read_frame(f32 *out_buffer) {
@@ -608,16 +654,20 @@ bool SpireReader::read_frame(f32 *out_buffer) {
     streamsize bytes_read = file_.gcount();
 
     if (bytes_read == 0) return false; // clean EOF — no partial frame
-    if (bytes_read != frame_bytes)
-        throw std::runtime_error("Truncated recording: frame ended after " + std::to_string(bytes_read)
-            + " of " + std::to_string(frame_bytes) + " expected bytes");
+    if (bytes_read != frame_bytes) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("Truncated recording: frame ended after {} of {} expected bytes",
+                        bytes_read, frame_bytes));
+    }
 
+    log::logger().trace("SpireReader::read_frame: neuron_count={}", neuron_count_);
     return true;
 }
 
 // ── read_spire_recording ─────────────────────────────────────────────────────
 
 SpireRecording spikecorec::read_spire_recording(const string &filename) {
+    log::logger().debug("read_spire_recording: filename={}", filename);
     SpireCompression compression = resolve_spire_compression(filename, nullopt).first;
     unique_ptr<SpireSource> source = make_spire_source(filename, compression);
 
@@ -635,8 +685,10 @@ SpireRecording spikecorec::read_spire_recording(const string &filename) {
     };
 
     u32 header;
-    if (read_fully(reinterpret_cast<u8 *>(&header), sizeof(u32)) != sizeof(u32))
-        throw std::runtime_error(".spire file is too short to contain a neuron_count header: " + filename);
+    if (read_fully(reinterpret_cast<u8 *>(&header), sizeof(u32)) != sizeof(u32)) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format(".spire file is too short to contain a neuron_count header: {}", filename));
+    }
 
     SpireRecording recording;
     recording.neuron_count = (s64)from_big_endian_u32(header);
@@ -649,13 +701,17 @@ SpireRecording spikecorec::read_spire_recording(const string &filename) {
         usize bytes_read = read_fully(reinterpret_cast<u8 *>(frame.data()), frame_bytes);
         if (bytes_read == 0) break; // clean EOF — no partial frame
 
-        if (bytes_read != frame_bytes)
-            throw std::runtime_error("Truncated recording: frame ended after " + std::to_string(bytes_read)
-                + " of " + std::to_string(frame_bytes) + " expected bytes");
+        if (bytes_read != frame_bytes) {
+            log::throw_runtime_error(log::logger(),
+                fmt::format("Truncated recording: frame ended after {} of {} expected bytes",
+                            bytes_read, frame_bytes));
+        }
 
         recording.frames.insert(recording.frames.end(), frame.begin(), frame.end());
         ++recording.frame_count;
     }
 
+    log::logger().debug("read_spire_recording: filename={} neuron_count={} frame_count={}",
+                        filename, recording.neuron_count, recording.frame_count);
     return recording;
 }

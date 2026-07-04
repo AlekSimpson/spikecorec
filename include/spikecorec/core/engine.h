@@ -3,15 +3,18 @@
 //
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/log.h"
 #include "spikecorec/core/weight_matrix.h"
 
 using namespace std;
+using namespace spikecorec::log;
 
 namespace spikecorec {
     struct ScaledReservoirResult {
@@ -22,6 +25,8 @@ namespace spikecorec {
 
     class SpikeEngine {
     public:
+        SharedPointer<EngineLogger> logger;
+
         WeightMatrix weights;
 
         GpuPointer<f32> network_inputs; // [neuron_count] — external input accumulator
@@ -39,7 +44,7 @@ namespace spikecorec {
         // ODR-used as a default-argument value in the pybind11 bindings
         // (bindings.cpp), which would otherwise require an out-of-line definition.
         static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
-        f32 **mp_logs = nullptr;
+        f32 **cell_state_logs = nullptr;
 
         s64 lifetime = 0;
         s64 neuron_count;
@@ -104,7 +109,6 @@ namespace spikecorec {
             usize compression_chunk_bytes = 4 * 1024 * 1024);
 
         [[nodiscard]] bool is_alive() const;
-
 
         [[nodiscard]] pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
 
