@@ -535,15 +535,24 @@ __global__ void reservoir_features_kernel(
 
 // ── step_apply_hebbian_update ─────────────────────────────────────────────────
 // Mirrors step_apply_hebbian_update in src/metal/kernels.metal — single-pass
-// rank-1 Hebbian nudge of U[source_node] and V[target_node]. Uses atomicAdd
-// because multiple spiking neurons in this tick's active set may update
-// overlapping rows concurrently. The reference's l2_regularization *
-// (anchor[d] - anchor[d]) term is always zero and is omitted as dead code.
+// rank-1 Hebbian nudge of U[source_node] (via u_row_accumulator) and V[target_node].
+// The reference's l2_regularization * (anchor[d] - anchor[d]) term is always zero
+// and is omitted as dead code.
+//
+// U[source_node] is only ever touched by the one step_kernel thread that owns
+// source_node (active_neuron_indices has no duplicates in a given tick), so the
+// caller passes it in as a plain register array — accumulated across every edge
+// of that neuron with ordinary arithmetic and flushed to global memory once —
+// instead of routing every edge's update through atomicAdd. V[target_node], in
+// contrast, is genuinely shared across neurons' threads (fan-in), so it stays
+// atomic; its anchor snapshot is now taken via atomicAdd(&slot, 0.0f) (CUDA has no
+// atomic load for float, but a zero-add is a real atomic RMW and serializes with
+// the atomicAdds below) instead of a plain load, removing the previous read/modify
+// race against other threads' atomic adds to the same row.
 __device__ __forceinline__ void step_apply_hebbian_update(
-    float4 *U,
+    float4 *u_row_accumulator,
     float4 *V,
     s64     rank_float4_stride,
-    s32     source_node,
     s32     target_node,
     f32     delta,
     f32     learning_rate,
@@ -552,14 +561,18 @@ __device__ __forceinline__ void step_apply_hebbian_update(
     float4 anchor_u[MAX_RANK_FLOAT4_STRIDE];
     float4 anchor_v[MAX_RANK_FLOAT4_STRIDE];
 
-    float4 *u_row = U + (s64)source_node * rank_float4_stride;
     float4 *v_row = V + (s64)target_node * rank_float4_stride;
 
     f32 sum_u = l2_regularization;
     f32 sum_v = l2_regularization;
     for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-        float4 u4 = u_row[lane];
-        float4 v4 = v_row[lane];
+        float4 u4 = u_row_accumulator[lane];
+        float4 *v_slot = v_row + lane;
+        float4 v4;
+        v4.x = atomicAdd(&v_slot->x, 0.0f);
+        v4.y = atomicAdd(&v_slot->y, 0.0f);
+        v4.z = atomicAdd(&v_slot->z, 0.0f);
+        v4.w = atomicAdd(&v_slot->w, 0.0f);
         anchor_u[lane] = u4;
         anchor_v[lane] = v4;
         sum_u += u4.x * u4.x + u4.y * u4.y + u4.z * u4.z + u4.w * u4.w;
@@ -574,12 +587,12 @@ __device__ __forceinline__ void step_apply_hebbian_update(
         float4 av = anchor_v[lane];
         float4 au = anchor_u[lane];
 
-        float4 *u_slot = u_row + lane;
+        u_row_accumulator[lane].x += av.x * scale_u;
+        u_row_accumulator[lane].y += av.y * scale_u;
+        u_row_accumulator[lane].z += av.z * scale_u;
+        u_row_accumulator[lane].w += av.w * scale_u;
+
         float4 *v_slot = v_row + lane;
-        atomicAdd(&u_slot->x, av.x * scale_u);
-        atomicAdd(&u_slot->y, av.y * scale_u);
-        atomicAdd(&u_slot->z, av.z * scale_u);
-        atomicAdd(&u_slot->w, av.w * scale_u);
         atomicAdd(&v_slot->x, au.x * scale_v);
         atomicAdd(&v_slot->y, au.y * scale_v);
         atomicAdd(&v_slot->z, au.z * scale_v);
@@ -666,7 +679,18 @@ __global__ void step_kernel(
         last_spiked[neuron_thread_id] = tick;
     }
 
-    // FLAG: why is there no end conditional defined here? 
+    // U[neuron_thread_id] is exclusively owned by this thread for the whole tick
+    // (active_neuron_indices has no duplicates), so it's staged into registers
+    // once, accumulated across every outgoing edge below with plain (non-atomic)
+    // math, and flushed back to global memory a single time — instead of routing
+    // each edge's Hebbian update through 4 atomicAdds per rank lane.
+    float4 u_row_accumulator[MAX_RANK_FLOAT4_STRIDE];
+    float4 *u_row_global = U + (s64)neuron_thread_id * rank_float4_stride;
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_accumulator[lane] = u_row_global[lane];
+    }
+
+    // FLAG: why is there no end conditional defined here?
     for (s32 neighbor_slot = 0; ; ++neighbor_slot) {
         s32 child = k2t_find_nth_neighbor(
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
@@ -681,18 +705,17 @@ __global__ void step_kernel(
             s64 delta_ticks = tick - child_last_spiked;
             f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
             f32 decay_delta = -learning_rate * powf(tick_delta, -3.0f);
-            step_apply_hebbian_update(U, V, rank_float4_stride, neuron_thread_id, child,
+            step_apply_hebbian_update(u_row_accumulator, V, rank_float4_stride, child,
                                       decay_delta, 0.5f, 1.0f);
         }
 
         // resolve the synaptic weight: constant (if configured) or U[source]·V[target]
         f32 weight = constant_weight;
         if (constant_weight == 0.0f) {
-            const float4 *u_row = U + (s64)neuron_thread_id * rank_float4_stride;
             const float4 *v_row = V + (s64)child * rank_float4_stride;
             f32 dot_product = 0.0f;
             for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-                float4 u4 = u_row[lane];
+                float4 u4 = u_row_accumulator[lane];
                 float4 v4 = v_row[lane];
                 dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;
             }
@@ -707,6 +730,10 @@ __global__ void step_kernel(
             s32 position = atomicAdd(next_active_neuron_count, 1);
             next_active_neuron_indices[position] = child;
         }
+    }
+
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_global[lane] = u_row_accumulator[lane];
     }
 
     // re-enqueue the spiking neuron itself for next tick (it may decay/spike again)
