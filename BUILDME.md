@@ -7,7 +7,7 @@ and the Python extension (setuptools + pybind11). Run from the repo root.
 
     pip install pybind11
     brew install bear        # optional, for compile_commands.json
-    git submodule update --init   # metal-cpp, required for Metal builds
+    git submodule update --init   # metal-cpp (Metal builds) + spdlog (logging, both backends)
 
 `zlib` / `liblzma` / `libbz2` are optional and auto-detected via `pkg-config`
 at build time (enables compressed `.spire` recordings). Uncompressed `.spire`
