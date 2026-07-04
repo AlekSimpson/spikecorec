@@ -72,12 +72,13 @@ if BACKEND not in ("cuda", "metal"):
     raise ValueError(f"SPIKECOREC_BACKEND must be 'cuda' or 'metal', got '{BACKEND}'")
 
 # ── Common settings ──────────────────────────────────────────
-INC = ["include", pybind11.get_include()]
+INC = ["include", pybind11.get_include(), "third_party/spdlog/include"]
 SRCS = [
     "src/bindings/bindings.cpp",
     "src/core/backend.cpp",
     "src/core/engine.cpp",
     "src/core/k2tree.cpp",
+    "src/core/log.cpp",
     "src/core/recording.cpp",
     "src/core/topologies.cpp",
     "src/core/types.cpp",
@@ -85,7 +86,7 @@ SRCS = [
 ]
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
 EXTRA_LINK_ARGS = []
-DEFINE_MACROS = []
+DEFINE_MACROS = [("SPDLOG_ACTIVE_LEVEL", "SPDLOG_LEVEL_TRACE")]  # spdlog is header-only by default
 
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ──────────────
 # Mirrors the Makefile's HAS_ZLIB/HAS_LZMA/HAS_BZ2 probing: query pkg-config

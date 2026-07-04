@@ -5,12 +5,15 @@
 #endif
 
 #include <cassert>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
 #include <chrono>
 #include <fstream>
+#include <iterator>
 #include <thread>
 #include <algorithm>
+#include <stdexcept>
 #include <vector>
 #include <unordered_set>
 
@@ -24,8 +27,14 @@
 
 using namespace std;
 using namespace spikecorec;
+using namespace spikecorec::log;
 
 namespace {
+
+string read_file(const string &path) {
+    ifstream file(path);
+    return string((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+}
 
 // ── topology smoke tests ─────────────────────────────────────────────────────
 
@@ -381,6 +390,7 @@ void test_spire_truncated_decode_error() {
         dst.write(all.data(), 4 + neuron_count * 4 * 4 + 6);
     }
 
+    string log_before = read_file("logs/spikecorec.log");
     bool threw = false;
     try {
         read_spire_recording(trunc_path);
@@ -389,6 +399,8 @@ void test_spire_truncated_decode_error() {
         assert(string(e.what()).find("Truncated recording") != string::npos);
     }
     assert(threw && "read_spire_recording must throw on a truncated final frame");
+    string appended = read_file("logs/spikecorec.log").substr(log_before.size());
+    assert(appended.find("Truncated recording") != string::npos && "the critical log line must precede the throw");
 
     printf("  spire_truncated_decode_error: ok\n");
 }
@@ -404,6 +416,7 @@ void test_record_frame_size_validation() {
     recorder.record_frame(correct.data(), neuron_count); // exact length — ok
 
     vector<f32> too_small(3, 1.0f);
+    string log_before = read_file("logs/spikecorec.log");
     bool threw = false;
     try {
         recorder.record_frame(too_small.data(), (s64)too_small.size());
@@ -412,6 +425,8 @@ void test_record_frame_size_validation() {
         assert(string(e.what()).find("does not match") != string::npos);
     }
     assert(threw && "record_frame must reject a frame whose length != neuron_count");
+    string appended = read_file("logs/spikecorec.log").substr(log_before.size());
+    assert(appended.find("does not match") != string::npos && "the critical log line must precede the throw");
 
     recorder.finish();
     printf("  record_frame_size_validation: ok\n");
@@ -431,6 +446,7 @@ void test_start_static_record_bad_input_width() {
     {
         vector<vector<f32>> wide(lifetime, vector<f32>{1.0f, 1.0f, 1.0f});
         wide[2] = vector<f32>{1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // 5 > 3
+        string log_before = read_file("logs/spikecorec.log");
         bool threw = false;
         try {
             engine.start_static_record(wide, lifetime, path, true, 1, string("none"), nullopt, true, false);
@@ -439,6 +455,8 @@ void test_start_static_record_bad_input_width() {
             assert(string(e.what()).find("input neurons") != string::npos);
         }
         assert(threw && "start_static_record must reject an over-wide input row");
+        string appended = read_file("logs/spikecorec.log").substr(log_before.size());
+        assert(appended.find("input neurons") != string::npos && "the critical log line must precede the throw");
     }
 
     // Empty row → rejected up front (no truncated file).
@@ -980,7 +998,7 @@ void test_setup_lifetime() {
     {   // allocates per-neuron logs when the budget allows
         SpikeEngine engine(&net, {4, 4}, /*rank=*/8);
         engine.setup_lifetime(/*lifetime=*/10, /*allocate_logs=*/true);
-        assert(engine.lifetime == 10 && engine.mp_logs != nullptr);
+        assert(engine.lifetime == 10 && engine.cell_state_logs != nullptr);
         engine.shutdown();
     }
     {   // a too-small byte budget is rejected
@@ -994,7 +1012,7 @@ void test_setup_lifetime() {
     {   // allocate_logs = false → no allocation
         SpikeEngine engine(&net, {4, 4}, /*rank=*/8);
         engine.setup_lifetime(/*lifetime=*/10, /*allocate_logs=*/false);
-        assert(engine.mp_logs == nullptr);
+        assert(engine.cell_state_logs == nullptr);
         engine.shutdown();
     }
     printf("  setup_lifetime: ok\n");
