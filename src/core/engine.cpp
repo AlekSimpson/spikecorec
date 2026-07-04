@@ -83,6 +83,11 @@ SpikeEngine::SpikeEngine(
     for (s64 neuron_index = 0; neuron_index < neuron_count; ++neuron_index)
         active_generation_data[neuron_index] = -1;
 
+    // input_staging / override_staging [neuron_count] — persistent step_simulation scratch
+    // buffers, overwritten in place each tick instead of allocate/copy/free per tick (SC-20)
+    input_staging = allocate<f32>(neuron_f32_byte_size);
+    override_staging = allocate<s64>(neuron_s64_byte_size);
+
     logger->debug("SpikeEngine buffers allocated: neuron_f32_byte_size={} neuron_s32_byte_size={} "
                   "neuron_s64_byte_size={} thread_count_per_block={} block_count={}",
                   neuron_f32_byte_size, neuron_s32_byte_size, neuron_s64_byte_size,
@@ -176,36 +181,28 @@ void SpikeEngine::step_simulation(
             decay_rate);
     }
 
-    // input_values/override_input_neurons are host-side vectors — the GPU kernels
-    // need them in GPU-visible memory (mirrors the Python reference's per-step
-    // cp.asarray(input_values) transfer), so stage transient copies here.
-    // FLAG: ya idk if this is true since we are assuming unified memory hardware? wouldn't this essentially be a no-op
-    GpuPointer<f32> staged_input_values = allocate<f32>(input_values.size() * sizeof(f32));
-    memcpy(staged_input_values.get_contents(), input_values.data(), input_values.size() * sizeof(f32));
+    // input_values/override_input_neurons are host-side vectors — the GPU kernels need them
+    // in GPU-visible memory (mirrors the Python reference's per-step cp.asarray(input_values)
+    // transfer), so copy into the persistent staging buffers here (input_staging /
+    // override_staging are allocated once in the constructor and overwritten in place).
+    memcpy(input_staging.get_contents(), input_values.data(), input_values.size() * sizeof(f32));
 
-    // FLAG: also doesn't this happen in the gpu_step wrapper kernel? we are we doing it in a completely separate kernel?
     gpu_add_network_input(
         membrane_potentials.get_contents(),
         input_neuron_indices.get_contents(),
-        staged_input_values.get_contents(),
+        input_staging.get_contents(),
         (s64)input_values.size());
-
-    // FLAG: why are we deallocating? can't we just keep the input buffer for the next step? 
-    deallocate(std::move(staged_input_values));
 
     next_active_neuron_count.get_contents()[0] = 0;
 
     if (!override_input_neurons.empty()) {
-        GpuPointer<s64> staged_override_neurons = allocate<s64>(override_input_neurons.size() * sizeof(s64));
-        memcpy(staged_override_neurons.get_contents(), override_input_neurons.data(), override_input_neurons.size() * sizeof(s64));
+        memcpy(override_staging.get_contents(), override_input_neurons.data(), override_input_neurons.size() * sizeof(s64));
 
         gpu_merge_input_neurons(
             active_neuron_indices.get_contents(),
             active_neuron_count.get_contents(),
-            staged_override_neurons.get_contents(),
+            override_staging.get_contents(),
             (s64)override_input_neurons.size());
-
-        deallocate(std::move(staged_override_neurons));
     }
 
     gpu_step(
@@ -427,6 +424,8 @@ void SpikeEngine::shutdown() {
     deallocate(std::move(next_active_neuron_count));
     deallocate(std::move(active_generation));
     deallocate(std::move(input_neuron_indices));
+    deallocate(std::move(input_staging));
+    deallocate(std::move(override_staging));
 
     running = false;
 }
