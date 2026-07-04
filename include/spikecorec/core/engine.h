@@ -40,6 +40,12 @@ namespace spikecorec {
         GpuPointer<s32> active_generation; // [neuron_count] — generation tag, -1 = inactive
         GpuPointer<s32> input_neuron_indices; // set via set_input_neurons()
 
+        // Persistent step_simulation scratch buffers, sized to neuron_count (the existing
+        // hard upper bound already relied on by input_neuron_indices / active_neuron_indices)
+        // and overwritten in place each tick instead of allocate/copy/free per tick (SC-20).
+        GpuPointer<f32> input_staging; // [neuron_count] — staged input_values
+        GpuPointer<s64> override_staging; // [neuron_count] — staged override_input_neurons
+
         // constexpr (not plain const) so it is implicitly inline in C++17 — it is
         // ODR-used as a default-argument value in the pybind11 bindings
         // (bindings.cpp), which would otherwise require an out-of-line definition.
