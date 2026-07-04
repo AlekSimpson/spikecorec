@@ -2,8 +2,7 @@
 // Created by Alek Simpson on 5/30/26.
 //
 
-#include <map>
-#include <tuple>
+#include <unordered_map>
 #include <vector>
 #include <cstring>
 #include <fstream>
@@ -34,6 +33,13 @@ static pair<s32, s32> compute_tree_parameters(s32 node_count, s32 branching_fact
         tree_height++;
     }
     return {tree_height, padded_size};
+}
+
+// Packs (level, block_row, block_column) into a single 64-bit key for child_masks.
+// 8 bits for level / 28 bits each for block_row and block_column comfortably covers
+// node counts into the hundreds of millions, far beyond the stated 1M-neuron scale.
+static u64 pack_child_mask_key(s32 level, s32 block_row, s32 block_column) {
+    return (u64(u32(level)) << 56) | (u64(u32(block_row)) << 28) | u64(u32(block_column));
 }
 
 static u32 get_bit(const u32 *words, s32 bit_index) {
@@ -132,7 +138,7 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
         return {{}, {}, {u32(0)}, {}, tree_height, padded_node_count, 0};
 
     // record which children are set at each (level, block_row, block_col)
-    map<tuple<s32, s32, s32>, s32> child_masks;
+    unordered_map<u64, s32> child_masks;
     for (auto [source_node, target_node]: edges) {
         s32 current_row = source_node;
         s32 current_column = target_node;
@@ -149,7 +155,7 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
             s32 child_row_index = current_row / block_size;
             s32 child_column_index = current_column / block_size;
             s32 child_flat_index = child_row_index * branching_factor + child_column_index;
-            child_masks[{level, block_row, block_column}] |= (1 << child_flat_index);
+            child_masks[pack_child_mask_key(level, block_row, block_column)] |= (1 << child_flat_index);
             current_row = current_row % block_size;
             current_column = current_column % block_size;
             block_row = block_row * branching_factor + child_row_index;
@@ -165,7 +171,7 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
     for (s32 level = 0; level < tree_height; level++) {
         vector<pair<s32, s32> > next_level_nodes;
         for (auto [block_row, block_column]: current_level_nodes) {
-            auto it = child_masks.find({level, block_row, block_column});
+            auto it = child_masks.find(pack_child_mask_key(level, block_row, block_column));
             s32 child_presence_mask = (it != child_masks.end()) ? it->second : 0;
 
             auto &target_bit_array = (level < tree_height - 1) ? internal_bits : leaf_bits;
