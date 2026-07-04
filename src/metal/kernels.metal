@@ -422,17 +422,25 @@ inline float apply_decay(float membrane_potential, float resting_potential, floa
 }
 
 // ── step_apply_hebbian_update ─────────────────────────────────────────────────
-// Single-pass rank-1 Hebbian nudge of U[source_node] and V[target_node], mirroring
-// spikecore's update_weight_matrix (cuda_code/kernels.c). Uses atomic adds because
-// multiple spiking neurons in this tick's active set may update overlapping rows
-// concurrently. NOTE: the reference's l2_regularization * (anchor[d] - anchor[d])
-// term is always zero (anchor minus itself), so it's omitted here as dead code —
-// the effective update is purely the delta-scaled anchor term, matching reference behavior.
+// Single-pass rank-1 Hebbian nudge of U[source_node] (via u_row_accumulator) and
+// V[target_node], mirroring spikecore's update_weight_matrix (cuda_code/kernels.c).
+// NOTE: the reference's l2_regularization * (anchor[d] - anchor[d]) term is always
+// zero (anchor minus itself), so it's omitted here as dead code — the effective
+// update is purely the delta-scaled anchor term, matching reference behavior.
+//
+// U[source_node] is only ever touched by the one `step` thread that owns
+// source_node (active_neuron_indices has no duplicates in a given tick), so the
+// caller passes it in as a plain thread-local register array — accumulated across
+// every edge of that neuron and flushed to device memory once — instead of routing
+// every edge's update through a global atomic. V[target_node], in contrast, is
+// genuinely shared across neurons' threads (fan-in), so it remains atomic; its
+// anchor snapshot is now read via atomic_load_explicit instead of a plain load,
+// removing the previous read/modify race against other threads' atomic adds to
+// the same row.
 inline void step_apply_hebbian_update(
-    device float4 *U,
+    thread float4 *u_row_accumulator,
     device float4 *V,
     long rank_float4_stride,
-    int source_node,
     int target_node,
     float delta,
     float learning_rate,
@@ -441,14 +449,19 @@ inline void step_apply_hebbian_update(
     thread float4 anchor_u[MAX_RANK_FLOAT4_STRIDE];
     thread float4 anchor_v[MAX_RANK_FLOAT4_STRIDE];
 
-    device float4 *u_row = U + (long)source_node * rank_float4_stride;
     device float4 *v_row = V + (long)target_node * rank_float4_stride;
 
     float sum_u = l2_regularization;
     float sum_v = l2_regularization;
     for (long lane = 0; lane < rank_float4_stride; ++lane) {
-        float4 u4 = u_row[lane];
-        float4 v4 = v_row[lane];
+        device atomic_float *v_components = (device atomic_float *)(v_row + lane);
+        float4 u4 = u_row_accumulator[lane];
+        float4 v4(
+            atomic_load_explicit(&v_components[0], memory_order_relaxed),
+            atomic_load_explicit(&v_components[1], memory_order_relaxed),
+            atomic_load_explicit(&v_components[2], memory_order_relaxed),
+            atomic_load_explicit(&v_components[3], memory_order_relaxed)
+        );
         anchor_u[lane] = u4;
         anchor_v[lane] = v4;
         sum_u += dot(u4, u4);
@@ -461,12 +474,9 @@ inline void step_apply_hebbian_update(
         float4 du = learning_rate * delta * (anchor_v[lane] * inv_den_v);
         float4 dv = learning_rate * delta * (anchor_u[lane] * inv_den_u);
 
-        device atomic_float *u_components = (device atomic_float *)(u_row + lane);
+        u_row_accumulator[lane] += du;
+
         device atomic_float *v_components = (device atomic_float *)(v_row + lane);
-        atomic_fetch_add_explicit(&u_components[0], du.x, memory_order_relaxed);
-        atomic_fetch_add_explicit(&u_components[1], du.y, memory_order_relaxed);
-        atomic_fetch_add_explicit(&u_components[2], du.z, memory_order_relaxed);
-        atomic_fetch_add_explicit(&u_components[3], du.w, memory_order_relaxed);
         atomic_fetch_add_explicit(&v_components[0], dv.x, memory_order_relaxed);
         atomic_fetch_add_explicit(&v_components[1], dv.y, memory_order_relaxed);
         atomic_fetch_add_explicit(&v_components[2], dv.z, memory_order_relaxed);
@@ -558,6 +568,17 @@ kernel void step(
         last_spiked[neuron_thread_id] = tick;
     }
 
+    // U[neuron_thread_id] is exclusively owned by this thread for the whole tick
+    // (active_neuron_indices has no duplicates), so it's staged into thread-local
+    // registers once, accumulated across every outgoing edge below with plain
+    // (non-atomic) math, and flushed back to device memory a single time — instead
+    // of routing each edge's Hebbian update through 4 atomics per rank lane.
+    thread float4 u_row_accumulator[MAX_RANK_FLOAT4_STRIDE];
+    device float4 *u_row_global = U + (long)neuron_thread_id * rank_float4_stride;
+    for (long lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_accumulator[lane] = u_row_global[lane];
+    }
+
     for (int neighbor_slot = 0; ; ++neighbor_slot) {
         int child = k2t_find_nth_neighbor(
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
@@ -571,18 +592,17 @@ kernel void step(
         if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
             float tick_delta = (float)abs(tick - child_last_spiked);
             float decay_delta = -learning_rate * pow(tick_delta, -3.0f);
-            step_apply_hebbian_update(U, V, rank_float4_stride, neuron_thread_id, child,
+            step_apply_hebbian_update(u_row_accumulator, V, rank_float4_stride, child,
                                       decay_delta, 0.5f, 1.0f);
         }
 
         // resolve the synaptic weight: constant (if configured) or U[source]·V[target]
         float weight = constant_weight;
         if (constant_weight == 0.0f) {
-            const device float4 *u_row = U + (long)neuron_thread_id * rank_float4_stride;
             const device float4 *v_row = V + (long)child * rank_float4_stride;
             float dot_product = 0.0f;
             for (long lane = 0; lane < rank_float4_stride; ++lane) {
-                dot_product += dot(u_row[lane], v_row[lane]);
+                dot_product += dot(u_row_accumulator[lane], v_row[lane]);
             }
             weight = dot_product;
         }
@@ -598,6 +618,10 @@ kernel void step(
             int position = atomic_fetch_add_explicit(next_count_slot, 1, memory_order_relaxed);
             next_active_neuron_indices[position] = child;
         }
+    }
+
+    for (long lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_global[lane] = u_row_accumulator[lane];
     }
 
     // re-enqueue the spiking neuron itself for next tick (it may decay/spike again)
