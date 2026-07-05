@@ -297,6 +297,21 @@ K2Tree::K2Tree(
       , leaf_node_words_length(leaf_node_words_length)
       , rank_superblock_length(rank_superblock_length)
       , rank_subblock_length(rank_subblock_length) {
+    // These arrays are read by every gpu_step/gpu_neighbor_weights/k2tree query
+    // and never modified after construction — advise the driver they're
+    // read-mostly (so CPU and GPU can each keep a local read replica instead of
+    // migrating the whole allocation on every touch) and warm the device with
+    // one bulk copy up front instead of faulting it in page-by-page on first
+    // kernel use (SC-18).
+    advise_read_mostly(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
+    advise_read_mostly(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
+    advise_read_mostly(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
+    advise_read_mostly(this->rank_subblock_table, this->rank_subblock_length * sizeof(u16));
+
+    prefetch_to_gpu(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
+    prefetch_to_gpu(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
+    prefetch_to_gpu(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
+    prefetch_to_gpu(this->rank_subblock_table, this->rank_subblock_length * sizeof(u16));
 }
 
 K2Tree::~K2Tree() {
