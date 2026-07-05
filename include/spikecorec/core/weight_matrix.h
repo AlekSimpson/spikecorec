@@ -10,6 +10,8 @@
 
 using namespace std;
 
+#define MAX_RANK_FLOAT4_STRIDE 64
+
 namespace spikecorec {
     struct WeightStats {
         f32 mean;

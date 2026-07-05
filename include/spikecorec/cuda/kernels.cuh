@@ -65,16 +65,6 @@ void launch_weight_update(
     cudaStream_t stream = nullptr
 );
 
-// Element-wise addition of two equal-length vectors: result[i] = a[i] + b[i].
-// result may alias a or b for in-place accumulation.
-void launch_vector_add(
-    f32          *result,
-    const f32    *a,
-    const f32    *b,
-    s64           element_count,
-    cudaStream_t  stream = nullptr
-);
-
 // Run one simulation tick: propagate spikes and update membrane potentials.
 // Uncompiled mirror of the Metal `step` kernel — pending verification on CUDA
 // hardware (this development machine has no CUDA toolchain).

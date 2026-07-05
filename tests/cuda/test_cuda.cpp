@@ -3,9 +3,9 @@
 #include <cstdio>
 
 int main() {
-    auto cfg = spikecorec::cuda::default_launch_config(1024);
-    assert(cfg.block.x == 256);
-    assert(cfg.grid.x  == 4);
+    auto config = spikecorec::cuda::default_launch_config(1024);
+    assert(config.block.x == 256);
+    assert(config.grid.x  == 4);
 
     printf("cuda tests passed\n");
     return 0;
