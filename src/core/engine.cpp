@@ -156,15 +156,12 @@ void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
     );
     input_neuron_count = (s64) input_neuron_list.size();
 
-    // Read by gpu_add_network_input on every tick for the rest of the engine's
-    // lifetime — prefetch it to the device right after the host-side fill (SC-18).
     prefetch_to_gpu(input_neuron_indices, (usize)neuron_count * s32_byte_size);
 }
 
 void SpikeEngine::reset_state(s64 last_spiked_value, s32 active_gen_value) {
     logger->debug("reset_state: last_spiked_value={} active_gen_value={}", last_spiked_value, active_gen_value);
     s32 f32_byte_size = 4;
-    usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
     usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
 
     memset(network_inputs.get_contents(), 0, (usize) neuron_count * f32_byte_size);
@@ -197,7 +194,7 @@ void SpikeEngine::step_simulation(
     // before returning: the host swaps active_neuron_indices/active_neuron_count below and
     // the next tick immediately overwrites input_staging/override_staging/next_active_neuron_count,
     // all of which the just-encoded kernels read or write.
-    CommandBatch *batch = begin_command_batch();
+    MetalCommandBatch *batch = begin_command_batch();
 
     if (decay_all_neurons) {
         gpu_decay_all_neurons(
@@ -216,6 +213,7 @@ void SpikeEngine::step_simulation(
     // override_staging are allocated once in the constructor and overwritten in place).
     memcpy(input_staging.get_contents(), input_values.data(), input_values.size() * sizeof(f32));
 
+    // QUESTION: anyway to combine these two steps? what exactly is the merge_input_neurons for?
     gpu_add_network_input(
         membrane_potentials.get_contents(),
         input_neuron_indices.get_contents(),

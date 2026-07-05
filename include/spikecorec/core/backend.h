@@ -15,13 +15,23 @@ namespace spikecorec {
     #ifdef SPIKECOREC_CUDA
         T *pointer = nullptr;
 
-        T*       get_contents()       { return pointer; }
-        const T* get_contents() const { return pointer; }
-    #elif defined(SPIKECOREC_METAL)
-        MTL::Buffer *buffer = nullptr;
+        T *get_contents() {
+            return pointer;
+        }
 
-        T*       get_contents()       { return static_cast<T*>(buffer->contents()); }
-        const T* get_contents() const { return static_cast<const T*>(buffer->contents()); }
+        const T *get_contents() const { 
+            return pointer; 
+        }
+    #elif defined(SPIKECOREC_METAL)
+        MTL::Buffer *pointer = nullptr;
+
+        T *get_contents() { 
+            return static_cast<T *>(pointer->contents()); 
+        }
+
+        const T *get_contents() const { 
+            return static_cast<const T *>(pointer->contents()); 
+        }
     #endif
 
         GpuPointer() = default;
@@ -31,30 +41,18 @@ namespace spikecorec {
         GpuPointer &operator=(const GpuPointer &) = delete;
 
         GpuPointer(GpuPointer &&other) noexcept {
-        #ifdef SPIKECOREC_CUDA
             pointer = other.pointer;
             other.pointer = nullptr;
-        #elif defined(SPIKECOREC_METAL)
-            buffer = other.buffer;
-            other.buffer = nullptr;
-        #endif
         }
 
         GpuPointer &operator=(GpuPointer &&other) noexcept {
+            assert(pointer == nullptr &&
+                   "GpuPointer move assignment would leak an existing CUDA allocation — "
+                   "call backend::deallocate() before reassigning");
+
             if (this != &other) {
-            #ifdef SPIKECOREC_CUDA
-                assert(pointer == nullptr &&
-                       "GpuPointer move assignment would leak an existing CUDA allocation — "
-                       "call backend::deallocate() before reassigning");
                 pointer = other.pointer;
                 other.pointer = nullptr;
-            #elif defined(SPIKECOREC_METAL)
-                assert(buffer == nullptr &&
-                    "GpuPointer move assignment would leak an existing MTL::Buffer — "
-                    "call backend::deallocate() before reassigning");
-                buffer = other.buffer;
-                other.buffer = nullptr;
-            #endif
             }
             return *this;
         }
@@ -62,34 +60,33 @@ namespace spikecorec {
 
     // --- buffer ---
     // non-template bridges — defined in backend.cpp, hide platform types from callers
-    void* allocate_bytes(usize byte_size);
-    void  deallocate_bytes(void* platform_handle);
+    void *allocate_bytes(usize byte_size);
+    void deallocate_bytes(void *platform_handle);
 
     template<typename T>
     GpuPointer<T> allocate(usize byte_size) {
-        GpuPointer<T> ptr;
+        GpuPointer<T> wrapper;
     #ifdef SPIKECOREC_CUDA
-        ptr.pointer = static_cast<T*>(allocate_bytes(byte_size));
+        wrapper.pointer = static_cast<T *>(allocate_bytes(byte_size));
     #elif defined(SPIKECOREC_METAL)
-        ptr.buffer  = static_cast<MTL::Buffer*>(allocate_bytes(byte_size));
+        wrapper.pointer = static_cast<MTL::Buffer *>(allocate_bytes(byte_size));
     #endif
-        return ptr;
+        return wrapper;
     }
 
     template<typename T>
-    void deallocate(GpuPointer<T> ptr) {
-    #ifdef SPIKECOREC_CUDA
-        deallocate_bytes(ptr.pointer);
-    #elif defined(SPIKECOREC_METAL)
-        deallocate_bytes(ptr.buffer);
-    #endif
+    void deallocate(GpuPointer<T> wrapper) {
+        deallocate_bytes(wrapper.pointer);
     }
 
     // CUDA hint, no-op on Metal
     template<typename T>
-    void prefetch_to_gpu(const GpuPointer<T>& ptr, usize size_in_bytes) {
+    void prefetch_to_gpu(const GpuPointer<T> &wrapper_pointer, usize size_in_bytes) {
     #ifdef SPIKECOREC_CUDA
-        cudaMemPrefetchAsync(ptr.pointer, size_in_bytes, 0);
+        cudaMemPrefetchAsync(wrapper_pointer.pointer, size_in_bytes, 0);
+    #elif defined(SPIKECOREC_METAL)
+        (void)size_in_bytes;
+        (void)wrapper_pointer;
     #endif
     }
 
@@ -99,9 +96,12 @@ namespace spikecorec {
     // one touch at a time from the host thread, into a single bulk async copy.
     // No-op on Metal, where buffers already live in host-visible shared storage.
     template<typename T>
-    void prefetch_to_cpu(const GpuPointer<T>& ptr, usize size_in_bytes) {
+    void prefetch_to_cpu(const GpuPointer<T> &wrapper_pointer, usize size_in_bytes) {
     #ifdef SPIKECOREC_CUDA
-        cudaMemPrefetchAsync(ptr.pointer, size_in_bytes, cudaCpuDeviceId);
+        cudaMemPrefetchAsync(wrapper_pointer.pointer, size_in_bytes, cudaCpuDeviceId);
+    #elif defined(SPIKECOREC_METAL)
+        (void)size_in_bytes;
+        (void)wrapper_pointer;
     #endif
     }
 
@@ -111,9 +111,12 @@ namespace spikecorec {
     // the whole allocation to whichever processor touches it last.
     // No-op on Metal.
     template<typename T>
-    void advise_read_mostly(const GpuPointer<T>& ptr, usize size_in_bytes) {
+    void advise_read_mostly(const GpuPointer<T> &wrapper_pointer, usize size_in_bytes) {
     #ifdef SPIKECOREC_CUDA
-        cudaMemAdvise(ptr.pointer, size_in_bytes, cudaMemAdviseSetReadMostly, 0);
+        cudaMemAdvise(wrapper_pointer.pointer, size_in_bytes, cudaMemAdviseSetReadMostly, 0);
+    #elif defined(SPIKECOREC_METAL)
+        (void)size_in_bytes;
+        (void)wrapper_pointer;
     #endif
     }
 
@@ -126,8 +129,7 @@ namespace spikecorec {
     // CUfunction on CUDA
     struct KernelHandle;
 
-    KernelHandle compile_kernel(
-        const char *source, const char *function_name);
+    KernelHandle compile_kernel(const char *source, const char *function_name);
 
     void release_kernel(KernelHandle handle);
 
@@ -137,13 +139,13 @@ namespace spikecorec {
     // pays one commit+waitUntilCompleted round trip instead of one per kernel (Metal).
     // No-op on CUDA, where kernel launches are already enqueued async on the default
     // stream — begin/commit are safe to call unconditionally from backend-agnostic code.
-    struct CommandBatch;
+    struct MetalCommandBatch;
 
-    CommandBatch *begin_command_batch();
+    MetalCommandBatch *begin_command_batch();
 
     // Commits the batch's command buffer and blocks until the GPU has finished
     // executing every kernel encoded into it since begin_command_batch().
-    void commit_command_batch(CommandBatch *batch);
+    void commit_command_batch(MetalCommandBatch *batch);
 
 
     // --- dispatch ---
@@ -152,19 +154,18 @@ namespace spikecorec {
         u32 block_size;
     };
 
-    // generic dispatch:
     // - takes raw pointers, backend resolves to MTLBuffers
     //   internally on Metal
     // - if batch is non-null, encodes into the batch's already-open command buffer
     //   instead of creating/committing/waiting on one of its own (Metal); the caller
     //   is responsible for calling commit_command_batch() once all encodes are queued
-    void dispatch(
+    void metal_dispatch(
         KernelHandle handle,
         LaunchConfig config,
         const void *const *args,
         const usize *arg_sizes,
         u32 arg_count,
-        CommandBatch *batch = nullptr
+        MetalCommandBatch *batch = nullptr
     );
 
     // --- atomic ops (for backends that need explicit support) ---
@@ -226,19 +227,17 @@ namespace spikecorec {
         s64  tick,
         f32  resting_mp,
         f32  decay_rate,
-        CommandBatch *batch = nullptr
+        MetalCommandBatch *batch = nullptr
     );
 
-    // Element-wise addition of two equal-length vectors: result[i] = a[i] + b[i].
-    // result may alias a or b for in-place accumulation.
-    // void gpu_vector_add(
-    //     f32       *result,
-    //     const f32 *a,
-    //     const f32 *b,
-    //     s64        element_count
-    // );
     // If batch is non-null, encodes into it instead of dispatching standalone (see dispatch()).
-    void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, const f32 *input_values, s64 element_count, CommandBatch *batch = nullptr);
+    void gpu_add_network_input(
+        f32 *membrane_potentials, 
+        s32 *input_neuron_indices, 
+        const f32 *input_values, 
+        s64 element_count, 
+        MetalCommandBatch *batch = nullptr
+    );
 
     // Merge override_input_neurons into the current active neuron set for this tick.
     // If batch is non-null, encodes into it instead of dispatching standalone (see dispatch()).
@@ -247,7 +246,7 @@ namespace spikecorec {
         s32       *active_neuron_count,
         const s64 *override_input_neurons,
         s64        override_count,
-        CommandBatch *batch = nullptr
+        MetalCommandBatch *batch = nullptr
     );
 
     // Run one simulation tick: propagate spikes and update membrane potentials.
@@ -288,7 +287,7 @@ namespace spikecorec {
         s32          *active_generation,
         s32           thread_count_per_block,
         s32           block_count,
-        CommandBatch *batch = nullptr
+        MetalCommandBatch *batch = nullptr
     );
 
     // Build the reservoir feature vector: spike traces, normalised membrane voltages, bias.
