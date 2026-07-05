@@ -6,6 +6,8 @@
 #include <cuda.h>
 #include <nvrtc.h>
 #include "spikecorec/cuda/kernels.cuh"
+#include <stdexcept>
+#include <string>
 #elif defined(SPIKECOREC_METAL)
 #include <Metal/Metal.hpp>
 #include <dlfcn.h>
@@ -24,6 +26,39 @@ namespace spikecorec {
 #ifdef SPIKECOREC_CUDA
 static CUdevice  global_device  = 0;
 static CUcontext global_context = nullptr;
+
+static void check_cuda_driver_result(CUresult result, const char *call) {
+    if (result == CUDA_SUCCESS) return;
+    const char *error_string = nullptr;
+    cuGetErrorString(result, &error_string);
+    string description = error_string ? error_string : "unknown error";
+    log::logger().critical("CUDA driver error: {}: {}", call, description);
+    throw runtime_error("CUDA driver: " + string(call) + " failed: " + description);
+}
+
+static void check_cuda_runtime_result(cudaError_t result, const char *call) {
+    if (result == cudaSuccess) return;
+    string description = cudaGetErrorString(result);
+    log::logger().critical("CUDA error: {}: {}", call, description);
+    throw runtime_error("CUDA: " + string(call) + " failed: " + description);
+}
+
+static void check_nvrtc_result(nvrtcResult result, const char *call) {
+    if (result == NVRTC_SUCCESS) return;
+    string description = nvrtcGetErrorString(result);
+    log::logger().critical("NVRTC error: {}: {}", call, description);
+    throw runtime_error("NVRTC: " + string(call) + " failed: " + description);
+}
+
+static void check_nvrtc_compile_result(nvrtcResult result, nvrtcProgram program) {
+    if (result == NVRTC_SUCCESS) return;
+    size_t log_size = 0;
+    nvrtcGetProgramLogSize(program, &log_size);
+    string compile_log(log_size, '\0');
+    nvrtcGetProgramLog(program, compile_log.data());
+    log::logger().critical("NVRTC compile error: {}", compile_log);
+    throw runtime_error("NVRTC: compile failed: " + compile_log);
+}
 
 #elif defined(SPIKECOREC_METAL)
 static MTL::Device       *global_device          = nullptr;
@@ -97,9 +132,9 @@ static KernelHandle load_precompiled_kernel(const char *function_name) {
 void initialize_gpu_context() {
 #ifdef SPIKECOREC_CUDA
     log::logger().debug("initialize_gpu_context: backend=CUDA");
-    cuInit(0);
-    cuDeviceGet(&global_device, 0);
-    cuCtxCreate(&global_context, 0, global_device);
+    check_cuda_driver_result(cuInit(0), "cuInit");
+    check_cuda_driver_result(cuDeviceGet(&global_device, 0), "cuDeviceGet");
+    check_cuda_driver_result(cuCtxCreate(&global_context, 0, global_device), "cuCtxCreate");
 
 #elif defined(SPIKECOREC_METAL)
     log::logger().debug("initialize_gpu_context: backend=Metal");
@@ -113,7 +148,7 @@ void initialize_gpu_context() {
 void release_gpu_resources() {
 #ifdef SPIKECOREC_CUDA
     log::logger().debug("release_gpu_resources: backend=CUDA");
-    cuCtxDestroy(global_context);
+    check_cuda_driver_result(cuCtxDestroy(global_context), "cuCtxDestroy");
     global_context = nullptr;
 
 #elif defined(SPIKECOREC_METAL)
@@ -144,7 +179,7 @@ void* allocate_bytes(usize byte_size) {
     log::logger().trace("allocate_bytes: byte_size={}", byte_size);
 #ifdef SPIKECOREC_CUDA
     void *pointer = nullptr;
-    cudaMallocManaged(&pointer, byte_size);
+    check_cuda_runtime_result(cudaMallocManaged(&pointer, byte_size), "cudaMallocManaged");
     return pointer;
 
 #elif defined(SPIKECOREC_METAL)
@@ -164,7 +199,7 @@ void deallocate_bytes(void *platform_handle) {
     log::logger().trace("deallocate_bytes");
 
 #ifdef SPIKECOREC_CUDA
-    cudaFree(platform_handle);
+    check_cuda_runtime_result(cudaFree(platform_handle), "cudaFree");
 
 #elif defined(SPIKECOREC_METAL)
     auto *buffer = static_cast<MTL::Buffer *>(platform_handle);
@@ -177,7 +212,7 @@ void deallocate_bytes(void *platform_handle) {
 
 void synchronize_gpu_work() {
 #ifdef SPIKECOREC_CUDA
-    cudaDeviceSynchronize();
+    check_cuda_runtime_result(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 #endif
     // no-op on Metal — dispatch() already blocks via waitUntilCompleted
 }
@@ -190,18 +225,18 @@ KernelHandle compile_kernel(const char *source, const char *function_name) {
 
 #ifdef SPIKECOREC_CUDA
     nvrtcProgram program;
-    nvrtcCreateProgram(&program, source, nullptr, 0, nullptr, nullptr);
-    nvrtcCompileProgram(program, 0, nullptr);
+    check_nvrtc_result(nvrtcCreateProgram(&program, source, nullptr, 0, nullptr, nullptr), "nvrtcCreateProgram");
+    check_nvrtc_compile_result(nvrtcCompileProgram(program, 0, nullptr), program);
 
     size_t parallel_thread_execution_size;
-    nvrtcGetPTXSize(program, &parallel_thread_execution_size);
-    char *parallel_thread_execution= new char[parallel_thread_execution_size];
-    nvrtcGetPTX(program, parallel_thread_execution);
-    nvrtcDestroyProgram(&program);
+    check_nvrtc_result(nvrtcGetPTXSize(program, &parallel_thread_execution_size), "nvrtcGetPTXSize");
+    char *parallel_thread_execution = new char[parallel_thread_execution_size];
+    check_nvrtc_result(nvrtcGetPTX(program, parallel_thread_execution), "nvrtcGetPTX");
+    check_nvrtc_result(nvrtcDestroyProgram(&program), "nvrtcDestroyProgram");
 
-    cuModuleLoadData(&handle.cuda_module, parallel_thread_execution);
+    check_cuda_driver_result(cuModuleLoadData(&handle.cuda_module, parallel_thread_execution), "cuModuleLoadData");
     delete[] parallel_thread_execution;
-    cuModuleGetFunction(&handle.cuda_kernel_function, handle.cuda_module, function_name);
+    check_cuda_driver_result(cuModuleGetFunction(&handle.cuda_kernel_function, handle.cuda_module, function_name), "cuModuleGetFunction");
 
 #elif defined(SPIKECOREC_METAL)
     NS::Error *error = nullptr;
@@ -239,7 +274,7 @@ KernelHandle compile_kernel(const char *source, const char *function_name) {
 void release_kernel(KernelHandle handle) {
     log::logger().debug("release_kernel");
 #ifdef SPIKECOREC_CUDA
-    cuModuleUnload(handle.cuda_module);
+    check_cuda_driver_result(cuModuleUnload(handle.cuda_module), "cuModuleUnload");
 
 #elif defined(SPIKECOREC_METAL)
     if (handle.pipeline_state)
