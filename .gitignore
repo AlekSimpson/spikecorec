@@ -8,6 +8,8 @@ logs/
 *.air
 *.metallib
 
+notebooks/
+
 # CUDA
 *.ptx
 *.cubin
@@ -19,6 +21,7 @@ logs/
 xcuserdata/
 
 # IDE
+.claude/
 .vscode/
 .idea/
 *.swp
@@ -29,6 +32,7 @@ xcuserdata/
 /tests/*.out
 
 # Python
+.pytest_cache/
 __pycache__/
 *.py[cod]
 *.pyd

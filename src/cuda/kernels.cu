@@ -2,14 +2,12 @@
 
 namespace spikecorec::cuda {
 
-LaunchConfig default_launch_config(usize n, usize threads_per_block) {
-    LaunchConfig cfg;
-    cfg.block = dim3(static_cast<unsigned>(threads_per_block));
-    cfg.grid  = dim3(static_cast<unsigned>((n + threads_per_block - 1) / threads_per_block));
-    return cfg;
+LaunchConfig default_launch_config(usize elements_to_process, usize threads_per_block) {
+    LaunchConfig config;
+    config.block = dim3(static_cast<unsigned>(threads_per_block));
+    config.grid  = dim3(static_cast<unsigned>((elements_to_process + threads_per_block - 1) / threads_per_block));
+    return config;
 }
-
-namespace {
 
 // ── k2tree bit-walk helpers ───────────────────────────────────────────────────
 // Shared by neighbor_weights_kernel and k2tree_adjacent_batch_kernel.
@@ -195,10 +193,7 @@ __device__ __forceinline__ s32 k2t_next_neighbor(
 // node's row in the k^2-tree (descending only into populated subtrees) to discover
 // up to max_neighbor_count targets, then dot-products U[source]·V[target]. Slots
 // beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
-// TODO: threads sharing a source_node each independently re-walk that row from the
-// root for their one slot, redoing overlapping work. Restructuring to one thread
-// (or one block) per source_node — walking the row once and filling all
-// max_neighbor_count slots — would eliminate that redundancy.
+
 __global__ void neighbor_weights_kernel(
     const float4 *__restrict__ U,
     const float4 *__restrict__ V,
@@ -263,22 +258,6 @@ __global__ void scale_uv_kernel(
     float4 v = V[index];
     v.x *= scale_factor; v.y *= scale_factor; v.z *= scale_factor; v.w *= scale_factor;
     V[index] = v;
-}
-
-// ── vector_add ────────────────────────────────────────────────────────────────
-// Pure memory-bound element-wise addition; one thread per element, fully coalesced.
-// `result` may alias `a` or `b` for in-place accumulation, so the pointers are
-// deliberately NOT marked __restrict__ (that would assert no-aliasing to the
-// compiler and could miscompile the in-place case).
-__global__ void vector_add_kernel(
-    f32 *result,
-    const f32 *a,
-    const f32 *b,
-    s64 element_count
-) {
-    s64 index = static_cast<s64>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= element_count) return;
-    result[index] = a[index] + b[index];
 }
 
 // ── weight_update ─────────────────────────────────────────────────────────────
@@ -826,255 +805,6 @@ __global__ void step_kernel(
 
     membrane_potentials[neuron_thread_id] = membrane_potential;
     last_tick_updated[neuron_thread_id] = tick;
-}
-
-} // namespace
-
-void launch_neighbor_weights(
-    const float4 *U,
-    const float4 *V,
-    const u32    *internal_node_words,
-    const u32    *leaf_node_words,
-    const u32    *rank_superblock_table,
-    const u16    *rank_subblock_table,
-    s32 branching_factor,
-    s32 superblock_size_words,
-    s32 padded_node_count,
-    s32 tree_height,
-    s32 internal_bit_count,
-    s64 node_count,
-    s64 max_neighbor_count,
-    s64 rank_float4_stride,
-    f32 *output_weights,
-    cudaStream_t stream
-) {
-    s64 total_pairs = node_count * max_neighbor_count;
-    if (total_pairs <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(total_pairs));
-    neighbor_weights_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        U, V,
-        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        node_count, max_neighbor_count, rank_float4_stride, output_weights
-    );
-}
-
-void launch_scale_uv(
-    float4 *U,
-    float4 *V,
-    s64 total_float4_element_count,
-    f32 scale_factor,
-    cudaStream_t stream
-) {
-    if (total_float4_element_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(total_float4_element_count));
-    scale_uv_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        U, V, total_float4_element_count, scale_factor
-    );
-}
-
-void launch_weight_update(
-    float4 *U,
-    float4 *V,
-    s64 rank_float4_stride,
-    s32 source_node,
-    s32 target_node,
-    f32 delta,
-    f32 learning_rate,
-    f32 l2_regularization,
-    s32 iterations,
-    cudaStream_t stream
-) {
-    if (rank_float4_stride <= 0 || iterations <= 0) return;
-
-    unsigned threads = 32u;
-    while (static_cast<s64>(threads) < rank_float4_stride) threads <<= 1;
-    threads = threads > 1024u ? 1024u : threads;
-
-    usize shared_bytes = static_cast<usize>(2 * rank_float4_stride) * sizeof(float4);
-    weight_update_kernel<<<1, threads, shared_bytes, stream>>>(
-        U, V, rank_float4_stride, source_node, target_node,
-        delta, learning_rate, l2_regularization, iterations
-    );
-}
-
-void launch_vector_add(
-    f32 *result,
-    const f32 *a,
-    const f32 *b,
-    s64 element_count,
-    cudaStream_t stream
-) {
-    if (element_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(element_count));
-    vector_add_kernel<<<cfg.grid, cfg.block, 0, stream>>>(result, a, b, element_count);
-}
-
-void launch_step(
-    s64           tick,
-    s64           next_tick,
-    s32           spike_period,
-    f32           spike_threshold,
-    f32           learning_rate,
-    f32           decay_rate,
-    f32           resting_mp,
-    float4       *U,
-    float4       *V,
-    s64           rank_float4_stride,
-    f32           constant_weight,
-    const u32    *internal_node_words,
-    const u32    *leaf_node_words,
-    const u32    *rank_superblock_table,
-    const u16    *rank_subblock_table,
-    s32           branching_factor,
-    s32           superblock_size_words,
-    s32           padded_node_count,
-    s32           tree_height,
-    s32           internal_bit_count,
-    s64           neuron_count,
-    f32          *network_inputs,
-    f32          *membrane_potentials,
-    s64          *last_spiked,
-    s64          *last_tick_updated,
-    const s32    *active_neuron_indices,
-    const s32    *active_neuron_count,
-    s32          *next_active_neuron_indices,
-    s32          *next_active_neuron_count,
-    s32          *active_generation,
-    s32           thread_count_per_block,
-    s32           block_count,
-    cudaStream_t  stream
-) {
-    if (block_count <= 0 || thread_count_per_block <= 0) return;
-    step_kernel<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
-        tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
-        U, V, rank_float4_stride, constant_weight,
-        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
-        active_neuron_indices, active_neuron_count, next_active_neuron_indices, next_active_neuron_count,
-        active_generation
-    );
-}
-
-void launch_add_network_input(
-    f32       *membrane_potentials,
-    const s32 *input_neuron_indices,
-    const f32 *input_values,
-    s64        element_count,
-    cudaStream_t stream
-) {
-    if (element_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(element_count));
-    add_network_input_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        membrane_potentials, input_neuron_indices, input_values, element_count
-    );
-}
-
-void launch_decay_all_neurons(
-    f32 *membrane_potentials,
-    s64 *last_tick_updated,
-    s64  neuron_count,
-    s64  tick,
-    f32  resting_mp,
-    f32  decay_rate,
-    cudaStream_t stream
-) {
-    if (neuron_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(neuron_count));
-    decay_all_neurons_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        membrane_potentials, last_tick_updated, neuron_count, tick, resting_mp, decay_rate
-    );
-}
-
-void launch_merge_input_neurons(
-    s32       *active_neuron_indices,
-    s32       *active_neuron_count,
-    const s64 *override_input_neurons,
-    s64        override_count,
-    cudaStream_t stream
-) {
-    if (override_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(override_count));
-    merge_input_neurons_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        active_neuron_indices, active_neuron_count, override_input_neurons, override_count
-    );
-}
-
-void launch_reservoir_features(
-    s64        neuron_count,
-    s64        tick,
-    f32        spike_tau,
-    f32        voltage_scale,
-    f32       *membrane_potentials,
-    const s64 *last_spiked,
-    s64       *last_tick_updated,
-    f32        resting_mp,
-    f32        decay_rate,
-    f32       *output_buffer,
-    cudaStream_t stream
-) {
-    if (neuron_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(neuron_count));
-    reservoir_features_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        neuron_count, tick, spike_tau, voltage_scale, membrane_potentials,
-        last_spiked, last_tick_updated, resting_mp, decay_rate, output_buffer
-    );
-}
-
-void launch_k2tree_adjacent_batch(
-    const u32 *internal_node_words,
-    const u32 *leaf_node_words,
-    const u32 *rank_superblock_table,
-    const u16 *rank_subblock_table,
-    s32 branching_factor,
-    s32 superblock_size_words,
-    s32 node_count,
-    s32 padded_node_count,
-    s32 tree_height,
-    s32 internal_bit_count,
-    const s32 *source_indices,
-    const s32 *target_indices,
-    uint8_t *output_buffer,
-    s32 query_count,
-    cudaStream_t stream
-) {
-    if (query_count <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(query_count));
-    k2tree_adjacent_batch_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        branching_factor, superblock_size_words, node_count, padded_node_count,
-        tree_height, internal_bit_count, source_indices, target_indices,
-        output_buffer, query_count
-    );
-}
-
-void launch_k2tree_get_neighbors_batch(
-    const u32 *internal_node_words,
-    const u32 *leaf_node_words,
-    const u32 *rank_superblock_table,
-    const u16 *rank_subblock_table,
-    s32 branching_factor,
-    s32 superblock_size_words,
-    s32 node_count,
-    s32 padded_node_count,
-    s32 tree_height,
-    s32 internal_bit_count,
-    const s32 *source_node_indices,
-    s32 query_count,
-    s32 max_neighbor_count,
-    s32 *output_buffer,
-    cudaStream_t stream
-) {
-    s64 total_pairs = static_cast<s64>(query_count) * max_neighbor_count;
-    if (total_pairs <= 0) return;
-    LaunchConfig cfg = default_launch_config(static_cast<usize>(total_pairs));
-    k2tree_get_neighbors_batch_kernel<<<cfg.grid, cfg.block, 0, stream>>>(
-        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        branching_factor, superblock_size_words, node_count, padded_node_count,
-        tree_height, internal_bit_count, source_node_indices, query_count,
-        max_neighbor_count, output_buffer
-    );
 }
 
 } // namespace spikecorec::cuda

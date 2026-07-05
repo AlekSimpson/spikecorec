@@ -51,9 +51,8 @@ WeightMatrix::WeightMatrix(
     , check_indexing(check_indexing)
     , using_constant_weight(false)
 {
-    if (max_neighbor_count > 0) {
-        this->max_neighbor_count = max_neighbor_count;
-    } else {
+    this->max_neighbor_count = max_neighbor_count;
+    if (max_neighbor_count == -1) {
         s64 longest_row = 0;
         for (s64 node_index = 0; node_index < node_count; node_index++) {
             longest_row = max(longest_row, (s64)network[node_index].size());
@@ -66,7 +65,6 @@ WeightMatrix::WeightMatrix(
 
     // Must match MAX_RANK_FLOAT4_STRIDE in kernels.cu / kernels.metal (both == 64).
     // Exceeding it causes out-of-bounds writes into fixed-size kernel arrays (SC-13).
-    static constexpr s64 MAX_RANK_FLOAT4_STRIDE = 64;
     if (rank_float4_stride > MAX_RANK_FLOAT4_STRIDE) {
         log::throw_invalid_argument(log::logger(),
             fmt::format("WeightMatrix: rank_float4_stride ({}) exceeds the GPU kernel "

@@ -247,22 +247,6 @@ kernel void scale_uv_kernel(
     V[index] *= scale_factor;
 }
 
-// ── vector_add ────────────────────────────────────────────────────────────────
-// Pure memory-bound element-wise addition; one thread per element, fully coalesced.
-// `result` may alias `a` or `b` for in-place accumulation — each thread only
-// touches its own index once, so aliasing is safe.
-kernel void vector_add_kernel(
-    device float       *result        [[ buffer(0) ]],
-    const device float *a             [[ buffer(1) ]],
-    const device float *b             [[ buffer(2) ]],
-    constant long      &element_count [[ buffer(3) ]],
-    uint thread_id [[ thread_position_in_grid ]]
-) {
-    long index = (long)thread_id;
-    if (index >= element_count) return;
-    result[index] = a[index] + b[index];
-}
-
 kernel void add_network_input_kernel(
     device float      *membrane_potentials  [[ buffer(0) ]],
     const device int  *input_neuron_indices [[ buffer(1) ]],

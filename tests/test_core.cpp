@@ -162,11 +162,8 @@ void test_reservoir_features() {
     // handle. GpuPointer is move-only, so hand it a borrowed duplicate of the raw
     // handle and keep `output` as the sole owner responsible for deallocate().
     GpuPointer<f32> borrowed;
-#ifdef SPIKECOREC_CUDA
     borrowed.pointer = output.pointer;
-#elif defined(SPIKECOREC_METAL)
-    borrowed.buffer = output.buffer;
-#endif
+
     engine.get_reservoir_features_vector(5, /*spike_tau=*/10.0f, /*voltage_scale=*/1.0f, std::move(borrowed));
 
     for (s64 i = 0; i < feature_count; ++i)
@@ -606,12 +603,10 @@ void test_gpu_pointer_alloc() {
 
     // move-construction transfers ownership and nulls the source handle
     GpuPointer<f32> moved = std::move(buf);
+
     assert(moved.get_contents() == data);
-#ifdef SPIKECOREC_METAL
-    assert(buf.buffer == nullptr && "moved-from GpuPointer must be null");
-#elif defined(SPIKECOREC_CUDA)
     assert(buf.pointer == nullptr && "moved-from GpuPointer must be null");
-#endif
+
     deallocate(std::move(moved));
     printf("  gpu_pointer_alloc: ok\n");
 }
@@ -690,8 +685,8 @@ void test_random_fixed_outdegree_edge_cases() {
 
 void test_k2tree_from_adjacency_list_invalid_branching_factor() {
     auto list = k2_reference_adjacency();
-    const s32 node_count = 8;
-    auto result = K2Tree::from_adjacency_list(list, node_count);
+    const s32 node_count = 0;
+    auto result = K2Tree::from_adjacency_list(list, node_count, -1);
     assert(!result.has_value());
 }
 
@@ -1067,11 +1062,7 @@ void test_reservoir_features_guard() {
     for (s64 i = 0; i < feature_count; ++i) raw[i] = -12345.0f;
 
     GpuPointer<f32> borrowed;
-#ifdef SPIKECOREC_METAL
-    borrowed.buffer = output.buffer;
-#elif defined(SPIKECOREC_CUDA)
     borrowed.pointer = output.pointer;
-#endif
     // spike_tau <= 0 → early return, output left untouched.
     engine.get_reservoir_features_vector(1, /*spike_tau=*/-1.0f, /*voltage_scale=*/1.0f, std::move(borrowed));
     for (s64 i = 0; i < feature_count; ++i)
@@ -1432,6 +1423,8 @@ int main() {
     test_k2tree_from_edges();
     test_k2tree_single_node_and_bounds();
     test_k2tree_save_load();
+    test_k2tree_from_adjacency_list_invalid_branching_factor();
+    test_k2tree_from_edges_invalid_branching_factor();
 
     printf("weight_matrix tests:\n");
     test_weight_matrix_construction();
