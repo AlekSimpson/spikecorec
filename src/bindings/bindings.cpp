@@ -45,7 +45,7 @@ PYBIND11_MODULE(_spikecorec, m) {
     initialize_gpu_context();
 
     m.def("set_log_level", [](const string &level) {
-        spikecorec::log::set_level(spikecorec::log::level_from_string(spikecorec::log::logger(), level));
+        spikecorec::log::logger().set_level(spdlog::level::from_str(level));
     }, py::arg("level"));
 
     m.def("square_torus", &square_torus, py::arg("k"));
@@ -205,7 +205,7 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readwrite("spike_period", &SpikeEngine::spike_period)
         .def_readwrite("spike_threshold", &SpikeEngine::spike_threshold)
         .def_readwrite("use_constant_weight", &SpikeEngine::use_constant_weight)
-        .def_readonly("running", &SpikeEngine::running)
+        .def_readonly("running", &SpikeEngine::running);
 
     // Decodes a `.spire`/`.spire.gz`/`.spire.xz`/`.spire.bz2` recording (as
     // written by start_static_record / SimulationRecorder, or by the
