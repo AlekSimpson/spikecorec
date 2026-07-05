@@ -611,8 +611,9 @@ kernel void step(
     long time_since_last_update = tick - last_updated_tick;
     float membrane_potential = membrane_potentials[neuron_thread_id];
     membrane_potential = apply_decay(membrane_potential, resting_mp, decay_rate, (int)time_since_last_update);
-    membrane_potential += network_inputs[neuron_thread_id];
-    network_inputs[neuron_thread_id] = 0.0f;
+    device atomic_float *self_input_slot = (device atomic_float *)(network_inputs + neuron_thread_id);
+    float accumulated_input = atomic_exchange_explicit(self_input_slot, 0.0f, memory_order_relaxed);
+    membrane_potential += accumulated_input;
 
     long time_last_spiked = last_spiked[neuron_thread_id];
     if ((tick - time_last_spiked) == spike_period) {
