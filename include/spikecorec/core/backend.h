@@ -93,6 +93,30 @@ namespace spikecorec {
     #endif
     }
 
+    // CUDA hint: prefetch managed memory back to the host before the CPU reads
+    // it (e.g. before memcpy'ing a GPU-written buffer out to a numpy array or a
+    // recorder frame) — turns a synchronous page-by-page fault-in, triggered
+    // one touch at a time from the host thread, into a single bulk async copy.
+    // No-op on Metal, where buffers already live in host-visible shared storage.
+    template<typename T>
+    void prefetch_to_cpu(const GpuPointer<T>& ptr, usize size_in_bytes) {
+    #ifdef SPIKECOREC_CUDA
+        cudaMemPrefetchAsync(ptr.pointer, size_in_bytes, cudaCpuDeviceId);
+    #endif
+    }
+
+    // CUDA hint: advise the driver that a managed allocation is read far more
+    // than it's written (e.g. the k^2-tree adjacency arrays, immutable once
+    // built) so it keeps per-device read-only replicas instead of migrating
+    // the whole allocation to whichever processor touches it last.
+    // No-op on Metal.
+    template<typename T>
+    void advise_read_mostly(const GpuPointer<T>& ptr, usize size_in_bytes) {
+    #ifdef SPIKECOREC_CUDA
+        cudaMemAdvise(ptr.pointer, size_in_bytes, cudaMemAdviseSetReadMostly, 0);
+    #endif
+    }
+
     // --- synchronization ---
     // wait for all in-flight GPU work to complete
     void synchronize_gpu_work();

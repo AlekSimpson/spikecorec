@@ -88,6 +88,22 @@ SpikeEngine::SpikeEngine(
     input_staging = allocate<f32>(neuron_f32_byte_size);
     override_staging = allocate<s64>(neuron_s64_byte_size);
 
+    // Every buffer above is read and/or written by step_simulation's kernels on
+    // every tick for the engine's whole lifetime — prefetch them to the device
+    // once here instead of letting the first tick fault each page over
+    // one-by-one as the kernels touch it (SC-18).
+    prefetch_to_gpu(network_inputs, neuron_f32_byte_size);
+    prefetch_to_gpu(membrane_potentials, neuron_f32_byte_size);
+    prefetch_to_gpu(last_spiked, neuron_s64_byte_size);
+    prefetch_to_gpu(last_tick_updated, neuron_s64_byte_size);
+    prefetch_to_gpu(active_neuron_indices, neuron_s32_byte_size);
+    prefetch_to_gpu(next_active_neuron_indices, neuron_s32_byte_size);
+    prefetch_to_gpu(active_neuron_count, sizeof(s32));
+    prefetch_to_gpu(next_active_neuron_count, sizeof(s32));
+    prefetch_to_gpu(active_generation, neuron_s32_byte_size);
+    prefetch_to_gpu(input_staging, neuron_f32_byte_size);
+    prefetch_to_gpu(override_staging, neuron_s64_byte_size);
+
     logger->debug("SpikeEngine buffers allocated: neuron_f32_byte_size={} neuron_s32_byte_size={} "
                   "neuron_s64_byte_size={} thread_count_per_block={} block_count={}",
                   neuron_f32_byte_size, neuron_s32_byte_size, neuron_s64_byte_size,
@@ -139,6 +155,10 @@ void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
         input_neuron_list.size() * s32_byte_size
     );
     input_neuron_count = (s64) input_neuron_list.size();
+
+    // Read by gpu_add_network_input on every tick for the rest of the engine's
+    // lifetime — prefetch it to the device right after the host-side fill (SC-18).
+    prefetch_to_gpu(input_neuron_indices, (usize)neuron_count * s32_byte_size);
 }
 
 void SpikeEngine::reset_state(s64 last_spiked_value, s32 active_gen_value) {
@@ -337,6 +357,7 @@ void SpikeEngine::start_static_record(
             }
 
             synchronize_gpu_work();
+            prefetch_to_cpu(membrane_potentials, (usize)neuron_count * sizeof(f32));
             recorder.record_frame(membrane_potentials.get_contents(), neuron_count);
         }
     }
