@@ -776,7 +776,7 @@ void gpu_step(
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
-    KernelHandle kernel_handle = load_precompiled_kernel("step");
+    static KernelHandle kernel_handle = load_precompiled_kernel("step");
     constexpr u32 threads_per_block = 256;
     LaunchConfig config{
         (static_cast<u32>(neuron_count) + threads_per_block - 1) / threads_per_block,
