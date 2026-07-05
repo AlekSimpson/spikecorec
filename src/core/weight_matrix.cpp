@@ -85,6 +85,12 @@ WeightMatrix::WeightMatrix(
         v_data[element_index] = {normal_dist(rng), normal_dist(rng), normal_dist(rng), normal_dist(rng)};
     }
 
+    // U/V are read by every gpu_step/gpu_neighbor_weights/gpu_scale_uv call this
+    // run — prefetch them to the device right after the host-side fill instead
+    // of letting the first kernel fault every page over one at a time (SC-18).
+    prefetch_to_gpu(U_matrix, matrix_byte_size);
+    prefetch_to_gpu(V_matrix, matrix_byte_size);
+
     log::logger().debug("WeightMatrix constructed: node_count={} rank={} rank_float4_stride={} "
                         "max_neighbor_count={} weight_seed={} check_indexing={}",
                         node_count, this->rank, rank_float4_stride, this->max_neighbor_count,
@@ -184,6 +190,7 @@ void WeightMatrix::neighbor_weights(f32 *output_weights) const {
         device_weights.get_contents()
     );
     synchronize_gpu_work();
+    prefetch_to_cpu(device_weights, (usize)total_pair_count * sizeof(f32));
     memcpy(output_weights, device_weights.get_contents(), (usize)total_pair_count * sizeof(f32));
     deallocate(std::move(device_weights));
 }

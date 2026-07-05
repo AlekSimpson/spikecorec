@@ -165,23 +165,33 @@ PYBIND11_MODULE(_spikecorec, m) {
 
         // Read-back accessors — copy GPU buffer contents into numpy arrays.
         // No raw GpuPointer<T> is exposed to Python (see to_numpy's note).
+        // Each prefetches the buffer to the host first (SC-18) — a single bulk
+        // async copy instead of the memcpy below faulting every page back from
+        // the device one touch at a time.
         .def("get_membrane_potentials", [](const SpikeEngine &self) {
+            prefetch_to_cpu(self.membrane_potentials, static_cast<usize>(self.neuron_count) * sizeof(f32));
             return to_numpy(self.membrane_potentials.get_contents(), self.neuron_count);
         })
         .def("get_network_inputs", [](const SpikeEngine &self) {
+            prefetch_to_cpu(self.network_inputs, static_cast<usize>(self.neuron_count) * sizeof(f32));
             return to_numpy(self.network_inputs.get_contents(), self.neuron_count);
         })
         .def("get_last_spiked", [](const SpikeEngine &self) {
+            prefetch_to_cpu(self.last_spiked, static_cast<usize>(self.neuron_count) * sizeof(s64));
             return to_numpy(self.last_spiked.get_contents(), self.neuron_count);
         })
         .def("get_last_tick_updated", [](const SpikeEngine &self) {
+            prefetch_to_cpu(self.last_tick_updated, static_cast<usize>(self.neuron_count) * sizeof(s64));
             return to_numpy(self.last_tick_updated.get_contents(), self.neuron_count);
         })
         .def("get_active_neuron_indices", [](const SpikeEngine &self) {
+            prefetch_to_cpu(self.active_neuron_count, sizeof(s32));
             s64 count = self.active_neuron_count.get_contents()[0];
+            prefetch_to_cpu(self.active_neuron_indices, static_cast<usize>(count) * sizeof(s32));
             return to_numpy(self.active_neuron_indices.get_contents(), count);
         })
         .def("get_active_neuron_count", [](const SpikeEngine &self) {
+            prefetch_to_cpu(self.active_neuron_count, sizeof(s32));
             return self.active_neuron_count.get_contents()[0];
         })
         .def_property_readonly("weights", [](SpikeEngine &self) -> WeightMatrix & { return self.weights; },
