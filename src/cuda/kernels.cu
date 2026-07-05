@@ -123,6 +123,73 @@ __device__ __forceinline__ s32 k2t_find_nth_neighbor(
     return -1;
 }
 
+// Resumes a DFS over a row's neighbors from the caller's stack state, returning
+// the next neighbor index each call, or -1 when exhausted. Stack arrays must be
+// allocated by the caller (size MAX_K2TREE_HEIGHT each) and initialized once:
+//   stack_row_base[0]=0, stack_col_base[0]=0, stack_block_size[0]=padded_node_count,
+//   stack_bit_offset[0]=0, stack_next_col[0]=0, stack_top=0 (or -1 to short-circuit).
+__device__ __forceinline__ s32 k2t_next_neighbor(
+    const u32 *internal_node_words,
+    const u32 *leaf_node_words,
+    const u32 *rank_superblock_table,
+    const u16 *rank_subblock_table,
+    s32 branching_factor,
+    s32 superblock_size_words,
+    s32 node_count,
+    s32 tree_height,
+    s32 internal_bit_count,
+    s32 u,
+    s32 *stack_row_base,
+    s32 *stack_col_base,
+    s32 *stack_block_size,
+    s32 *stack_bit_offset,
+    s32 *stack_next_col,
+    s32 &stack_top
+) {
+    s32 branching_factor_squared = branching_factor * branching_factor;
+
+    while (stack_top >= 0) {
+        s32 level      = stack_top;
+        s32 col_offset = stack_next_col[level];
+        if (col_offset >= branching_factor) {
+            stack_top--;
+            continue;
+        }
+        stack_next_col[level] = col_offset + 1;
+
+        s32 row_base         = stack_row_base[level];
+        s32 col_base         = stack_col_base[level];
+        s32 block_size       = stack_block_size[level];
+        s32 level_bit_offset = stack_bit_offset[level];
+
+        s32 child_block_size = block_size / branching_factor;
+        s32 row_offset       = (u - row_base) / child_block_size;
+        s32 child_flat_index = row_offset * branching_factor + col_offset;
+        s32 bit_position     = level_bit_offset + child_flat_index;
+
+        if (level == tree_height - 1) {
+            if (k2t_get_bit(leaf_node_words, bit_position)) {
+                s32 v = col_base + col_offset;
+                if (v < node_count) return v;
+            }
+        } else if (k2t_get_bit(internal_node_words, bit_position)) {
+            s32 rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
+                                                      rank_subblock_table, bit_position, superblock_size_words) + 1;
+            s32 child_level = stack_top + 1;
+            s32 raw_offset  = branching_factor_squared * rank_inclusive;
+            stack_row_base[child_level]   = row_base + row_offset * child_block_size;
+            stack_col_base[child_level]   = col_base + col_offset * child_block_size;
+            stack_block_size[child_level] = child_block_size;
+            stack_bit_offset[child_level] = (child_level == tree_height - 1)
+                ? (raw_offset - internal_bit_count)
+                : raw_offset;
+            stack_next_col[child_level] = 0;
+            stack_top = child_level;
+        }
+    }
+    return -1;
+}
+
 // ── neighbor_weights ──────────────────────────────────────────────────────────
 // One thread per (source_node, neighbor_slot) pair; each thread walks its source
 // node's row in the k^2-tree (descending only into populated subtrees) to discover
@@ -607,7 +674,7 @@ __device__ __forceinline__ void step_apply_hebbian_update(
 // adjacency and updates membrane potentials. One thread per *active* neuron —
 // the global thread index indexes into active_neuron_indices, mirroring
 // spikecore's step_kernel (cuda_code/kernels.c). Adjacency is resolved via
-// k2t_find_nth_neighbor, enumerating each spiking neuron's row until -1.
+// k2t_next_neighbor, walking each spiking neuron's row once (O(D·H)).
 __global__ void step_kernel(
     s64           tick,
     s64           next_tick,
@@ -690,14 +757,28 @@ __global__ void step_kernel(
         u_row_accumulator[lane] = u_row_global[lane];
     }
 
-    // FLAG: why is there no end conditional defined here?
-    for (s32 neighbor_slot = 0; ; ++neighbor_slot) {
-        s32 child = k2t_find_nth_neighbor(
-            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-            branching_factor, superblock_size_words, (s32)neuron_count, padded_node_count,
-            tree_height, internal_bit_count, neuron_thread_id, neighbor_slot
-        );
-        if (child < 0) break;
+    // Single DFS walk over the row — O(D·H) instead of O(D²·H).
+    s32 walk_stack_row_base[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_col_base[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_block_size[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_next_col[MAX_K2TREE_HEIGHT];
+    walk_stack_row_base[0]   = 0;
+    walk_stack_col_base[0]   = 0;
+    walk_stack_block_size[0] = padded_node_count;
+    walk_stack_bit_offset[0] = 0;
+    walk_stack_next_col[0]   = 0;
+    s32 walk_stack_top = (tree_height > 0 && neuron_thread_id >= 0 &&
+                          neuron_thread_id < (s32)neuron_count) ? 0 : -1;
+
+    s32 child;
+    while ((child = k2t_next_neighbor(
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, (s32)neuron_count,
+        tree_height, internal_bit_count, neuron_thread_id,
+        walk_stack_row_base, walk_stack_col_base, walk_stack_block_size,
+        walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
+    )) >= 0) {
 
         // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
         s64 child_last_spiked = last_spiked[child];
