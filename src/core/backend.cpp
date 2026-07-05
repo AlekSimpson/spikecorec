@@ -222,6 +222,41 @@ void release_kernel(KernelHandle handle) {
 #endif
 }
 
+// ── command batching ─────────────────────────────────────────────────────────
+
+struct CommandBatch {
+#ifdef SPIKECOREC_METAL
+    MTL::CommandBuffer *command_buffer = nullptr;
+#endif
+};
+
+CommandBatch *begin_command_batch() {
+#ifdef SPIKECOREC_CUDA
+    return nullptr;
+
+#elif defined(SPIKECOREC_METAL)
+    auto *batch = new CommandBatch();
+    batch->command_buffer = global_queue->commandBuffer();
+    return batch;
+#else
+    return nullptr;
+#endif
+}
+
+void commit_command_batch(CommandBatch *batch) {
+#ifdef SPIKECOREC_CUDA
+    (void)batch;
+
+#elif defined(SPIKECOREC_METAL)
+    if (!batch) return;
+    log::logger().trace("commit_command_batch");
+    batch->command_buffer->commit();
+    batch->command_buffer->waitUntilCompleted();
+    batch->command_buffer->release();
+    delete batch;
+#endif
+}
+
 // ── dispatch ──────────────────────────────────────────────────────────────────
 
 void dispatch(
@@ -229,11 +264,13 @@ void dispatch(
     LaunchConfig config,
     const void *const *args,
     const usize *arg_sizes,
-    u32 arg_count
+    u32 arg_count,
+    CommandBatch *batch
 ) {
-    log::logger().trace("dispatch: grid_size={} block_size={} arg_count={}",
-                        config.grid_size, config.block_size, arg_count);
+    log::logger().trace("dispatch: grid_size={} block_size={} arg_count={} batched={}",
+                        config.grid_size, config.block_size, arg_count, batch != nullptr);
 #ifdef SPIKECOREC_CUDA
+    (void)batch; // kernel launches are already async on the default stream
     cuLaunchKernel(
         handle.cuda_kernel_function,
         config.grid_size,  1, 1,
@@ -245,7 +282,10 @@ void dispatch(
     );
 
 #elif defined(SPIKECOREC_METAL)
-    MTL::CommandBuffer *command_buffer = global_queue->commandBuffer();
+    // When batched, encode into the batch's already-open command buffer and leave
+    // committing/waiting to commit_command_batch() — lets the caller fold multiple
+    // kernel encodes (e.g. decay + merge + step per tick) into one GPU round trip.
+    MTL::CommandBuffer *command_buffer = batch ? batch->command_buffer : global_queue->commandBuffer();
     MTL::ComputeCommandEncoder *encoder = command_buffer->computeCommandEncoder();
 
     encoder->setComputePipelineState(handle.pipeline_state);
@@ -275,10 +315,13 @@ void dispatch(
     encoder->dispatchThreadgroups(threadgroups_per_grid, threads_per_threadgroup);
 
     encoder->endEncoding();
-    command_buffer->commit();
-    command_buffer->waitUntilCompleted();
-    command_buffer->release();
     encoder->release();
+
+    if (!batch) {
+        command_buffer->commit();
+        command_buffer->waitUntilCompleted();
+        command_buffer->release();
+    }
 #endif
 }
 
@@ -378,10 +421,11 @@ void gpu_scale_uv(
 #endif
 }
 
-void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, const f32 *input_values, s64 element_count) {
+void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, const f32 *input_values, s64 element_count, CommandBatch *batch) {
     if (element_count <= 0) return;
     log::logger().trace("gpu_add_network_input: element_count={}", element_count);
 #ifdef SPIKECOREC_CUDA
+    (void)batch;
     cuda::launch_add_network_input(membrane_potentials, input_neuron_indices, input_values, element_count);
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -395,7 +439,7 @@ void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, 
     };
     const void *args[] = { &membrane_potentials, &input_neuron_indices, &input_values, &element_count };
     const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(void*), sizeof(s64) };
-    dispatch(kernel_handle, config, args, arg_sizes, 4);
+    dispatch(kernel_handle, config, args, arg_sizes, 4, batch);
 
 #endif
 }
@@ -406,12 +450,14 @@ void gpu_decay_all_neurons(
     s64  neuron_count,
     s64  tick,
     f32  resting_mp,
-    f32  decay_rate
+    f32  decay_rate,
+    CommandBatch *batch
 ) {
     if (neuron_count <= 0) return;
     log::logger().trace("gpu_decay_all_neurons: neuron_count={} tick={}", neuron_count, tick);
 
 #ifdef SPIKECOREC_CUDA
+    (void)batch;
     cuda::launch_decay_all_neurons(membrane_potentials, last_tick_updated, neuron_count, tick, resting_mp, decay_rate);
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -425,7 +471,7 @@ void gpu_decay_all_neurons(
     };
     const void *args[] = { &membrane_potentials, &last_tick_updated, &neuron_count, &tick, &resting_mp, &decay_rate };
     const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(s64), sizeof(s64), sizeof(f32), sizeof(f32) };
-    dispatch(kernel_handle, config, args, arg_sizes, 6);
+    dispatch(kernel_handle, config, args, arg_sizes, 6, batch);
 #endif
 }
 
@@ -433,12 +479,14 @@ void gpu_merge_input_neurons(
     s32       *active_neuron_indices,
     s32       *active_neuron_count,
     const s64 *override_input_neurons,
-    s64        override_count
+    s64        override_count,
+    CommandBatch *batch
 ) {
     if (override_count <= 0) return;
     log::logger().trace("gpu_merge_input_neurons: override_count={}", override_count);
 
 #ifdef SPIKECOREC_CUDA
+    (void)batch;
     cuda::launch_merge_input_neurons(active_neuron_indices, active_neuron_count, override_input_neurons, override_count);
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -452,7 +500,7 @@ void gpu_merge_input_neurons(
     };
     const void *args[] = { &active_neuron_indices, &active_neuron_count, &override_input_neurons, &override_count };
     const usize arg_sizes[] = { sizeof(void*), sizeof(void*), sizeof(void*), sizeof(s64) };
-    dispatch(kernel_handle, config, args, arg_sizes, 4);
+    dispatch(kernel_handle, config, args, arg_sizes, 4, batch);
 #endif
 }
 
@@ -706,13 +754,15 @@ void gpu_step(
    s32          *next_active_neuron_count,
    s32          *active_generation,
    s32           thread_count_per_block,
-   s32           block_count
+   s32           block_count,
+   CommandBatch *batch
 ) {
     if (tick < 0 || next_tick < 0) return;
     log::logger().trace("gpu_step: tick={} next_tick={} neuron_count={} thread_count_per_block={} block_count={}",
                         tick, next_tick, neuron_count, thread_count_per_block, block_count);
 
 #ifdef SPIKECOREC_CUDA
+    (void)batch;
     // launch_step takes float4* (the step kernel writes U/V during the Hebbian
     // update); gpu_step's signature is const, so cast away const for the call.
     cuda::launch_step(
@@ -762,7 +812,7 @@ void gpu_step(
     // arg_count is 31, not 32 — the step kernel intentionally has no buffer(31)
     // for block_count (it derives thread index from thread_position_in_grid),
     // so the trailing &block_count entry in args[]/arg_sizes[] is left unbound.
-    dispatch(kernel_handle, config, args, arg_sizes, 31);
+    dispatch(kernel_handle, config, args, arg_sizes, 31, batch);
 
 #endif
 }

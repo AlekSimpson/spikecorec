@@ -171,6 +171,14 @@ void SpikeEngine::step_simulation(
     logger->trace("step_simulation: tick={} input_values.size={} override_input_neurons.size={} decay_all_neurons={}",
                   tick, input_values.size(), override_input_neurons.size(), decay_all_neurons);
 
+    // Batch every kernel this tick needs (decay + add_network_input + merge + step) into
+    // a single command buffer instead of committing/waitUntilCompleted per kernel — cuts
+    // the tick from up to four CPU/GPU round trips down to one (SC-19). Still waited on
+    // before returning: the host swaps active_neuron_indices/active_neuron_count below and
+    // the next tick immediately overwrites input_staging/override_staging/next_active_neuron_count,
+    // all of which the just-encoded kernels read or write.
+    CommandBatch *batch = begin_command_batch();
+
     if (decay_all_neurons) {
         gpu_decay_all_neurons(
             membrane_potentials.get_contents(),
@@ -178,7 +186,8 @@ void SpikeEngine::step_simulation(
             neuron_count,
             tick,
             resting_membrane_potential,
-            decay_rate);
+            decay_rate,
+            batch);
     }
 
     // input_values/override_input_neurons are host-side vectors — the GPU kernels need them
@@ -191,7 +200,8 @@ void SpikeEngine::step_simulation(
         membrane_potentials.get_contents(),
         input_neuron_indices.get_contents(),
         input_staging.get_contents(),
-        (s64)input_values.size());
+        (s64)input_values.size(),
+        batch);
 
     next_active_neuron_count.get_contents()[0] = 0;
 
@@ -202,7 +212,8 @@ void SpikeEngine::step_simulation(
             active_neuron_indices.get_contents(),
             active_neuron_count.get_contents(),
             override_staging.get_contents(),
-            (s64)override_input_neurons.size());
+            (s64)override_input_neurons.size(),
+            batch);
     }
 
     gpu_step(
@@ -237,7 +248,10 @@ void SpikeEngine::step_simulation(
         next_active_neuron_count.get_contents(),
         active_generation.get_contents(),
         thread_count_per_block,
-        block_count);
+        block_count,
+        batch);
+
+    commit_command_batch(batch);
 
     std::swap(active_neuron_indices, next_active_neuron_indices);
     std::swap(active_neuron_count, next_active_neuron_count);
