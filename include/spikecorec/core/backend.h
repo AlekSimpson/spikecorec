@@ -108,6 +108,20 @@ namespace spikecorec {
     void release_kernel(KernelHandle handle);
 
 
+    // --- command batching ---
+    // Batches multiple kernel dispatches into a single command buffer so the caller
+    // pays one commit+waitUntilCompleted round trip instead of one per kernel (Metal).
+    // No-op on CUDA, where kernel launches are already enqueued async on the default
+    // stream — begin/commit are safe to call unconditionally from backend-agnostic code.
+    struct CommandBatch;
+
+    CommandBatch *begin_command_batch();
+
+    // Commits the batch's command buffer and blocks until the GPU has finished
+    // executing every kernel encoded into it since begin_command_batch().
+    void commit_command_batch(CommandBatch *batch);
+
+
     // --- dispatch ---
     struct LaunchConfig {
         u32 grid_size;
@@ -117,12 +131,16 @@ namespace spikecorec {
     // generic dispatch:
     // - takes raw pointers, backend resolves to MTLBuffers
     //   internally on Metal
+    // - if batch is non-null, encodes into the batch's already-open command buffer
+    //   instead of creating/committing/waiting on one of its own (Metal); the caller
+    //   is responsible for calling commit_command_batch() once all encodes are queued
     void dispatch(
         KernelHandle handle,
         LaunchConfig config,
         const void *const *args,
         const usize *arg_sizes,
-        u32 arg_count
+        u32 arg_count,
+        CommandBatch *batch = nullptr
     );
 
     // --- atomic ops (for backends that need explicit support) ---
@@ -176,13 +194,15 @@ namespace spikecorec {
     );
 
     // Apply exponential membrane decay to all neurons from last_tick_updated up to tick.
+    // If batch is non-null, encodes into it instead of dispatching standalone (see dispatch()).
     void gpu_decay_all_neurons(
         f32 *membrane_potentials,
         s64 *last_tick_updated,
         s64  neuron_count,
         s64  tick,
         f32  resting_mp,
-        f32  decay_rate
+        f32  decay_rate,
+        CommandBatch *batch = nullptr
     );
 
     // Element-wise addition of two equal-length vectors: result[i] = a[i] + b[i].
@@ -193,20 +213,24 @@ namespace spikecorec {
     //     const f32 *b,
     //     s64        element_count
     // );
-    void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, const f32 *input_values, s64 element_count);
+    // If batch is non-null, encodes into it instead of dispatching standalone (see dispatch()).
+    void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, const f32 *input_values, s64 element_count, CommandBatch *batch = nullptr);
 
     // Merge override_input_neurons into the current active neuron set for this tick.
+    // If batch is non-null, encodes into it instead of dispatching standalone (see dispatch()).
     void gpu_merge_input_neurons(
         s32       *active_neuron_indices,
         s32       *active_neuron_count,
         const s64 *override_input_neurons,
-        s64        override_count
+        s64        override_count,
+        CommandBatch *batch = nullptr
     );
 
     // Run one simulation tick: propagate spikes and update membrane potentials.
     // Adjacency is looked up via the bit-packed k^2-tree (replaces the flat
     // neighbor_indices adjacency array) — the kernel walks each spiking neuron's
     // row of the tree to discover its downstream targets.
+    // If batch is non-null, encodes into it instead of dispatching standalone (see dispatch()).
     void gpu_step(
         s64           tick,
         s64           next_tick,
@@ -239,7 +263,8 @@ namespace spikecorec {
         s32          *next_active_neuron_count,
         s32          *active_generation,
         s32           thread_count_per_block,
-        s32           block_count
+        s32           block_count,
+        CommandBatch *batch = nullptr
     );
 
     // Build the reservoir feature vector: spike traces, normalised membrane voltages, bias.
