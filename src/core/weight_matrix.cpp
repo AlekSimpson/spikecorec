@@ -209,6 +209,9 @@ void WeightMatrix::neighbor_weights(f32 *output_weights) const {
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {
     s64 total_pair_count = node_count * max_neighbor_count;
+    if (total_pair_count == 0) {
+        return {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    }
     vector<f32> weight_buffer((usize)total_pair_count);
     neighbor_weights(weight_buffer.data());
 
