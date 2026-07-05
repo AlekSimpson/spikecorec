@@ -171,11 +171,11 @@ void SpikeEngine::reset_state(s64 last_spiked_value, s32 active_gen_value) {
     std::fill(membrane_potentials.get_contents(),
             membrane_potentials.get_contents() + neuron_count,
             resting_membrane_potential);
-    memset(last_spiked.get_contents(), last_spiked_value, neuron_s64_byte_size);
+    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + neuron_count, last_spiked_value);
     memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
     active_neuron_count.get_contents()[0] = 0;
     next_active_neuron_count.get_contents()[0] = 0;
-    memset(active_generation.get_contents(), active_gen_value, neuron_s32_byte_size);
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + neuron_count, active_gen_value);
 }
 
 void SpikeEngine::step_simulation(
