@@ -723,8 +723,8 @@ __global__ void step_kernel(
     s64 time_since_last_update = tick - last_updated_tick;
     f32 membrane_potential = membrane_potentials[neuron_thread_id];
     membrane_potential = apply_decay(membrane_potential, resting_mp, decay_rate, (int)time_since_last_update);
-    membrane_potential += network_inputs[neuron_thread_id];
-    network_inputs[neuron_thread_id] = 0.0f;
+    f32 accumulated_input = atomicExch(&network_inputs[neuron_thread_id], 0.0f);
+    membrane_potential += accumulated_input;
 
     s64 time_last_spiked = last_spiked[neuron_thread_id];
     if ((tick - time_last_spiked) == spike_period) {
