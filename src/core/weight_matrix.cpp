@@ -64,6 +64,18 @@ WeightMatrix::WeightMatrix(
     this->rank = (rank > 0) ? rank : min(DEFAULT_WEIGHT_RANK, node_count);
     rank_float4_stride = (this->rank + 3) / 4;
 
+    // Must match MAX_RANK_FLOAT4_STRIDE in kernels.cu / kernels.metal (both == 64).
+    // Exceeding it causes out-of-bounds writes into fixed-size kernel arrays (SC-13).
+    static constexpr s64 MAX_RANK_FLOAT4_STRIDE = 64;
+    if (rank_float4_stride > MAX_RANK_FLOAT4_STRIDE) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix: rank_float4_stride ({}) exceeds the GPU kernel "
+                        "limit MAX_RANK_FLOAT4_STRIDE ({}); reduce rank to at most {} "
+                        "(got rank={})",
+                        rank_float4_stride, MAX_RANK_FLOAT4_STRIDE,
+                        MAX_RANK_FLOAT4_STRIDE * 4, this->rank));
+    }
+
     // allocate U and V in unified memory — shape [node_count][rank_float4_stride]
     usize matrix_byte_size = (usize)node_count * (usize)rank_float4_stride * sizeof(float4);
     U_matrix = allocate<float4>(matrix_byte_size);
