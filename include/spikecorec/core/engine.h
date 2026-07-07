@@ -66,9 +66,7 @@ namespace spikecorec {
         f32 spike_threshold;
 
         bool use_constant_weight = false;
-        bool running = false;
-
-        SpikeEngine() = delete;
+        bool alive = false;
 
         SpikeEngine(const SpikeEngine &) = delete;
 
@@ -84,8 +82,11 @@ namespace spikecorec {
             s64 rank = 1,
             f32 resting_mp = 0.1f,
             f32 decay_rate = 0.01f,
-            f32 learning_rate = 0.00222f
+            f32 learning_rate = 0.00222f,
+            bool plasticity_enabled = true
         );
+
+        SpikeEngine();
 
         ~SpikeEngine();
 
@@ -114,9 +115,11 @@ namespace spikecorec {
             usize compression_queue_max = 8,
             usize compression_chunk_bytes = 4 * 1024 * 1024);
 
-        [[nodiscard]] bool is_alive() const;
-
         [[nodiscard]] pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
+
+        bool plasticity_enabled();
+        void enable_plasticity(f32 _learning_rate = 0.00222f);
+        void disable_plasticity();
 
         void get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 voltage_scale, GpuPointer<f32> output_buffer);
 
