@@ -7,7 +7,7 @@ and the Python extension (setuptools + pybind11). Run from the repo root.
 
     pip install pybind11
     brew install bear        # optional, for compile_commands.json
-    git submodule update --init   # metal-cpp (Metal builds) + spdlog (logging, both backends)
+    git submodule update --init   # metal-cpp (Metal builds) + spdlog (logging) + googletest (tests)
 
 `zlib` / `liblzma` / `libbz2` are optional and auto-detected via `pkg-config`
 at build time (enables compressed `.spire` recordings). Uncompressed `.spire`
@@ -58,35 +58,56 @@ The Makefile auto-detects backend by platform: `metal` on macOS (Darwin),
 
 ### Tests
 
-Each backend builds two separate binaries (`test_core.cpp` and the backend
-smoke test each define their own `main()`, so they can't be linked together).
-Both `test-metal` and `test-cuda` build their two binaries AND execute them as
-part of the same `make` invocation — you don't run anything separately, and
-the recipe fails (non-zero exit) if either binary aborts or asserts.
+Tests use [GoogleTest](https://github.com/google/googletest), compiled from the
+vendored submodule at `third_party/googletest/`. Each `make test-*` target
+builds a single test runner binary and immediately executes it. The recipe fails
+(non-zero exit) if any test fails.
 
 - `make test`
-  Builds and runs the tests for the auto-detected backend (equivalent to
-  `make test-metal` on macOS, `make test-cuda` elsewhere). No separate run
-  step needed.
+  Builds and runs all tests for the auto-detected backend (`test-metal` on
+  macOS, `test-cuda` elsewhere).
 
 - `make test-metal`
-  Builds `build/test_runner_metal` (from `tests/test_core.cpp`, the main
-  unit-test suite) and `build/test_smoke_metal` (from `tests/metal/*.cpp`,
-  a one-off check that a Metal device is available), then immediately runs
-  both binaries in sequence. Output/pass-fail prints straight to the
-  terminal — there's no separate test report file.
+  Builds `build/test_runner_metal` from all `tests/*.cpp` files and runs it.
 
 - `make test-cuda`
-  Same idea for CUDA: builds `build/test_runner_cuda` and
-  `build/test_smoke_cuda` (from `tests/cuda/*.cpp`), then runs both.
+  Builds `build/test_runner_cuda` from all `tests/*.cpp` files and runs it.
 
-If you want to re-run the tests without recompiling, invoke the produced
-binaries directly:
+**Running a subset of tests** — invoke the binary directly after the first build
+and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple):
 
-    build/test_runner_metal
-    build/test_smoke_metal
-    build/test_runner_cuda
-    build/test_smoke_cuda
+    # All tests in a suite
+    ./build/test_runner_metal --gtest_filter='K2Tree.*'
+    ./build/test_runner_metal --gtest_filter='WeightMatrix.*'
+    ./build/test_runner_metal --gtest_filter='SpikeEngine.*'
+
+    # One specific test
+    ./build/test_runner_metal --gtest_filter='SpikeEngine.spike_fanout'
+
+    # Multiple suites
+    ./build/test_runner_metal --gtest_filter='K2Tree.*:WeightMatrix.*'
+
+    # Wildcard on test name across all suites
+    ./build/test_runner_metal --gtest_filter='*.save_load'
+
+    # Negate — run everything except one suite
+    ./build/test_runner_metal --gtest_filter='-AsyncSpireWriter.*'
+
+    # List all test names without running them
+    ./build/test_runner_metal --gtest_list_tests
+
+**Test suite index:**
+
+| Suite | File | What it covers |
+|---|---|---|
+| `Backend` | `engine_tests.cpp` | Type sizes, `GpuPointer` alloc/move |
+| `SpikeEngine` | `engine_tests.cpp`, `recording_tests.cpp` | Construction, step loop, reset, reservoir features, input guards, bifurcation scaling, decay path, spike propagation, plasticity, recording |
+| `K2Tree` | `k2tree_tests.cpp` | Adjacency queries, batch ops, bounds, save/load, invalid branching factor |
+| `SpireCodec` | `recording_tests.cpp` | Raw roundtrip, compression codecs, zero-frame file, header overflow, truncation error |
+| `AsyncSpireWriter` | `recording_tests.cpp` | Backpressure, unbounded queue, no re-entry after error |
+| `SimulationRecorder` | `recording_tests.cpp` | Frame-size validation |
+| `Topologies` | `topology_tests.cpp` | `square_torus`, `small_world_torus`, `random_fixed_outdegree` — basic and edge cases |
+| `WeightMatrix` | `weight_matrix_tests.cpp` | Construction, constant/random weights, stats, scaling, neighbor queries, bounds, update, save/load |
 
 ### Examples
 
