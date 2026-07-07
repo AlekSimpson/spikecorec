@@ -148,6 +148,7 @@ void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
     if (input_neuron_list.empty()) return;
 
     s32 s32_byte_size = 4;
+    if (input_neuron_indices.pointer != nullptr) deallocate(std::move(input_neuron_indices));
     input_neuron_indices = allocate<s32>(neuron_count * s32_byte_size);
     memcpy(
         input_neuron_indices.get_contents(),

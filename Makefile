@@ -68,6 +68,11 @@ endif
 # whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.
 CXXFLAGS += -Ithird_party/spdlog/include -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
 
+# ── GoogleTest (compiled from submodule source) ───────────────────────────────
+GTEST_DIR  := third_party/googletest/googletest
+GTEST_OBJ  := $(BUILD_DIR)/gtest-all.o
+CXXFLAGS   += -I$(GTEST_DIR)/include
+
 ifeq ($(UNAME_S),Darwin)
   HAS_METAL     := yes
   CXX           := clang++
@@ -194,30 +199,23 @@ endif
 
 test: test-$(BACKEND)
 
-# test_core.cpp and the per-backend smoke tests (tests/cuda/test_cuda.cpp,
-# tests/metal/test_metal.cpp) each define their own main(), so they must be built
-# as separate binaries rather than linked together.
 CUDA_LINK := -L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc
 
-test-cuda: check-cuda $(CUDA_LIB)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) \
+$(GTEST_OBJ): $(GTEST_DIR)/src/gtest-all.cc
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -I$(GTEST_DIR) -c $< -o $@
+
+test-cuda: check-cuda $(CUDA_LIB) $(GTEST_OBJ)
+	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_cuda
-	$(CXX) $(CXXFLAGS) $(TEST_CUDA_SRCS) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) -lpthread \
-	    -o $(BUILD_DIR)/test_smoke_cuda
 	$(BUILD_DIR)/test_runner_cuda
-	$(BUILD_DIR)/test_smoke_cuda
 
-test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) \
+test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
+	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_metal
-	$(CXX) $(CXXFLAGS) $(TEST_METAL_SRCS) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) -lpthread \
-	    -o $(BUILD_DIR)/test_smoke_metal
 	$(BUILD_DIR)/test_runner_metal
-	$(BUILD_DIR)/test_smoke_metal
 
 # ── Examples ─────────────────────────────────────────────────
 examples: examples-$(BACKEND)
