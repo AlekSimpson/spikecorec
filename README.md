@@ -116,11 +116,31 @@ features, weight scaling, simulation recording to `.spire` files, etc.).
 
 ## Tests
 
+Tests use [GoogleTest](https://github.com/google/googletest) (vendored as a submodule).
+
 ```bash
-make test
-make test-metal
-make test-cuda
+make test          # build + run all tests (auto-detects backend)
+make test-metal    # Metal backend explicitly
+make test-cuda     # CUDA backend explicitly
 ```
+
+To run a subset after the initial build, invoke the runner directly with `--gtest_filter`:
+
+```bash
+# All tests in a suite
+./build/test_runner_metal --gtest_filter='K2Tree.*'
+
+# A single test
+./build/test_runner_metal --gtest_filter='SpikeEngine.spike_fanout'
+
+# Wildcard across all suites
+./build/test_runner_metal --gtest_filter='*.save_load'
+
+# List every test name without running
+./build/test_runner_metal --gtest_list_tests
+```
+
+See **[`BUILDME.md`](BUILDME.md)** for the full filter reference and suite index.
 
 ---
 
