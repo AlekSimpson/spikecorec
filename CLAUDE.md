@@ -32,6 +32,25 @@ third_party/          — vendored dependencies (metal-cpp submodule)
 - Metal host code uses **metal-cpp** (pure C++, no `.mm` / Objective-C++)
 - Backend is selected at compile time via `-DSPIKECOREC_METAL` or `-DSPIKECOREC_CUDA`
 
+## CRITICAL: U/V factorization is a memory optimization, NOT learning
+
+The `WeightMatrix` stores adjacency weights as a low-rank factorization `W ≈ U * Vᵀ`
+(rank controlled by the `rank` constructor parameter). **This is purely a memory
+compression scheme.** Large spiking networks would require terabytes of RAM to store
+a full dense weight matrix; the U/V factorization combined with the k²-tree adjacency
+structure makes massive networks tractable.
+
+**Do not confuse this with task learning or training.** The U/V matrices encode the
+connection strengths between neurons in the graph — nothing more. They do not implement
+backpropagation, gradient descent, or any task-level learning algorithm. The `rank`
+parameter controls compression fidelity, not model capacity in any machine-learning
+sense. When you see `gpu_weight_update`, `learning_rate`, or Hebbian update logic in
+the engine, that is local synaptic plasticity (spike-timing-dependent updates to
+individual edge weights) — it is also not task learning; it is a biological simulation
+feature that modifies how compressed weights evolve during a simulation run.
+
+In short: **U/V factorization = memory savings. The engine does not train on tasks.**
+
 ## Build
 
 ```bash

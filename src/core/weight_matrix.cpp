@@ -27,7 +27,7 @@ using namespace spikecorec;
 static constexpr s64 DEFAULT_WEIGHT_RANK = 64;
 static constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5458;
 
-vector<vector<s32>> &WeightMatrix::validate_network(vector<vector<s32>> &network) {
+const vector<vector<s32>> &WeightMatrix::validate_network(const vector<vector<s32>> &network) {
     if (network.empty()) {
         log::throw_invalid_argument(log::logger(),
             fmt::format("WeightMatrix: network must have at least one neuron (got {})", network.size()));
@@ -36,7 +36,7 @@ vector<vector<s32>> &WeightMatrix::validate_network(vector<vector<s32>> &network
 }
 
 WeightMatrix::WeightMatrix(
-    vector<vector<s32>> &network,
+    const vector<vector<s32>> &network,
     s64 rank,
     bool check_indexing,
     s64 max_neighbor_count,
@@ -95,9 +95,6 @@ WeightMatrix::WeightMatrix(
         v_data[element_index] = {normal_dist(rng), normal_dist(rng), normal_dist(rng), normal_dist(rng)};
     }
 
-    // U/V are read by every gpu_step/gpu_neighbor_weights/gpu_scale_uv call this
-    // run — prefetch them to the device right after the host-side fill instead
-    // of letting the first kernel fault every page over one at a time (SC-18).
     prefetch_to_gpu(U_matrix, matrix_byte_size);
     prefetch_to_gpu(V_matrix, matrix_byte_size);
 
@@ -178,9 +175,7 @@ void WeightMatrix::neighbor_weights(f32 *output_weights) const {
     s64 total_pair_count = node_count * max_neighbor_count;
     if (total_pair_count <= 0) return;
 
-    // output_weights is caller-owned host memory (e.g. std::vector::data()) — not
-    // GPU-visible — so the kernel writes into a scratch unified-memory buffer and
-    // we copy the result back once the device is done.
+    // output_weights is caller-owned host memory (e.g. std::vector::data())
     GpuPointer<f32> device_weights = allocate<f32>((usize)total_pair_count * sizeof(f32));
     gpu_neighbor_weights(
         U_matrix.get_contents(),

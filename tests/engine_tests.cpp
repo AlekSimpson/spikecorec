@@ -81,9 +81,9 @@ TEST(SpikeEngine, validate_construction) {
     SpikeEngine engine(&network, {4, 4});
 
     EXPECT_EQ(engine.neuron_count, 16);
-    EXPECT_TRUE(engine.is_alive());
+    EXPECT_TRUE(engine.alive);
     engine.shutdown();
-    EXPECT_FALSE(engine.is_alive());
+    EXPECT_FALSE(engine.alive);
 }
 
 class SpikeEngineTest : public ::testing::Test {
