@@ -702,6 +702,137 @@ kernel void step(
     last_tick_updated[neuron_thread_id] = tick;
 }
 
+kernel void step_no_active_optimization(
+    constant long        &tick                       [[ buffer(0) ]],
+    constant long        &next_tick                  [[ buffer(1) ]],
+    constant int         &spike_period               [[ buffer(2) ]],
+    constant float       &spike_threshold            [[ buffer(3) ]],
+    constant float       &learning_rate              [[ buffer(4) ]],
+    constant float       &decay_rate                 [[ buffer(5) ]],
+    constant float       &resting_mp                 [[ buffer(6) ]],
+    device float4        *U                          [[ buffer(7) ]],
+    device float4        *V                          [[ buffer(8) ]],
+    constant long        &rank_float4_stride         [[ buffer(9) ]],
+    constant float       &constant_weight            [[ buffer(10) ]],
+    const device uint    *internal_node_words        [[ buffer(11) ]],
+    const device uint    *leaf_node_words            [[ buffer(12) ]],
+    const device uint    *rank_superblock_table      [[ buffer(13) ]],
+    const device ushort  *rank_subblock_table        [[ buffer(14) ]],
+    constant int         &branching_factor           [[ buffer(15) ]],
+    constant int         &superblock_size_words      [[ buffer(16) ]],
+    constant int         &padded_node_count          [[ buffer(17) ]],
+    constant int         &tree_height                [[ buffer(18) ]],
+    constant int         &internal_bit_count         [[ buffer(19) ]],
+    constant long        &neuron_count               [[ buffer(20) ]],
+    device float         *network_inputs             [[ buffer(21) ]],
+    device float         *membrane_potentials        [[ buffer(22) ]],
+    device long          *last_spiked                [[ buffer(23) ]],
+    device long          *last_tick_updated          [[ buffer(24) ]],
+    constant int         &thread_count_per_block     [[ buffer(25) ]],
+    uint thread_id [[ thread_position_in_grid ]]
+) {
+    int neuron_thread_id = (int)thread_id;
+
+    if (neuron_thread_id < 0 || (long)neuron_thread_id >= neuron_count) return;
+
+    // active_generation stores 32-bit generation tags (Metal has no 64-bit atomic
+    // exchange/fetch_add — only int/uint), so next_tick is narrowed just for that.
+    // tick/last_spiked/last_tick_updated stay 64-bit and compare directly.
+    int next_tick_i = (int)next_tick;
+
+    long last_updated_tick = last_tick_updated[neuron_thread_id];
+    long time_since_last_update = tick - last_updated_tick;
+    float membrane_potential = membrane_potentials[neuron_thread_id];
+    membrane_potential = apply_decay(membrane_potential, resting_mp, decay_rate, (int)time_since_last_update);
+    device atomic_float *self_input_slot = (device atomic_float *)(network_inputs + neuron_thread_id);
+    float accumulated_input = atomic_exchange_explicit(self_input_slot, 0.0f, memory_order_relaxed);
+    membrane_potential += accumulated_input;
+
+    long time_last_spiked = last_spiked[neuron_thread_id];
+    if ((tick - time_last_spiked) == spike_period) {
+        membrane_potentials[neuron_thread_id] = resting_mp;
+        last_tick_updated[neuron_thread_id] = tick;
+        return;
+    }
+
+    if (membrane_potential <= spike_threshold) {
+        membrane_potentials[neuron_thread_id] = membrane_potential;
+        last_tick_updated[neuron_thread_id] = tick;
+        return;
+    }
+
+    // spike: mark spike time, then propagate to every downstream neighbor —
+    // discovered by walking neuron_thread_id's row in the k^2-tree (no fixed
+    // neighbor-count array; enumeration stops at the first -1 sentinel).
+    if ((tick - time_last_spiked) > spike_period) {
+        last_spiked[neuron_thread_id] = tick;
+    }
+
+    // U[neuron_thread_id] is exclusively owned by this thread for the whole tick
+    // (active_neuron_indices has no duplicates), so it's staged into thread-local
+    // registers once, accumulated across every outgoing edge below with plain
+    // (non-atomic) math, and flushed back to device memory a single time — instead
+    // of routing each edge's Hebbian update through 4 atomics per rank lane.
+    thread float4 u_row_accumulator[MAX_RANK_FLOAT4_STRIDE];
+    device float4 *u_row_global = U + (long)neuron_thread_id * rank_float4_stride;
+    for (long lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_accumulator[lane] = u_row_global[lane];
+    }
+
+    // Single DFS walk over the row — O(D·H) instead of O(D²·H).
+    thread int walk_stack_row_base[MAX_K2TREE_HEIGHT];
+    thread int walk_stack_col_base[MAX_K2TREE_HEIGHT];
+    thread int walk_stack_block_size[MAX_K2TREE_HEIGHT];
+    thread int walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
+    thread int walk_stack_next_col[MAX_K2TREE_HEIGHT];
+    walk_stack_row_base[0]   = 0;
+    walk_stack_col_base[0]   = 0;
+    walk_stack_block_size[0] = padded_node_count;
+    walk_stack_bit_offset[0] = 0;
+    walk_stack_next_col[0]   = 0;
+    int walk_stack_top = (tree_height > 0 && neuron_thread_id >= 0 &&
+                          neuron_thread_id < (int)neuron_count) ? 0 : -1;
+
+    int child;
+    while ((child = k2t_next_neighbor(
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, (int)neuron_count,
+        tree_height, internal_bit_count, neuron_thread_id,
+        walk_stack_row_base, walk_stack_col_base, walk_stack_block_size,
+        walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
+    )) >= 0) {
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        long child_last_spiked = last_spiked[child];
+        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+            float tick_delta = (float)abs(tick - child_last_spiked);
+            float decay_delta = -learning_rate * pow(tick_delta, -3.0f);
+            step_apply_hebbian_update(u_row_accumulator, V, rank_float4_stride, child,
+                                      decay_delta, 0.5f, 1.0f);
+        }
+
+        // resolve the synaptic weight: constant (if configured) or U[source]·V[target]
+        float weight = constant_weight;
+        if (constant_weight == 0.0f) {
+            const device float4 *v_row = V + (long)child * rank_float4_stride;
+            float dot_product = 0.0f;
+            for (long lane = 0; lane < rank_float4_stride; ++lane) {
+                dot_product += dot(u_row_accumulator[lane], v_row[lane]);
+            }
+            weight = dot_product;
+        }
+
+        device atomic_float *input_slot = (device atomic_float *)(network_inputs + child);
+        atomic_fetch_add_explicit(input_slot, weight, memory_order_relaxed);
+    }
+
+    for (long lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_global[lane] = u_row_accumulator[lane];
+    }
+
+    membrane_potentials[neuron_thread_id] = membrane_potential;
+    last_tick_updated[neuron_thread_id] = tick;
+}
+
 kernel void decay_all_neurons_kernel(
     device float   *membrane_potentials [[ buffer(0) ]],
     device long    *last_tick_updated   [[ buffer(1) ]],

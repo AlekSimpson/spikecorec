@@ -807,4 +807,135 @@ __global__ void step_kernel(
     last_tick_updated[neuron_thread_id] = tick;
 }
 
+__global__ void step_kernel_no_active_optimization(
+    s64           tick,
+    s64           next_tick,
+    s32           spike_period,
+    f32           spike_threshold,
+    f32           learning_rate,
+    f32           decay_rate,
+    f32           resting_mp,
+    float4       *U,
+    float4       *V,
+    s64           rank_float4_stride,
+    f32           constant_weight,
+    const u32    *internal_node_words,
+    const u32    *leaf_node_words,
+    const u32    *rank_superblock_table,
+    const u16    *rank_subblock_table,
+    s32           branching_factor,
+    s32           superblock_size_words,
+    s32           padded_node_count,
+    s32           tree_height,
+    s32           internal_bit_count,
+    s64           neuron_count,
+    f32          *network_inputs,
+    f32          *membrane_potentials,
+    s64          *last_spiked,
+    s64          *last_tick_updated
+) {
+    s32 neuron_thread_id = static_cast<s32>(blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (neuron_thread_id < 0 || (s64)neuron_thread_id >= neuron_count) return;
+
+    // active_generation stores 32-bit generation tags (no 64-bit atomic exchange
+    // on either platform), so next_tick is narrowed just for that. tick/last_spiked/
+    // last_tick_updated stay 64-bit and compare directly — mirrors Metal exactly.
+    s32 next_tick_i = (s32)next_tick;
+
+    s64 last_updated_tick = last_tick_updated[neuron_thread_id];
+    s64 time_since_last_update = tick - last_updated_tick;
+    f32 membrane_potential = membrane_potentials[neuron_thread_id];
+    membrane_potential = apply_decay(membrane_potential, resting_mp, decay_rate, (int)time_since_last_update);
+    f32 accumulated_input = atomicExch(&network_inputs[neuron_thread_id], 0.0f);
+    membrane_potential += accumulated_input;
+
+    s64 time_last_spiked = last_spiked[neuron_thread_id];
+    if ((tick - time_last_spiked) == spike_period) {
+        membrane_potentials[neuron_thread_id] = resting_mp;
+        last_tick_updated[neuron_thread_id] = tick;
+        return;
+    }
+
+    if (membrane_potential <= spike_threshold) {
+        membrane_potentials[neuron_thread_id] = membrane_potential;
+        last_tick_updated[neuron_thread_id] = tick;
+        return;
+    }
+
+    // spike: mark spike time, then propagate to every downstream neighbor —
+    // discovered by walking neuron_thread_id's row in the k^2-tree (enumeration
+    // stops at the first -1 sentinel; no fixed neighbor-count array).
+    if ((tick - time_last_spiked) > spike_period) {
+        last_spiked[neuron_thread_id] = tick;
+    }
+
+    // U[neuron_thread_id] is exclusively owned by this thread for the whole tick
+    // (active_neuron_indices has no duplicates), so it's staged into registers
+    // once, accumulated across every outgoing edge below with plain (non-atomic)
+    // math, and flushed back to global memory a single time — instead of routing
+    // each edge's Hebbian update through 4 atomicAdds per rank lane.
+    float4 u_row_accumulator[MAX_RANK_FLOAT4_STRIDE];
+    float4 *u_row_global = U + (s64)neuron_thread_id * rank_float4_stride;
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_accumulator[lane] = u_row_global[lane];
+    }
+
+    // Single DFS walk over the row — O(D·H) instead of O(D²·H).
+    s32 walk_stack_row_base[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_col_base[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_block_size[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
+    s32 walk_stack_next_col[MAX_K2TREE_HEIGHT];
+    walk_stack_row_base[0]   = 0;
+    walk_stack_col_base[0]   = 0;
+    walk_stack_block_size[0] = padded_node_count;
+    walk_stack_bit_offset[0] = 0;
+    walk_stack_next_col[0]   = 0;
+    s32 walk_stack_top = (tree_height > 0 && neuron_thread_id >= 0 &&
+                          neuron_thread_id < (s32)neuron_count) ? 0 : -1;
+
+    s32 child;
+    while ((child = k2t_next_neighbor(
+        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+        branching_factor, superblock_size_words, (s32)neuron_count,
+        tree_height, internal_bit_count, neuron_thread_id,
+        walk_stack_row_base, walk_stack_col_base, walk_stack_block_size,
+        walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
+    )) >= 0) {
+
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        s64 child_last_spiked = last_spiked[child];
+        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+            s64 delta_ticks = tick - child_last_spiked;
+            f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
+            f32 decay_delta = -learning_rate * powf(tick_delta, -3.0f);
+            step_apply_hebbian_update(u_row_accumulator, V, rank_float4_stride, child,
+                                      decay_delta, 0.5f, 1.0f);
+        }
+
+        // resolve the synaptic weight: constant (if configured) or U[source]·V[target]
+        f32 weight = constant_weight;
+        if (constant_weight == 0.0f) {
+            const float4 *v_row = V + (s64)child * rank_float4_stride;
+            f32 dot_product = 0.0f;
+            for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+                float4 u4 = u_row_accumulator[lane];
+                float4 v4 = v_row[lane];
+                dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;
+            }
+            weight = dot_product;
+        }
+
+        atomicAdd(&network_inputs[child], weight);
+    }
+
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        u_row_global[lane] = u_row_accumulator[lane];
+    }
+
+    membrane_potentials[neuron_thread_id] = membrane_potential;
+    last_tick_updated[neuron_thread_id] = tick;
+}
+
 } // namespace spikecorec::cuda
