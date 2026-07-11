@@ -67,6 +67,7 @@ namespace spikecorec {
 
         bool use_constant_weight = false;
         bool alive = false;
+        bool active_set_optimization_enabled = true;
 
         SpikeEngine(const SpikeEngine &) = delete;
 
@@ -83,7 +84,8 @@ namespace spikecorec {
             f32 resting_mp = 0.1f,
             f32 decay_rate = 0.01f,
             f32 learning_rate = 0.00222f,
-            bool plasticity_enabled = true
+            bool plasticity_enabled = true, 
+            bool active_set_optimization_enabled = true
         );
 
         SpikeEngine();

@@ -285,6 +285,7 @@ namespace spikecorec {
         s32          *next_active_neuron_indices,
         s32          *next_active_neuron_count,
         s32          *active_generation,
+        bool          active_set_optimization_enabled,
         s32           thread_count_per_block,
         s32           block_count,
         MetalCommandBatch *batch = nullptr
