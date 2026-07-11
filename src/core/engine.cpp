@@ -14,6 +14,7 @@
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/recording.h"
+#include "spikecorec/core/topologies.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -21,77 +22,142 @@ using namespace spikecorec::log;
 
 // ── constructor / destructor ──────────────────────────────────────────────────
 
-SpikeEngine::SpikeEngine(
-    vector<vector<s32>> *network,
-    const vector<s64> &shape,
-    s64 rank,
-    f32 resting_mp,
-    f32 decay_rate,
-    f32 learning_rate
-)
+SpikeEngine::SpikeEngine()
     : logger(make_logger())
-    , weights(*network, rank, true)
-    , neuron_count(shape[0] * shape[1])
+    , weights(random_fixed_outdegree(15), 1, true)
+    , neuron_count(15 * 15)
     , input_neuron_count(0)
-    , thread_count_per_block(0)
+    , thread_count_per_block(256)
     , block_count(0)
-    , resting_membrane_potential(resting_mp)
-    , decay_rate(decay_rate)
-    , learning_rate(learning_rate)
+    , resting_membrane_potential(0.1f)
+    , decay_rate(0.01f)
+    , learning_rate(0.0f) // plasticity off by default
     , spike_period(1)
     , spike_threshold(1.0f)
-    , running(true)
+    , alive(true)
 {
-    thread_count_per_block = 256;
+
     block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
 
     usize neuron_f32_byte_size = (usize) neuron_count * sizeof(f32);
     usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
     usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
 
-    // network_inputs [neuron_count] — zero initialized
     network_inputs = allocate<f32>(neuron_f32_byte_size);
     memset(network_inputs.get_contents(), 0, neuron_f32_byte_size);
 
-    // membrane_potentials [neuron_count] — filled with resting_mp
     membrane_potentials = allocate<f32>(neuron_f32_byte_size);
     std::fill(membrane_potentials.get_contents(),
             membrane_potentials.get_contents() + neuron_count,
             resting_membrane_potential);
 
-    // last_spiked [neuron_count] — zero initialized
     last_spiked = allocate<s64>(neuron_s64_byte_size);
     memset(last_spiked.get_contents(), 0, neuron_s64_byte_size);
 
-    // last_tick_updated [neuron_count] — zero initialized
     last_tick_updated = allocate<s64>(neuron_s64_byte_size);
     memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
 
-    // active/next_active index buffers [neuron_count] — filled during simulation
     active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
     next_active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
 
-    // single-element count buffers — zero initialized
     active_neuron_count = allocate<s32>(sizeof(s32));
     next_active_neuron_count = allocate<s32>(sizeof(s32));
     active_neuron_count.get_contents()[0] = 0;
     next_active_neuron_count.get_contents()[0] = 0;
 
-    // active_generation [neuron_count] — filled with -1 (all inactive)
     active_generation = allocate<s32>(neuron_s32_byte_size);
     s32 *active_generation_data = active_generation.get_contents();
     for (s64 neuron_index = 0; neuron_index < neuron_count; ++neuron_index)
         active_generation_data[neuron_index] = -1;
 
-    // input_staging / override_staging [neuron_count] — persistent step_simulation scratch
-    // buffers, overwritten in place each tick instead of allocate/copy/free per tick (SC-20)
     input_staging = allocate<f32>(neuron_f32_byte_size);
     override_staging = allocate<s64>(neuron_s64_byte_size);
 
-    // Every buffer above is read and/or written by step_simulation's kernels on
-    // every tick for the engine's whole lifetime — prefetch them to the device
-    // once here instead of letting the first tick fault each page over
-    // one-by-one as the kernels touch it (SC-18).
+    prefetch_to_gpu(network_inputs, neuron_f32_byte_size);
+    prefetch_to_gpu(membrane_potentials, neuron_f32_byte_size);
+    prefetch_to_gpu(last_spiked, neuron_s64_byte_size);
+    prefetch_to_gpu(last_tick_updated, neuron_s64_byte_size);
+    prefetch_to_gpu(active_neuron_indices, neuron_s32_byte_size);
+    prefetch_to_gpu(next_active_neuron_indices, neuron_s32_byte_size);
+    prefetch_to_gpu(active_neuron_count, sizeof(s32));
+    prefetch_to_gpu(next_active_neuron_count, sizeof(s32));
+    prefetch_to_gpu(active_generation, neuron_s32_byte_size);
+    prefetch_to_gpu(input_staging, neuron_f32_byte_size);
+    prefetch_to_gpu(override_staging, neuron_s64_byte_size);
+
+    logger->debug("SpikeEngine buffers allocated: neuron_f32_byte_size={} neuron_s32_byte_size={} "
+                  "neuron_s64_byte_size={} thread_count_per_block={} block_count={}",
+                  neuron_f32_byte_size, neuron_s32_byte_size, neuron_s64_byte_size,
+                  thread_count_per_block, block_count);
+    logger->info("SpikeEngine constructed: neuron_count={} resting_mp={} decay_rate={} learning_rate={}",
+                  neuron_count, resting_membrane_potential, decay_rate, learning_rate);
+}
+
+SpikeEngine::SpikeEngine(
+    vector<vector<s32>> *network,
+    const vector<s64> &shape,
+    s64 rank,
+    f32 resting_mp,
+    f32 decay_rate,
+    f32 learning_rate,
+    bool plasticity_enabled
+)
+    : logger(make_logger())
+    , weights(*network, rank, true)
+    , neuron_count(shape[0] * shape[1])
+    , input_neuron_count(0)
+    , thread_count_per_block(256)
+    , block_count(0)
+    , resting_membrane_potential(resting_mp)
+    , decay_rate(decay_rate)
+    , learning_rate(learning_rate)
+    , spike_period(1)
+    , spike_threshold(1.0f)
+    , alive(true)
+{
+    if (!plasticity_enabled && learning_rate > 0.0f) {
+        throw std::runtime_error("Spike engine cannot be initialized with learning rate > 0.0f while plasticity is disabled.");
+    }
+
+    if (!plasticity_enabled) learning_rate = 0.0f;
+
+
+    block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
+
+    usize neuron_f32_byte_size = (usize) neuron_count * sizeof(f32);
+    usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
+    usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
+
+    network_inputs = allocate<f32>(neuron_f32_byte_size);
+    memset(network_inputs.get_contents(), 0, neuron_f32_byte_size);
+
+    membrane_potentials = allocate<f32>(neuron_f32_byte_size);
+    std::fill(membrane_potentials.get_contents(),
+            membrane_potentials.get_contents() + neuron_count,
+            resting_membrane_potential);
+
+    last_spiked = allocate<s64>(neuron_s64_byte_size);
+    memset(last_spiked.get_contents(), 0, neuron_s64_byte_size);
+
+    last_tick_updated = allocate<s64>(neuron_s64_byte_size);
+    memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
+
+    active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
+    next_active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
+
+    active_neuron_count = allocate<s32>(sizeof(s32));
+    next_active_neuron_count = allocate<s32>(sizeof(s32));
+    active_neuron_count.get_contents()[0] = 0;
+    next_active_neuron_count.get_contents()[0] = 0;
+
+    active_generation = allocate<s32>(neuron_s32_byte_size);
+    s32 *active_generation_data = active_generation.get_contents();
+    for (s64 neuron_index = 0; neuron_index < neuron_count; ++neuron_index)
+        active_generation_data[neuron_index] = -1;
+
+    input_staging = allocate<f32>(neuron_f32_byte_size);
+    override_staging = allocate<s64>(neuron_s64_byte_size);
+
     prefetch_to_gpu(network_inputs, neuron_f32_byte_size);
     prefetch_to_gpu(membrane_potentials, neuron_f32_byte_size);
     prefetch_to_gpu(last_spiked, neuron_s64_byte_size);
@@ -114,7 +180,23 @@ SpikeEngine::SpikeEngine(
 
 SpikeEngine::~SpikeEngine() {
     logger->info("Spike Engine shutting down.");
-    if (running) shutdown();
+    if (alive) shutdown();
+}
+
+bool SpikeEngine::plasticity_enabled() {
+    return learning_rate > 0.0f;
+}
+
+void SpikeEngine::enable_plasticity(f32 _learning_rate) {
+    if (plasticity_enabled()) return;
+
+    learning_rate = _learning_rate;
+}
+
+void SpikeEngine::disable_plasticity() {
+    if (!plasticity_enabled()) return;
+
+    learning_rate = 0.0f;
 }
 
 void SpikeEngine::setup_lifetime(int lifetime_, bool allocate_logs, s64 max_log_bytes) {
@@ -189,12 +271,6 @@ void SpikeEngine::step_simulation(
     logger->trace("step_simulation: tick={} input_values.size={} override_input_neurons.size={} decay_all_neurons={}",
                   tick, input_values.size(), override_input_neurons.size(), decay_all_neurons);
 
-    // Batch every kernel this tick needs (decay + add_network_input + merge + step) into
-    // a single command buffer instead of committing/waitUntilCompleted per kernel — cuts
-    // the tick from up to four CPU/GPU round trips down to one (SC-19). Still waited on
-    // before returning: the host swaps active_neuron_indices/active_neuron_count below and
-    // the next tick immediately overwrites input_staging/override_staging/next_active_neuron_count,
-    // all of which the just-encoded kernels read or write.
     MetalCommandBatch *batch = begin_command_batch();
 
     if (decay_all_neurons) {
@@ -208,10 +284,6 @@ void SpikeEngine::step_simulation(
             batch);
     }
 
-    // input_values/override_input_neurons are host-side vectors — the GPU kernels need them
-    // in GPU-visible memory (mirrors the Python reference's per-step cp.asarray(input_values)
-    // transfer), so copy into the persistent staging buffers here (input_staging /
-    // override_staging are allocated once in the constructor and overwritten in place).
     memcpy(input_staging.get_contents(), input_values.data(), input_values.size() * sizeof(f32));
 
     // QUESTION: anyway to combine these two steps? what exactly is the merge_input_neurons for?
@@ -310,12 +382,7 @@ void SpikeEngine::start_static_record(
     }
 
     // Each tick's input row is positionally matched to input_neuron_indices, so
-    // it must contain exactly input_neuron_count values. A wider row would make
-    // step_simulation's add_network_input kernel read uninitialized
-    // input_neuron_indices slots and write out of bounds; an empty/short row
-    // would silently under-stimulate or fail mid-loop, leaving a truncated
-    // recording. Validate up front (before opening the output file) so bad input
-    // produces no partial file.
+    // it must contain exactly input_neuron_count values.
     for (s64 tick = 0; tick < lifetime; ++tick) {
         if ((s64)input_spikes[(usize)tick].size() != input_neuron_count) {
             log::throw_runtime_error(*logger,
@@ -331,8 +398,7 @@ void SpikeEngine::start_static_record(
         compression_async, compression_queue_max, compression_chunk_bytes);
 
     // Forces input neurons into the active set every tick regardless of
-    // whether they're already active — mirrors the reference's per-tick
-    // _add_active(self.input_neurons, tick) call (spike_engine_cuda.py:344-345).
+    // whether they're already active
     vector<s64> override_input_neurons((usize)input_neuron_count);
     const s32 *input_indices = input_neuron_indices.get_contents();
     for (s64 i = 0; i < input_neuron_count; ++i)
@@ -343,8 +409,7 @@ void SpikeEngine::start_static_record(
 
         if (record_membrane && tick % record_stride == 0) {
             // _decay_all(tick) runs after step() and only on recorded ticks,
-            // immediately before the membrane-potential snapshot — a real,
-            // stateful operation (spike_engine_cuda.py:347-352), not a preview.
+            // immediately before the membrane-potential snapshot
             if (full_decay) {
                 gpu_decay_all_neurons(
                     membrane_potentials.get_contents(),
@@ -381,9 +446,11 @@ void SpikeEngine::scale_uniform_weights_near_bifurcation(
     *w_instant = w_instant_;
     *target = *w_accum * scale;
     weights.set_constant_weight(*target);
+
     if (freeze_learning) {
         learning_rate = 0.0f;
     }
+
     use_constant_weight = use_constant_weight_ != nullptr
         ? *use_constant_weight_
         : freeze_learning;
@@ -397,7 +464,9 @@ ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(s32
     auto [w_accum, w_instant] = estimate_bifurcation_weight(input_period);
     f32 target = abs(w_accum * scale);
     ScaleResult result = weights.scale_neighbor_weights_to_root_mean_square(target);
+
     use_constant_weight = false;
+
     if (freeze_learning) {
         learning_rate = 0.0f;
     }
@@ -432,12 +501,8 @@ void SpikeEngine::get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 vol
         output_buffer.get_contents());
 }
 
-bool SpikeEngine::is_alive() const {
-    return running;
-}
-
 void SpikeEngine::shutdown() {
-    if (!running) return;
+    if (!alive) return;
 
     logger->info("shutdown: releasing GPU buffers");
 
@@ -461,7 +526,7 @@ void SpikeEngine::shutdown() {
     deallocate(std::move(input_staging));
     deallocate(std::move(override_staging));
 
-    running = false;
+    alive = false;
 }
 
 
