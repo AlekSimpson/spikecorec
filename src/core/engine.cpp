@@ -35,6 +35,7 @@ SpikeEngine::SpikeEngine()
     , spike_period(1)
     , spike_threshold(1.0f)
     , alive(true)
+    , active_set_optimization_enabled(true)
 {
 
     block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
@@ -100,7 +101,8 @@ SpikeEngine::SpikeEngine(
     f32 resting_mp,
     f32 decay_rate,
     f32 learning_rate,
-    bool plasticity_enabled
+    bool plasticity_enabled, 
+    bool active_set_optimization_enabled
 )
     : logger(make_logger())
     , weights(*network, rank, true)
@@ -114,6 +116,7 @@ SpikeEngine::SpikeEngine(
     , spike_period(1)
     , spike_threshold(1.0f)
     , alive(true)
+    , active_set_optimization_enabled(active_set_optimization_enabled)
 {
     if (!plasticity_enabled && learning_rate > 0.0f) {
         throw std::runtime_error("Spike engine cannot be initialized with learning rate > 0.0f while plasticity is disabled.");
@@ -338,6 +341,7 @@ void SpikeEngine::step_simulation(
         next_active_neuron_indices.get_contents(),
         next_active_neuron_count.get_contents(),
         active_generation.get_contents(),
+        active_set_optimization_enabled,
         thread_count_per_block,
         block_count,
         batch);
