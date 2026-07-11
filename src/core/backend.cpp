@@ -836,6 +836,7 @@ void gpu_step(
    s32          *next_active_neuron_indices,
    s32          *next_active_neuron_count,
    s32          *active_generation,
+   bool          active_set_optimization_enabled,
    s32           thread_count_per_block,
    s32           block_count,
    MetalCommandBatch *batch
@@ -848,48 +849,87 @@ void gpu_step(
     (void)batch;
     if (block_count <= 0 || thread_count_per_block <= 0) return;
 
-    cuda::step_kernel<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
-        tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
-        U, V, rank_float4_stride, constant_weight,
-        internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
-        active_neuron_indices, active_neuron_count, next_active_neuron_indices, next_active_neuron_count,
-        active_generation
-    );
+    if (active_set_optimization_enabled) {
+        cuda::step_kernel<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
+            tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
+            U, V, rank_float4_stride, constant_weight,
+            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+            branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
+            neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
+            active_neuron_indices, active_neuron_count, next_active_neuron_indices, next_active_neuron_count,
+            active_generation
+        );
+    }else {
+        cuda::step_kernel_no_active_optimization<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
+            tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
+            U, V, rank_float4_stride, constant_weight,
+            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+            branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
+            neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated
+        );
+    }
+
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
 #elif defined(SPIKECOREC_METAL)
-    static KernelHandle kernel_handle = load_precompiled_kernel("step");
-    constexpr u32 threads_per_block = 256;
-    LaunchConfig config{
-        (static_cast<u32>(neuron_count) + threads_per_block - 1) / threads_per_block,
-        threads_per_block
-    };
+    if (active_set_optimization_enabled) {
+        static KernelHandle kernel_handle = load_precompiled_kernel("step");
+        constexpr u32 threads_per_block = 256;
+        LaunchConfig config{
+            (static_cast<u32>(neuron_count) + threads_per_block - 1) / threads_per_block,
+            threads_per_block
+        };
 
-    const void *args[] = {
-       &tick, &next_tick, &spike_period, &spike_threshold,
-       &learning_rate, &decay_rate, &resting_mp, &U, &V,
-       &rank_float4_stride, &constant_weight, &internal_node_words, &leaf_node_words,
-       &rank_superblock_table, &rank_subblock_table, &branching_factor,
-       &superblock_size_words, &padded_node_count, &tree_height,
-       &internal_bit_count, &neuron_count, &network_inputs, &membrane_potentials,
-       &last_spiked, &last_tick_updated, &active_neuron_indices, &active_neuron_count,
-       &next_active_neuron_indices, &next_active_neuron_count,
-       &active_generation, &thread_count_per_block, &block_count
-    };
-    const usize arg_sizes[] = {
-        sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),
-        sizeof(float4 *), sizeof(float4 *), sizeof(s64), sizeof(f32), sizeof(const u32 *), sizeof(const u32 *), sizeof(const u32 *),
-        sizeof(const u16 *), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s64),
-        sizeof(f32 *), sizeof(f32 *), sizeof(s64 *), sizeof(s64 *), sizeof(const s32 *), sizeof(const s32 *),
-        sizeof(s32 *), sizeof(s32 *), sizeof(s32 *),
-        sizeof(s32), sizeof(s32)
-    };
+        const void *args[] = {
+           &tick, &next_tick, &spike_period, &spike_threshold,
+           &learning_rate, &decay_rate, &resting_mp, &U, &V,
+           &rank_float4_stride, &constant_weight, &internal_node_words, &leaf_node_words,
+           &rank_superblock_table, &rank_subblock_table, &branching_factor,
+           &superblock_size_words, &padded_node_count, &tree_height,
+           &internal_bit_count, &neuron_count, &network_inputs, &membrane_potentials,
+           &last_spiked, &last_tick_updated, &active_neuron_indices, &active_neuron_count,
+           &next_active_neuron_indices, &next_active_neuron_count,
+           &active_generation, &thread_count_per_block, &block_count
+        };
+        const usize arg_sizes[] = {
+            sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),
+            sizeof(float4 *), sizeof(float4 *), sizeof(s64), sizeof(f32), sizeof(const u32 *), sizeof(const u32 *), sizeof(const u32 *),
+            sizeof(const u16 *), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s64),
+            sizeof(f32 *), sizeof(f32 *), sizeof(s64 *), sizeof(s64 *), sizeof(const s32 *), sizeof(const s32 *),
+            sizeof(s32 *), sizeof(s32 *), sizeof(s32 *),
+            sizeof(s32), sizeof(s32)
+        };
 
-    metal_dispatch(kernel_handle, config, args, arg_sizes, 31, batch);
 
+        metal_dispatch(kernel_handle, config, args, arg_sizes, 31, batch);
+    }else {
+        static KernelHandle kernel_handle = load_precompiled_kernel("step_no_active_optimization");
+        constexpr u32 threads_per_block = 256;
+        LaunchConfig config{
+            (static_cast<u32>(neuron_count) + threads_per_block - 1) / threads_per_block,
+            threads_per_block
+        };
+
+        const void *args[] = {
+           &tick, &next_tick, &spike_period, &spike_threshold,
+           &learning_rate, &decay_rate, &resting_mp, &U, &V,
+           &rank_float4_stride, &constant_weight, &internal_node_words, &leaf_node_words,
+           &rank_superblock_table, &rank_subblock_table, &branching_factor,
+           &superblock_size_words, &padded_node_count, &tree_height,
+           &internal_bit_count, &neuron_count, &network_inputs, &membrane_potentials,
+           &last_spiked, &last_tick_updated, &thread_count_per_block, &block_count
+        };
+        const usize arg_sizes[] = {
+            sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),
+            sizeof(float4 *), sizeof(float4 *), sizeof(s64), sizeof(f32), sizeof(const u32 *), sizeof(const u32 *), sizeof(const u32 *),
+            sizeof(const u16 *), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s64),
+            sizeof(f32 *), sizeof(f32 *), sizeof(s64 *), sizeof(s64 *),
+            sizeof(s32), sizeof(s32)
+        };
+
+        metal_dispatch(kernel_handle, config, args, arg_sizes, 26, batch);
+    }
 #endif
 }
 

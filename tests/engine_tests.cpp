@@ -467,3 +467,109 @@ TEST(SpikeEngine, plasticity_end_to_end) {
     auto [live_before, live_after] = run_edge_update(/*learning_rate=*/0.5f);
     EXPECT_GT(std::fabs(live_after - live_before), 1e-6f);
 }
+
+// ── active-set optimization toggle ────────────────────────────────────────────
+
+TEST(SpikeEngine, active_set_optimization_constructor_flag) {
+    auto network = square_torus(4);
+
+    {
+        SpikeEngine engine_with_optimization(&network, {4, 4}, /*rank=*/4,
+                                             /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                                             /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                                             /*active_set_optimization_enabled=*/true);
+        EXPECT_TRUE(engine_with_optimization.active_set_optimization_enabled);
+        engine_with_optimization.shutdown();
+    }
+    {
+        SpikeEngine engine_without_optimization(&network, {4, 4}, /*rank=*/4,
+                                                /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                                                /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                                                /*active_set_optimization_enabled=*/false);
+        EXPECT_FALSE(engine_without_optimization.active_set_optimization_enabled);
+        engine_without_optimization.shutdown();
+    }
+}
+
+TEST(SpikeEngine, active_set_optimization_disabled_step_loop) {
+    auto network = square_torus(4);
+    SpikeEngine engine(&network, {4, 4}, /*rank=*/4,
+                       /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                       /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                       /*active_set_optimization_enabled=*/false);
+    engine.set_input_neurons({0, 1, 2});
+
+    bool moved_from_resting = false;
+    for (s64 tick = 0; tick < 10; ++tick) {
+        engine.step_simulation({2.0f, 2.0f, 2.0f}, tick);
+
+        const f32 *membrane_potentials = engine.membrane_potentials.get_contents();
+        for (s64 index = 0; index < engine.neuron_count; ++index) {
+            EXPECT_TRUE(std::isfinite(membrane_potentials[index]));
+            if (std::fabs(membrane_potentials[index] - engine.resting_membrane_potential) > 1e-6f)
+                moved_from_resting = true;
+        }
+    }
+    EXPECT_TRUE(moved_from_resting);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, active_set_optimization_disabled_active_count_not_tracked) {
+    auto network = square_torus(4);
+    SpikeEngine engine(&network, {4, 4}, /*rank=*/4,
+                       /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                       /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                       /*active_set_optimization_enabled=*/false);
+    engine.set_input_neurons({0, 1, 2});
+
+    for (s64 tick = 0; tick < 5; ++tick)
+        engine.step_simulation({2.0f, 2.0f, 2.0f}, tick);
+
+    // The no-active-optimization kernel does not write to next_active_neuron_count,
+    // so after each step the count (reset to 0 before gpu_step) stays 0.
+    EXPECT_EQ(engine.active_neuron_count.get_contents()[0], 0);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, active_set_optimization_disabled_spike_propagation_equivalence) {
+    // Chain: 0 -> 1 -> 2 -> 3 -> 4. Fire neuron 0 at tick 0, expect each
+    // subsequent neuron to fire one tick later. Verify both code paths produce
+    // the same last_spiked vector.
+    const s32 chain_length = 5;
+    vector<vector<s32>> network(chain_length);
+    for (s32 index = 0; index + 1 < chain_length; ++index) network[index] = {index + 1};
+    network[chain_length - 1] = {};
+
+    auto run_chain = [&](bool active_set_optimization_enabled) -> vector<s64> {
+        SpikeEngine engine(&network, {chain_length, 1}, /*rank=*/4,
+                           /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                           /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                           active_set_optimization_enabled);
+        configure_deterministic(engine, /*weight=*/2.0f);
+        engine.set_input_neurons({0});
+
+        for (s64 tick = 0; tick < chain_length; ++tick) {
+            vector<f32> input_values = (tick == 0) ? vector<f32>{2.0f} : vector<f32>{0.0f};
+            vector<s64> override_neurons = (tick == 0) ? vector<s64>{0} : vector<s64>{};
+            engine.step_simulation(input_values, tick, override_neurons);
+        }
+
+        const s64 *last_spiked_ptr = engine.last_spiked.get_contents();
+        vector<s64> result(last_spiked_ptr, last_spiked_ptr + chain_length);
+        engine.shutdown();
+        return result;
+    };
+
+    vector<s64> with_optimization    = run_chain(/*active_set_optimization_enabled=*/true);
+    vector<s64> without_optimization = run_chain(/*active_set_optimization_enabled=*/false);
+
+    ASSERT_EQ(with_optimization.size(), without_optimization.size());
+    for (s32 index = 0; index < chain_length; ++index) {
+        EXPECT_EQ(with_optimization[index], without_optimization[index])
+            << "last_spiked mismatch at neuron " << index;
+        EXPECT_EQ(with_optimization[index], (s64)index)
+            << "expected neuron " << index << " to spike at tick " << index;
+    }
+}
