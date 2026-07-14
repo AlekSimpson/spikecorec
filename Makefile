@@ -80,6 +80,10 @@ endif
 NML_STD_LIB_DIR := $(abspath third_party/neuroml2/std_lib)
 CXXFLAGS        += -DSPIKECOREC_NML_STD_LIB_DIR=\"$(NML_STD_LIB_DIR)\"
 
+# ── NeuroML2 XSD schema path (vendored, ticket #8 [A2]) ──────────────────────
+NML_SCHEMA_PATH := $(abspath third_party/neuroml2/schema/NeuroML_v2.3.xsd)
+CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
+
 # ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────
 # Header-only mode is spdlog's default (it self-defines SPDLOG_HEADER_ONLY
 # whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.
