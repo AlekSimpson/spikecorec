@@ -355,7 +355,7 @@
 
     <!--   Not yet stable...
 
-    <Component Type name="EventConnectivity">
+    <ComponentType name="EventConnectivity">
         <Child name="Connections" type="ConnectionPattern"/>
         <Link name="source" type="population"/>
         <Link name="target" type="population"/>

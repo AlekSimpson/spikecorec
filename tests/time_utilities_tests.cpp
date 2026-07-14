@@ -3,7 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "spikecorec/core/types.h"
-#include "spikecorec/core/simulation_time_utilities.h"
+#include "spikecorec/core/time_utilities.h"
 
 using namespace std;
 using namespace spikecorec;
