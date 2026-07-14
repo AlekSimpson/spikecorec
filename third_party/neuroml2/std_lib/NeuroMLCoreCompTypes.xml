@@ -1,0 +1,254 @@
+<Lems xmlns="http://www.neuroml.org/lems/0.7.6"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.neuroml.org/lems/0.7.6 ../../LEMS/Schemas/LEMS/LEMS_v0.7.6.xsd">
+
+    <!-- A number of common component types for use in NeuroML 2 documents  -->
+
+    <!-- Including standard unit definitions for NeuroML 2 -->
+    <Include file="NeuroMLCoreDimensions.xml"/>
+
+    <!-- Potentially needed for any NeuroML 2 file...-->
+    <ComponentType name="notes" description="Human readable notes/description for a Component">
+    </ComponentType>
+
+
+    <ComponentType name="annotation" description="A structured annotation containing metadata, specifically RDF or _property_ elements">
+        <Child name="rdf:RDF" type="rdf_RDF"/>
+        <Children name="property" type="property"/>
+        <Dynamics/>
+    </ComponentType>
+
+
+    <ComponentType name="property" description="A property (a _tag and _value pair), which can be on any _baseStandalone_ either as a direct child, or within an _Annotation_. Generally something which helps the visual display or facilitates simulation of a Component, but is not a core physiological property. Common examples include: _numberInternalDivisions, equivalent of nseg in NEURON; _radius, for a radius to use in graphical displays for abstract cells (i.e. without defined morphologies); _color, the color to use for a _Population_ or _populationList_ of cells; _recommended_dt_ms, the recommended timestep to use for simulating a _Network_, _recommended_duration_ms the recommended duration to use when running a _Network_ ">
+        <Text name="tag" description="Name of the property"/>
+        <Text name="value" description="Value of the property"/>
+        <Dynamics/>
+    </ComponentType>
+
+    <ComponentType name="baseStandalone"
+        description="Base type of any Component which can have _Notes_, _Annotation_, or a _property_ list.">
+        <Child name="notes" type="notes"/>
+        <Child name="annotation" type="annotation"/>
+        <Children name="property" type="property"/>
+    </ComponentType>
+
+
+    <ComponentType name="rdf_RDF" description="Structured block in an _annotation_ based on RDF. See https://github.com/OpenSourceBrain/OSB_API/blob/master/python/examples/grancelllayer.xml">
+        <Child name="rdf:Description" type="rdf_Description"/>
+        <Text name="xmlns:rdf"/>
+        <Text name="xmlns:rdfs"/>
+        <Text name="xmlns:dcterms"/>
+        <Text name="xmlns:dc"/>
+        <Text name="xmlns:prism"/>
+        <Text name="xmlns:bqbiol"/>
+        <Text name="xmlns:bqmodel"/>
+        <Text name="xmlns:scoro"/>
+        <Text name="xmlns:collex"/>
+        <Dynamics/>
+    </ComponentType>
+
+
+    <ComponentType name="rdf_Description" description="Structured block in an _annotation_ based on RDF.">
+
+        <Child name="dc:title" type="dc_title"/>
+        <Child name="dc:description" type="dc_description"/>
+        <Child name="dcterms:abstract" type="dcterms_abstract"/>
+        <Child name="dcterms:license" type="dcterms_license"/>
+        <Child name="dcterms:created" type="dcterms_created"/>
+
+        <!-- for people info from FOAF: not complete -->
+        <Child name="foaf:name" type="foaf_name"/>
+        <Child name="foaf:homepage" type="foaf_homepage"/>
+        <Child name="foaf:account" type="foaf_account"/>
+        <Child name="foaf:fundedBy" type="foaf_fundedBy"/>
+        <Child name="foaf:mbox" type="foaf_mbox"/>
+        <Child name="foaf:weblog" type="foaf_weblog"/>
+        <Child name="foaf:thumbnail" type="foaf_thumbnail"/>
+        <Child name="foaf:publications" type="foaf_publications"/>
+        <Child name="orcid:id" type="orcid_id"/>
+
+        <Child name="bqbiol:encodes" type="bqbiol_encodes"/>
+        <Child name="bqbiol:hasPart" type="bqbiol_hasPart"/>
+        <Child name="bqbiol:hasProperty" type="bqbiol_hasProperty"/>
+        <Child name="bqbiol:hasVersion" type="bqbiol_hasVersion"/>
+        <Child name="bqbiol:is" type="bqbiol_is"/>
+        <Child name="bqbiol:isDescribedBy" type="bqbiol_isDescribedBy"/>
+        <Child name="bqbiol:isEncodedBy" type="bqbiol_isEncodedBy"/>
+        <Child name="bqbiol:isHomologTo" type="bqbiol_isHomologTo"/>
+        <Child name="bqbiol:isPartOf" type="bqbiol_isPartOf"/>
+        <Child name="bqbiol:isPropertyOf" type="bqbiol_isPropertyOf"/>
+        <Child name="bqbiol:isVersionOf" type="bqbiol_isVersionOf"/>
+        <Child name="bqbiol:occursIn" type="bqbiol_occursIn"/>
+        <Child name="bqbiol:hasTaxon" type="bqbiol_hasTaxon"/>
+        <Child name="bqmodel:is" type="bqmodel_is"/>
+        <Child name="bqmodel:isDescribedBy" type="bqmodel_isDescribedBy"/>
+        <Child name="bqmodel:isDerivedFrom" type="bqmodel_isDerivedFrom"/>
+        <Child name="bqmodel:isIntanceOf" type="bqmodel_isInstanceOf"/>
+        <Child name="bqmodel:hasInstance" type="bqmodel_hasInstance"/>
+        <Child name="prism:keyword" type="prism_keyword"/>
+        <Child name="collex:thumbnail" type="collex_thumbnail"/>
+        <Child name="scoro:successor" type="scoro_successor"/>
+        <Child name="rdfs:seeAlso" type="rdfs_seeAlso"/>
+        <Child name="dcterms:references" type="dcterms_references"/>
+        <Child name="dc:creator" type="dc_creator"/>
+        <Child name="dc:contributor" type="dc_contributor"/>
+        <Child name="dc:source" type="dc_source"/>
+        <Child name="scoro:funder" type="scoro_funder"/>
+        <Child name="dcterms:modified" type="dcterms_modified"/>
+        <Text name="rdf:about"/>
+        <Dynamics/>
+    </ComponentType>
+
+
+    <!-- base RDF types -->
+    <ComponentType name="baseAnnotation_without_ns" description="Structured block in an _annotation_ based on RDF.">
+        <Child name="rdf:Bag" type="rdf_Bag"/>
+        <Dynamics/>
+    </ComponentType>
+
+    <ComponentType name="baseBqbiol" description="Structured block in an _annotation_ based on RDF." extends="baseAnnotation_without_ns">
+        <Text name="xmlns:bqbiol"/>
+        <Dynamics/>
+    </ComponentType>
+
+    <ComponentType name="baseBqmodel" description="Structured block in an _annotation_ based on RDF." extends="baseAnnotation_without_ns">
+        <Text name="xmlns:bqmodel"/>
+        <Dynamics/>
+    </ComponentType>
+
+    <ComponentType name="rdf_Bag" description="Structured block in an _annotation_ based on RDF.">
+        <Child name="rdf:li" type="rdf_li"/>
+        <Dynamics/>
+    </ComponentType>
+
+    <ComponentType name="rdf_li" description="Structured block in an _annotation_ based on RDF.">
+        <Text name="rdf:resource"/>
+        <Dynamics/>
+    </ComponentType>
+
+
+    <ComponentType name="bqbiol_encodes" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_hasPart" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_hasProperty" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_hasVersion" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_is" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_isDescribedBy" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_isEncodedBy" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_isHomologTo" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_isPartOf" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_isPropertyOf" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_isVersionOf" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol" />
+
+    <ComponentType name="bqbiol_occursIn" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqbiol_hasTaxon" description="See https://github.com/combine-org/combine-specifications" extends="baseBqbiol"/>
+
+    <ComponentType name="bqmodel_is" description="See https://github.com/combine-org/combine-specifications" extends="baseBqmodel"/>
+
+    <ComponentType name="bqmodel_isDescribedBy" description="See https://github.com/combine-org/combine-specifications" extends="baseBqmodel" />
+
+    <ComponentType name="bqmodel_isDerivedFrom" description="See https://github.com/combine-org/combine-specifications" extends="baseBqmodel"/>
+
+    <ComponentType name="bqmodel_isInstanceOf" description="See https://github.com/combine-org/combine-specifications" extends="baseBqmodel"/>
+
+    <ComponentType name="bqmodel_hasInstance" description="See https://github.com/combine-org/combine-specifications" extends="baseBqmodel"/>
+
+    <ComponentType name="dc_title" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" />
+
+    <ComponentType name="dc_description" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/"/>
+
+    <ComponentType name="dcterms_abstract" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/"/>
+
+    <ComponentType name="dcterms_license" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/"/>
+
+    <ComponentType name="dcterms_created" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/">
+        <Child name="rdf:Description" type="dcterms_created_description"/>
+    </ComponentType>
+
+    <ComponentType name="dcterms_created_description" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/">
+        <Child name="dcterms:W3CDTF" type="dcterms_date" />
+    </ComponentType>
+
+    <ComponentType name="dcterms_date" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" />
+
+    <ComponentType name="dcterms_modified" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/">
+        <Child name="rdf:Description" type="dcterms_modified_description"/>
+    </ComponentType>
+
+    <ComponentType name="dcterms_modified_description" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/">
+        <Child name="dcterms:W3CDTF" type="dcterms_date_list" />
+    </ComponentType>
+
+    <ComponentType name="dcterms_date_list" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+    <ComponentType name="dc_source" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="prism_keyword" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="collex_thumbnail" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="scoro_successor" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="rdfs_seeAlso" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="dcterms_references" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+    <ComponentType name="dc_creator" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="dc_contributor" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="scoro_funder" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" extends="baseAnnotation_without_ns"/>
+
+    <ComponentType name="foaf_name" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_homepage" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_account" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_fundedBy" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_mbox" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_weblog" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_thumbnail" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="foaf_publications" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+    <ComponentType name="orcid_id" description="https://docs.biosimulations.org/concepts/conventions/simulation-project-metadata/" >
+        <Text name="rdf:resource"/>
+    </ComponentType>
+
+    <ComponentType name="point3DWithDiam"
+                   description="Base type for ComponentTypes which specify an ( _x, _y, _z ) coordinate along with a _diameter. Note: no dimension used in the attributes for these coordinates! These are assumed to have dimension micrometer (10^-6 m). This is due to micrometers being the default option for the majority of neuronal morphology formats, and dimensions are omitted here to facilitate reading and writing of morphologies in NeuroML.">
+        <Parameter name="x" dimension="none" description="x coordinate of the point. Note: no dimension used, see description of _point3DWithDiam_ for details."/>
+        <Parameter name="y" dimension="none" description="y coordinate of the ppoint. Note: no dimension used, see description of _point3DWithDiam_ for details."/>
+        <Parameter name="z" dimension="none" description="z coordinate of the ppoint. Note: no dimension used, see description of _point3DWithDiam_ for details."/>
+        <Parameter name="diameter" dimension="none" description="Diameter of the ppoint. Note: no dimension used, see description of _point3DWithDiam_ for details."/> <!-- TODO decide whether this or radius should be default input field!!! -->
+
+        <DerivedParameter name="radius" dimension="length" value="MICRON * diameter / 2" description="A dimensional quantity given by half the _diameter."/>
+        <DerivedParameter name="xLength" dimension="length" value="MICRON * x" description="A version of _x with dimension length."/>  <!-- conversion to SI units... -->
+        <DerivedParameter name="yLength" dimension="length" value="MICRON * y" description="A version of _y with dimension length."/>  <!-- conversion to SI units... -->
+        <DerivedParameter name="zLength" dimension="length" value="MICRON * z" description="A version of _z with dimension length."/>  <!-- conversion to SI units... -->
+
+        <Constant name="MICRON" dimension="length" value="1um"/>
+    </ComponentType>
+
+
+</Lems>

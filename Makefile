@@ -63,6 +63,23 @@ ifeq ($(HAS_BZ2),yes)
   COMPRESSION_LIBS += $(shell pkg-config --libs bzip2)
 endif
 
+# ── XML parsing (libxml2 — NML/LEMS front-end, ticket #2 [A3]) ───────────────
+# Parse + XSD-validate NeuroML/LEMS XML (third_party/neuroml2/schema, std_lib).
+# Detected the same way as the compression codecs above, via pkg-config.
+HAS_LIBXML2 := $(shell pkg-config --exists libxml-2.0 && echo yes || echo no)
+
+ifeq ($(HAS_LIBXML2),yes)
+  CXXFLAGS     += -DSPIKECOREC_HAVE_LIBXML2 $(shell pkg-config --cflags libxml-2.0)
+  LIBXML2_LIBS := $(shell pkg-config --libs libxml-2.0)
+endif
+
+# ── NeuroML/LEMS standard-library bundle path (vendored, ticket #3 [A1]) ─────
+# Baked in as an absolute path at compile time (via $(abspath), a GNU Make
+# built-in) so NML_StandardLibrary::STANDARD_LIBRARY_PATH resolves correctly
+# no matter what directory the binary is later run from.
+NML_STD_LIB_DIR := $(abspath third_party/neuroml2/std_lib)
+CXXFLAGS        += -DSPIKECOREC_NML_STD_LIB_DIR=\"$(NML_STD_LIB_DIR)\"
+
 # ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────
 # Header-only mode is spdlog's default (it self-defines SPDLOG_HEADER_ONLY
 # whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.
@@ -97,6 +114,7 @@ endif
 
 # ── Source files ─────────────────────────────────────────────
 CORE_SRCS      := $(wildcard $(SRC_DIR)/core/*.cpp)
+NML_SRCS       := $(wildcard $(SRC_DIR)/nml/*.cpp)
 CUDA_SRCS      := $(wildcard $(SRC_DIR)/cuda/*.cu)
 METAL_SRCS     := $(wildcard $(SRC_DIR)/metal/*.cpp)
 METAL_SHADERS  := $(wildcard $(SRC_DIR)/metal/*.metal)
@@ -109,6 +127,7 @@ EX_SRCS        := $(wildcard $(EX_DIR)/*.cpp)
 
 # ── Object / artifact paths ──────────────────────────────────
 CORE_OBJS   := $(patsubst $(SRC_DIR)/%.cpp,  $(BUILD_DIR)/%.o,   $(CORE_SRCS))
+NML_OBJS    := $(patsubst $(SRC_DIR)/%.cpp,  $(BUILD_DIR)/%.o,   $(NML_SRCS))
 CUDA_OBJS   := $(patsubst $(SRC_DIR)/%.cu,   $(BUILD_DIR)/%.o,   $(CUDA_SRCS))
 METAL_OBJS  := $(patsubst $(SRC_DIR)/%.cpp,  $(BUILD_DIR)/%.o,   $(METAL_SRCS))
 AIR_FILES   := $(patsubst $(SRC_DIR)/metal/%.metal, \
@@ -145,16 +164,21 @@ ifneq ($(HAS_METAL),yes)
 endif
 
 # ── Static libraries ─────────────────────────────────────────
-$(CUDA_LIB): $(CORE_OBJS) $(CUDA_OBJS)
+$(CUDA_LIB): $(CORE_OBJS) $(NML_OBJS) $(CUDA_OBJS)
 	@mkdir -p $(@D)
 	$(AR) $(ARFLAGS) $@ $^
 
-$(METAL_LIB): $(CORE_OBJS) $(METAL_OBJS)
+$(METAL_LIB): $(CORE_OBJS) $(NML_OBJS) $(METAL_OBJS)
 	@mkdir -p $(@D)
 	$(AR) $(ARFLAGS) $@ $^
 
 # ── Core objects (platform-agnostic C++) ─────────────────────
 $(BUILD_DIR)/core/%.o: $(SRC_DIR)/core/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# ── NML/LEMS front-end objects (platform-agnostic C++) ───────
+$(BUILD_DIR)/nml/%.o: $(SRC_DIR)/nml/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -207,13 +231,13 @@ $(GTEST_OBJ): $(GTEST_DIR)/src/gtest-all.cc
 
 test-cuda: check-cuda $(CUDA_LIB) $(GTEST_OBJ)
 	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) -lpthread \
+	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_cuda
 	$(BUILD_DIR)/test_runner_cuda
 
 test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
 	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) -lpthread \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_metal
 	$(BUILD_DIR)/test_runner_metal
 
@@ -223,12 +247,12 @@ examples: examples-$(BACKEND)
 examples-cuda: check-cuda $(CUDA_LIB)
 	$(NVCC) $(NVCCFLAGS) $(EX_DIR)/cuda_example.cpp \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda \
-	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) \
+	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) $(LIBXML2_LIBS) \
 	    -o $(BUILD_DIR)/cuda_example
 
 examples-metal: check-metal $(METAL_LIB)
 	$(CXX) $(CXXFLAGS) $(EX_DIR)/metal_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(LIBXML2_LIBS) \
 	    -o $(BUILD_DIR)/metal_example
 
 # ── Utilities ────────────────────────────────────────────────
@@ -239,6 +263,7 @@ info:
 	@echo "zlib found : $(HAS_ZLIB)"
 	@echo "lzma found : $(HAS_LZMA)"
 	@echo "bzip2 found: $(HAS_BZ2)"
+	@echo "libxml2    : $(HAS_LIBXML2)"
 	@echo "Backend    : $(BACKEND)"
 	@echo "CXX        : $(CXX)"
 
