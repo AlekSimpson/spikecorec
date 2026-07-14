@@ -7,6 +7,7 @@
 #include <any>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <gtest/gtest.h>
 #include <libxml/parser.h>
@@ -153,4 +154,54 @@ TEST(NmlStandardLibrary, get_type_by_name_throws_on_missing_type) {
     ASSERT_FALSE(library.load_library());
 
     EXPECT_THROW(library.get_type_by_name("definitelyNotARealType_xyz"), std::runtime_error);
+}
+
+// ── validate_against_schema (ticket #8 [A2]) ────────────────
+
+namespace {
+
+String write_temp_file(const String &filename, const String &contents) {
+    String path = (std::filesystem::temp_directory_path() / filename).string();
+    std::ofstream out(path);
+    out << contents;
+    out.close();
+    return path;
+}
+
+} // namespace
+
+TEST(ValidateAgainstSchema, schema_path_is_baked_and_exists) {
+    EXPECT_FALSE(NML_SCHEMA_PATH.empty());
+    EXPECT_TRUE(std::filesystem::exists(NML_SCHEMA_PATH));
+}
+
+TEST(ValidateAgainstSchema, accepts_a_conformant_neuroml_document) {
+    String path = write_temp_file("spikecorec_valid_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TestDoc\">"
+        "  <izhikevichCell id=\"izTest\" v0=\"-70mV\" thresh=\"30mV\" a=\"0.02\" b=\"0.2\" c=\"-65\" d=\"6\"/>"
+        "</neuroml>");
+
+    EXPECT_TRUE(validate_against_schema(path));
+}
+
+TEST(ValidateAgainstSchema, rejects_a_document_with_an_unknown_element) {
+    String path = write_temp_file("spikecorec_invalid_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TestDoc\">"
+        "  <thisTagDoesNotExistInSchema id=\"oops\"/>"
+        "</neuroml>");
+
+    EXPECT_FALSE(validate_against_schema(path));
+}
+
+// A LEMS file (root <Lems>) is a real, well-formed XML document, but it is
+// not a NeuroML2 document — validating it against the NeuroML2 XSD must
+// still fail rather than silently pass.
+TEST(ValidateAgainstSchema, rejects_a_wellformed_but_wrong_schema_document) {
+    NML_StandardLibrary library;
+    String lems_file = library.STANDARD_LIBRARY_PATH + "/Cells.xml";
+    EXPECT_FALSE(validate_against_schema(lems_file));
+}
+
+TEST(ValidateAgainstSchema, rejects_a_missing_file) {
+    EXPECT_FALSE(validate_against_schema("/tmp/definitely_not_a_real_file_xyz.nml"));
 }

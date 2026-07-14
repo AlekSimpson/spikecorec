@@ -49,6 +49,21 @@ struct NML_StandardLibrary {
 //     Core types resolve fully offline; version is pinned and recorded.
 //     Merge-point API is documented and used by the resolve pass (A4).
 
+// Set by the Makefile via -DSPIKECOREC_NML_SCHEMA_PATH to an absolute path
+// (third_party/neuroml2/schema/NeuroML_v2.3.xsd, resolved with $(abspath) at
+// build time) — same approach as SPIKECOREC_NML_STD_LIB_DIR.
+#ifndef SPIKECOREC_NML_SCHEMA_PATH
+#define SPIKECOREC_NML_SCHEMA_PATH ""
+#endif
+
+const String NML_SCHEMA_PATH = SPIKECOREC_NML_SCHEMA_PATH;
+
+// Validates an NML/XML file against the vendored NeuroML2 XSD schema, using
+// libxml2's own schema-validation API (xmlSchema*) rather than a hand-rolled
+// check. Returns true iff the file is schema-valid; a malformed file returns
+// false and libxml2 prints its own located (element/line) diagnostics.
+bool validate_against_schema(const String &nml_file_path);
+
 
 
 
