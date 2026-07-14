@@ -1,5 +1,6 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <libxml/xmlschemastypes.h>
 #include <filesystem>
 
 #include "spikecorec/nml/nml.h"
@@ -113,6 +114,38 @@ ComponentType &NML_StandardLibrary::get_type_by_name(String name) {
     }
 
     return entry->second;
+}
+
+bool validate_against_schema(const String &nml_file_path) {
+    xmlSchemaParserCtxtPtr parser_context = xmlSchemaNewParserCtxt(NML_SCHEMA_PATH.c_str());
+    if (!parser_context) {
+        log::logger().error("Could not create XSD parser context for schema {}", NML_SCHEMA_PATH);
+        return false;
+    }
+
+    xmlSchemaPtr schema = xmlSchemaParse(parser_context);
+    xmlSchemaFreeParserCtxt(parser_context);
+    if (!schema) {
+        log::logger().error("Could not parse XSD schema {}", NML_SCHEMA_PATH);
+        return false;
+    }
+
+    xmlSchemaValidCtxtPtr valid_context = xmlSchemaNewValidCtxt(schema);
+    if (!valid_context) {
+        log::logger().error("Could not create XSD validation context for schema {}", NML_SCHEMA_PATH);
+        xmlSchemaFree(schema);
+        return false;
+    }
+
+    // xmlSchemaValidateFile: 0 = valid, >0 = validation errors (already
+    // printed to stderr by libxml2's default handler, located by element and
+    // line number), <0 = internal/API error.
+    int result = xmlSchemaValidateFile(valid_context, nml_file_path.c_str(), 0);
+
+    xmlSchemaFreeValidCtxt(valid_context);
+    xmlSchemaFree(schema);
+
+    return result == 0;
 }
 
 }
