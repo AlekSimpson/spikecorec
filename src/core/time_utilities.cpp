@@ -1,7 +1,7 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "spikecorec/core/simulation_time_utilities.h"
+#include "spikecorec/core/time_utilities.h"
 
 using namespace std;
 using namespace spikecorec;
