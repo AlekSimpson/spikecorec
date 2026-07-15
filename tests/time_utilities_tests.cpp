@@ -199,3 +199,46 @@ TEST(TickToSeconds, invalid_negative_tick) {
 TEST(TickToSeconds, invalid_negative_total_seconds) {
     EXPECT_THROW(tick_to_seconds(0, -1.0, 1000), invalid_argument);
 }
+
+// ── unit_value_to_si ──────────────────────────────────────────────────────────
+
+TEST(UnitValueToSi, converts_millivolts) {
+    EXPECT_TRUE(approx(unit_value_to_si("-70mV"), -0.07));
+}
+
+TEST(UnitValueToSi, converts_nanoamps) {
+    EXPECT_TRUE(approx(unit_value_to_si("0.5nA"), 5e-10));
+}
+
+TEST(UnitValueToSi, converts_nanosiemens) {
+    EXPECT_TRUE(approx(unit_value_to_si("5nS"), 5e-9));
+}
+
+TEST(UnitValueToSi, converts_nanofarads) {
+    EXPECT_TRUE(approx(unit_value_to_si("1.0nF"), 1e-9));
+}
+
+TEST(UnitValueToSi, converts_microsiemens) {
+    EXPECT_TRUE(approx(unit_value_to_si("0.05uS"), 5e-8));
+}
+
+TEST(UnitValueToSi, converts_milliseconds) {
+    EXPECT_TRUE(approx(unit_value_to_si("3ms"), 0.003));
+}
+
+TEST(UnitValueToSi, passes_through_dimensionless_bare_number) {
+    EXPECT_TRUE(approx(unit_value_to_si("0.02"), 0.02));
+    EXPECT_TRUE(approx(unit_value_to_si("1"), 1.0));
+}
+
+TEST(UnitValueToSi, converts_non_power_of_ten_minute_scale) {
+    EXPECT_TRUE(approx(unit_value_to_si("2min"), 120.0));
+}
+
+TEST(UnitValueToSi, throws_on_unknown_unit_symbol) {
+    EXPECT_THROW(unit_value_to_si("5zz"), invalid_argument);
+}
+
+TEST(UnitValueToSi, throws_on_malformed_numeric_prefix) {
+    EXPECT_THROW(unit_value_to_si("abc"), invalid_argument);
+}
