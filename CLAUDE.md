@@ -164,7 +164,7 @@ make clean
 - Repo: `AlekSimpson/spikecorec` (default branch `main`)
 - Project board: **spikecorec_project_board** — project number `5`, owner `AlekSimpson`
   (`gh project list --owner AlekSimpson` to re-derive the number if it ever changes)
-- Branches follow `SC-<issue-number>_<short-description>`, e.g. `SC-25_add_branching_factor_bound_checks`
+- Feature/Dev Branches follow `SC-<issue-number>_<short-description>`, e.g. `SC-25_add_branching_factor_bound_checks`
   is the working branch for issue #25 — the numeric prefix is the GitHub issue number, so
   `gh issue view <N>` finds the corresponding issue directly.
 - Issue labels: severity (`severity: critical|high|medium|low`) + category
@@ -175,6 +175,9 @@ make clean
   ```bash
   gh project item-add 5 --owner AlekSimpson --url <pr-url>
   ```
+- When a coding agent is assigned a task to work on, it should always check out a new feature branch to do the work on.
+  - Once a dev feature is complete and the review agent has approved it then all dev branches must make PRs into the "nightly" branch of the project. 
+  - ALL LLM DEV BRANCHES THAT OPEN A PR TO MASTER WILL BE DECLINED
 - **Sub-issues** are set via the REST API (`gh` has no direct command). To make issue `C` a child of
   issue `P`: `gh api --method POST repos/AlekSimpson/spikecorec/issues/<P>/sub_issues -F sub_issue_id=<C-database-id>`
   where the database id comes from `gh api repos/AlekSimpson/spikecorec/issues/<C> --jq .id`. Read a
