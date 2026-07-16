@@ -194,9 +194,29 @@ namespace spikecorec::nml {
 // walk helpers, RNG helpers) should be emitted once for the whole assembled file, not once per type
 // -- this ticket emits it per program since each example here is compiled as its own standalone
 // translation unit.
+// One generated top-level function's name plus its ordered parameter-name list -- exposes this
+// ticket's own "calling convention" (documented above) as DATA, not just text, so a caller (ticket
+// #6's master-kernel assembly) can build a metal_dispatch/cuda_dispatch args[] array generically by
+// resolving each name to a runtime pointer/value itself, instead of re-deriving which names a
+// generated function references (duplicating this lowering's own internal scan/bake/dedup rules
+// independently would risk silently drifting out of sync with the text actually emitted below).
+// Names are exactly the argument identifiers used in the generated signature, in the same order,
+// including the trailing dispatch-bound parameter(s) (`neuron_count` for the combined per-neuron
+// function; `source_node_indices`/`target_node_indices`/`edge_slot_indices`/`event_count` for a
+// deliver function).
+struct GpuFunctionSignature {
+    String function_name;
+    Vector<String> parameter_names_in_order;
+};
+
 struct GpuSource {
     String msl_source;
     String cuda_source;
+
+    // One entry per top-level function generated into msl_source/cuda_source, in the same order
+    // they appear there: the combined per-neuron function first (if any), then one per onevent/
+    // deliver block found in `.tick.deliver`, in that section's own order.
+    Vector<GpuFunctionSignature> functions;
 };
 
 // Lowers program's `.tick` to standalone, compilable MSL and CUDA source (see the calling
@@ -204,5 +224,14 @@ struct GpuSource {
 // parameter names/types/order -- `.alloc` itself is engine-interpreted at init (ticket #5), not
 // compiled.
 GpuSource lower_ir_program_to_gpu_source(const IrProgram &program);
+
+// The shared k^2-tree bit-walk preamble (`k2t_find_nth_neighbor` + its rank/bit helpers) this
+// lowering emits into a generated source whenever a program's `forall`/whole-set edge op needs it
+// (see this header's own doc comment above). Exposed standalone so ticket #6's master-kernel
+// assembly can reuse the SAME text for its own fixed k^2-tree propagate/scatter stage instead of
+// maintaining a second copy that could drift out of sync with the walk this file's own `forall`
+// lowering relies on.
+String k2tree_walk_preamble_msl();
+String k2tree_walk_preamble_cuda();
 
 } // namespace spikecorec::nml
