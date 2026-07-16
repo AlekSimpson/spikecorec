@@ -175,6 +175,14 @@ Vector<RegimeDecl> extract_regimes(const NML_Node &dynamics) {
     return result;
 }
 
+Vector<OnStartDecl> extract_on_starts(const NML_Node &dynamics) {
+    Vector<OnStartDecl> result;
+    for (const auto *child : find_children(dynamics, "OnStart")) {
+        result.push_back(OnStartDecl{*child});
+    }
+    return result;
+}
+
 ComponentTypeBase make_base(const NML_Node &node, const String &extends) {
     return ComponentTypeBase(get_attr(node, "name"), extends, node);
 }
@@ -192,6 +200,7 @@ CellType build_cell_type(const NML_Node &node, const String &extends) {
         result.derived_variables = extract_derived_variables(*dynamics);
         result.time_derivatives = extract_time_derivatives(*dynamics);
         result.on_conditions = extract_on_conditions(*dynamics);
+        result.on_starts = extract_on_starts(*dynamics);
         result.regimes = extract_regimes(*dynamics);
     }
 
@@ -214,6 +223,7 @@ SynapseType build_synapse_type(const NML_Node &node, const String &extends) {
         result.derived_variables = extract_derived_variables(*dynamics);
         result.time_derivatives = extract_time_derivatives(*dynamics);
         result.on_events = extract_on_events(*dynamics);
+        result.on_starts = extract_on_starts(*dynamics);
     }
 
     return result;
@@ -235,6 +245,7 @@ InputsType build_inputs_type(const NML_Node &node, const String &extends) {
         result.time_derivatives = extract_time_derivatives(*dynamics);
         result.on_conditions = extract_on_conditions(*dynamics);
         result.on_events = extract_on_events(*dynamics);
+        result.on_starts = extract_on_starts(*dynamics);
     }
 
     return result;

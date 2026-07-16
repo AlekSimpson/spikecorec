@@ -156,10 +156,20 @@ struct RegimeDecl {
     NML_Node body;
 };
 
+// `OnStart` (§3.2): initial-value assignments (seeds state at INIT, arch
+// §1.2 S3). Modeled explicitly (not left in `raw`, ticket #49 [A4]) so it
+// merges across an `extends` chain the same way as every other Dynamics-nested
+// tag — otherwise an ancestor-only `OnStart` (common in the std lib, e.g.
+// `iafTauCell`) is silently lost once a descendant is flattened. The nested
+// `StateAssignment`s stay tree-shaped, same rationale as OnConditionDecl.
+struct OnStartDecl {
+    NML_Node body;
+};
+
 // Identity common to every cataloged ComponentType (§1.2 S6, §3.1
 // `ComponentType`): its name, what it extends, and the untouched raw parsed
 // node — so nothing the categorized fields below don't model explicitly is
-// lost (e.g. `Structure`/`MultiInstantiate`/`ChildInstance`, `OnStart`).
+// lost (e.g. `Structure`/`MultiInstantiate`/`ChildInstance`).
 //
 // Provides an explicit (name, extends, raw) constructor so every category
 // below can be built by construction rather than default-construct-then-
@@ -186,6 +196,7 @@ struct CellType : ComponentTypeBase {
     Vector<DerivedVariableDecl> derived_variables;
     Vector<TimeDerivativeDecl> time_derivatives;
     Vector<OnConditionDecl> on_conditions;
+    Vector<OnStartDecl> on_starts;
     Vector<ExposureDecl> exposures;
     Vector<EventPortDecl> event_ports;
     Vector<RegimeDecl> regimes;
@@ -207,6 +218,7 @@ struct SynapseType : ComponentTypeBase {
     Vector<ExposureDecl> exposures;
     Vector<EventPortDecl> event_ports;
     Vector<OnEventDecl> on_events;
+    Vector<OnStartDecl> on_starts;
     Vector<ComponentReferenceDecl> component_references;
     Vector<ChildrenDecl> children;
 };
@@ -224,6 +236,7 @@ struct InputsType : ComponentTypeBase {
     Vector<TimeDerivativeDecl> time_derivatives;
     Vector<OnConditionDecl> on_conditions;
     Vector<OnEventDecl> on_events;
+    Vector<OnStartDecl> on_starts;
     Vector<ExposureDecl> exposures;
     Vector<EventPortDecl> event_ports;
     Vector<ChildrenDecl> children;
