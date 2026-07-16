@@ -12,6 +12,257 @@ using namespace std::filesystem;
 
 namespace spikecorec::nml {
 
+namespace {
+
+// ── ComponentType classification/extraction helpers (ticket #2 [A3]) ────
+//
+// Pulls the declaration-level (§3.1) and, where present, Dynamics-nested
+// (§3.2) tags out of a raw `<ComponentType>` NML_Node into the typed decl
+// structs declared in nml.h. Each extractor is a one-to-one mapping from one
+// recurring LEMS tag to its decl struct — no semantic interpretation, just
+// structural extraction (bake-vs-parameterize, extends-merge, etc. stay
+// resolve-pass concerns, ticket #49).
+
+String get_attr(const NML_Node &node, const String &name) {
+    auto entry = node.attributes.find(name);
+    if (entry == node.attributes.end()) return "";
+    return std::any_cast<String>(entry->second);
+}
+
+const NML_Node *find_child(const NML_Node &node, const String &tag) {
+    for (const auto &child : node.body) {
+        if (child.tag_name == tag) return &child;
+    }
+    return nullptr;
+}
+
+Vector<const NML_Node *> find_children(const NML_Node &node, const String &tag) {
+    Vector<const NML_Node *> matches;
+    for (const auto &child : node.body) {
+        if (child.tag_name == tag) matches.push_back(&child);
+    }
+    return matches;
+}
+
+Vector<ParameterDecl> extract_parameters(const NML_Node &node) {
+    Vector<ParameterDecl> result;
+    for (const auto *child : find_children(node, "Parameter")) {
+        result.push_back(ParameterDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
+    }
+    return result;
+}
+
+Vector<PropertyDecl> extract_properties(const NML_Node &node) {
+    Vector<PropertyDecl> result;
+    for (const auto *child : find_children(node, "Property")) {
+        result.push_back(PropertyDecl{get_attr(*child, "name"), get_attr(*child, "dimension"), get_attr(*child, "defaultValue")});
+    }
+    return result;
+}
+
+Vector<ExposureDecl> extract_exposures(const NML_Node &node) {
+    Vector<ExposureDecl> result;
+    for (const auto *child : find_children(node, "Exposure")) {
+        result.push_back(ExposureDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
+    }
+    return result;
+}
+
+Vector<EventPortDecl> extract_event_ports(const NML_Node &node) {
+    Vector<EventPortDecl> result;
+    for (const auto *child : find_children(node, "EventPort")) {
+        result.push_back(EventPortDecl{get_attr(*child, "name"), get_attr(*child, "direction")});
+    }
+    return result;
+}
+
+Vector<AttachmentDecl> extract_attachments(const NML_Node &node) {
+    Vector<AttachmentDecl> result;
+    for (const auto *child : find_children(node, "Attachments")) {
+        result.push_back(AttachmentDecl{get_attr(*child, "name"), get_attr(*child, "type")});
+    }
+    return result;
+}
+
+Vector<RequirementDecl> extract_requirements(const NML_Node &node) {
+    Vector<RequirementDecl> result;
+    for (const auto *child : find_children(node, "Requirement")) {
+        result.push_back(RequirementDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
+    }
+    return result;
+}
+
+// `ComponentReference`/`Link`, plus the electrical/graded-synapse and
+// projection-family equivalents (`InstanceRequirement`, `ComponentRequirement`)
+// — all "a reference to another component's type," unified into one list.
+Vector<ComponentReferenceDecl> extract_component_references(const NML_Node &node) {
+    Vector<ComponentReferenceDecl> result;
+    for (const char *tag : {"ComponentReference", "Link", "InstanceRequirement", "ComponentRequirement"}) {
+        for (const auto *child : find_children(node, tag)) {
+            result.push_back(ComponentReferenceDecl{get_attr(*child, "name"), get_attr(*child, "type")});
+        }
+    }
+    return result;
+}
+
+Vector<ChildrenDecl> extract_children_decls(const NML_Node &node) {
+    Vector<ChildrenDecl> result;
+    for (const char *tag : {"Children", "Child"}) {
+        for (const auto *child : find_children(node, tag)) {
+            result.push_back(ChildrenDecl{get_attr(*child, "name"), get_attr(*child, "type")});
+        }
+    }
+    return result;
+}
+
+Vector<PathDecl> extract_path_fields(const NML_Node &node) {
+    Vector<PathDecl> result;
+    for (const char *tag : {"Path", "Text"}) {
+        for (const auto *child : find_children(node, tag)) {
+            result.push_back(PathDecl{get_attr(*child, "name")});
+        }
+    }
+    return result;
+}
+
+Vector<StateVariableDecl> extract_state_variables(const NML_Node &dynamics) {
+    Vector<StateVariableDecl> result;
+    for (const auto *child : find_children(dynamics, "StateVariable")) {
+        result.push_back(StateVariableDecl{get_attr(*child, "name"), get_attr(*child, "dimension"), get_attr(*child, "exposure")});
+    }
+    return result;
+}
+
+Vector<DerivedVariableDecl> extract_derived_variables(const NML_Node &dynamics) {
+    Vector<DerivedVariableDecl> result;
+    for (const auto *child : find_children(dynamics, "DerivedVariable")) {
+        result.push_back(DerivedVariableDecl{
+            get_attr(*child, "name"), get_attr(*child, "dimension"), get_attr(*child, "exposure"),
+            get_attr(*child, "value"), get_attr(*child, "select"), get_attr(*child, "reduce")});
+    }
+    return result;
+}
+
+Vector<TimeDerivativeDecl> extract_time_derivatives(const NML_Node &dynamics) {
+    Vector<TimeDerivativeDecl> result;
+    for (const auto *child : find_children(dynamics, "TimeDerivative")) {
+        result.push_back(TimeDerivativeDecl{get_attr(*child, "variable"), get_attr(*child, "value")});
+    }
+    return result;
+}
+
+Vector<OnConditionDecl> extract_on_conditions(const NML_Node &dynamics) {
+    Vector<OnConditionDecl> result;
+    for (const auto *child : find_children(dynamics, "OnCondition")) {
+        result.push_back(OnConditionDecl{get_attr(*child, "test"), *child});
+    }
+    return result;
+}
+
+Vector<OnEventDecl> extract_on_events(const NML_Node &dynamics) {
+    Vector<OnEventDecl> result;
+    for (const auto *child : find_children(dynamics, "OnEvent")) {
+        result.push_back(OnEventDecl{get_attr(*child, "port"), *child});
+    }
+    return result;
+}
+
+Vector<RegimeDecl> extract_regimes(const NML_Node &dynamics) {
+    Vector<RegimeDecl> result;
+    for (const auto *child : find_children(dynamics, "Regime")) {
+        result.push_back(RegimeDecl{get_attr(*child, "name"), get_attr(*child, "initial"), *child});
+    }
+    return result;
+}
+
+ComponentTypeBase make_base(const NML_Node &node, const String &extends) {
+    return ComponentTypeBase(get_attr(node, "name"), extends, node);
+}
+
+CellType build_cell_type(const NML_Node &node, const String &extends) {
+    CellType result(get_attr(node, "name"), extends, node);
+
+    result.parameters = extract_parameters(node);
+    result.exposures = extract_exposures(node);
+    result.event_ports = extract_event_ports(node);
+    result.attachments = extract_attachments(node);
+
+    if (const NML_Node *dynamics = find_child(node, "Dynamics")) {
+        result.state_variables = extract_state_variables(*dynamics);
+        result.derived_variables = extract_derived_variables(*dynamics);
+        result.time_derivatives = extract_time_derivatives(*dynamics);
+        result.on_conditions = extract_on_conditions(*dynamics);
+        result.regimes = extract_regimes(*dynamics);
+    }
+
+    return result;
+}
+
+SynapseType build_synapse_type(const NML_Node &node, const String &extends) {
+    SynapseType result(get_attr(node, "name"), extends, node);
+
+    result.parameters = extract_parameters(node);
+    result.properties = extract_properties(node);
+    result.requirements = extract_requirements(node);
+    result.exposures = extract_exposures(node);
+    result.event_ports = extract_event_ports(node);
+    result.component_references = extract_component_references(node);
+    result.children = extract_children_decls(node);
+
+    if (const NML_Node *dynamics = find_child(node, "Dynamics")) {
+        result.state_variables = extract_state_variables(*dynamics);
+        result.derived_variables = extract_derived_variables(*dynamics);
+        result.time_derivatives = extract_time_derivatives(*dynamics);
+        result.on_events = extract_on_events(*dynamics);
+    }
+
+    return result;
+}
+
+InputsType build_inputs_type(const NML_Node &node, const String &extends) {
+    InputsType result(get_attr(node, "name"), extends, node);
+
+    result.parameters = extract_parameters(node);
+    result.properties = extract_properties(node);
+    result.exposures = extract_exposures(node);
+    result.event_ports = extract_event_ports(node);
+    result.children = extract_children_decls(node);
+    result.component_references = extract_component_references(node);
+
+    if (const NML_Node *dynamics = find_child(node, "Dynamics")) {
+        result.state_variables = extract_state_variables(*dynamics);
+        result.derived_variables = extract_derived_variables(*dynamics);
+        result.time_derivatives = extract_time_derivatives(*dynamics);
+        result.on_conditions = extract_on_conditions(*dynamics);
+        result.on_events = extract_on_events(*dynamics);
+    }
+
+    return result;
+}
+
+PopulationType build_population_type(const NML_Node &node, const String &extends) {
+    PopulationType result(get_attr(node, "name"), extends, node);
+
+    result.component_references = extract_component_references(node);
+    result.parameters = extract_parameters(node);
+    result.children = extract_children_decls(node);
+
+    return result;
+}
+
+ProjectType build_project_type(const NML_Node &node, const String &extends) {
+    ProjectType result(get_attr(node, "name"), extends, node);
+
+    result.component_references = extract_component_references(node);
+    result.parameters = extract_parameters(node);
+    result.path_fields = extract_path_fields(node);
+    result.children = extract_children_decls(node);
+
+    return result;
+}
+
+} // namespace
+
 void NML_Node::add_attribute(String name, Any value) {
     attributes[name] = std::move(value);
 }
@@ -28,6 +279,18 @@ void NML_Parser::parse(const String &nml_input_file) {
     }
 
     ingest_file(nml_input_file, true);
+
+    // ingest_file's own recursion fully resolves the whole <include> graph
+    // before returning, so every ComponentType this run will ever see (std
+    // lib + every included file) is now in raw_component_types — safe to
+    // classify the newly-ingested user/include types (the std-lib ones are
+    // already classified from inside load_standard_library() and are left
+    // untouched). Once done, raw_component_types has served its only purpose
+    // for this run, so it's dropped rather than left holding a second copy
+    // of every node library's entries already own.
+    classify_all_cataloged_types();
+    raw_component_types.clear();
+
     xmlCleanupParser();
 }
 
@@ -86,18 +349,7 @@ void NML_Parser::ingest_file(const String &nml_file_path, bool run_schema_valida
             continue;
         }
 
-        auto name_attribute = child.attributes.find("name");
-        if (name_attribute == child.attributes.end()) {
-            log::logger().warn("ComponentType in {} has no name attribute, skipping", nml_file_path);
-            continue;
-        }
-
-        try {
-            String type_name = std::any_cast<String>(name_attribute->second);
-            library.emplace(type_name, std::move(child));
-        } catch (const std::bad_any_cast &) {
-            log::logger().error("ComponentType in {} has a non-string name attribute, skipping", nml_file_path);
-        }
+        catalog_raw_component_type(child, nml_file_path);
     }
 
     xmlFreeDoc(document);
@@ -161,34 +413,135 @@ bool NML_Parser::load_standard_library() {
 
             NML_Node component_type = xml_node_to_nml_node(node);
 
-            auto name_attribute = component_type.attributes.find("name");
-            if (name_attribute == component_type.attributes.end()) {
-                log::logger().warn("ComponentType in {} has no name attribute, skipping", file_path);
+            if (!catalog_raw_component_type(component_type, file_path)) {
                 library_failed_to_load = true;
-                continue;
             }
-
-            String type_name;
-            try {
-                type_name = std::any_cast<String>(name_attribute->second);
-            } catch (const std::bad_any_cast &) {
-                log::logger().error("ComponentType in {} has a non-string name attribute, skipping", file_path);
-                library_failed_to_load = true;
-                continue;
-            }
-
-            library.emplace(type_name, component_type);
-
         }
 
         xmlFreeDoc(document);
     }
 
+    // The directory scan above (across every std-lib file, in whatever order
+    // std::filesystem::directory_iterator happens to visit them) is fully
+    // done at this point, so every std-lib ComponentType is now in
+    // raw_component_types — safe to classify the whole batch in one pass.
+    classify_all_cataloged_types();
+
     xmlCleanupParser();
     return library_failed_to_load;
 }
 
-NML_Node &NML_Parser::get_type_by_name(String name) {
+// Records a parsed `<ComponentType>` node's raw form into
+// `raw_component_types`. Duplicate names are dropped silently
+// (first-cataloged-wins, matching the original flat-library behavior) —
+// that is not a failure. Classification is deferred — see
+// classify_all_cataloged_types.
+bool NML_Parser::catalog_raw_component_type(const NML_Node &component_type_node, const String &source_path) {
+    auto name_attribute = component_type_node.attributes.find("name");
+    if (name_attribute == component_type_node.attributes.end()) {
+        log::logger().warn("ComponentType in {} has no name attribute, skipping", source_path);
+        return false;
+    }
+
+    String type_name;
+    try {
+        type_name = std::any_cast<String>(name_attribute->second);
+    } catch (const std::bad_any_cast &) {
+        log::logger().error("ComponentType in {} has a non-string name attribute, skipping", source_path);
+        return false;
+    }
+
+    if (raw_component_types.find(type_name) != raw_component_types.end()) {
+        return true; // already cataloged — first-cataloged-wins, not a failure
+    }
+
+    raw_component_types.emplace(type_name, component_type_node);
+    return true;
+}
+
+// Classifies every node in raw_component_types not yet in `library`. Called
+// only at the end of a whole ingestion phase (load_standard_library()'s full
+// directory scan; parse()'s whole <include> graph), so every call sees every
+// node cataloged during that phase — the fix for the order-dependent
+// misclassification eager per-node classification had, since a chain walk
+// can now never give up on a parent merely because it hasn't been reached
+// yet. Deliberately additive (never clears/rebuilds `library`): a type
+// classified correctly on an earlier call (e.g. by load_standard_library(),
+// before parse() goes on to ingest more files) stays classified without its
+// entry's address changing — re-running classify_component_type on it here
+// would just recompute the identical result, so it's skipped instead.
+void NML_Parser::classify_all_cataloged_types() {
+    for (const auto &[type_name, raw_node] : raw_component_types) {
+        if (library.find(type_name) != library.end()) continue;
+        library.emplace(type_name, classify_component_type(raw_node));
+    }
+}
+
+// Classifies `node` into one of the five ComponentType categories (nml.h)
+// by walking its `extends` chain (through `raw_component_types`, by name) up
+// to one of the anchor base types the arch doc's §3.3 D1/D3/D4/ST2/ST3
+// buckets are grounded on. The chain check includes `node` itself, since
+// several Structure-level types (`connection`, `projection`, ...) are
+// themselves roots with no `extends` at all. A chain reaching none of the
+// anchors (ion channels, morphology, biophysical properties, Phase 3, ...)
+// is left unclassified — the bare ComponentTypeBase identity, raw node
+// still intact.
+ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
+    static const Vector<String> cell_anchors = {"baseCell"};
+    static const Vector<String> synapse_anchors = {"baseSynapse"};
+    static const Vector<String> inputs_anchors = {"basePointCurrent", "baseSpikeSource"};
+    static const Vector<String> population_anchors = {"basePopulation", "population", "populationList"};
+    static const Vector<String> project_anchors = {
+        "projection", "connection", "connectionWD", "explicitConnection",
+        "synapticConnection", "synapticConnectionWD",
+        "electricalConnection", "electricalConnectionInstance", "electricalConnectionInstanceW",
+        "electricalProjection",
+        "continuousConnection", "continuousConnectionInstance", "continuousConnectionInstanceW",
+        "continuousProjection"};
+
+    auto contains = [](const Vector<String> &anchors, const String &value) {
+        for (const auto &anchor : anchors) {
+            if (anchor == value) return true;
+        }
+        return false;
+    };
+
+    // Walks from `node` up through successive `extends` lookups (bounded to
+    // guard against a cyclic chain), returning true the moment any name in
+    // the chain (including `node` itself) matches one of `anchors`.
+    auto reaches_anchor = [this, &contains](const NML_Node &start, const Vector<String> &anchors) {
+        String current_name = get_attr(start, "name");
+        const NML_Node *current_node = &start;
+
+        for (int hop = 0; hop < 64 && !current_name.empty(); ++hop) {
+            if (contains(anchors, current_name)) return true;
+
+            String parent_name = get_attr(*current_node, "extends");
+            if (parent_name.empty()) return false;
+
+            auto parent_entry = raw_component_types.find(parent_name);
+            if (parent_entry == raw_component_types.end()) {
+                return contains(anchors, parent_name);
+            }
+
+            current_name = parent_name;
+            current_node = &parent_entry->second;
+        }
+        return false;
+    };
+
+    String extends = get_attr(node, "extends");
+
+    if (reaches_anchor(node, cell_anchors)) return build_cell_type(node, extends);
+    if (reaches_anchor(node, synapse_anchors)) return build_synapse_type(node, extends);
+    if (reaches_anchor(node, inputs_anchors)) return build_inputs_type(node, extends);
+    if (reaches_anchor(node, population_anchors)) return build_population_type(node, extends);
+    if (reaches_anchor(node, project_anchors)) return build_project_type(node, extends);
+
+    return make_base(node, extends);
+}
+
+ComponentTypeEntry &NML_Parser::get_type_by_name(const String &name) {
     auto entry = library.find(name);
     if (entry == library.end()) {
         log::logger().error("NML Standard Library type {} could not be found.", name);
