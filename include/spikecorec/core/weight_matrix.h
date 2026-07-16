@@ -134,6 +134,15 @@ namespace spikecorec {
         // 0 by refit().
         s64 ticks_since_last_refit;
 
+        // Number of per-edge synapse-state variables (arch §4.3's `Ck`/`Sk` family)
+        // this WeightMatrix's shared U/V basis is configured to support, on top of
+        // the weight itself — set by configure_per_edge_variable_count() (ticket #5
+        // [C2], from a model's `.alloc` `peredge` directive count, IR spec §2). This
+        // is only the COUNT the engine has committed to; it does not yet allocate or
+        // seed any real per-matrix `Ck` coefficient vectors or sparse `Sk` delta
+        // buffers (that's tickets #52-54/#57).
+        s64 per_edge_variable_count = 0;
+
         WeightMatrix() = delete;
 
         WeightMatrix(const WeightMatrix &) = delete;
@@ -168,6 +177,10 @@ namespace spikecorec {
 
         bool check_index_inbounds(s32, s32) const;
         bool check_index_inbounds(s32) const;
+
+        // Sets per_edge_variable_count (arch §4.3, ticket #5 [C2]). Throws if
+        // count is negative.
+        void configure_per_edge_variable_count(s64 count);
 
     private:
         // Fatally exits if `network` is empty. Called from the constructor's
