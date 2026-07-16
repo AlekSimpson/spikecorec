@@ -41,11 +41,12 @@ TEST(Topologies, topology_initialization) {
 }
 
 TEST(Topologies, square_torus_edge_cases) {
-    // k == 1: a single node whose four neighbors all wrap back to itself.
+    // k == 1: all four torus-wraparound directions point back to the single cell
+    // itself; since self-loops are not supported, square_torus omits them rather
+    // than reporting node 0 as its own neighbor, so node 0 has no neighbors at all.
     auto one = square_torus(1);
     EXPECT_EQ((s64)one.size(), 1);
-    EXPECT_EQ((s64)one[0].size(), 4);
-    for (s32 child : one[0]) EXPECT_EQ(child, 0);
+    EXPECT_EQ((s64)one[0].size(), 0);
 
     // k == 3: exact 4-neighbor torus wrapping for node 0 → {right=1,left=2,down=3,up=6}.
     auto three = square_torus(3);

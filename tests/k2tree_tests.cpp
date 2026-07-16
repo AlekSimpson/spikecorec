@@ -18,14 +18,16 @@ using namespace spikecorec;
 
 namespace {
 
-// Small fixed 8-node directed graph with two self-loops (nodes 1 and 4).
+// Small fixed 8-node directed graph. Self-loops are not supported (see
+// K2Tree's self-loop validation in build_tree_arrays), so this fixture must
+// not declare any i==j edge.
 vector<vector<s32>> k2_reference_adjacency() {
     return {
         {1, 4, 7}, // 0
-        {1, 2},    // 1 — self-loop
+        {2},       // 1
         {0, 3, 5}, // 2
         {},        // 3 — no out-edges
-        {4},       // 4 — self-loop
+        {},        // 4
         {6, 7},    // 5
         {0},       // 6
         {3, 6},    // 7
@@ -51,8 +53,6 @@ TEST(K2Tree, adjacent_and_neighbors) {
         for (s32 target = 0; target < node_count; ++target)
             EXPECT_EQ(tree.adjacent(source, target), (row.count(target) ? 1 : 0));
     }
-    EXPECT_EQ(tree.adjacent(1, 1), 1);
-    EXPECT_EQ(tree.adjacent(4, 4), 1);
 
     vector<s32> buffer(node_count);
     for (s32 source = 0; source < node_count; ++source) {
@@ -83,23 +83,21 @@ TEST(K2Tree, adjacent_batch) {
 }
 
 TEST(K2Tree, single_node_and_bounds) {
-    // A single-node graph must still be able to represent its one possible edge --
-    // the self-loop (0,0) -- which needs a one-level tree (tree_height=1), not zero
-    // levels; compute_tree_parameters previously special-cased node_count<=1 to
-    // tree_height=0, producing an entirely empty bit array that could represent no
-    // edge at all, including this self-loop. Fixed alongside ticket SC-52/D2.
-    vector<vector<s32>> single = {{0}};
-    K2Tree one = *K2Tree::from_adjacency_list(single, 1);
-    EXPECT_EQ(one.tree_height, 1);
-    vector<s32> buffer(4);
-    EXPECT_EQ(one.adjacent(0, 0), 1);
-    EXPECT_EQ(one.get_neighbors(0, buffer.data(), 4), 1);
-    EXPECT_EQ(buffer[0], 0);
+    // A single-node graph's only possible edge would be the self-loop (0,0),
+    // which is not supported -- constructing over an adjacency list containing
+    // it must throw, not silently report "no edge" (see the self-loop
+    // validation in build_tree_arrays, which from_adjacency_list/from_edges
+    // both funnel through).
+    vector<vector<s32>> single_with_self_loop = {{0}};
+    EXPECT_THROW({ K2Tree::from_adjacency_list(single_with_self_loop, 1); }, std::invalid_argument);
 
-    // An isolated single node (no self-loop declared) correctly reports no edge.
+    // An isolated single node (no self-loop declared) constructs normally: with
+    // no other node to connect to, it collapses to a zero-level tree
+    // (tree_height=0) and correctly reports no edge.
     vector<vector<s32>> single_isolated = {{}};
     K2Tree isolated = *K2Tree::from_adjacency_list(single_isolated, 1);
-    EXPECT_EQ(isolated.tree_height, 1);
+    EXPECT_EQ(isolated.tree_height, 0);
+    vector<s32> buffer(4);
     EXPECT_EQ(isolated.adjacent(0, 0), 0);
     EXPECT_EQ(isolated.get_neighbors(0, buffer.data(), 4), 0);
 
@@ -110,6 +108,25 @@ TEST(K2Tree, single_node_and_bounds) {
     EXPECT_EQ(tree.get_neighbors(-1, buffer.data(), 4), 0);
     EXPECT_EQ(tree.get_neighbors(8, buffer.data(), 4), 0);
     EXPECT_EQ(tree.get_neighbors(0, buffer.data(), 0), 0);
+}
+
+TEST(K2Tree, self_loop_rejected_for_any_node_count) {
+    // Self-loops (i==j) are never supported, for any node_count -- not just the
+    // degenerate single-node case above -- and regardless of which entry point
+    // (adjacency list or flat edge arrays) the edge arrives through, since both
+    // funnel through the same build_tree_arrays validation.
+    vector<vector<s32>> adjacency_with_self_loop = {
+        {1, 2},
+        {1, 2}, // node 1: self-loop + normal edge
+        {0}
+    };
+    EXPECT_THROW({ K2Tree::from_adjacency_list(adjacency_with_self_loop, 3); }, std::invalid_argument);
+
+    vector<s32> source_nodes = {0, 1, 1, 2};
+    vector<s32> target_nodes = {1, 1, 2, 0};
+    EXPECT_THROW({
+        K2Tree::from_edges(source_nodes.data(), target_nodes.data(), (s32)source_nodes.size(), 3);
+    }, std::invalid_argument);
 }
 
 TEST(K2Tree, save_load) {
