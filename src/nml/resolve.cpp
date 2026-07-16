@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <stdexcept>
 #include <variant>
 
@@ -31,16 +32,36 @@ bool contains(const Vector<String> &values, const String &target) {
 
 // Instance-level attributes that are IDrefs (arch §1.2 S7): they must
 // resolve through the symbol table to another cataloged id/name, or it is a
-// resolve error.
+// resolve error. `target` is deliberately NOT here -- see below.
 const Vector<String> IDREF_ATTRIBUTE_NAMES = {
     "component", "cell", "presynapticPopulation", "postsynapticPopulation",
-    "synapse", "target", "ionChannel"};
+    "synapse", "input", "ionChannel"};
 
 // Instance-level attributes that are identity/metadata or structural paths
 // (arch §1.2 S6 / §3.1 `Path`/`Text`) rather than dimensioned quantities --
-// passed through as raw strings, never unit-converted.
+// passed through as raw strings, never unit-converted or IDref-resolved.
+// `target` is genuinely dual-use in real NeuroML (`Simulation target="net1"`
+// is a bare id, but `explicitInput target="Pop0[0]"` is a population-index
+// path expression) -- treating it as a strict IDref makes the common path
+// form throw a false "unresolved IDref", so it is treated as an opaque path
+// here, same as `preCellId`/`postCellId`, at the cost of not validating the
+// bare-id (`Simulation target=`) form.
 const Vector<String> OPAQUE_STRING_ATTRIBUTE_NAMES = {
-    "name", "notes", "preCellId", "postCellId", "destination", "type"};
+    "name", "notes", "preCellId", "postCellId", "destination", "type", "target"};
+
+// Whether `value_text` even looks like a dimensioned literal (a leading
+// parsable number, per the same `strtod` rule `unit_value_to_si` itself
+// uses) as opposed to an arbitrary metadata/identifier string. Attributes
+// outside the hardcoded IDref/opaque allowlists above fall back to this
+// check rather than being force-fed to `unit_value_to_si` -- so an unlisted
+// string attribute is treated as opaque instead of throwing a misleading
+// "unconvertible unit" error (it never was a unit to begin with).
+bool looks_like_dimensioned_literal(const String &value_text) {
+    const char *text_start = value_text.c_str();
+    char *number_end = nullptr;
+    std::strtod(text_start, &number_end);
+    return number_end != text_start;
+}
 
 // `Fixed` (§3.1) lives as a direct child of a ComponentType node, alongside
 // `Parameter`/`Constant` -- not nested inside `<Dynamics>`.
@@ -58,11 +79,43 @@ void append_all(Vector<T> &destination, const Vector<T> &source) {
     destination.insert(destination.end(), source.begin(), source.end());
 }
 
+// Merges one ancestor's declarations into `accumulated` (the so-far-merged,
+// more-derived set: the type's own declarations, plus every nearer ancestor
+// already folded in), keyed by `key_of` (a decl's `name`, or `variable` for
+// TimeDerivativeDecl, or `test`/`port` for OnCondition/OnEventDecl). An
+// ancestor's declaration for a key `accumulated` already carries is skipped
+// -- so the most-derived declaration for a given key always wins (arch
+// §3.1 `extends`: inheritance-override semantics) and no key is ever
+// double-counted downstream, where these vectors size per-instance state
+// (ticket #50 [B2] cell lowering, #5 [C2] allocator).
+template <typename T, typename KeyFunction>
+void merge_with_override(Vector<T> &accumulated, const Vector<T> &ancestor_declarations, KeyFunction key_of) {
+    for (const auto &ancestor_declaration : ancestor_declarations) {
+        String key = key_of(ancestor_declaration);
+        bool already_declared = false;
+        for (const auto &existing : accumulated) {
+            if (key_of(existing) == key) {
+                already_declared = true;
+                break;
+            }
+        }
+        if (!already_declared) accumulated.push_back(ancestor_declaration);
+    }
+}
+
 // Applies every pending `Fixed` pin, converting its value to SI (S1) and
-// recording it under the parameter's name. An unconvertible value is a
-// resolve error, same as any other dimensioned literal.
+// recording it under the parameter's name. `pending_fixed` is ordered
+// most-derived-first (a type's own `Fixed`s, then its nearest ancestor's,
+// and so on -- see merge_chain), so a parameter already pinned is skipped
+// here rather than overwritten: the most-derived `Fixed` for a given
+// parameter always wins over an ancestor's (arch §3.1 `extends`:
+// inheritance-override semantics), without even evaluating an
+// already-shadowed ancestor value. An unconvertible value is a resolve
+// error, same as any other dimensioned literal.
 void apply_fixed_pins(const Vector<FixedDecl> &pending_fixed, UnorderedMap<String, f64> &fixed_parameter_values) {
     for (const auto &fixed : pending_fixed) {
+        if (fixed_parameter_values.count(fixed.parameter)) continue;
+
         try {
             fixed_parameter_values[fixed.parameter] = time::unit_value_to_si(fixed.value);
         } catch (const std::invalid_argument &conversion_error) {
@@ -119,57 +172,71 @@ ComponentTypeStruct merge_chain(const String &name, const UnorderedMap<String, C
 
 // ── Per-category field-merge functions (arch §3.1's declaration lists) ──
 
+// Key extractors shared across categories -- a generic lambda works for any
+// decl struct with a `.name` member (ParameterDecl, StateVariableDecl, ...).
+auto by_name = [](const auto &decl) { return decl.name; };
+auto by_variable = [](const TimeDerivativeDecl &decl) { return decl.variable; };
+auto by_test = [](const OnConditionDecl &decl) { return decl.test; };
+auto by_port = [](const OnEventDecl &decl) { return decl.port; };
+
 void merge_cell_fields(CellType &destination, const CellType &parent) {
-    append_all(destination.parameters, parent.parameters);
-    append_all(destination.state_variables, parent.state_variables);
-    append_all(destination.derived_variables, parent.derived_variables);
-    append_all(destination.time_derivatives, parent.time_derivatives);
-    append_all(destination.on_conditions, parent.on_conditions);
-    append_all(destination.exposures, parent.exposures);
-    append_all(destination.event_ports, parent.event_ports);
-    append_all(destination.regimes, parent.regimes);
-    append_all(destination.attachments, parent.attachments);
+    merge_with_override(destination.parameters, parent.parameters, by_name);
+    merge_with_override(destination.state_variables, parent.state_variables, by_name);
+    merge_with_override(destination.derived_variables, parent.derived_variables, by_name);
+    merge_with_override(destination.time_derivatives, parent.time_derivatives, by_variable);
+    merge_with_override(destination.on_conditions, parent.on_conditions, by_test);
+    merge_with_override(destination.exposures, parent.exposures, by_name);
+    merge_with_override(destination.event_ports, parent.event_ports, by_name);
+    merge_with_override(destination.regimes, parent.regimes, by_name);
+    merge_with_override(destination.attachments, parent.attachments, by_name);
+    // OnStart has no natural override key (no name/variable identity) --
+    // an ancestor's initial-value assignments are simply additional seeds
+    // alongside the child's own (arch §3.1 `extends`: "merges ... the
+    // entire <Dynamics>").
+    append_all(destination.on_starts, parent.on_starts);
 }
 
 void merge_synapse_fields(SynapseType &destination, const SynapseType &parent) {
-    append_all(destination.parameters, parent.parameters);
-    append_all(destination.properties, parent.properties);
-    append_all(destination.state_variables, parent.state_variables);
-    append_all(destination.derived_variables, parent.derived_variables);
-    append_all(destination.time_derivatives, parent.time_derivatives);
-    append_all(destination.requirements, parent.requirements);
-    append_all(destination.exposures, parent.exposures);
-    append_all(destination.event_ports, parent.event_ports);
-    append_all(destination.on_events, parent.on_events);
-    append_all(destination.component_references, parent.component_references);
-    append_all(destination.children, parent.children);
+    merge_with_override(destination.parameters, parent.parameters, by_name);
+    merge_with_override(destination.properties, parent.properties, by_name);
+    merge_with_override(destination.state_variables, parent.state_variables, by_name);
+    merge_with_override(destination.derived_variables, parent.derived_variables, by_name);
+    merge_with_override(destination.time_derivatives, parent.time_derivatives, by_variable);
+    merge_with_override(destination.requirements, parent.requirements, by_name);
+    merge_with_override(destination.exposures, parent.exposures, by_name);
+    merge_with_override(destination.event_ports, parent.event_ports, by_name);
+    merge_with_override(destination.on_events, parent.on_events, by_port);
+    merge_with_override(destination.component_references, parent.component_references, by_name);
+    merge_with_override(destination.children, parent.children, by_name);
+    append_all(destination.on_starts, parent.on_starts);
 }
 
 void merge_inputs_fields(InputsType &destination, const InputsType &parent) {
-    append_all(destination.parameters, parent.parameters);
-    append_all(destination.properties, parent.properties);
-    append_all(destination.state_variables, parent.state_variables);
-    append_all(destination.derived_variables, parent.derived_variables);
-    append_all(destination.time_derivatives, parent.time_derivatives);
-    append_all(destination.on_conditions, parent.on_conditions);
-    append_all(destination.on_events, parent.on_events);
-    append_all(destination.exposures, parent.exposures);
-    append_all(destination.event_ports, parent.event_ports);
-    append_all(destination.children, parent.children);
-    append_all(destination.component_references, parent.component_references);
+    merge_with_override(destination.parameters, parent.parameters, by_name);
+    merge_with_override(destination.properties, parent.properties, by_name);
+    merge_with_override(destination.state_variables, parent.state_variables, by_name);
+    merge_with_override(destination.derived_variables, parent.derived_variables, by_name);
+    merge_with_override(destination.time_derivatives, parent.time_derivatives, by_variable);
+    merge_with_override(destination.on_conditions, parent.on_conditions, by_test);
+    merge_with_override(destination.on_events, parent.on_events, by_port);
+    merge_with_override(destination.exposures, parent.exposures, by_name);
+    merge_with_override(destination.event_ports, parent.event_ports, by_name);
+    merge_with_override(destination.children, parent.children, by_name);
+    merge_with_override(destination.component_references, parent.component_references, by_name);
+    append_all(destination.on_starts, parent.on_starts);
 }
 
 void merge_population_fields(PopulationType &destination, const PopulationType &parent) {
-    append_all(destination.component_references, parent.component_references);
-    append_all(destination.parameters, parent.parameters);
-    append_all(destination.children, parent.children);
+    merge_with_override(destination.component_references, parent.component_references, by_name);
+    merge_with_override(destination.parameters, parent.parameters, by_name);
+    merge_with_override(destination.children, parent.children, by_name);
 }
 
 void merge_project_fields(ProjectType &destination, const ProjectType &parent) {
-    append_all(destination.component_references, parent.component_references);
-    append_all(destination.parameters, parent.parameters);
-    append_all(destination.path_fields, parent.path_fields);
-    append_all(destination.children, parent.children);
+    merge_with_override(destination.component_references, parent.component_references, by_name);
+    merge_with_override(destination.parameters, parent.parameters, by_name);
+    merge_with_override(destination.path_fields, parent.path_fields, by_name);
+    merge_with_override(destination.children, parent.children, by_name);
 }
 
 // Flattens one library entry, dispatching on which of the five categories
@@ -240,7 +307,7 @@ ResolvedInstance resolve_instance(const NML_Node &node, const SymbolTable &symbo
             continue;
         }
 
-        if (contains(OPAQUE_STRING_ATTRIBUTE_NAMES, attribute_name)) {
+        if (contains(OPAQUE_STRING_ATTRIBUTE_NAMES, attribute_name) || !looks_like_dimensioned_literal(value_text)) {
             result.string_attributes[attribute_name] = value_text;
             continue;
         }

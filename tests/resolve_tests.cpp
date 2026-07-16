@@ -29,6 +29,22 @@ const ResolvedInstance *find_instance_by_tag(const Vector<ResolvedInstance> &ins
     return nullptr;
 }
 
+// Small helpers for inspecting the still-tree-shaped OnStart/OnCondition/...
+// bodies (arch §1.4: expression-tree content stays opaque even after
+// flattening) -- mirrors nml_tests.cpp's own private helpers of the same name.
+String get_string_attribute(const NML_Node &node, const String &key) {
+    auto entry = node.attributes.find(key);
+    if (entry == node.attributes.end()) return "";
+    return std::any_cast<String>(entry->second);
+}
+
+const NML_Node *find_child_by_tag(const NML_Node &node, const String &tag) {
+    for (const auto &child : node.body) {
+        if (child.tag_name == tag) return &child;
+    }
+    return nullptr;
+}
+
 // A GLIF-shaped cell that extends a 3-hop ancestor chain with REAL content
 // at every hop: GLIF3TestCell -> GLIFBaseCell (user-defined) ->
 // baseCellMembPot -> baseSpikingCell -> baseCell (std-lib), so that
@@ -271,4 +287,151 @@ TEST(ResolveAndLower, throws_a_clear_error_on_an_unrecognized_unit) {
     parser.parse(top_path);
 
     EXPECT_THROW(resolve_and_lower(parser), std::invalid_argument);
+}
+
+// ── Regression: ancestor-only `OnStart` survives flattening (review finding #1) ──
+//
+// `iafTauCell` (Cells.xml) declares its own `OnStart` (`v = leakReversal`)
+// but no other Dynamics-bearing descendant in this fixture redeclares one --
+// exactly the real-world shape the finding flagged: a user cell extending a
+// std-lib cell without repeating its `OnStart` must still carry that
+// ancestor's initial-value assignment through flattening, not lose it.
+TEST(ResolveAndLower, merges_ancestor_only_on_start_across_extends_chain) {
+    String path = write_temp_file("spikecorec_resolve_on_start_inheritance_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"OnStartInheritanceTestDoc\">"
+        "  <ComponentType name=\"ChildOfIafTauCell\" extends=\"iafTauCell\">"
+        "    <Parameter name=\"extraParam\" dimension=\"none\"/>"
+        "  </ComponentType>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    ResolvedModel model = resolve_and_lower(parser);
+
+    ASSERT_EQ(model.types.count("ChildOfIafTauCell"), 1u);
+    ASSERT_TRUE(std::holds_alternative<CellType>(model.types.at("ChildOfIafTauCell").flattened));
+    const CellType &flattened_cell = std::get<CellType>(model.types.at("ChildOfIafTauCell").flattened);
+
+    // ChildOfIafTauCell declares no <Dynamics>/<OnStart> of its own -- this
+    // OnStart can only have come from iafTauCell across the extends chain.
+    ASSERT_EQ(flattened_cell.on_starts.size(), 1u);
+    const NML_Node *state_assignment = find_child_by_tag(flattened_cell.on_starts[0].body, "StateAssignment");
+    ASSERT_NE(state_assignment, nullptr);
+    EXPECT_EQ(get_string_attribute(*state_assignment, "variable"), "v");
+    EXPECT_EQ(get_string_attribute(*state_assignment, "value"), "leakReversal");
+}
+
+// ── Regression: descendant declarations override, not duplicate, an ancestor's (review finding #4/minor) ──
+
+TEST(ResolveAndLower, deduplicates_overridden_declarations_keeping_the_most_derived) {
+    String path = write_temp_file("spikecorec_resolve_dedup_override_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"DedupOverrideTestDoc\">"
+        "  <ComponentType name=\"DedupBaseCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"sharedParam\" dimension=\"voltage\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\"/>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <ComponentType name=\"DedupChildCell\" extends=\"DedupBaseCell\">"
+        "    <Parameter name=\"sharedParam\" dimension=\"voltage\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "      <TimeDerivative variable=\"v\" value=\"0\"/>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    ResolvedModel model = resolve_and_lower(parser);
+
+    ASSERT_EQ(model.types.count("DedupChildCell"), 1u);
+    const CellType &flattened_cell = std::get<CellType>(model.types.at("DedupChildCell").flattened);
+
+    // `sharedParam` and `v` are each declared once on the ancestor and once
+    // (redeclared) on the child -- the flattened set must carry exactly one
+    // entry per name (not two), and it must be the child's (most-derived)
+    // version: `v`'s `exposure="v"` only appears on the child's redeclaration.
+    ASSERT_EQ(flattened_cell.parameters.size(), 1u);
+    EXPECT_EQ(flattened_cell.parameters[0].name, "sharedParam");
+
+    ASSERT_EQ(flattened_cell.state_variables.size(), 1u);
+    EXPECT_EQ(flattened_cell.state_variables[0].name, "v");
+    EXPECT_EQ(flattened_cell.state_variables[0].exposure, "v");
+}
+
+// ── Regression: `target` is path-shaped, not an IDref; `input` is (review finding #3) ──
+
+TEST(ResolveAndLower, treats_path_shaped_target_as_opaque_and_resolves_genuine_input_idref) {
+    String path = write_temp_file("spikecorec_resolve_target_vs_input_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TargetVsInputTestDoc\">"
+        "  <pulseGenerator id=\"pulseGen1\" delay=\"10ms\" duration=\"100ms\" amplitude=\"1nA\"/>"
+        "  <network id=\"net1\">"
+        "    <population id=\"Pop0\" component=\"pulseGen1\" size=\"1\"/>"
+        "    <explicitInput target=\"Pop0[0]\" input=\"pulseGen1\"/>"
+        "  </network>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    ResolvedModel model;
+    EXPECT_NO_THROW(model = resolve_and_lower(parser));
+
+    const ResolvedInstance *network = find_instance_by_tag(model.instances, "network");
+    ASSERT_NE(network, nullptr);
+    const ResolvedInstance *explicit_input = find_instance_by_tag(network->children, "explicitInput");
+    ASSERT_NE(explicit_input, nullptr);
+
+    // `target="Pop0[0]"` is a population-index path, not a bare id -- passed
+    // through as an opaque string, never IDref-resolved.
+    ASSERT_EQ(explicit_input->string_attributes.count("target"), 1u);
+    EXPECT_EQ(explicit_input->string_attributes.at("target"), "Pop0[0]");
+    EXPECT_EQ(explicit_input->idref_attributes.count("target"), 0u);
+
+    // `input="pulseGen1"` IS a genuine bare-id IDref, resolved to the
+    // generator instance's own symbol index.
+    ASSERT_EQ(explicit_input->idref_attributes.count("input"), 1u);
+    EXPECT_EQ(explicit_input->idref_attributes.at("input"), model.symbols.index_of("pulseGen1"));
+}
+
+// ── Regression: an unlisted string attribute is opaque, not a "bad unit" (review finding #2) ──
+
+TEST(ResolveAndLower, treats_an_unlisted_non_numeric_attribute_as_opaque_instead_of_throwing) {
+    // A custom instance attribute name outside every hardcoded IDref/opaque
+    // list, routed through <include> since the custom tag itself isn't a
+    // schema-known element (see write_glif_chain_fixture's rationale).
+    write_temp_file("spikecorec_resolve_unlisted_string_types.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"UnlistedStringTypesDoc\">"
+        "  <ComponentType name=\"TaggedTestCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "  </ComponentType>"
+        "  <TaggedTestCell id=\"taggedInstance\" EL=\"-70mV\" label=\"excitatory\"/>"
+        "</neuroml>");
+
+    String top_path = write_temp_file("spikecorec_resolve_unlisted_string_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"UnlistedStringTop\">"
+        "  <include href=\"spikecorec_resolve_unlisted_string_types.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+
+    ResolvedModel model;
+    EXPECT_NO_THROW(model = resolve_and_lower(parser));
+
+    const ResolvedInstance *cell_instance = find_instance_by_tag(model.instances, "TaggedTestCell");
+    ASSERT_NE(cell_instance, nullptr);
+
+    // "excitatory" doesn't even look like a dimensioned literal (no leading
+    // number) -- it must land as an opaque string, not be force-fed to
+    // unit_value_to_si and throw.
+    ASSERT_EQ(cell_instance->string_attributes.count("label"), 1u);
+    EXPECT_EQ(cell_instance->string_attributes.at("label"), "excitatory");
+
+    // The genuinely-dimensioned attribute alongside it still converts normally.
+    ASSERT_EQ(cell_instance->numeric_attributes.count("EL"), 1u);
+    EXPECT_NEAR(cell_instance->numeric_attributes.at("EL"), -0.07, 1e-12);
 }
