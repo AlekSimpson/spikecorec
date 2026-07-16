@@ -153,7 +153,7 @@ ModelSpecification (#7) — and the parse tree is discarded.
 - **What it holds** (each a flat table, index-addressed):
   - Cell-type and synapse-type library — each entry carries its dynamics (the expression trees plus
     stage structure), baked constants, initial values, and classification flags (conductance-based vs
-    current-based, aggregatable vs per-edge).
+    current-based).
   - Populations — each: cell-type index, size, neuron-index range, and state-vector chunk base offset.
   - Adjacency + initial weights — the existing `vector<vector<s32>>` → `WeightMatrix`/k²-tree path.
   - Projection/synapse routing and any delay data; input (stimulus) specs; output (recording)
@@ -276,12 +276,10 @@ uses the shared-basis representation of §4.3.
   - Stage: composed into the owner's stages (usually 2 Integrate); a `select`/`reduce` over
     `Children` runs there too.
   - Effect: the child's dynamics become part of the owner's per-tick behavior. `Children` + a parent
-    `DerivedVariable reduce="add"` = "sum over the children" (e.g. total synaptic current). For
-    aggregatable synapses this sum collapses to reading one per-neuron accumulator instead of
-    iterating edges.
+    `DerivedVariable reduce="add"` = "sum over the children" (e.g. total synaptic current), realized
+    by iterating each child's per-edge state (§4.3).
   - Allocation: each child instance adds its state to the owner — gates/pools → extra intrinsic
-    state (`V_t`, biophysical, deferred); aggregatable synapses → one shared per-neuron accumulator
-    slot (§4.2); non-aggregatable synapses → per-edge state (§4.3).
+    state (`V_t`, biophysical, deferred); synapses → per-edge state (§4.3).
 
 - **`ComponentReference`** (`name`, `type`) / **`Link`** (`name`, `type`)
   - Specifies: a reference to another component (projection→its synapse type; channelDensity→its
@@ -296,8 +294,7 @@ uses the shared-basis representation of §4.3.
     cell); the seam that ties synapse dynamics to a target cell.
   - Stage: 1 Deliver (arriving synaptic input lands here).
   - Effect: routes a projection's synapse contributions onto the postsynaptic cell.
-  - Allocation: the postsynaptic accumulator slot (§4.2) or per-edge state (§4.3), per the synapse's
-    aggregatability.
+  - Allocation: per-edge state (§4.3).
 
 - **`Text`** (`name`) / **`Path`** (`name`) — Specifies a string/structural-path parameter
   (metadata, output file names, `select` targets). Stage: build-time. Effect: none in the step.
@@ -347,8 +344,8 @@ uses the shared-basis representation of §4.3.
     children (`select`/`reduce`).
   - Stage: the stage that consumes it (usually 2 Integrate; sometimes 3 Detect).
   - Effect: `value` form = an inline computed quantity (a current term, a rate). `select`/`reduce`
-    form = a sum/product over selected child exposures (e.g. total synaptic current). With
-    aggregatable synapses the reduction is precollapsed to one accumulator read.
+    form = a sum/product over selected child exposures (e.g. total synaptic current), realized by
+    iterating each child's per-edge state (§4.3).
   - Allocation: none, unless exposed-and-recorded, or needed across a pass boundary → a scratch slot.
 
 - **`ConditionalDerivedVariable`** with **`Case`** (`condition`, `value`)
@@ -374,8 +371,7 @@ uses the shared-basis representation of §4.3.
 - **`OnEvent`** (`port`) containing **`StateAssignment`**
   - Specifies: "when a spike arrives on `port`, do these actions" — the arrival handler (`g += weight`).
   - Stage: **1 Deliver** (applied as input lands).
-  - Effect: bumps synaptic state on arrival. For aggregatable synapses this is an add into the
-    per-neuron accumulator; for per-edge synapses, an accumulate into the edge's sparse delta buffer
+  - Effect: bumps synaptic state on arrival — an accumulate into the edge's sparse delta buffer
     `Sk[i,j]` (§4.3).
   - Allocation: none new — writes the synapse state it references.
 
@@ -419,10 +415,10 @@ Concrete instances of the tags above — the full target surface.
   early target — linear GLIF/LIF cells in Phase 1, nonlinear cells in Phase 2.**
 - **Dynamics / channel gates (D2)** — `gateHH*`, `HH*Rate`, `q10*`. Composed into a biophysical cell
   (§3.1 `Child`), not standalone. **Deferred.**
-- **Dynamics / synapses (D3)** — `alphaCurrentSynapse` (current-based, aggregatable), `expOneSynapse`
-  (aggregatable; `g(erev−v)` if conductance-based), `expTwoSynapse`/`alphaSynapse` (aggregatable),
-  `blockingPlasticSynapse` (NMDA, **per-edge**), `gradedSynapse`/`gapJunction` (continuous,
-  **deferred**). Split: §4.2 vs §4.3.
+- **Dynamics / synapses (D3)** — `alphaCurrentSynapse` (current-based), `expOneSynapse`/
+  `expTwoSynapse`/`alphaSynapse` (conductance-based, `g(erev−v)`), `blockingPlasticSynapse` (NMDA,
+  short-term plasticity), `gradedSynapse`/`gapJunction` (continuous, **deferred**). All realized via
+  §4.3's uniform per-edge storage.
 - **Dynamics / inputs (D4)** — `pulseGenerator`, `sineGenerator`/`rampGenerator`, `voltageClamp`,
   spike sources (`spikeArray`/`SpikeSourcePoisson`/…), Poisson synaptic drive, `compoundInput`.
   Host-precomputed into the stimulus buffer in Phase 1; on-device generators in Phase 2.
@@ -459,8 +455,8 @@ altitude (sizing intuition and structural choices, not byte-exact addressing).
 ### 4.1 Per-cell-type state (widened state vector)
 
 Today one scalar `v` per neuron. NML cells carry several state variables, so each population needs a
-per-type-width slice: population `p` of cell type `t` needs `size_p × V_t` state values (plus any
-aggregated synapse slots, §4.2). `StateVariable` declarations drive this. Neuron-level bookkeeping
+per-type-width slice: population `p` of cell type `t` needs `size_p × V_t` state values.
+`StateVariable` declarations drive this. Neuron-level bookkeeping
 (`last_spiked`, `last_tick_updated`, regime index, active-set) stays one-per-neuron regardless of `V_t`.
 
 - **Layout that fits — struct-of-arrays within per-population chunks.** Partition one widened state
@@ -478,19 +474,25 @@ aggregated synapse slots, §4.2). `StateVariable` declarations drive this. Neuro
   that lacks a given variable and scatters a cell's state across buffers; the per-population SoA chunk
   packs tightly and keeps each cell type's slice contiguous.
 
-### 4.2 Aggregated per-neuron synapse state
+### 4.2 Aggregated per-neuron synapse state (considered, not used)
 
-Linear conductance synapses of the same type converging on one neuron superpose, so only the *sum*
-need be stored: one accumulator per postsynaptic neuron per aggregatable synapse type (this is the
-generalization of today's `network_inputs`, but typed and decaying by the synapse's own `tau`).
-Cheap: `O(neuron_count × types × state_vars)`; per-tick decay is a uniform scale. Default path.
+Linear conductance synapses of the same type converging on one neuron superpose, so their contributions
+*could* in principle be summed into one accumulator per postsynaptic neuron per synapse type instead of
+stored per edge (this would have generalized today's `network_inputs`, but typed and decaying by the
+synapse's own `tau`) — this was Phase 1's original default path for such synapses. **Rejected/dropped:**
+#52's shared-basis `WeightMatrix` generalization (§4.3) makes per-edge storage cheap — one shared U/V
+basis plus a tiny per-matrix coefficient vector, not a dense per-type accumulator array — so there is no
+longer an efficiency argument for a separate aggregated fast path. Every synapse now uses §4.3's
+per-edge storage uniformly, whether or not its contributions would superpose (ticket #57, which would
+have consumed this path, is closed as won't-do).
 
 ### 4.3 Per-edge synapse state — shared basis + per-matrix coefficients + a sparse delta buffer (decided)
 
-**The problem.** Non-aggregatable synapses (NMDA, per-synapse short-term plasticity) need a value stored
-*per edge*, and a network has several such per-edge matrices over the same connections — the weight
-plus each per-edge synapse state variable. Storing each one densely, or even as its own separate
-low-rank factorization, wastes memory.
+**The problem.** Every synapse needs a value stored *per edge* (NMDA, per-synapse short-term
+plasticity, and — since §4.2's aggregated alternative was dropped — every other synapse too), and a
+network has several such per-edge matrices over the same connections — the weight plus each per-edge
+synapse state variable. Storing each one densely, or even as its own separate low-rank factorization,
+wastes memory.
 
 **The idea, in one picture.** Think of each per-edge matrix as a single point in a huge space. Across
 the whole family of matrices, those points cluster near a low-dimensional "plane." Fit that plane once
@@ -535,9 +537,9 @@ scratchpads `O(nnz in S)`. Sharing the basis (instead of one per variable) is th
 the refit constantly. Refit *every `t` ticks* → cheap amortized refit, but reads must consult a
 scratchpad that grows denser (and slower) between refits. The interval is not yet chosen.
 
-**When this path is used (unchanged rule; parser, build time):** a synapse type uses per-edge storage
-iff its dynamics don't superpose across converging edges (nonlinear-in-state, edge-dependent, or
-non-additive arrival); linear/superposable synapses use the cheaper per-neuron accumulator (§4.2).
+**When this path is used:** every synapse type, uniformly — the aggregated-per-neuron-accumulator
+alternative once considered for superposable synapses (§4.2) was dropped once shared-basis storage
+made per-edge state cheap enough for every synapse, not just non-superposable ones.
 
 ### 4.4 Spike delays (new subsystem)
 
@@ -583,13 +585,13 @@ networks.
 
 ### Phase 1 — GLIF cells with the full synapse model (single cell → networks)
 - Unlocks: **GLIF1–GLIF5 in full**, plus any other linear point cell, both standalone and in networks
-  — wired with the full synapse model: current-based, conductance-based, and per-edge synapses. The
-  prioritized modeling target.
+  — wired with the full synapse model: current-based and conductance-based synapses, both realized via
+  uniform per-edge shared-basis storage. The prioritized modeling target.
 - Why it groups: the GLIF family is the priority, and real GLIF circuits need realistic synapses, so
   the synapse machinery ships with them. Linear cells reuse most of the engine directly (active set,
   lazy decay, `network_inputs`-style accumulation, k²-tree, WeightMatrix, STDP, recording); the new
   capabilities are the per-cell-type **multi-variable state vector** and the **synapse machinery**
-  (aggregated per-neuron conductances, the conductance driving-force term, and per-edge state).
+  (uniform per-edge synapse state via shared-basis storage, and the conductance driving-force term).
 - NML surface:
   - Whole pipeline: `ComponentType`/`extends`/`Fixed`, `Parameter`/`Constant`/`DerivedParameter`/
     `Property`, Statics S1–S7, the resolve/lower pass.
@@ -599,20 +601,22 @@ networks.
     multi-target `StateAssignment` reset rules + `EventOut`; `OnEvent` arrival bump; `Regime` for the
     refractory period; `ConditionalDerivedVariable`/`Case`.
   - Inputs: `pulseGenerator` (D4, host-precomputed).
-  - Synapses: aggregatable current-based (`alphaCurrentSynapse` / current-based `expOneSynapse`);
-    conductance-based (`baseConductanceBasedSynapse` chain — `expOneSynapse`/`expTwoSynapse` with
-    `erev`); non-aggregatable per-edge (`blockingPlasticSynapse`/NMDA, short-term plasticity).
+  - Synapses: current-based (`alphaCurrentSynapse` / current-based `expOneSynapse`); conductance-based
+    (`baseConductanceBasedSynapse` chain — `expOneSynapse`/`expTwoSynapse` with `erev`);
+    `blockingPlasticSynapse`/NMDA, short-term plasticity. All realized via §4.3's uniform per-edge
+    shared-basis storage — current-based vs conductance-based determines the computed value, not the
+    storage shape.
   - Structures: ST1, ST2 (multiple populations/types), ST3 (weights, no delay), ST6 (`OutputFile`
     traces + `EventOutputFile` spikes).
 - Engine work: #2 parser, #3 std-lib bundle, #8 XSD, #7 `ModelSpecification`, resolve/lower; the
   **widened per-cell-type multi-variable state vector** (§4.1) + cell-type boundaries (#5); generic
   per-type codegen for linear ODE systems + multi-state resets (#4); the **synapse machinery** —
-  aggregated per-neuron accumulators (§4.2), the conductance driving-force term `g(erev−v)` inside
-  integrate, and **per-edge synapse state** (shared low-rank basis + per-matrix coefficient vectors +
-  sparse delta buffers, §4.3); regime index for refractory
+  uniform **per-edge synapse state** for every synapse (shared low-rank basis + per-matrix coefficient
+  vectors + sparse delta buffers, §4.3) and the conductance driving-force term `g(erev−v)` inside
+  integrate; regime index for refractory
   (§4.5); exponential/forward Euler. Linear cells with current-based synapses stay
-  closed-form-advanceable and reuse the active set unchanged; cells receiving conductance-based /
-  per-edge input use the per-tick integration path (§0.5).
+  closed-form-advanceable and reuse the active set unchanged; cells receiving conductance-based
+  input use the per-tick integration path (§0.5).
 - Exit models: a GLIF3/GLIF5 single cell reproducing after-spike-current and spike-frequency
   adaptation under a current step; a current- and conductance-based GLIF E/I network (including an
   NMDA synapse) producing a spike raster.
@@ -664,13 +668,13 @@ rest of #4/#5 grow across Phases 2–3 as the feature surface widens (see §5 fo
 - **#8 XSD validator** — structural gate before resolve. *(Phase 1.)*
 - **#7 `ModelSpecification`** — the flat lowered tables (cell/synapse types with dynamics trees,
   populations + boundaries, adjacency + weights, inputs, outputs). *(Phase 1 minimal; extended per phase.)*
-- **#5 Allocation** — widened state vector + boundaries (§4.1, **Phase 1**), aggregated synapse
-  accumulators (§4.2, **Phase 1**), per-edge synapse state — shared basis + `Ck` + sparse `Sk` (§4.3,
-  **Phase 1**), regime indices (§4.5,
+- **#5 Allocation** — widened state vector + boundaries (§4.1, **Phase 1**), per-edge synapse state —
+  shared basis + `Ck` + sparse `Sk` (§4.3, **Phase 1**), regime indices (§4.5,
   **Phase 1**); delay data (§4.4, **Phase 2**).
 - **#4 Codegen** — per-Dynamics-ComponentType generation of the compute stages, constants baked,
-  runtime-compiled on both backends. *(Linear cells + full synapse model — current/conductance/
-  per-edge — in Phase 1; nonlinear cells + delays in Phase 2; biophysical in Phase 3.)*
+  runtime-compiled on both backends. *(Linear cells + full synapse model — current-based and
+  conductance-based, both per-edge — in Phase 1; nonlinear cells + delays in Phase 2; biophysical in
+  Phase 3.)*
 - **#6 (reframed)** — turn cell-type dynamics into the runnable step: lower each ComponentType's IR
   `.tick` to GPU source and **assemble them into one master kernel** (per-neuron dispatch by cell-type
   boundary), compiled once and cached. Codegen stays generic — only per-type IR is emitted; the master

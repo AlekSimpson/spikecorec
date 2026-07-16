@@ -76,13 +76,11 @@ void lower_all_derived_variables(const SynapseType &synapse, Vector<TickInstruct
 }
 
 // Lowers one synapse's `onevent <port> { accedge <var>@edge, <increment> }`
-// spike-arrival handler(s) (arch §4.2/§4.3; IR spec §3.4 `onevent`, §3.3
-// `accedge`) into `tick.deliver` -- shared verbatim between the aggregatable
-// and per-edge shapes, since `accedge` itself is polymorphic over
-// `accum`/`peredge` destinations (IR spec §3.3: "a per-neuron accumulate for
-// `accum`" vs "`Sk[edge]+=value` for `peredge`"). Every real D3 fixture this
-// ticket targets (expOneSynapse/expTwoSynapse/alphaCurrentSynapse's
-// `g`/`I`/`J`/`A`/`B` bumps) shapes each `OnEvent` body as one or more
+// spike-arrival handler(s) (arch §4.3; IR spec §3.4 `onevent`, §3.3
+// `accedge`) into `tick.deliver` (IR spec §3.3: `accedge` is `Sk[edge]+=value`
+// for a `peredge` destination). Every real D3 fixture this ticket targets
+// (expOneSynapse/expTwoSynapse/alphaCurrentSynapse's `g`/`I`/`J`/`A`/`B`
+// bumps) shapes each `OnEvent` body as one or more
 // additive self-increment `StateAssignment`s (`var = var + <increment>`);
 // anything else (a non-additive assignment, or an `EventOut` inside the
 // handler -- e.g. a real `blockingPlasticSynapse`'s `relay` port) is out of
@@ -136,9 +134,10 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     std::unordered_set<String> known_names = gather_known_names(synapse);
     const DerivedVariableDecl &current_derived_variable = find_current_derived_variable(synapse);
 
-    // ── .alloc (arch §4.2 accum vs §4.3 peredge, dispatched on ticket #7's
-    // own `is_aggregatable` flag; requirements; §3.1 Parameter/Property
-    // bake-vs-parameterize, same Phase-1 rule cell_lowering.cpp uses; §4.6
+    // ── .alloc (arch §4.3 peredge, uniformly -- every synapse's state now
+    // uses per-edge storage regardless of superposability, see this file's
+    // header comment; requirements; §3.1 Parameter/Property bake-vs-
+    // parameterize, same Phase-1 rule cell_lowering.cpp uses; §4.6
     // expose) ────────────────────────────────────────────────────────────────
     Vector<AllocDirective> alloc_directives;
 
@@ -147,11 +146,7 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     }
 
     for (const auto &state_variable : synapse.state_variables) {
-        if (synapse_entry.is_aggregatable) {
-            alloc_directives.push_back(AccumDirective{state_variable.name, "f32"});
-        } else {
-            alloc_directives.push_back(PeredgeDirective{state_variable.name});
-        }
+        alloc_directives.push_back(PeredgeDirective{state_variable.name});
     }
 
     auto bake_constant_directive = [&](const String &name) {
@@ -175,8 +170,7 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     for (const auto &exposure : synapse.exposures) add_exposure(exposure.name);
     for (const auto &exposure_name : exposed_names_in_order) alloc_directives.push_back(ExposeDirective{exposure_name});
 
-    // ── .tick @deliver: the onevent arrival handler(s), identical for both
-    // shapes ────────────────────────────────────────────────────────────────
+    // ── .tick @deliver: the onevent arrival handler(s) ───────────────────────
     TickProgram tick;
     UnorderedMap<String, String> no_aliases;
     LoweringContext top_level_context(known_names, no_aliases);
@@ -186,65 +180,51 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     // invariant ("every synapse type ... computes its finished total
     // current with .tick instructions and writes it into network_inputs";
     // a conductance synapse's `g·(erev−v)` needs no special cell-side case
-    // -- it is just this type's own DerivedVariable exposing "i") ───────────
-    if (synapse_entry.is_aggregatable) {
-        // TimeDerivatives THEN DerivedVariables -- the REVERSE of
-        // cell_lowering.cpp's own DerivedVariable-before-TimeDerivative
-        // convention. A cell's DerivedVariable (e.g. GLIF3's `ascSum`) feeds
-        // that SAME tick's own TimeDerivative right-hand side, so it must
-        // read PRE-tick state. A synapse's DerivedVariables never feed a
-        // TimeDerivative that way -- they only ever feed the one
-        // `network_inputs` write at the very end -- so they read this
-        // tick's just-decayed state instead, matching the locked IR spec's
-        // own expOne example exactly (`expdecay g,g,tau` THEN
-        // `add network_inputs,network_inputs,g`).
-        for (const auto &time_derivative : synapse.time_derivatives) {
-            lower_time_derivative(time_derivative.variable, time_derivative.value, tick.integrate, top_level_context);
-        }
-        lower_all_derived_variables(synapse, tick.integrate, top_level_context);
-        tick.integrate.push_back(BinaryInstruction{BinaryOpcode::Add, "network_inputs", "network_inputs", current_derived_variable.name});
-    } else {
-        // Per-edge: `forall neuron_in { loadedge ...; ... }` (IR spec §4's
-        // NMDA example). No explicit per-edge decay instruction is emitted
-        // (see synapse_lowering.h's header comment for why this is
-        // spec-conformant, not an oversight) -- each peredge state variable
-        // is `loadedge`'d into a name derived from the variable itself
-        // (`edge_<name>`, never a `tN` temp) so it stays valid across
-        // however many subsequent statements the forall body's own
-        // DerivedVariable computations need, without colliding with their
-        // OWN per-statement-reset `tN` counter.
-        //
-        // A per-edge synapse that actually declares a `TimeDerivative` has
-        // it silently dropped from `.tick` below (unlike every other
-        // unsupported shape in this file, which throws) -- the current
-        // behavior is intentional/spec-conformant (see synapse_lowering.h),
-        // but a silent drop is still worth a diagnostic so a future real
-        // per-edge synapse with genuine decay dynamics doesn't lose it
-        // without at least a build-time signal.
-        for (const auto &time_derivative : synapse.time_derivatives) {
-            log::logger().warn(
-                "synapse_lowering: '{}' is per-edge and declares a TimeDerivative for '{}' -- its decay is "
-                "NOT lowered into '.tick' (Phase-1 per-edge time-evolution is deferred/unspecified, matching "
-                "the provisional IR spec's own NMDA example, which never decays its per-edge 'g' either)",
-                synapse_entry.component_type_name, time_derivative.variable);
-        }
-
-        Vector<TickInstruction> forall_body;
-        UnorderedMap<String, String> peredge_aliases;
-        for (const auto &state_variable : synapse.state_variables) {
-            peredge_aliases[state_variable.name] = "edge_" + state_variable.name;
-        }
-        LoweringContext forall_context(known_names, peredge_aliases);
-
-        for (const auto &state_variable : synapse.state_variables) {
-            forall_body.push_back(LoadEdgeInstruction{
-                "edge_" + state_variable.name, state_variable.name, EdgeSetReference::CurrentEdge});
-        }
-        lower_all_derived_variables(synapse, forall_body, forall_context);
-        forall_body.push_back(BinaryInstruction{BinaryOpcode::Add, "network_inputs", "network_inputs", current_derived_variable.name});
-
-        tick.integrate.push_back(ForAllInstruction{EdgeSetReference::NeuronIn, std::move(forall_body)});
+    // -- it is just this type's own DerivedVariable exposing "i") -- always
+    // `forall neuron_in { loadedge ...; ... }` (IR spec §4's NMDA example),
+    // uniformly for every synapse now (see this file's header comment). No
+    // explicit per-edge decay instruction is emitted (see
+    // synapse_lowering.h's header comment for why this is spec-conformant,
+    // not an oversight) -- each peredge state variable is `loadedge`'d into
+    // a name derived from the variable itself (`edge_<name>`, never a `tN`
+    // temp) so it stays valid across however many subsequent statements the
+    // forall body's own DerivedVariable computations need (this is also
+    // what folds a conductance-based synapse's `require v`-driven
+    // `g·(erev−v)` into the exact same generic path a current-based
+    // synapse's trivial `i = g` identity takes -- `lower_all_derived_variables`
+    // below has no conductance-vs-current special case; it just evaluates
+    // whichever expression the type's own `i` DerivedVariable declares),
+    // without colliding with their OWN per-statement-reset `tN` counter.
+    //
+    // A synapse that actually declares a `TimeDerivative` has it silently
+    // dropped from `.tick` below (unlike every other unsupported shape in
+    // this file, which throws) -- the current behavior is intentional/
+    // spec-conformant (see synapse_lowering.h), but a silent drop is still
+    // worth a diagnostic so a future synapse with genuine decay dynamics
+    // doesn't lose it without at least a build-time signal.
+    for (const auto &time_derivative : synapse.time_derivatives) {
+        log::logger().warn(
+            "synapse_lowering: '{}' declares a TimeDerivative for '{}' -- its decay is NOT lowered "
+            "into '.tick' (Phase-1 per-edge time-evolution is deferred/unspecified, matching the "
+            "provisional IR spec's own NMDA example, which never decays its per-edge 'g' either)",
+            synapse_entry.component_type_name, time_derivative.variable);
     }
+
+    Vector<TickInstruction> forall_body;
+    UnorderedMap<String, String> peredge_aliases;
+    for (const auto &state_variable : synapse.state_variables) {
+        peredge_aliases[state_variable.name] = "edge_" + state_variable.name;
+    }
+    LoweringContext forall_context(known_names, peredge_aliases);
+
+    for (const auto &state_variable : synapse.state_variables) {
+        forall_body.push_back(LoadEdgeInstruction{
+            "edge_" + state_variable.name, state_variable.name, EdgeSetReference::CurrentEdge});
+    }
+    lower_all_derived_variables(synapse, forall_body, forall_context);
+    forall_body.push_back(BinaryInstruction{BinaryOpcode::Add, "network_inputs", "network_inputs", current_derived_variable.name});
+
+    tick.integrate.push_back(ForAllInstruction{EdgeSetReference::NeuronIn, std::move(forall_body)});
 
     IrProgram program;
     program.component_type_name = synapse_entry.component_type_name;

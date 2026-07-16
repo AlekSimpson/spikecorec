@@ -23,12 +23,16 @@ using namespace spikecorec::nml;
 
 // ── Synapse dynamics -> IR lowering tests (ticket #51 [B3]) ──────────────
 //
-// Covers the three shapes ticket #51 scopes: aggregatable current-based,
-// aggregatable conductance-based, and per-edge (all conductance-based).
-// Where the real vendored std-lib ComponentType is directly usable
-// (`expOneSynapse`, `alphaCurrentSynapse` -- neither needs anything this
-// front-end can't already parse), the fixture below references it directly
-// by tag, with no inline `<ComponentType>` declaration, exactly like
+// Every synapse now lowers uniformly through the sole per-edge shape (arch
+// §4.3 design revision -- the old aggregatable-per-neuron-accumulator vs
+// per-edge storage split is gone, see synapse_lowering.h's header comment).
+// These tests cover the one classification distinction that's still
+// meaningful -- current-based vs conductance-based, which determines what
+// VALUE the `forall` body computes (`i = g` vs `i = g*(erev-v)`), not how
+// state is stored. Where the real vendored std-lib ComponentType is
+// directly usable (`expOneSynapse` -- needs nothing this front-end can't
+// already parse), the fixture below references it directly by tag, with no
+// inline `<ComponentType>` declaration, exactly like
 // model_specification_tests.cpp's own synapse fixtures. Two targets need a
 // custom, self-contained fixture instead (same precedent cell_lowering_tests.cpp
 // itself sets for GLIF1-5, none of which reuse a real Allen ComponentType
@@ -43,7 +47,10 @@ using namespace spikecorec::nml;
 //     structure (two decaying state variables A/B, a derived `g` from their
 //     difference, a derived `i = g*(erev-v)`, an OnEvent bumping both A and
 //     B) with `waveformFactor` declared as a plain `Parameter` instead of a
-//     `DerivedParameter` -- sidestepping the gap without masking it.
+//     `DerivedParameter` -- sidestepping the gap without masking it. It also
+//     exercises the multi-state-variable per-edge case (two `peredge` slots
+//     loaded in the same `forall` body) that the single-state-variable
+//     fixtures below don't.
 //   - `blockingPlasticSynapse` (real, the NMDA target): its real Dynamics
 //     compose child `plasticityMechanisms`/`blockMechanisms` components via
 //     `select`/`reduce="multiply"` DerivedVariables -- full sub-component
@@ -52,10 +59,9 @@ using namespace spikecorec::nml;
 //     itself extends expTwoSynapse so also inherits the waveformFactor gap
 //     above). `TestNmdaSynapse` below reproduces the IR spec §4 NMDA
 //     example's own simplified shape almost exactly (single decaying
-//     conductance `g`, `i = g*(erev-v)`, one `Children` declaration so
-//     ticket #7's own `synapse_is_aggregatable` classifier correctly marks
-//     it per-edge -- matching the real blockingPlasticSynapse's actual
-//     per-edge classification, just without composing the elided mechanism).
+//     conductance `g`, `i = g*(erev-v)`, a `Children` declaration for
+//     fidelity to the real type's shape), just without composing the
+//     elided mechanism.
 //
 // Every fixture is routed through a trivial one-neuron self-loop network (a
 // `DummyCell` used purely as projection plumbing, irrelevant to what's under
@@ -208,16 +214,15 @@ const String TEST_NMDA_SYNAPSE_COMPONENT_TYPE =
 
 } // namespace
 
-// ── expOneSynapse (real, conductance-based, aggregatable) ────────────────
+// ── expOneSynapse (real, conductance-based) ──────────────────────────────
 
-TEST(SynapseLoweringAggregatable, lowers_exp_one_synapse_conductance_based) {
+TEST(SynapseLoweringPerEdge, lowers_exp_one_synapse_conductance_based) {
     TypeLibraryEntry entry = build_synapse_type_library_entry(
         "exp_one_conductance", "", "expOneSynapse",
         "gbase=\"1nS\" erev=\"0mV\" tauDecay=\"3ms\" weight=\"2\"");
 
     ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
     ASSERT_TRUE(entry.is_conductance_based);
-    ASSERT_TRUE(entry.is_aggregatable);
 
     IrProgram program = lower_synapse_to_ir(entry);
     EXPECT_EQ(program.component_type_name, "expOneSynapse");
@@ -225,7 +230,7 @@ TEST(SynapseLoweringAggregatable, lowers_exp_one_synapse_conductance_based) {
     String expected =
         ".alloc\n"
         "  require v from postsynaptic\n"
-        "  accum g : f32\n"
+        "  peredge g\n"
         "  param tauDecay = 0.0030000000000000001\n"
         "  param gbase = 1.0000000000000001e-09\n"
         "  param erev = 0\n"
@@ -239,34 +244,42 @@ TEST(SynapseLoweringAggregatable, lowers_exp_one_synapse_conductance_based) {
         "      accedge g@edge, t0\n"
         "    }\n"
         "  @integrate\n"
-        "    expdecay g, g, tauDecay\n"
-        "    sub i, erev, v\n"
-        "    mul i, g, i\n"
-        "    add network_inputs, network_inputs, i\n";
+        "    forall neuron_in {\n"
+        "      loadedge edge_g, g@edge\n"
+        "      sub i, erev, v\n"
+        "      mul i, edge_g, i\n"
+        "      add network_inputs, network_inputs, i\n"
+        "    }\n";
 
     // Conductance-based: `i = g*(erev-v)` (arch §3.5's own invariant -- "no
     // special cell-side case" -- is exactly this: the synapse itself
-    // computes `g*(erev-v)` via `require v` before writing network_inputs).
+    // computes `g*(erev-v)` via `require v` before writing network_inputs),
+    // realized through the sole per-edge shape every synapse now uses
+    // (arch §4.3 design revision). `g`'s TimeDerivative (`-g/tauDecay`) is
+    // not lowered into `.tick` -- a per-edge variable's time-evolution is
+    // deferred/unspecified in Phase 1 (see synapse_lowering.h) -- so this
+    // test also emits (and doesn't need to assert) the accompanying
+    // diagnostic warning covered explicitly by
+    // warns_when_per_edge_synapse_declares_a_time_derivative below.
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
-// ── ExpOneCurrentSynapse (custom, current-based, aggregatable) ───────────
+// ── ExpOneCurrentSynapse (custom, current-based) ─────────────────────────
 
-TEST(SynapseLoweringAggregatable, lowers_exp_one_synapse_current_based) {
+TEST(SynapseLoweringPerEdge, lowers_exp_one_synapse_current_based) {
     TypeLibraryEntry entry = build_synapse_type_library_entry(
         "exp_one_current", EXP_ONE_CURRENT_SYNAPSE_COMPONENT_TYPE, "ExpOneCurrentSynapse",
         "tau=\"5ms\" weight=\"3\"");
 
     ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
     ASSERT_FALSE(entry.is_conductance_based);
-    ASSERT_TRUE(entry.is_aggregatable);
 
     IrProgram program = lower_synapse_to_ir(entry);
     EXPECT_EQ(program.component_type_name, "ExpOneCurrentSynapse");
 
     String expected =
         ".alloc\n"
-        "  accum g : f32\n"
+        "  peredge g\n"
         "  param tau = 0.0050000000000000001\n"
         "  param weight = 3\n"
         "  expose g\n"
@@ -277,37 +290,36 @@ TEST(SynapseLoweringAggregatable, lowers_exp_one_synapse_current_based) {
         "      accedge g@edge, weight\n"
         "    }\n"
         "  @integrate\n"
-        "    expdecay g, g, tau\n"
-        "    mov i, g\n"
-        "    add network_inputs, network_inputs, i\n";
+        "    forall neuron_in {\n"
+        "      loadedge edge_g, g@edge\n"
+        "      mov i, edge_g\n"
+        "      add network_inputs, network_inputs, i\n"
+        "    }\n";
 
-    // Matches the locked IR spec's own "expOne -- current-based, aggregatable
-    // synapse" example (§4) almost exactly: the `@deliver` onevent is
-    // BYTE-identical to the spec's `accedge g@edge, weight` (the increment
-    // here is a bare Property leaf, so emit_expression resolves it with zero
-    // extra instructions). `@integrate` has one extra `mov i, g` the spec's
-    // own illustrative text elides (it treats the trivial identity
-    // `i = g` as needing no instruction at all) -- this lowering's
-    // DerivedVariable handling is uniform/generic (every DerivedVariable,
-    // "i" included, is computed into its own name, same as cell_lowering.cpp's
-    // convention), so a genuinely trivial identity DerivedVariable still
-    // costs one harmless `mov`, exactly the same class of cosmetic-only
-    // deviation cell_lowering_tests.cpp's own PlainLifCell test already
-    // documents for `.alloc`'s literal-vs-bare-param difference.
+    // Current-based: the trivial identity `i = g` DerivedVariable is lowered
+    // through the exact same generic `forall`/`loadedge` machinery a
+    // conductance-based synapse's `g*(erev-v)` uses -- no special case for
+    // either (see synapse_lowering.cpp's own comment). The `@deliver`
+    // onevent is BYTE-identical to the locked IR spec's own illustrative
+    // `accedge g@edge, weight` (the increment here is a bare Property leaf,
+    // so emit_expression resolves it with zero extra instructions); the one
+    // extra `mov i, edge_g` in `@integrate` is the same class of
+    // cosmetic-only deviation cell_lowering_tests.cpp's own PlainLifCell
+    // test already documents for `.alloc`'s literal-vs-bare-param
+    // difference -- a genuinely trivial identity DerivedVariable still
+    // costs one harmless `mov`.
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
-// ── TestExpTwoSynapse (custom, conductance-based, aggregatable, two state
-// variables) ──────────────────────────────────────────────────────────────
+// ── TestExpTwoSynapse (custom, conductance-based, two state variables) ───
 
-TEST(SynapseLoweringAggregatable, lowers_exp_two_synapse) {
+TEST(SynapseLoweringPerEdge, lowers_exp_two_synapse) {
     TypeLibraryEntry entry = build_synapse_type_library_entry(
         "exp_two", TEST_EXP_TWO_SYNAPSE_COMPONENT_TYPE, "TestExpTwoSynapse",
         "gbase=\"2nS\" erev=\"0mV\" tauRise=\"1ms\" tauDecay=\"10ms\" waveformFactor=\"1.5\" weight=\"2\"");
 
     ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
     ASSERT_TRUE(entry.is_conductance_based);
-    ASSERT_TRUE(entry.is_aggregatable);
 
     IrProgram program = lower_synapse_to_ir(entry);
     EXPECT_EQ(program.component_type_name, "TestExpTwoSynapse");
@@ -315,8 +327,8 @@ TEST(SynapseLoweringAggregatable, lowers_exp_two_synapse) {
     String expected =
         ".alloc\n"
         "  require v from postsynaptic\n"
-        "  accum A : f32\n"
-        "  accum B : f32\n"
+        "  peredge A\n"
+        "  peredge B\n"
         "  param tauRise = 0.001\n"
         "  param tauDecay = 0.01\n"
         "  param waveformFactor = 1.5\n"
@@ -334,65 +346,24 @@ TEST(SynapseLoweringAggregatable, lowers_exp_two_synapse) {
         "      accedge B@edge, t0\n"
         "    }\n"
         "  @integrate\n"
-        "    expdecay A, A, tauRise\n"
-        "    expdecay B, B, tauDecay\n"
-        "    sub g, B, A\n"
-        "    mul g, gbase, g\n"
-        "    sub i, erev, v\n"
-        "    mul i, g, i\n"
-        "    add network_inputs, network_inputs, i\n";
+        "    forall neuron_in {\n"
+        "      loadedge edge_A, A@edge\n"
+        "      loadedge edge_B, B@edge\n"
+        "      sub g, edge_B, edge_A\n"
+        "      mul g, gbase, g\n"
+        "      sub i, erev, v\n"
+        "      mul i, g, i\n"
+        "      add network_inputs, network_inputs, i\n"
+        "    }\n";
 
-    // Two state variables both become their own `accum` slot (arch §4.2);
-    // the plain-value DerivedVariable `g` is computed (from the just-decayed
-    // A/B) before the finished-current DerivedVariable `i` that reads it --
-    // declaration order alone gets this right, no dependency analysis
+    // Two state variables both become their own `peredge` slot, both
+    // `loadedge`'d in the same `forall` body (a case none of the
+    // single-state-variable fixtures above exercise); the plain-value
+    // DerivedVariable `g` is computed from the just-loaded `edge_A`/`edge_B`
+    // aliases before the finished-current DerivedVariable `i` that reads it
+    // -- declaration order alone gets this right, no dependency analysis
     // needed (same convention cell_lowering.cpp's own DerivedVariable
     // iteration relies on).
-    EXPECT_EQ(print_ir_program(program), expected);
-}
-
-// ── alphaCurrentSynapse (real, current-based, aggregatable) ──────────────
-
-TEST(SynapseLoweringAggregatable, lowers_alpha_current_synapse) {
-    TypeLibraryEntry entry = build_synapse_type_library_entry(
-        "alpha_current", "", "alphaCurrentSynapse",
-        "tau=\"2ms\" ibase=\"0.1nA\" weight=\"2\"");
-
-    ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
-    ASSERT_FALSE(entry.is_conductance_based);
-    ASSERT_TRUE(entry.is_aggregatable);
-
-    IrProgram program = lower_synapse_to_ir(entry);
-    EXPECT_EQ(program.component_type_name, "alphaCurrentSynapse");
-
-    String expected =
-        ".alloc\n"
-        "  accum I : f32\n"
-        "  accum J : f32\n"
-        "  param tau = 0.002\n"
-        "  param ibase = 1.0000000000000002e-10\n"
-        "  param weight = 2\n"
-        "  expose i\n"
-        ".tick\n"
-        "  @deliver\n"
-        "    onevent in {\n"
-        "      mul t0, weight, ibase\n"
-        "      accedge J@edge, t0\n"
-        "    }\n"
-        "  @integrate\n"
-        "    mul t0, 2.7182818284590451, J\n"
-        "    sub t0, t0, I\n"
-        "    div t0, t0, tau\n"
-        "    mul t0, t0, dt\n"
-        "    add I, I, t0\n"
-        "    expdecay J, J, tau\n"
-        "    mov i, I\n"
-        "    add network_inputs, network_inputs, i\n";
-
-    // `I`'s TimeDerivative `(2.7182818284590451*J - I)/tau` doesn't match
-    // the linear-decay shape (its target `2.7182818284590451*J` isn't a bare
-    // leaf), so it takes the forward-Euler fallback -- exactly like a GLIF
-    // cell's own non-decay-shaped TimeDerivative would.
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
