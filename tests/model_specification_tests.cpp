@@ -198,34 +198,31 @@ String write_single_population_recording_fixture(const String &quantity_path) {
 
 // ── Type library: classification flags (acceptance criterion) ─────────────
 
-TEST(ModelSpecification, classifies_current_based_aggregatable_synapse) {
+TEST(ModelSpecification, classifies_current_based_synapse) {
     ModelSpecification specification = build_test_model_specification();
 
     const TypeLibraryEntry &alpha_current = type_library_entry_for(specification, "glifCurrSynapse");
     EXPECT_EQ(alpha_current.component_type_name, "alphaCurrentSynapse");
     EXPECT_EQ(alpha_current.category, TypeLibraryCategory::Synapse);
     EXPECT_FALSE(alpha_current.is_conductance_based);
-    EXPECT_TRUE(alpha_current.is_aggregatable);
 }
 
-TEST(ModelSpecification, classifies_conductance_based_aggregatable_synapse) {
+TEST(ModelSpecification, classifies_conductance_based_synapse) {
     ModelSpecification specification = build_test_model_specification();
 
     const TypeLibraryEntry &exp_one = type_library_entry_for(specification, "glifExcSynapse");
     EXPECT_EQ(exp_one.component_type_name, "expOneSynapse");
     EXPECT_EQ(exp_one.category, TypeLibraryCategory::Synapse);
     EXPECT_TRUE(exp_one.is_conductance_based);
-    EXPECT_TRUE(exp_one.is_aggregatable);
 }
 
-TEST(ModelSpecification, classifies_conductance_based_per_edge_nmda_synapse) {
+TEST(ModelSpecification, classifies_conductance_based_nmda_synapse) {
     ModelSpecification specification = build_test_model_specification();
 
     const TypeLibraryEntry &nmda = type_library_entry_for(specification, "glifNmdaSynapse");
     EXPECT_EQ(nmda.component_type_name, "blockingPlasticSynapse");
     EXPECT_EQ(nmda.category, TypeLibraryCategory::Synapse);
     EXPECT_TRUE(nmda.is_conductance_based);   // extends expTwoSynapse -> baseConductanceBasedSynapse
-    EXPECT_FALSE(nmda.is_aggregatable);       // plasticity/block Children -> per-edge (arch §4.3)
 }
 
 TEST(ModelSpecification, classifies_inputs_type_entry) {

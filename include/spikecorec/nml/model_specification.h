@@ -84,16 +84,6 @@ struct TypeLibraryEntry {
     // (current = g -> current-based)? Always false for Cell/Inputs entries.
     bool is_conductance_based = false;
 
-    // Meaningful only when category == Synapse (arch §4.2 vs §4.3): true
-    // (the default) for synapses whose converging-edge contributions
-    // superpose into one per-neuron accumulator; false for synapses needing
-    // per-edge state (e.g. `blockingPlasticSynapse`'s plasticity/block
-    // Children, whose state is a function of that specific edge's own
-    // arrival history and cannot be summed away). Detected structurally: a
-    // synapse type with any `Children`/`Child` sub-mechanism declared is
-    // per-edge. Always true (unused) for Cell/Inputs entries.
-    bool is_aggregatable = true;
-
     // Per-instance state slot count (`V_t`, arch §4.1) -- state_variables
     // size after extends-flattening. Used to size population chunk offsets.
     s32 state_variable_count = 0;

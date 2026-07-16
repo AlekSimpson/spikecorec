@@ -48,16 +48,6 @@ s32 state_variable_count_of(const ComponentTypeEntry &entry) {
     return 0;
 }
 
-// A synapse type uses per-edge storage iff its dynamics don't superpose
-// across converging edges (arch §4.3): structurally, a synapse type with any
-// `Children`/`Child` sub-mechanism (e.g. blockingPlasticSynapse's
-// plasticity/block mechanisms, whose state is a function of that edge's own
-// arrival history) is per-edge; a synapse type with none is the linear,
-// superposable, aggregatable default (arch §4.2).
-bool synapse_is_aggregatable(const SynapseType &synapse) {
-    return synapse.children.empty();
-}
-
 bool synapse_is_conductance_based(const Vector<String> &ancestor_chain) {
     return chain_contains(ancestor_chain, "baseConductanceBasedSynapse") ||
            chain_contains(ancestor_chain, "baseConductanceBasedSynapseTwo");
@@ -225,7 +215,6 @@ s32 get_or_create_type_library_entry(
 
     if (entry.category == TypeLibraryCategory::Synapse) {
         entry.is_conductance_based = synapse_is_conductance_based(type.ancestor_chain);
-        entry.is_aggregatable = synapse_is_aggregatable(std::get<SynapseType>(type.flattened));
     }
 
     s32 new_index = (s32)type_library.size();
