@@ -173,7 +173,9 @@ String print_alloc_directive(const AllocDirective &directive) {
             return "param " + param.name + " : dyn " + param.dtype;
         },
         [](const StateDirective &state) -> String {
-            return "state " + state.name + " : " + state.dtype;
+            String rendered = "state " + state.name + " : " + state.dtype;
+            if (state.initial_value.has_value()) rendered += " = " + *state.initial_value;
+            return rendered;
         },
         [](const AccumDirective &accum) -> String {
             return "accum " + accum.name + " : " + accum.dtype;

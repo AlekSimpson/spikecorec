@@ -37,9 +37,23 @@ struct ParamDynamicDirective {
 };
 
 // `state <name> : <dtype>` -- a per-neuron cell-state-vector slot (IR spec §2).
+//
+// `initial_value` (ticket #50 [B2], an additive gap fix, not part of the
+// locked v1.0 text): the IR spec's `.alloc` is explicitly "interpreted at
+// init" (§2), and arch §3.2 says `OnStart` "seeds the state arrays... at
+// INIT" -- but before this ticket nothing in the IR could carry that seed
+// anywhere; TickProgram has no INIT-stage hook (arch's stage 9 has none) and
+// StateDirective had no value slot. This is the natural, minimal home for it:
+// the raw LEMS `OnStart` `StateAssignment` value text (a bare identifier like
+// `EL` or a numeric literal like `0`), left uninterpreted here -- resolving it
+// to a concrete seed (param lookup vs. literal parse) is the future
+// allocator's job (#5), matching `.alloc`'s existing "engine-interpreted, not
+// compiled" fate. Absent (nullopt) => no OnStart declared for this state
+// variable; the allocator defaults it (Phase-1 convention: 0).
 struct StateDirective {
     String name;
     String dtype;
+    std::optional<String> initial_value;
 };
 
 // `accum <name> : <dtype>` -- a per-neuron synapse accumulator feeding
