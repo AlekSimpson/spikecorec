@@ -435,3 +435,37 @@ TEST(ResolveAndLower, treats_an_unlisted_non_numeric_attribute_as_opaque_instead
     ASSERT_EQ(cell_instance->numeric_attributes.count("EL"), 1u);
     EXPECT_NEAR(cell_instance->numeric_attributes.at("EL"), -0.07, 1e-12);
 }
+
+// ── ancestor_chain (ticket #7 [A5]'s additive gap fix, option (a)) ─────────
+//
+// merge_chain's walk now also records the same-category ancestor names it
+// visits, so a synapse's classification (arch §3.1 `ComponentType`: does the
+// `extends` chain pass through `baseConductanceBasedSynapse`?) can be
+// determined from a ResolvedComponentType alone, without re-walking
+// NML_Parser::library.
+
+TEST(ResolveAndLower, captures_ancestor_chain_across_a_synapse_extends_walk) {
+    String path = write_temp_file("spikecorec_resolve_ancestor_chain_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"AncestorChainTestDoc\">"
+        "  <expOneSynapse id=\"expSynInstance\" gbase=\"1nS\" erev=\"0mV\" tauDecay=\"3ms\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    ResolvedModel model = resolve_and_lower(parser);
+
+    ASSERT_EQ(model.types.count("expOneSynapse"), 1u);
+    const Vector<String> &chain = model.types.at("expOneSynapse").ancestor_chain;
+
+    // expOneSynapse -> baseConductanceBasedSynapse -> baseVoltageDepSynapse
+    // -> baseSynapse -- the walk stops there since baseSynapse's own parent,
+    // basePointCurrent, is cataloged as a different category (InputsType),
+    // matching merge_chain's "stops... the moment it reaches an ancestor
+    // cataloged under a different category" rule.
+    ASSERT_EQ(chain.size(), 4u);
+    EXPECT_EQ(chain[0], "expOneSynapse");
+    EXPECT_EQ(chain[1], "baseConductanceBasedSynapse");
+    EXPECT_EQ(chain[2], "baseVoltageDepSynapse");
+    EXPECT_EQ(chain[3], "baseSynapse");
+}

@@ -46,6 +46,17 @@ struct ResolvedComponentType {
     ComponentTypeEntry flattened;
     ComponentTypeBucket bucket = ComponentTypeBucket::Structure;
     UnorderedMap<String, f64> fixed_parameter_values;
+
+    // The `extends` ancestor names visited while flattening this type (own
+    // name first, then each same-category ancestor merge_chain walked, in
+    // nearest-to-furthest order; stops where merge_chain's own walk stops --
+    // see resolve.cpp). Needed downstream (ticket #7 [A5] ModelSpecification)
+    // to classify a SynapseType's `extends` chain (arch §3.1 `ComponentType`:
+    // `baseConductanceBasedSynapse` in the chain -> conductance-based) --
+    // merge_chain already walks this chain to merge fields but previously
+    // discarded the visited names once merging finished. A small additive
+    // capture of resolve.cpp's own walk, not a second traversal.
+    Vector<String> ancestor_chain;
 };
 
 // id/name → stable integer index, backing S7 IDref wiring. Shared by every

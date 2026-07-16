@@ -138,7 +138,8 @@ void apply_fixed_pins(const Vector<FixedDecl> &pending_fixed, UnorderedMap<Strin
 template <typename ComponentTypeStruct, typename MergeFieldsFunction>
 ComponentTypeStruct merge_chain(const String &name, const UnorderedMap<String, ComponentTypeEntry> &library,
                                  const String &category_label, MergeFieldsFunction merge_fields,
-                                 UnorderedMap<String, f64> &fixed_parameter_values) {
+                                 UnorderedMap<String, f64> &fixed_parameter_values,
+                                 Vector<String> &ancestor_chain) {
     auto entry_iterator = library.find(name);
     if (entry_iterator == library.end() || !std::holds_alternative<ComponentTypeStruct>(entry_iterator->second)) {
         log::logger().error("resolve: '{}' is not a cataloged {}", name, category_label);
@@ -147,6 +148,7 @@ ComponentTypeStruct merge_chain(const String &name, const UnorderedMap<String, C
 
     ComponentTypeStruct result = std::get<ComponentTypeStruct>(entry_iterator->second);
     Vector<FixedDecl> pending_fixed = extract_fixed_decls(result.raw);
+    ancestor_chain.push_back(name);
 
     String parent_name = result.extends;
     for (int hop = 0; !parent_name.empty() && hop < 64; ++hop) {
@@ -162,6 +164,7 @@ ComponentTypeStruct merge_chain(const String &name, const UnorderedMap<String, C
         const ComponentTypeStruct &parent = std::get<ComponentTypeStruct>(parent_iterator->second);
         merge_fields(result, parent);
         append_all(pending_fixed, extract_fixed_decls(parent.raw));
+        ancestor_chain.push_back(parent_name);
 
         parent_name = parent.extends;
     }
@@ -246,19 +249,19 @@ ResolvedComponentType flatten_component_type(const String &name, const Unordered
     ResolvedComponentType resolved;
 
     if (std::holds_alternative<CellType>(entry)) {
-        resolved.flattened = merge_chain<CellType>(name, library, "CellType", merge_cell_fields, resolved.fixed_parameter_values);
+        resolved.flattened = merge_chain<CellType>(name, library, "CellType", merge_cell_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Dynamics;
     } else if (std::holds_alternative<SynapseType>(entry)) {
-        resolved.flattened = merge_chain<SynapseType>(name, library, "SynapseType", merge_synapse_fields, resolved.fixed_parameter_values);
+        resolved.flattened = merge_chain<SynapseType>(name, library, "SynapseType", merge_synapse_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Dynamics;
     } else if (std::holds_alternative<InputsType>(entry)) {
-        resolved.flattened = merge_chain<InputsType>(name, library, "InputsType", merge_inputs_fields, resolved.fixed_parameter_values);
+        resolved.flattened = merge_chain<InputsType>(name, library, "InputsType", merge_inputs_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Dynamics;
     } else if (std::holds_alternative<PopulationType>(entry)) {
-        resolved.flattened = merge_chain<PopulationType>(name, library, "PopulationType", merge_population_fields, resolved.fixed_parameter_values);
+        resolved.flattened = merge_chain<PopulationType>(name, library, "PopulationType", merge_population_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Structure;
     } else if (std::holds_alternative<ProjectType>(entry)) {
-        resolved.flattened = merge_chain<ProjectType>(name, library, "ProjectType", merge_project_fields, resolved.fixed_parameter_values);
+        resolved.flattened = merge_chain<ProjectType>(name, library, "ProjectType", merge_project_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Structure;
     } else {
         // Bare ComponentTypeBase: an out-of-scope category (ion channels,
@@ -266,6 +269,7 @@ ResolvedComponentType flatten_component_type(const String &name, const Unordered
         // declared field vectors to merge, so it is passed through as-is.
         resolved.flattened = std::get<ComponentTypeBase>(entry);
         resolved.bucket = ComponentTypeBucket::Structure;
+        resolved.ancestor_chain = {name};
     }
 
     return resolved;
