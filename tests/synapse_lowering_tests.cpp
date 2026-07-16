@@ -194,6 +194,28 @@ const String TEST_EXP_TWO_SYNAPSE_COMPONENT_TYPE =
     "    </Dynamics>"
     "  </ComponentType>";
 
+// A per-edge synapse whose `TimeDerivative` is declared but does NOT match
+// the recognized linear-decay shape (`1 / tau`, a constant charging rate --
+// no `-state` numerator, so `detect_linear_decay_shape` returns nullopt) --
+// exercises the warn-and-skip path the decay-shaped fixtures above no longer
+// take now that they're actually lowered.
+const String TEST_NON_DECAYING_SYNAPSE_COMPONENT_TYPE =
+    "  <ComponentType name=\"TestNonDecayingSynapse\" extends=\"baseConductanceBasedSynapse\">"
+    "    <Property name=\"weight\" dimension=\"none\" defaultValue=\"1\"/>"
+    "    <Parameter name=\"tau\" dimension=\"time\"/>"
+    "    <Dynamics>"
+    "      <StateVariable name=\"g\" dimension=\"conductance\" exposure=\"g\"/>"
+    "      <DerivedVariable name=\"i\" exposure=\"i\" dimension=\"current\" value=\"g * (erev - v)\"/>"
+    "      <TimeDerivative variable=\"g\" value=\"1 / tau\"/>"
+    "      <OnStart>"
+    "        <StateAssignment variable=\"g\" value=\"0\"/>"
+    "      </OnStart>"
+    "      <OnEvent port=\"in\">"
+    "        <StateAssignment variable=\"g\" value=\"g + weight\"/>"
+    "      </OnEvent>"
+    "    </Dynamics>"
+    "  </ComponentType>";
+
 const String TEST_NMDA_SYNAPSE_COMPONENT_TYPE =
     "  <ComponentType name=\"TestNmdaSynapse\" extends=\"baseConductanceBasedSynapse\">"
     "    <Property name=\"weight\" dimension=\"none\" defaultValue=\"1\"/>"
@@ -245,7 +267,10 @@ TEST(SynapseLoweringPerEdge, lowers_exp_one_synapse_conductance_based) {
         "    }\n"
         "  @integrate\n"
         "    forall neuron_in {\n"
-        "      loadedge edge_g, g@edge\n"
+        "      loadedge edge_g_old, g@edge\n"
+        "      expdecay edge_g, edge_g_old, tauDecay\n"
+        "      sub edge_g_delta, edge_g, edge_g_old\n"
+        "      accedge g@edge, edge_g_delta\n"
         "      sub i, erev, v\n"
         "      mul i, edge_g, i\n"
         "      add network_inputs, network_inputs, i\n"
@@ -255,12 +280,12 @@ TEST(SynapseLoweringPerEdge, lowers_exp_one_synapse_conductance_based) {
     // special cell-side case" -- is exactly this: the synapse itself
     // computes `g*(erev-v)` via `require v` before writing network_inputs),
     // realized through the sole per-edge shape every synapse now uses
-    // (arch §4.3 design revision). `g`'s TimeDerivative (`-g/tauDecay`) is
-    // not lowered into `.tick` -- a per-edge variable's time-evolution is
-    // deferred/unspecified in Phase 1 (see synapse_lowering.h) -- so this
-    // test also emits (and doesn't need to assert) the accompanying
-    // diagnostic warning covered explicitly by
-    // warns_when_per_edge_synapse_declares_a_time_derivative below.
+    // (arch §4.3 design revision). `g`'s TimeDerivative (`-g/tauDecay`)
+    // matches the recognized linear-decay shape (target 0), so it IS now
+    // lowered via the accumulate-only read-decay-writeback-delta pattern
+    // (`loadedge` the old value, `expdecay` it, `accedge` the delta back --
+    // see synapse_lowering.h) before the finished-current computation reads
+    // the now-decayed `edge_g`.
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
@@ -291,7 +316,10 @@ TEST(SynapseLoweringPerEdge, lowers_exp_one_synapse_current_based) {
         "    }\n"
         "  @integrate\n"
         "    forall neuron_in {\n"
-        "      loadedge edge_g, g@edge\n"
+        "      loadedge edge_g_old, g@edge\n"
+        "      expdecay edge_g, edge_g_old, tau\n"
+        "      sub edge_g_delta, edge_g, edge_g_old\n"
+        "      accedge g@edge, edge_g_delta\n"
         "      mov i, edge_g\n"
         "      add network_inputs, network_inputs, i\n"
         "    }\n";
@@ -302,12 +330,14 @@ TEST(SynapseLoweringPerEdge, lowers_exp_one_synapse_current_based) {
     // either (see synapse_lowering.cpp's own comment). The `@deliver`
     // onevent is BYTE-identical to the locked IR spec's own illustrative
     // `accedge g@edge, weight` (the increment here is a bare Property leaf,
-    // so emit_expression resolves it with zero extra instructions); the one
-    // extra `mov i, edge_g` in `@integrate` is the same class of
-    // cosmetic-only deviation cell_lowering_tests.cpp's own PlainLifCell
-    // test already documents for `.alloc`'s literal-vs-bare-param
+    // so emit_expression resolves it with zero extra instructions). `g`'s
+    // TimeDerivative (`-g/tau`) matches the recognized linear-decay shape, so
+    // it decays via read-decay-writeback-delta before the trivial `i = g`
+    // identity is computed (the one extra `mov i, edge_g` is the same
+    // class of cosmetic-only deviation cell_lowering_tests.cpp's own
+    // PlainLifCell test already documents for `.alloc`'s literal-vs-bare-param
     // difference -- a genuinely trivial identity DerivedVariable still
-    // costs one harmless `mov`.
+    // costs one harmless `mov`).
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
@@ -347,8 +377,14 @@ TEST(SynapseLoweringPerEdge, lowers_exp_two_synapse) {
         "    }\n"
         "  @integrate\n"
         "    forall neuron_in {\n"
-        "      loadedge edge_A, A@edge\n"
-        "      loadedge edge_B, B@edge\n"
+        "      loadedge edge_A_old, A@edge\n"
+        "      expdecay edge_A, edge_A_old, tauRise\n"
+        "      sub edge_A_delta, edge_A, edge_A_old\n"
+        "      accedge A@edge, edge_A_delta\n"
+        "      loadedge edge_B_old, B@edge\n"
+        "      expdecay edge_B, edge_B_old, tauDecay\n"
+        "      sub edge_B_delta, edge_B, edge_B_old\n"
+        "      accedge B@edge, edge_B_delta\n"
         "      sub g, edge_B, edge_A\n"
         "      mul g, gbase, g\n"
         "      sub i, erev, v\n"
@@ -356,14 +392,16 @@ TEST(SynapseLoweringPerEdge, lowers_exp_two_synapse) {
         "      add network_inputs, network_inputs, i\n"
         "    }\n";
 
-    // Two state variables both become their own `peredge` slot, both
-    // `loadedge`'d in the same `forall` body (a case none of the
-    // single-state-variable fixtures above exercise); the plain-value
-    // DerivedVariable `g` is computed from the just-loaded `edge_A`/`edge_B`
-    // aliases before the finished-current DerivedVariable `i` that reads it
-    // -- declaration order alone gets this right, no dependency analysis
-    // needed (same convention cell_lowering.cpp's own DerivedVariable
-    // iteration relies on).
+    // Two state variables both become their own `peredge` slot, each
+    // independently decayed via its own read-decay-writeback-delta sequence
+    // (A's `-A/tauRise`, B's `-B/tauDecay`, both matching the recognized
+    // linear-decay shape) before the plain-value DerivedVariable `g` is
+    // computed from the now-decayed `edge_A`/`edge_B` registers -- a case
+    // none of the single-state-variable fixtures above exercise; the
+    // finished-current DerivedVariable `i` reads `g` afterward -- declaration
+    // order alone gets this right, no dependency analysis needed (same
+    // convention cell_lowering.cpp's own DerivedVariable iteration relies
+    // on).
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
@@ -398,47 +436,44 @@ TEST(SynapseLoweringPerEdge, lowers_nmda_style_synapse) {
         "    }\n"
         "  @integrate\n"
         "    forall neuron_in {\n"
-        "      loadedge edge_g, g@edge\n"
+        "      loadedge edge_g_old, g@edge\n"
+        "      expdecay edge_g, edge_g_old, tau\n"
+        "      sub edge_g_delta, edge_g, edge_g_old\n"
+        "      accedge g@edge, edge_g_delta\n"
         "      sub i, erev, v\n"
         "      mul i, edge_g, i\n"
         "      add network_inputs, network_inputs, i\n"
         "    }\n";
 
-    // Matches the locked IR spec's own NMDA example (§4) almost exactly:
-    // `peredge g` + `onevent in { accedge g@edge, weight }` +
-    // `forall neuron_in { loadedge ...; ...; add network_inputs,network_inputs,... }`.
-    // Differs only cosmetically in register naming (`edge_g`/`i` here vs. the
-    // spec's own `t0`/`t1` reuse) and in omitting an explicit per-edge decay
-    // instruction -- see synapse_lowering.h's header comment for why: `g`'s
-    // TimeDerivative (`-g/tau`) is intentionally NOT lowered for a `peredge`
-    // variable -- arch §4.3's shared-basis scheme is pure memory compression
-    // (Read/Update/Refit, none of which integrates an ODE), so per-edge
-    // time-evolution is simply deferred/unspecified in Phase 1, matching the
-    // provisional IR spec's own NMDA example (it declares `param tau` but
-    // never references it in `.tick`, and never decays its per-edge `g`
-    // either). `TestNmdaSynapse` DOES declare this TimeDerivative (see the
-    // fixture above), so this test also exercises the accompanying
-    // diagnostic (warns_when_per_edge_synapse_declares_a_time_derivative,
-    // below, asserts the warning text itself -- this test only pins the
-    // resulting `.tick` shape).
+    // Matches the locked IR spec's own NMDA example (§4) closely: `peredge g`
+    // + `onevent in { accedge g@edge, weight }` + `forall neuron_in { loadedge
+    // ...; ...; add network_inputs,network_inputs,... }`, plus the read-decay-
+    // writeback-delta sequence for `g`'s TimeDerivative (`-g/tau`, which
+    // matches the recognized linear-decay shape) that the accumulate-only
+    // per-edge storage requires (arch §4.3; see synapse_lowering.h). Differs
+    // from the spec's own illustrative (decay-eliding) example only
+    // cosmetically in register naming (`edge_g`/`i` here vs. the spec's own
+    // `t0`/`t1` reuse).
     EXPECT_EQ(print_ir_program(program), expected);
 }
 
-// The `TestNmdaSynapse` fixture above declares a `TimeDerivative` for its
-// per-edge `g` (`-g / tau`) that the lowering intentionally does not emit
-// into `.tick` (see this file's and synapse_lowering.h's comments on why).
-// Every OTHER unsupported shape in synapse_lowering.cpp throws; this one
-// silent drop instead logs a warning (review follow-up on ticket #51) so a
-// future real per-edge synapse with genuine decay dynamics is at least
-// observable, not silently lost. Asserts both halves: the warning fires,
-// AND the resulting `.tick` is unchanged (still the same shape as
-// `lowers_nmda_style_synapse` above -- the diagnostic is additive, not a
-// behavior change).
-TEST(SynapseLoweringPerEdge, warns_when_per_edge_synapse_declares_a_time_derivative) {
+// ── TestNonDecayingSynapse (custom, non-decay-shaped TimeDerivative) ─────
+
+// A per-edge synapse whose `TimeDerivative` (`1 / tau`, a constant charging
+// rate) does NOT match the recognized linear-decay shape -- unlike every
+// fixture above, this one's decay is still NOT lowered into `.tick` (general
+// per-edge forward-Euler integration for an arbitrary right-hand side is out
+// of this ticket's scope). Every OTHER unsupported shape in
+// synapse_lowering.cpp throws; this one silent drop instead logs a warning
+// (review follow-up on ticket #51) so a future real per-edge synapse with
+// genuine non-decay-shaped dynamics is at least observable, not silently
+// lost. Asserts both halves: the warning fires, AND the resulting `.tick` is
+// the same (no-decay) shape the per-edge fixtures used to all produce before
+// this ticket's fix.
+TEST(SynapseLoweringPerEdge, warns_and_skips_when_per_edge_time_derivative_is_not_decay_shaped) {
     TypeLibraryEntry entry = build_synapse_type_library_entry(
-        "nmda_warning", TEST_NMDA_SYNAPSE_COMPONENT_TYPE, "TestNmdaSynapse",
+        "non_decaying", TEST_NON_DECAYING_SYNAPSE_COMPONENT_TYPE, "TestNonDecayingSynapse",
         "gbase=\"1nS\" erev=\"0mV\" tau=\"50ms\" weight=\"1\"");
-    ASSERT_FALSE(entry.is_aggregatable);
     ASSERT_TRUE(std::holds_alternative<SynapseType>(entry.dynamics.flattened));
     const SynapseType &synapse = std::get<SynapseType>(entry.dynamics.flattened);
     ASSERT_EQ(synapse.time_derivatives.size(), 1u);
@@ -448,14 +483,14 @@ TEST(SynapseLoweringPerEdge, warns_when_per_edge_synapse_declares_a_time_derivat
     IrProgram program = lower_synapse_to_ir(entry);
     String captured_log_text = log_capture.text();
 
-    EXPECT_NE(captured_log_text.find("TestNmdaSynapse"), String::npos);
+    EXPECT_NE(captured_log_text.find("TestNonDecayingSynapse"), String::npos);
     EXPECT_NE(captured_log_text.find("'g'"), String::npos);
     EXPECT_NE(captured_log_text.find("TimeDerivative"), String::npos);
 
-    // Behavior is unchanged: the TimeDerivative is still correctly omitted
-    // (no `expdecay` anywhere, and `tau` is declared in `.alloc` but never
-    // read in `.tick`), exactly matching lowers_nmda_style_synapse's own
-    // pinned expected text above.
+    // The TimeDerivative is correctly omitted (no `expdecay`/`accedge`
+    // writeback for `g`'s decay, and `tau` is declared in `.alloc` but never
+    // read in `.tick`) -- the same no-decay shape every per-edge fixture used
+    // to produce before this ticket's fix.
     String rendered_program = print_ir_program(program);
     EXPECT_NE(rendered_program.find("peredge g"), String::npos);
     EXPECT_NE(rendered_program.find("param tau"), String::npos);
@@ -465,6 +500,30 @@ TEST(SynapseLoweringPerEdge, warns_when_per_edge_synapse_declares_a_time_derivat
     ASSERT_NE(tick_section_start, String::npos);
     String tick_section = rendered_program.substr(tick_section_start);
     EXPECT_EQ(tick_section.find("tau"), String::npos);
+
+    String expected =
+        ".alloc\n"
+        "  require v from postsynaptic\n"
+        "  peredge g\n"
+        "  param tau = 0.050000000000000003\n"
+        "  param gbase = 1.0000000000000001e-09\n"
+        "  param erev = 0\n"
+        "  param weight = 1\n"
+        "  expose g\n"
+        "  expose i\n"
+        ".tick\n"
+        "  @deliver\n"
+        "    onevent in {\n"
+        "      accedge g@edge, weight\n"
+        "    }\n"
+        "  @integrate\n"
+        "    forall neuron_in {\n"
+        "      loadedge edge_g, g@edge\n"
+        "      sub i, erev, v\n"
+        "      mul i, edge_g, i\n"
+        "      add network_inputs, network_inputs, i\n"
+        "    }\n";
+    EXPECT_EQ(rendered_program, expected);
 }
 
 // ── Error handling ────────────────────────────────────────────────────────

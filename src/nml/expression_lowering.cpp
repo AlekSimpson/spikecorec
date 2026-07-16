@@ -429,20 +429,11 @@ String LoweringContext::emit_expression(const ExpressionNode &node, Vector<TickI
 // (the after-spike-current case, `-state/tau`) collapses to the
 // single-instruction form matching the spec's own example exactly.
 
-namespace {
-
-struct LinearDecayShape {
-    String target;
-    String time_constant;
-};
-
-// Recognizes exactly two shapes (arch §3.2 TimeDerivative; "keep it simple
-// and pattern-based" -- not a general symbolic linearity prover):
-//   1. `(target - state) / tau`, where `target`/`tau` are each a bare
-//      identifier or number literal that isn't `state` itself and doesn't
-//      reference `network_inputs` (GLIF1's own `v` dynamics has an extra
-//      `network_inputs` term and so correctly does NOT match this shape).
-//   2. `-state / tau` (equivalent to target 0 -- after-spike-current decay).
+// (LinearDecayShape / detect_linear_decay_shape declared in
+// expression_lowering.h -- ticket #51 revision exposed them so
+// synapse_lowering.cpp's per-edge decay writeback can reuse the same shape
+// detection; see the header's doc comment. GLIF1's own `v` dynamics has an
+// extra `network_inputs` term and so correctly does NOT match shape 1 below.)
 std::optional<LinearDecayShape> detect_linear_decay_shape(const ExpressionNode &right_hand_side, const String &state_variable_name) {
     if (right_hand_side.kind != ExpressionNodeKind::Binary || right_hand_side.binary_operator_character != '/') return std::nullopt;
     const ExpressionNode &numerator = *right_hand_side.left;
@@ -469,8 +460,6 @@ std::optional<LinearDecayShape> detect_linear_decay_shape(const ExpressionNode &
 
     return std::nullopt;
 }
-
-} // namespace
 
 void lower_time_derivative(const String &state_variable_name, const String &right_hand_side_text,
                             Vector<TickInstruction> &output, LoweringContext &context) {
