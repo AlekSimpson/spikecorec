@@ -198,6 +198,96 @@ void append_regime_dispatch_for_variable(const String &state_variable_name, cons
     output.push_back(dispatch);
 }
 
+// ── Active-set x nonlinear-dynamics classification (ticket #62 [F1]; arch §0.5) ──────────────────
+//
+// Whether every TimeDerivative this cell type declares (its own top-level ones, plus every regime's
+// own) is AFFINE in the cell's own state variables -- i.e. whether the cell's dynamics, treating
+// network_inputs/parameters/constants as external, time-invariant-during-a-skip forcing terms, form
+// a linear ODE system with a closed-form solution the engine's active-set optimization can lazily
+// fast-forward across skipped ticks (arch §0.5's "linear (all of GLIF)" vs "nonlinear
+// (izhikevich/AdEx/HH)" split). This generalizes expression_lowering.h's own detect_linear_decay_shape
+// (a narrow single-shape pattern match -- `(target-state)/tau` or `-state/tau` -- used to pick
+// expdecay vs forward-Euler for ONE state variable's own TimeDerivative) to a whole-system structural
+// check across every state variable a cell declares: a real GLIF fixture's `v` dynamics (e.g.
+// `(gL*(EL-v)+iSyn)/C`) is affine in `v` but is NOT the narrow shape detect_linear_decay_shape
+// recognizes (it has a `C`/`gL` coefficient and an `iSyn` term), so classifying cells with that
+// function directly would misclassify every real GLIF fixture as nonlinear -- the more general
+// affine check below is what correctly keeps "all of GLIF" tagged linear.
+//
+// Referenced identifiers OTHER than the cell's own state variables (parameters, network_inputs, a
+// DerivedVariable's name) are treated as opaque affine leaves, matching detect_linear_decay_shape's
+// own precedent of not looking inside another identifier's definition -- a DerivedVariable with a
+// NONLINEAR `value=` expression that is then read by a TimeDerivative would be misclassified as
+// linear, but no Phase-1 GLIF fixture does this (the only DerivedVariables real GLIF cells declare
+// are select/reduce="add" network_inputs aliases, arch §3.2) and this ticket's own synthetic
+// nonlinear test fixture embeds its nonlinear term directly in a TimeDerivative rather than through
+// an intermediate DerivedVariable, so closing that gap is out of this ticket's scope.
+
+bool expression_depends_on_any_state_variable(const ExpressionNode &node, const std::unordered_set<String> &state_variable_names) {
+    switch (node.kind) {
+        case ExpressionNodeKind::Identifier: return state_variable_names.count(node.text) != 0;
+        case ExpressionNodeKind::Number: return false;
+        case ExpressionNodeKind::Negate: return expression_depends_on_any_state_variable(*node.left, state_variable_names);
+        case ExpressionNodeKind::Binary:
+            return expression_depends_on_any_state_variable(*node.left, state_variable_names) ||
+                   expression_depends_on_any_state_variable(*node.right, state_variable_names);
+    }
+    return false;
+}
+
+bool expression_is_affine_in_state_variables(const ExpressionNode &node, const std::unordered_set<String> &state_variable_names) {
+    switch (node.kind) {
+        case ExpressionNodeKind::Number:
+        case ExpressionNodeKind::Identifier:
+            return true;
+        case ExpressionNodeKind::Negate:
+            return expression_is_affine_in_state_variables(*node.left, state_variable_names);
+        case ExpressionNodeKind::Binary:
+            if (node.binary_operator_character == '+' || node.binary_operator_character == '-') {
+                return expression_is_affine_in_state_variables(*node.left, state_variable_names) &&
+                       expression_is_affine_in_state_variables(*node.right, state_variable_names);
+            }
+            if (node.binary_operator_character == '*') {
+                bool left_depends = expression_depends_on_any_state_variable(*node.left, state_variable_names);
+                bool right_depends = expression_depends_on_any_state_variable(*node.right, state_variable_names);
+                if (left_depends && right_depends) return false; // a state variable times another -- nonlinear
+                return expression_is_affine_in_state_variables(*node.left, state_variable_names) &&
+                       expression_is_affine_in_state_variables(*node.right, state_variable_names);
+            }
+            if (node.binary_operator_character == '/') {
+                // A state variable in the denominator (e.g. `1/v`) is never affine.
+                if (expression_depends_on_any_state_variable(*node.right, state_variable_names)) return false;
+                return expression_is_affine_in_state_variables(*node.left, state_variable_names);
+            }
+            return false;
+    }
+    return false;
+}
+
+// `regimes` is `lower_cell_to_ir`'s own already-gathered regime metadata (RegimeInfo, defined
+// above) -- passed in rather than recomputed so this stays a pure structural check over data the
+// caller already has.
+bool cell_dynamics_are_closed_form_advanceable(const CellType &cell, const Vector<RegimeInfo> &regimes) {
+    std::unordered_set<String> state_variable_names;
+    for (const auto &state_variable : cell.state_variables) state_variable_names.insert(state_variable.name);
+
+    auto right_hand_side_is_affine = [&](const String &value_text) {
+        ExpressionNodePointer right_hand_side =
+            parse_arithmetic_text(value_text, "TimeDerivative linearity classification (ticket #62)");
+        return expression_is_affine_in_state_variables(*right_hand_side, state_variable_names);
+    };
+
+    for (const auto &time_derivative : cell.time_derivatives) {
+        if (!right_hand_side_is_affine(time_derivative.value)) return false;
+    }
+    for (const auto &regime : regimes) {
+        for (const auto &time_derivative : regime.time_derivatives) {
+            if (!right_hand_side_is_affine(time_derivative.value_text)) return false;
+        }
+    }
+    return true;
+}
+
 // Gathers every `OnStart`'s `StateAssignment`s (arch §3.2: seeds state at
 // INIT) into a variable-name -> raw-value-text map. `CellType::on_starts`
 // is ordered own-declarations-first-then-ancestors (resolve.cpp's
@@ -381,6 +471,7 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
     program.component_type_name = cell_entry.component_type_name;
     program.alloc = std::move(alloc_directives);
     program.tick = std::move(tick);
+    program.closed_form_advanceable = cell_dynamics_are_closed_form_advanceable(cell, regimes);
     return program;
 }
 

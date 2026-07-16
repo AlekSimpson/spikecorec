@@ -582,6 +582,12 @@ AssembledModel::~AssembledModel() {
     release_kernel(propagate_kernel_handle_);
 }
 
+bool AssembledModel::population_is_closed_form_advanceable(usize population_index) const {
+    const PopulationRuntimeInfo &info = populations_.at(population_index);
+    if (!info.has_kernel) return false;
+    return type_library_ir_programs_.at((usize)info.type_library_index).closed_form_advanceable;
+}
+
 void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick, s64 next_tick) {
     if (buffers.allocation == nullptr || buffers.weights == nullptr) {
         fail("step_tick: ModelRuntimeBuffers::allocation/weights must be non-null");
@@ -593,7 +599,12 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
     // cell-type-boundary dispatch -- one dispatch per boundary, not a single mega-dispatch with a
     // runtime branch; see master_kernel.h's own header comment for why this is faithful to "one
     // thread per neuron, dispatching by cell-type boundary" without needing to merge every type's
-    // generated code into one literal kernel function).
+    // generated code into one literal kernel function). Every population dispatches its FULL range
+    // here regardless of population_is_closed_form_advanceable (arch §0.5, ticket #62 [F1]'s own
+    // still-deliberate scope boundary -- see master_kernel.h's step_tick doc comment): this is safe
+    // for a nonlinear-tagged population (never fast-forwarded/skipped, exactly the correctness rule
+    // requires) and does not yet exploit the tag for a closed_form_advanceable population's own
+    // optimization (a separate, future skip-dispatch ticket's job).
     for (usize index = 0; index < populations_.size(); ++index) {
         const PopulationRuntimeInfo &info = populations_[index];
         if (!info.has_kernel) continue;
