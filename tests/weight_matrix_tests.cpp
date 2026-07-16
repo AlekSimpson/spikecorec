@@ -74,6 +74,28 @@ f32 low_rank_dot(const vector<f32> &u_row, const vector<f32> &coefficients, cons
     return sum;
 }
 
+// Whitebox check for whether a matrix's Sk currently holds no accumulated
+// deltas at all. sparse_delta_buffers is a fixed-capacity GPU-resident array
+// per matrix (ticket #53/D3 rework), not a hash map, so there is no
+// container-level .empty() to call -- this instead reads the raw contents
+// directly (the same way sparse_delta_buffer_uses_position_indexed_gpu_resident_layout
+// above does) and confirms every slot is exactly 0.0f, matching the old map's
+// "no entries" semantics. Returns true trivially when the matrix has no
+// representable neighbor slots at all (its buffer is never allocated).
+bool sparse_delta_buffer_contents_are_all_zero(const WeightMatrix &weight_matrix, s64 matrix_index) {
+    s64 total_slot_count = weight_matrix.node_count * weight_matrix.max_neighbor_count;
+    if (total_slot_count == 0) {
+        return true;
+    }
+    const f32 *delta_data = weight_matrix.sparse_delta_buffers[(usize)matrix_index].get_contents();
+    for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
+        if (delta_data[slot_index] != 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 TEST(WeightMatrix, construction) {
@@ -1244,13 +1266,14 @@ TEST(WeightMatrix, refit_clears_sparse_delta_buffer_for_every_matrix) {
 
     weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 3.0f);
     weight_matrix.accumulate_edge_delta(matrix_a, 2, 3, -2.0f);
-    ASSERT_FALSE(weight_matrix.sparse_delta_buffers[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX].empty());
-    ASSERT_FALSE(weight_matrix.sparse_delta_buffers[(usize)matrix_a].empty());
+    ASSERT_FALSE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, WeightMatrix::DEFAULT_MATRIX_INDEX));
+    ASSERT_FALSE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_a));
 
     weight_matrix.refit();
 
-    for (const auto &delta_buffer : weight_matrix.sparse_delta_buffers) {
-        EXPECT_TRUE(delta_buffer.empty());
+    for (s64 matrix_index = 0; matrix_index < weight_matrix.matrix_count(); ++matrix_index) {
+        EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_index));
+        EXPECT_FALSE(weight_matrix.sparse_delta_touched[(usize)matrix_index]);
     }
 }
 
@@ -1308,7 +1331,7 @@ TEST(WeightMatrix, refit_couples_matrices_through_the_shared_basis) {
                 (s32)node, neighbor_buffer[(usize)slot], 25.0f);
         }
     }
-    ASSERT_TRUE(weight_matrix.sparse_delta_buffers[(usize)matrix_b].empty()); // matrix_b itself untouched
+    ASSERT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_b)); // matrix_b itself untouched
 
     weight_matrix.refit();
 
@@ -1347,8 +1370,8 @@ TEST(WeightMatrix, refit_handles_degenerate_low_degree_nodes_without_producing_n
         }
     }
 
-    for (const auto &delta_buffer : weight_matrix.sparse_delta_buffers) {
-        EXPECT_TRUE(delta_buffer.empty());
+    for (s64 matrix_index = 0; matrix_index < weight_matrix.matrix_count(); ++matrix_index) {
+        EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_index));
     }
 }
 
@@ -1360,8 +1383,8 @@ TEST(WeightMatrix, refit_on_a_graph_with_no_edges_is_a_safe_no_op) {
     weight_matrix.advance_tick();
     weight_matrix.refit(); // must not crash (e.g. divide-by-zero building an empty point cloud)
     EXPECT_EQ(weight_matrix.ticks_since_last_refit, 0);
-    for (const auto &delta_buffer : weight_matrix.sparse_delta_buffers) {
-        EXPECT_TRUE(delta_buffer.empty());
+    for (s64 matrix_index = 0; matrix_index < weight_matrix.matrix_count(); ++matrix_index) {
+        EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_index));
     }
 }
 

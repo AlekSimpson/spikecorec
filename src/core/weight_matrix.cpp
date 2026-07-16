@@ -711,11 +711,31 @@ f32 WeightMatrix::max_sparse_delta_occupancy_fraction() const {
     if (total_edge_count == 0) {
         return 0.0f;
     }
-    s64 largest_delta_buffer_size = 0;
-    for (const auto &delta_buffer : sparse_delta_buffers) {
-        largest_delta_buffer_size = max(largest_delta_buffer_size, (s64)delta_buffer.size());
+
+    // sparse_delta_buffers is a fixed-capacity GPU-resident array per matrix
+    // (ticket #53/D3 rework), not a hash map -- there is no O(1) "number of
+    // entries" to read off a container anymore, so occupancy is counted
+    // directly: a slot "holds an entry" iff its stored value is nonzero
+    // (matching how lookup_sparse_delta/apply_sparse_delta_overlay already
+    // treat 0.0f as "no delta" for that slot, whether never touched or
+    // accumulated back down to exactly zero). Skips the scan entirely for a
+    // matrix whose Sk has never been touched at all.
+    s64 total_slot_count = node_count * max_neighbor_count;
+    s64 largest_occupied_slot_count = 0;
+    for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+        if (!sparse_delta_touched[(usize)matrix_index]) {
+            continue;
+        }
+        const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+        s64 occupied_slot_count = 0;
+        for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
+            if (delta_data[slot_index] != 0.0f) {
+                ++occupied_slot_count;
+            }
+        }
+        largest_occupied_slot_count = max(largest_occupied_slot_count, occupied_slot_count);
     }
-    return (f32)largest_delta_buffer_size / (f32)total_edge_count;
+    return (f32)largest_occupied_slot_count / (f32)total_edge_count;
 }
 
 bool WeightMatrix::is_refit_due() const {
@@ -748,11 +768,24 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     }
 
     // Nothing to fit against — still complete the bookkeeping half of the
-    // contract (Sk is trivially already empty with zero edges, since
-    // accumulate_edge_delta requires a real k^2-tree edge to ever populate it).
+    // contract (Sk is trivially already all-zero with zero edges, since
+    // accumulate_edge_delta requires a real k^2-tree edge to ever populate
+    // it). sparse_delta_buffers is a fixed-capacity GPU-resident array per
+    // matrix (ticket #53/D3 rework), not a hash map -- "clearing" means
+    // zeroing every slot's contents (allocate_sparse_delta_buffer's own
+    // zero-fill convention) and resetting sparse_delta_touched to false, not
+    // calling a (nonexistent) container-clear method. Guarded by
+    // node_count*max_neighbor_count > 0 since a matrix with no representable
+    // neighbor slots at all has a null (never-allocated) buffer whose
+    // get_contents() must never be dereferenced.
     if (total_edge_count == 0) {
-        for (auto &delta_buffer : sparse_delta_buffers) {
-            delta_buffer.clear();
+        s64 delta_buffer_element_count = node_count * max_neighbor_count;
+        for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+            if (delta_buffer_element_count > 0) {
+                memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
+                       (usize)delta_buffer_element_count * sizeof(f32));
+            }
+            sparse_delta_touched[(usize)matrix_index] = false;
         }
         ticks_since_last_refit = 0;
         return;
@@ -933,9 +966,19 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     }
 
     // ---- Clear every matrix's Sk (the memory-reclaiming half of the
-    // acceptance criterion) and reset the tick-count knob. ----
-    for (auto &delta_buffer : sparse_delta_buffers) {
-        delta_buffer.clear();
+    // acceptance criterion) and reset the tick-count knob. sparse_delta_buffers
+    // is a fixed-capacity GPU-resident array per matrix (ticket #53/D3
+    // rework), not a hash map -- "clearing" means zeroing every slot's
+    // contents (allocate_sparse_delta_buffer's own zero-fill convention) and
+    // resetting sparse_delta_touched to false, not calling a (nonexistent)
+    // container-clear method. ----
+    s64 delta_buffer_element_count = node_count * max_neighbor_count;
+    for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+        if (delta_buffer_element_count > 0) {
+            memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
+                   (usize)delta_buffer_element_count * sizeof(f32));
+        }
+        sparse_delta_touched[(usize)matrix_index] = false;
     }
     ticks_since_last_refit = 0;
 
