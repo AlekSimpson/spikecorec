@@ -65,13 +65,19 @@ public:
     GpuPointer<s64> cell_type_boundaries;
     s64 population_count = 0;
 
-    // ── aggregated per-neuron synapse accumulators (arch §4.2) -- one
-    // `GpuPointer<f32>[total_neuron_count]` per (type-in-use, `accum`
-    // directive name) pair, keyed by `type_scoped_key()` below. Sized to the
-    // model's whole `total_neuron_count` (not just a projection's
+    // ── per-neuron accumulators for whatever `accum` directives a type-in-use
+    // declares -- one `GpuPointer<f32>[total_neuron_count]` per (type-in-use,
+    // `accum` directive name) pair, keyed by `type_scoped_key()` below. Sized
+    // to the model's whole `total_neuron_count` (not just a projection's
     // postsynaptic population), matching the existing engine-owned
     // `network_inputs`'s own whole-model sizing -- simplest safe upper bound,
-    // since any neuron could in principle be a target of that synapse type. ──
+    // since any neuron could in principle be a target of that synapse type.
+    // Note: the aggregated-per-neuron-accumulator synapse shape this was
+    // originally built for (arch §4.2, ticket #57/D1) was dropped in favor of
+    // uniform per-edge synapse storage (see synapse_lowering.h) -- no current
+    // Phase-1 ComponentType declares an `accum` directive, so this map is
+    // generic machinery for whatever future construct legitimately needs
+    // per-neuron accumulation, not synapse-specific. ──
     UnorderedMap<String, GpuPointer<f32>> accumulators;
 
     // ── regime index (arch §4.5) -- ONE shared `GpuPointer<s32>[total_neuron_count]`

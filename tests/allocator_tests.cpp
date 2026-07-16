@@ -27,14 +27,17 @@ using namespace spikecorec::nml;
 // fixture -- the plain model_specification_tests.cpp GLIF1Cell can't be
 // reused here since it references `iSyn` without declaring it as a
 // DerivedVariable, which lower_cell_to_ir would reject) wired to three
-// synapse types covering every §4.2/§4.3 shape: expOneSynapse (real,
-// conductance-based, aggregatable, one `require v`), alphaCurrentSynapse
-// (real, current-based, aggregatable, two accum state variables), and
-// TestNmdaSynapse (synapse_lowering_tests.cpp's own per-edge fixture,
-// conductance-based, `require v`, one `peredge` variable). The GLIF1Cell
-// fixture's `iSyn` DerivedVariable (`select`/`reduce="add"`, exposed but
-// never a `state`/`accum` slot) doubles as the derived-exposure-scratch
-// acceptance case (arch §4.1/§4.5).
+// synapse types, all lowering per-edge (the aggregatable/per-edge
+// distinction was dropped -- see synapse_lowering.h): expOneSynapse (real,
+// conductance-based, one `require v`, one `peredge` variable "g"),
+// alphaCurrentSynapse (real, current-based, two `peredge` variables "I"/"J",
+// whose alpha-shaped decay isn't Phase-1-recognized so it isn't lowered into
+// `.tick`, but the peredge slots are still declared), and TestNmdaSynapse
+// (synapse_lowering_tests.cpp's own per-edge fixture, conductance-based,
+// `require v`, one `peredge` variable "g"). The GLIF1Cell fixture's `iSyn`
+// DerivedVariable (`select`/`reduce="add"`, exposed but never a
+// `state`/`accum` slot) doubles as the derived-exposure-scratch acceptance
+// case (arch §4.1/§4.5).
 
 namespace {
 
@@ -203,31 +206,27 @@ TEST(Allocator, sizes_widened_state_vector_and_boundary_array_from_alloc_state_d
     }
 }
 
-// ── aggregated per-neuron synapse accumulators (arch §4.2) ────────────────
-
-TEST(Allocator, allocates_one_accumulator_per_type_and_accum_directive) {
+// ── synapse state produces no aggregated accumulators ─────────────────────
+//
+// Arch §4.2's aggregated-per-neuron-accumulator synapse shape (originally
+// ticket #57/D1) was dropped in favor of routing every synapse's state
+// uniformly through per-edge storage (see synapse_lowering.h's header
+// comment and CLAUDE.md's Phase-1 description) -- the per-edge/aggregatable
+// distinction this test originally exercised (expOneSynapse/alphaCurrentSynapse
+// as "aggregatable" with their own accumulators) no longer exists as a
+// classification. `allocate_model`'s AccumDirective handling itself is
+// generic and unchanged (it allocates one zeroed per-neuron buffer for
+// whatever accum directives an IR program declares); this fixture's three
+// synapse types now all declare their state via PeredgeDirective instead,
+// so this test instead guards that no synapse type in this fixture
+// spuriously produces an accumulator under the corrected design.
+TEST(Allocator, synapse_state_produces_no_accumulators_under_per_edge_design) {
     ModelSpecification model = build_allocator_test_model();
     Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    s32 exp_one_index = type_library_index_for(model, "glifExcSynapse");
-    s32 alpha_current_index = type_library_index_for(model, "glifCurrSynapse");
 
     ModelAllocation allocation = allocate_model(model, programs);
 
-    // expOneSynapse: one accum "g". alphaCurrentSynapse: two accums "I","J".
-    ASSERT_EQ(allocation.accumulators.size(), 3u);
-
-    String exp_one_g_key = type_scoped_key(exp_one_index, "g");
-    String alpha_i_key = type_scoped_key(alpha_current_index, "I");
-    String alpha_j_key = type_scoped_key(alpha_current_index, "J");
-
-    ASSERT_EQ(allocation.accumulators.count(exp_one_g_key), 1u);
-    ASSERT_EQ(allocation.accumulators.count(alpha_i_key), 1u);
-    ASSERT_EQ(allocation.accumulators.count(alpha_j_key), 1u);
-
-    const f32 *exp_one_g_buffer = allocation.accumulators.at(exp_one_g_key).get_contents();
-    for (s64 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-        EXPECT_FLOAT_EQ(exp_one_g_buffer[neuron_index], 0.0f);
-    }
+    EXPECT_EQ(allocation.accumulators.size(), 0u);
 }
 
 // ── regime index (arch §4.5) ──────────────────────────────────────────────
@@ -254,11 +253,14 @@ TEST(Allocator, sets_weight_matrix_per_edge_variable_count_from_peredge_directiv
 
     ModelAllocation allocation = allocate_model(model, programs);
 
-    // Only TestNmdaSynapse ("glifNmdaSynapse") is per-edge, with one peredge
-    // variable ("g"); expOneSynapse/alphaCurrentSynapse are aggregatable.
-    EXPECT_EQ(allocation.per_edge_variable_count, 1);
+    // Every synapse type now lowers per-edge (the aggregatable/per-edge
+    // distinction was dropped, see the accumulators test above): expOneSynapse
+    // contributes "g", alphaCurrentSynapse contributes "I" and "J" (its decay
+    // shape isn't Phase-1-recognized, but the peredge slot is still declared),
+    // and TestNmdaSynapse contributes "g" -- 4 peredge variables total.
+    EXPECT_EQ(allocation.per_edge_variable_count, 4);
     ASSERT_TRUE(model.adjacency.has_value());
-    EXPECT_EQ(model.adjacency->per_edge_variable_count, 1);
+    EXPECT_EQ(model.adjacency->per_edge_variable_count, 4);
 }
 
 // ── require bindings (metadata only, no allocation) ───────────────────────
