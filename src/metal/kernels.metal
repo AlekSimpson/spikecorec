@@ -188,6 +188,13 @@ inline int k2t_next_neighbor(
 // root for their one slot, redoing overlapping work. Restructuring to one thread
 // (or one threadgroup) per source_node — walking the row once and filling all
 // max_neighbor_count slots — would eliminate that redundancy.
+// `coefficients` is the shared-basis Ck vector (rank_float4_stride*4 scalar f32
+// elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r], with
+// the reweighted-V float4 built inline (same loop, same position as the plain
+// U*V dot product this replaces) so that WeightMatrix::DEFAULT_MATRIX_INDEX's
+// all-ones coefficients reduce this to today's dot(u_row[lane], v_row[lane])
+// bit-for-bit (1.0f * v is exactly v under IEEE-754, so the float4 handed to
+// dot() is bit-identical to v_row[lane] itself in that case).
 kernel void neighbor_weights_kernel(
     const device float4 *U                      [[ buffer(0) ]],
     const device float4 *V                      [[ buffer(1) ]],
@@ -203,7 +210,8 @@ kernel void neighbor_weights_kernel(
     constant long       &node_count             [[ buffer(11) ]],
     constant long       &max_neighbor_count     [[ buffer(12) ]],
     constant long       &rank_float4_stride     [[ buffer(13) ]],
-    device float        *output_weights         [[ buffer(14) ]],
+    const device float  *coefficients           [[ buffer(14) ]],
+    device float        *output_weights         [[ buffer(15) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
     long pair_index = (long)thread_id;
@@ -227,7 +235,11 @@ kernel void neighbor_weights_kernel(
 
     float dot_product = 0.0f;
     for (long lane = 0; lane < rank_float4_stride; ++lane) {
-        dot_product += dot(u_row[lane], v_row[lane]);
+        float4 lane_coefficients = float4(
+            coefficients[lane * 4 + 0], coefficients[lane * 4 + 1],
+            coefficients[lane * 4 + 2], coefficients[lane * 4 + 3]
+        );
+        dot_product += dot(u_row[lane], lane_coefficients * v_row[lane]);
     }
     output_weights[pair_index] = dot_product;
 }

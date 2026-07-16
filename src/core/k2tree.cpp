@@ -131,6 +131,20 @@ struct TreeArrays {
 
 static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 node_count, s32 branching_factor,
                                     s32 superblock_size) {
+    // Self-loops (i==j) are not supported and must never be silently accepted or
+    // silently dropped -- checked here, unconditionally over every edge, before any
+    // other branch (including the tree_height==0 early-return just below, which
+    // would otherwise skip this entirely for node_count<=1). This is the single
+    // point both K2Tree::from_adjacency_list and K2Tree::from_edges funnel through,
+    // so it's the one place that can catch a self-loop from either entry point.
+    for (auto [source_node, target_node]: edges) {
+        if (source_node == target_node) {
+            throw_invalid_argument(logger(),
+                fmt::format("K2Tree: self-loop edges are not supported (node {} -> {})",
+                            source_node, target_node));
+        }
+    }
+
     auto [tree_height, padded_node_count] = compute_tree_parameters(node_count, branching_factor);
     s32 branching_factor_squared = branching_factor * branching_factor;
 
