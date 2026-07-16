@@ -4,6 +4,8 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cmath>
 
@@ -69,11 +71,36 @@ bool synapse_is_conductance_based(const Vector<String> &ancestor_chain) {
 // `connection` inside a `projection` reaching a sibling `population`) is
 // stripped first; nothing else about relative-path depth is modeled here,
 // which is enough for the single-network-scope models Phase 1 targets.
+//
+// Both forms REQUIRE the index: in the slash form specifically, the segment
+// immediately after the population name must be a well-formed non-negative
+// integer -- there is no supported bare "PopName/exposureName" shorthand
+// (real NeuroML quantity/select/cell paths always name one specific neuron),
+// so a non-numeric segment there (e.g. "ExcPop/v") is rejected as malformed
+// input rather than silently misparsed as index 0 with the exposure dropped.
 struct ParsedPopulationPath {
     String population_name;
     s32 local_index = -1;
     String trailing; // component id (cell paths) or exposure/port name (recording paths); empty if absent
 };
+
+// Validates that `index_text` is a non-empty string of decimal digits (a
+// well-formed non-negative integer) before converting it, throwing a clear
+// error otherwise. `std::atoi` alone silently yields 0 on a malformed or
+// empty segment (e.g. "ExcPop[abc]", a truncated "ExcPop[", or "ExcPop/v"'s
+// non-numeric segment) -- that would produce a wrong-but-silent index
+// instead of a diagnostic, the same class of bug `looks_like_dimensioned_literal`
+// / `unit_value_to_si` guard against elsewhere in the NML front-end.
+s32 parse_required_index(const String &index_text, const String &raw_path) {
+    bool well_formed = !index_text.empty() &&
+        std::all_of(index_text.begin(), index_text.end(),
+                     [](unsigned char character) { return std::isdigit(character) != 0; });
+    if (!well_formed) {
+        log::throw_runtime_error(log::logger(),
+            "model_specification: path '" + raw_path + "' has a malformed index segment '" + index_text + "'");
+    }
+    return std::atoi(index_text.c_str());
+}
 
 ParsedPopulationPath parse_population_path(const String &raw_path) {
     ParsedPopulationPath parsed;
@@ -83,9 +110,14 @@ ParsedPopulationPath parse_population_path(const String &raw_path) {
     auto bracket_open = path.find('[');
     if (bracket_open != String::npos) {
         auto bracket_close = path.find(']', bracket_open);
+        if (bracket_close == String::npos) {
+            log::throw_runtime_error(log::logger(),
+                "model_specification: path '" + raw_path + "' has an unterminated '[' index");
+        }
         parsed.population_name = path.substr(0, bracket_open);
-        parsed.local_index = std::atoi(path.substr(bracket_open + 1, bracket_close - bracket_open - 1).c_str());
-        if (bracket_close != String::npos && bracket_close + 1 < path.size() && path[bracket_close + 1] == '/') {
+        String index_text = path.substr(bracket_open + 1, bracket_close - bracket_open - 1);
+        parsed.local_index = parse_required_index(index_text, raw_path);
+        if (bracket_close + 1 < path.size() && path[bracket_close + 1] == '/') {
             parsed.trailing = path.substr(bracket_close + 2);
         }
         return parsed;
@@ -102,10 +134,28 @@ ParsedPopulationPath parse_population_path(const String &raw_path) {
     String index_segment = second_slash == String::npos
         ? path.substr(first_slash + 1)
         : path.substr(first_slash + 1, second_slash - first_slash - 1);
-    parsed.local_index = std::atoi(index_segment.c_str());
+    parsed.local_index = parse_required_index(index_segment, raw_path);
     if (second_slash != String::npos) parsed.trailing = path.substr(second_slash + 1);
 
     return parsed;
+}
+
+// Resolves `local_index` within `population` to a global neuron index,
+// bounds-checked against the population's actual size. resolve only wires
+// IDrefs (S7); it never range-checks a path's numeric index, so nothing
+// upstream catches a preCellId/postCellId/target naming an in-range
+// population but an out-of-range neuron. Left unchecked, that index feeds
+// `adjacency_list[...]` directly (a raw `std::vector::operator[]`) -- a heap
+// out-of-bounds write, not just a logic bug -- so this is the single place
+// every "population + local index -> global neuron index" site in this file
+// routes through.
+s32 resolve_required_neuron_index(const PopulationEntry &population, s32 local_index, const String &context) {
+    if (local_index < 0 || local_index >= population.size) {
+        log::throw_runtime_error(log::logger(),
+            "model_specification: " + context + " names index " + std::to_string(local_index) +
+            " in population '" + population.id + "' (size " + std::to_string(population.size) + ")");
+    }
+    return population.neuron_index_begin + local_index;
 }
 
 void index_instances_by_symbol(const ResolvedInstance &instance, UnorderedMap<s32, const ResolvedInstance *> &by_symbol) {
@@ -304,10 +354,10 @@ ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 
             }
 
             ConnectionEntry connection;
-            connection.source_neuron_index =
-                specification.populations[source_population->second].neuron_index_begin + source_path.local_index;
-            connection.target_neuron_index =
-                specification.populations[target_population->second].neuron_index_begin + target_path.local_index;
+            connection.source_neuron_index = resolve_required_neuron_index(
+                specification.populations[source_population->second], source_path.local_index, "connection preCellId");
+            connection.target_neuron_index = resolve_required_neuron_index(
+                specification.populations[target_population->second], target_path.local_index, "connection postCellId");
             connection.weight = numeric_attribute_or(connection_instance, "weight", 1.0);
             connection.delay = numeric_attribute_or(connection_instance, "delay", 0.0);
 
@@ -347,7 +397,8 @@ ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 
         }
 
         StimulusEntry stimulus;
-        stimulus.target_neuron_index = specification.populations[target_population->second].neuron_index_begin + target_path.local_index;
+        stimulus.target_neuron_index = resolve_required_neuron_index(
+            specification.populations[target_population->second], target_path.local_index, "explicitInput target");
         stimulus.input_type_library_index = get_or_create_type_library_entry(
             input_idref->second, resolved, instances_by_symbol, type_library_index_by_symbol, specification.type_library);
         specification.stimuli.push_back(stimulus);
@@ -366,9 +417,17 @@ ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 
             recording.quantity_path = path_attribute->second;
             ParsedPopulationPath parsed_path = parse_population_path(recording.quantity_path);
             auto target_population = population_index_by_name.find(parsed_path.population_name);
+            // Unlike a connection/stimulus target (bounds-checked and fatal
+            // on failure, since those feed indices other code trusts as
+            // valid), an unresolved or out-of-range recording target is kept
+            // as the documented -1 diagnostic sentinel rather than thrown --
+            // recordings are read-only/informational, not something engine
+            // memory safety depends on.
             if (target_population != population_index_by_name.end()) {
-                recording.target_neuron_index =
-                    specification.populations[target_population->second].neuron_index_begin + parsed_path.local_index;
+                const PopulationEntry &population = specification.populations[target_population->second];
+                if (parsed_path.local_index >= 0 && parsed_path.local_index < population.size) {
+                    recording.target_neuron_index = population.neuron_index_begin + parsed_path.local_index;
+                }
             }
             recording.exposure_name = parsed_path.trailing;
         }

@@ -133,6 +133,67 @@ ModelSpecification build_test_model_specification() {
     return build_model_specification(resolved);
 }
 
+// A minimal single-population (size 3) network with one recurrent
+// projection, parameterized by the connection's own preCellId/postCellId --
+// used to exercise a malformed or out-of-range connection index without
+// repeating the full fixture above.
+String write_single_population_connection_fixture(const String &pre_cell_id, const String &post_cell_id) {
+    write_temp_file("spikecorec_model_spec_bad_connection_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"BadConnectionContent\">"
+        "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "      <TimeDerivative variable=\"v\" value=\"(gL * (EL - v)) / C\"/>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <GLIF1Cell id=\"glifCellInstance\" C=\"1.0e-10\" gL=\"1.0e-8\" EL=\"-70mV\"/>"
+        "  <alphaCurrentSynapse id=\"glifCurrSynapse\" tau=\"2ms\" ibase=\"0.1nA\"/>"
+        "  <network id=\"BadConnectionNet\">"
+        "    <population id=\"ExcPop\" component=\"glifCellInstance\" size=\"3\"/>"
+        "    <projection id=\"ExcRecurrent\" presynapticPopulation=\"ExcPop\" postsynapticPopulation=\"ExcPop\" synapse=\"glifCurrSynapse\">"
+        "      <connection id=\"0\" preCellId=\"" + pre_cell_id + "\" postCellId=\"" + post_cell_id + "\"/>"
+        "    </projection>"
+        "  </network>"
+        "</neuroml>");
+
+    return write_temp_file("spikecorec_model_spec_bad_connection_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"BadConnectionTop\">"
+        "  <include href=\"spikecorec_model_spec_bad_connection_content.nml\"/>"
+        "</neuroml>");
+}
+
+// A minimal single-population (size 3) network with an OutputColumn whose
+// `quantity` path is parameterized -- used to exercise a malformed
+// recording path without repeating the full fixture above.
+String write_single_population_recording_fixture(const String &quantity_path) {
+    write_temp_file("spikecorec_model_spec_bad_quantity_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"BadQuantityContent\">"
+        "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <GLIF1Cell id=\"glifCellInstance\" C=\"1.0e-10\"/>"
+        "  <network id=\"BadQuantityNet\">"
+        "    <population id=\"ExcPop\" component=\"glifCellInstance\" size=\"3\"/>"
+        "  </network>"
+        "  <Simulation id=\"sim1\" length=\"1000ms\" step=\"0.1ms\" target=\"BadQuantityNet\">"
+        "    <OutputFile id=\"of0\" fileName=\"results.dat\">"
+        "      <OutputColumn id=\"badCol\" quantity=\"" + quantity_path + "\"/>"
+        "    </OutputFile>"
+        "  </Simulation>"
+        "</neuroml>");
+
+    return write_temp_file("spikecorec_model_spec_bad_quantity_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"BadQuantityTop\">"
+        "  <include href=\"spikecorec_model_spec_bad_quantity_content.nml\"/>"
+        "</neuroml>");
+}
+
 } // namespace
 
 // ── Type library: classification flags (acceptance criterion) ─────────────
@@ -302,4 +363,48 @@ TEST(ModelSpecification, captures_stimulus_and_recording_specs) {
 
     EXPECT_EQ(event_recording->target_neuron_index, 4); // InhPop[1]
     EXPECT_EQ(event_recording->exposure_name, "spike");
+}
+
+// ── Regression: path-index safety (review findings #1-#3) ──────────────────
+
+// Finding #1 (memory safety): an out-of-range connection index must throw
+// instead of writing out-of-bounds into the adjacency list. ExcPop has size
+// 3 (valid local indices 0-2); index 9 is in-range for the population NAME
+// but out-of-range for its actual size.
+TEST(ModelSpecification, throws_instead_of_out_of_bounds_write_on_out_of_range_connection_index) {
+    String path = write_single_population_connection_fixture(
+        "../ExcPop/0/glifCellInstance", "../ExcPop/9/glifCellInstance");
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    EXPECT_THROW(build_model_specification(resolved), std::runtime_error);
+}
+
+// Finding #2: a malformed (non-numeric) index segment must throw instead of
+// silently defaulting to 0.
+TEST(ModelSpecification, throws_instead_of_defaulting_to_zero_on_malformed_connection_index) {
+    String path = write_single_population_connection_fixture(
+        "../ExcPop/0/glifCellInstance", "../ExcPop/abc/glifCellInstance");
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    EXPECT_THROW(build_model_specification(resolved), std::runtime_error);
+}
+
+// Finding #3: a slash-form path whose segment after the population name is
+// not numeric ("ExcPop/v", no index at all) must be rejected as malformed
+// input rather than silently misparsed as index 0 with the "v" exposure
+// dropped.
+TEST(ModelSpecification, throws_on_slash_form_path_with_non_numeric_trailing_token) {
+    String path = write_single_population_recording_fixture("ExcPop/v");
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    EXPECT_THROW(build_model_specification(resolved), std::runtime_error);
 }

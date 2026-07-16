@@ -146,8 +146,11 @@ struct StimulusEntry {
 // (`OutputColumn`/`Line`, `is_event_recording == false`, `exposure_name` the
 // recorded quantity) or a spike record (`EventSelection`,
 // `is_event_recording == true`, spikes read from `last_spiked`).
-// `target_neuron_index` is -1 if `quantity_path`/`select` didn't resolve to
-// a known population (kept for diagnostics rather than dropped).
+// `target_neuron_index` is -1 if `quantity_path`/`select` didn't resolve to a
+// known population, OR named an out-of-range index within one that was
+// resolved (kept for diagnostics rather than dropped or thrown -- unlike a
+// connection/stimulus target, a recording target isn't trusted downstream as
+// a raw array index, so an unresolved recording is a diagnostic, not fatal).
 struct RecordingEntry {
     String id;
     String quantity_path;
@@ -168,10 +171,19 @@ struct ModelSpecification {
 
     s32 total_neuron_count = 0;
 
-    // Adjacency + initial weights (arch §1.4): the existing
-    // `vector<vector<s32>>` -> WeightMatrix/k²-tree path (§0.3), built from
-    // the union of every projection's connections. Unset if the model has
-    // no connections (WeightMatrix rejects an empty network).
+    // Adjacency (arch §1.4): the existing `vector<vector<s32>>` ->
+    // WeightMatrix/k²-tree path (§0.3), built from the union of every
+    // projection's connections -- the exact edge SET (topology) only.
+    // WeightMatrix's own U/V is a random-seeded low-rank factorization, not
+    // a container for exact per-edge values (§0.3/§4.3) -- it does NOT hold
+    // the real initial connection weights, so `adjacency->get(i, j)` is a
+    // reconstructed/approximate value, not the modeled weight. The actual
+    // initial weight (and delay) for each edge lives on its
+    // `ConnectionEntry` (above), read from the model's `weight`/`delay`
+    // Property values; seeding those exact values into U/V (or deciding not
+    // to) is future allocator work (#52-#54/#57), not this ticket's job.
+    // Unset if the model has no connections (WeightMatrix rejects an empty
+    // network).
     std::optional<WeightMatrix> adjacency;
 };
 
