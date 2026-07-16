@@ -144,7 +144,7 @@ build-order graph). Tickets carry `[CODE]` title prefixes and are labeled `codeg
 ├── #4  [B1] IR representation          → #50 [B2] cell lowering · #51 [B3] synapse lowering ·
 │                                          #55 [C1] IR→GPU source · #5 [C2] .alloc allocator ·
 │                                          #6 [C3] master-kernel assembly · #56 [C4] cuda_dispatch
-├── #52 [D2] shared-basis WeightMatrix  → #53 [D3] sparse Sk + loadedge/accedge · #54 [D4] refit
+├── #52 [D2] shared-basis WeightMatrix  → #53 [D3] sparse Sk + loadedge/accedge · #54 [D4] refit · #57 [D1] aggregated accumulators (closed, won't-do)
 ├── #61 [H1] Phase-1 validation & wiring→ #58 [E1] stimulus · #59 [E2] recording · #60 [X1] diagnostics
 ├── #67 [H2] Phase 2                    → #62 [F1] active-set×nonlinear · #63 [F2] nonlinear cells ·
 │                                          #64 [F3] delay ring · #65 [F4] on-device gens+heterogeneity · #66 [F5] plasticity wiring
