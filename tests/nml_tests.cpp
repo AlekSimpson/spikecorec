@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <variant>
 #include <gtest/gtest.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -156,14 +157,23 @@ TEST(NmlParser, load_standard_library_loads_vendored_bundle_offline) {
     EXPECT_GT(parser.library.size(), 100u);
 }
 
+// iafCell's own `extends` is "baseIafCapCell", several hops short of
+// `baseCell` — this also exercises classify_component_type's extends-chain
+// walk, not just a direct-parent check.
 TEST(NmlParser, get_type_by_name_finds_a_real_core_type) {
     NML_Parser parser;
     ASSERT_FALSE(parser.load_standard_library());
 
-    NML_Node &iaf_cell = parser.get_type_by_name("iafCell");
-    EXPECT_EQ(iaf_cell.tag_name, "ComponentType");
-    EXPECT_EQ(get_string_attribute(iaf_cell, "name"), "iafCell");
-    EXPECT_GT(iaf_cell.body.size(), 0u);
+    ComponentTypeEntry &entry = parser.get_type_by_name("iafCell");
+    ASSERT_TRUE(std::holds_alternative<CellType>(entry));
+
+    CellType &iaf_cell = std::get<CellType>(entry);
+    EXPECT_EQ(iaf_cell.name, "iafCell");
+    EXPECT_EQ(iaf_cell.raw.tag_name, "ComponentType");
+    EXPECT_GT(iaf_cell.raw.body.size(), 0u);
+    EXPECT_GT(iaf_cell.state_variables.size(), 0u);
+    EXPECT_GT(iaf_cell.time_derivatives.size(), 0u);
+    EXPECT_GT(iaf_cell.on_conditions.size(), 0u);
 }
 
 // This is also the merge-point/lookup API the resolve pass (A4) will call;
@@ -173,6 +183,98 @@ TEST(NmlParser, get_type_by_name_throws_on_missing_type) {
     ASSERT_FALSE(parser.load_standard_library());
 
     EXPECT_THROW(parser.get_type_by_name("definitelyNotARealType_xyz"), std::runtime_error);
+}
+
+// ── ComponentType classification (typed `library`, ticket #2 [A3]) ──────
+//
+// Every cataloged <ComponentType> is classified into one of CellType,
+// SynapseType, InputsType/GeneratorType, PopulationType, or
+// ProjectType/ConnectionType (arch §3.3's D1/D3/D4/ST2/ST3 buckets), or left
+// as the bare ComponentTypeBase identity when it fits none of them. These
+// exercise the classification against real vendored std-lib types, across
+// every category.
+
+TEST(NmlComponentTypeClassification, classifies_pulse_generator_as_inputs_type) {
+    NML_Parser parser;
+    ASSERT_FALSE(parser.load_standard_library());
+
+    ComponentTypeEntry &entry = parser.get_type_by_name("pulseGenerator");
+    ASSERT_TRUE(std::holds_alternative<InputsType>(entry));
+
+    InputsType &pulse_generator = std::get<InputsType>(entry);
+    EXPECT_GT(pulse_generator.parameters.size(), 0u);
+    EXPECT_GT(pulse_generator.properties.size(), 0u);
+    EXPECT_GT(pulse_generator.state_variables.size(), 0u);
+    EXPECT_GT(pulse_generator.on_conditions.size(), 0u);
+}
+
+// `poissonFiringSynapse` is an InputsType that also carries a
+// ComponentReference to the synapse instance it drives.
+TEST(NmlComponentTypeClassification, inputs_type_captures_component_reference_to_driven_synapse) {
+    NML_Parser parser;
+    ASSERT_FALSE(parser.load_standard_library());
+
+    ComponentTypeEntry &entry = parser.get_type_by_name("poissonFiringSynapse");
+    ASSERT_TRUE(std::holds_alternative<InputsType>(entry));
+
+    InputsType &poisson_firing_synapse = std::get<InputsType>(entry);
+    ASSERT_GT(poisson_firing_synapse.component_references.size(), 0u);
+    EXPECT_EQ(poisson_firing_synapse.component_references[0].name, "synapse");
+}
+
+// `population` itself only directly declares `size` — its `component`
+// ComponentReference is declared on its parent, `basePopulation` (PARSE
+// doesn't flatten `extends`; that merge is RESOLVE's job, ticket #49), which
+// classifies as PopulationType in its own right (its own name is one of the
+// category's anchors).
+TEST(NmlComponentTypeClassification, classifies_population_as_population_type) {
+    NML_Parser parser;
+    ASSERT_FALSE(parser.load_standard_library());
+
+    ComponentTypeEntry &population_entry = parser.get_type_by_name("population");
+    ASSERT_TRUE(std::holds_alternative<PopulationType>(population_entry));
+    PopulationType &population = std::get<PopulationType>(population_entry);
+    ASSERT_GT(population.parameters.size(), 0u);
+    EXPECT_EQ(population.parameters[0].name, "size");
+
+    ComponentTypeEntry &base_population_entry = parser.get_type_by_name("basePopulation");
+    ASSERT_TRUE(std::holds_alternative<PopulationType>(base_population_entry));
+    PopulationType &base_population = std::get<PopulationType>(base_population_entry);
+    ASSERT_GT(base_population.component_references.size(), 0u);
+    EXPECT_EQ(base_population.component_references[0].name, "component");
+}
+
+// `projection` and `connection` are two different shapes (pre/post
+// population routing vs. pre/post cell-path routing) but both fall into the
+// single ProjectType/ConnectionType category.
+TEST(NmlComponentTypeClassification, classifies_projection_and_connection_as_project_type) {
+    NML_Parser parser;
+    ASSERT_FALSE(parser.load_standard_library());
+
+    ComponentTypeEntry &projection_entry = parser.get_type_by_name("projection");
+    ASSERT_TRUE(std::holds_alternative<ProjectType>(projection_entry));
+    ProjectType &projection = std::get<ProjectType>(projection_entry);
+    ASSERT_GT(projection.component_references.size(), 0u);
+    EXPECT_EQ(projection.component_references[0].name, "synapse");
+    EXPECT_GT(projection.path_fields.size(), 0u);
+    EXPECT_GT(projection.children.size(), 0u);
+
+    ComponentTypeEntry &connection_entry = parser.get_type_by_name("connection");
+    ASSERT_TRUE(std::holds_alternative<ConnectionType>(connection_entry));
+    EXPECT_GT(std::get<ConnectionType>(connection_entry).path_fields.size(), 0u);
+}
+
+// `morphology` declares no `extends` and doesn't fit any of the five
+// categories (it's Structures/multicompartment, deferred to Phase 3) — it
+// must stay the bare, unclassified ComponentTypeBase, with its raw node
+// still intact rather than being dropped or misclassified.
+TEST(NmlComponentTypeClassification, leaves_out_of_scope_types_unclassified) {
+    NML_Parser parser;
+    ASSERT_FALSE(parser.load_standard_library());
+
+    ComponentTypeEntry &entry = parser.get_type_by_name("morphology");
+    EXPECT_TRUE(std::holds_alternative<ComponentTypeBase>(entry));
+    EXPECT_FALSE(std::get<ComponentTypeBase>(entry).raw.body.empty());
 }
 
 // ── NML_Parser::validate_against_schema (ticket #8 [A2]) ────
@@ -250,7 +352,8 @@ TEST(NmlParserParse, catalogs_inline_component_type_without_duplicating_it_in_th
     parser.parse(path);
 
     ASSERT_EQ(parser.library.count("parseTestInlineCell"), 1u);
-    EXPECT_EQ(parser.library.at("parseTestInlineCell").body.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<CellType>(parser.library.at("parseTestInlineCell")));
+    EXPECT_EQ(std::get<CellType>(parser.library.at("parseTestInlineCell")).parameters.size(), 1u);
 
     ASSERT_EQ(parser.root_node->body.size(), 1u);
     EXPECT_EQ(parser.root_node->body[0].tag_name, "izhikevichCell");
@@ -277,7 +380,8 @@ TEST(NmlParserParse, follows_include_and_splices_it_into_the_shared_tree) {
     parser.parse(top_path);
 
     ASSERT_EQ(parser.library.count("parseTestIncludedCell"), 1u);
-    EXPECT_EQ(parser.library.at("parseTestIncludedCell").body.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<CellType>(parser.library.at("parseTestIncludedCell")));
+    EXPECT_EQ(std::get<CellType>(parser.library.at("parseTestIncludedCell")).parameters.size(), 1u);
 
     ASSERT_EQ(parser.root_node->body.size(), 1u);
     EXPECT_EQ(parser.root_node->body[0].tag_name, "izhikevichCell");
@@ -367,10 +471,14 @@ TEST(NmlParserParsePhase1Example, parses_single_glif_cell_model_with_merged_incl
 
     // The user-defined GLIF1Cell ComponentType, from the included file,
     // merged into the parser's library alongside the (already loaded) A1
-    // std-lib bundle.
+    // std-lib bundle, and classified as a CellType (extends "baseCell").
     ASSERT_EQ(parser.library.count("GLIF1Cell"), 1u);
-    NML_Node &glif1_cell_type = parser.library.at("GLIF1Cell");
-    EXPECT_TRUE(find_child_by_tag(glif1_cell_type, "Dynamics") != nullptr);
+    ASSERT_TRUE(std::holds_alternative<CellType>(parser.library.at("GLIF1Cell")));
+    CellType &glif1_cell_type = std::get<CellType>(parser.library.at("GLIF1Cell"));
+    EXPECT_EQ(glif1_cell_type.state_variables.size(), 1u);
+    EXPECT_EQ(glif1_cell_type.state_variables[0].name, "v");
+    EXPECT_EQ(glif1_cell_type.time_derivatives.size(), 1u);
+    EXPECT_EQ(glif1_cell_type.on_conditions.size(), 1u);
     EXPECT_GT(parser.library.count("iafCell"), 0u);
 
     // The GLIF1Cell instance (a non-ComponentType tag) is spliced into the
@@ -436,15 +544,34 @@ TEST(NmlParserParsePhase1Example, parses_glif_network_model_with_nested_includes
     NML_Parser parser;
     EXPECT_NO_THROW(parser.parse(top_path));
 
-    // The user-defined cell type, merged from two include levels deep.
+    // The user-defined cell type, merged from two include levels deep, and
+    // classified as a CellType.
     ASSERT_EQ(parser.library.count("GLIF1Cell"), 1u);
-    EXPECT_TRUE(find_child_by_tag(parser.library.at("GLIF1Cell"), "Dynamics") != nullptr);
+    ASSERT_TRUE(std::holds_alternative<CellType>(parser.library.at("GLIF1Cell")));
+    EXPECT_GT(std::get<CellType>(parser.library.at("GLIF1Cell")).attachments.size(), 0u);
 
     // The A1 std-lib synapse types (current-based, conductance-based, and
-    // per-edge/NMDA) are all still available alongside the user's types.
-    EXPECT_GT(parser.library.count("alphaCurrentSynapse"), 0u);
-    EXPECT_GT(parser.library.count("expOneSynapse"), 0u);
-    EXPECT_GT(parser.library.count("blockingPlasticSynapse"), 0u);
+    // per-edge/NMDA) are all still available alongside the user's types,
+    // each classified as a SynapseType (extends "baseSynapse").
+    ASSERT_GT(parser.library.count("alphaCurrentSynapse"), 0u);
+    ASSERT_GT(parser.library.count("expOneSynapse"), 0u);
+    ASSERT_GT(parser.library.count("blockingPlasticSynapse"), 0u);
+    EXPECT_TRUE(std::holds_alternative<SynapseType>(parser.library.at("alphaCurrentSynapse")));
+    EXPECT_TRUE(std::holds_alternative<SynapseType>(parser.library.at("expOneSynapse")));
+    EXPECT_TRUE(std::holds_alternative<SynapseType>(parser.library.at("blockingPlasticSynapse")));
+
+    // expOneSynapse's own Dynamics directly declares its conductance state
+    // and decay, plus the arrival handler that bumps it (§3.2 OnEvent). Its
+    // postsynaptic-`v` Requirement is declared on its parent,
+    // baseVoltageDepSynapse (PARSE doesn't flatten `extends`; that merge is
+    // RESOLVE's job, ticket #49) — also a SynapseType in its own right.
+    SynapseType &exp_one_synapse = std::get<SynapseType>(parser.library.at("expOneSynapse"));
+    EXPECT_GT(exp_one_synapse.state_variables.size(), 0u);
+    EXPECT_GT(exp_one_synapse.time_derivatives.size(), 0u);
+    EXPECT_GT(exp_one_synapse.on_events.size(), 0u);
+
+    ASSERT_TRUE(std::holds_alternative<SynapseType>(parser.library.at("baseVoltageDepSynapse")));
+    EXPECT_GT(std::get<SynapseType>(parser.library.at("baseVoltageDepSynapse")).requirements.size(), 0u);
 
     // The whole include graph (top-level network, the cell-type file, and
     // its own nested synapse-instances include) is spliced into one shared
