@@ -1163,6 +1163,7 @@ __device__ __forceinline__ float spikecorec_randn(unsigned int &state) {
 struct FunctionResult {
     String msl_text;
     String cuda_text;
+    GpuFunctionSignature signature;
 };
 
 void render_signature_and_prologue(Backend backend, const String &function_name,
@@ -1272,7 +1273,11 @@ std::optional<FunctionResult> generate_per_neuron_function(const IrProgram &prog
     }
     cuda << "}\n";
 
-    return FunctionResult{msl.str(), cuda.str()};
+    Vector<String> parameter_names;
+    parameter_names.reserve(parameters.size());
+    for (const auto &parameter : parameters) parameter_names.push_back(parameter.name);
+
+    return FunctionResult{msl.str(), cuda.str(), GpuFunctionSignature{function_name, parameter_names}};
 }
 
 // One function per `onevent <port> { ... }` block found at the top level of `.tick.deliver` (see
@@ -1326,7 +1331,11 @@ FunctionResult generate_deliver_function(const IrProgram &program, const AllocIn
     }
     cuda << "}\n";
 
-    return FunctionResult{msl.str(), cuda.str()};
+    Vector<String> parameter_names;
+    parameter_names.reserve(parameters.size());
+    for (const auto &parameter : parameters) parameter_names.push_back(parameter.name);
+
+    return FunctionResult{msl.str(), cuda.str(), GpuFunctionSignature{function_name, parameter_names}};
 }
 
 } // namespace
@@ -1385,7 +1394,14 @@ GpuSource lower_ir_program_to_gpu_source(const IrProgram &program) {
     if (needs_rng_anywhere) cuda_source += rng_preamble(Backend::Cuda);
     for (const auto &function : function_results) cuda_source += "\n" + function.cuda_text;
 
-    return GpuSource{msl_source, cuda_source};
+    Vector<GpuFunctionSignature> signatures;
+    signatures.reserve(function_results.size());
+    for (const auto &function : function_results) signatures.push_back(function.signature);
+
+    return GpuSource{msl_source, cuda_source, signatures};
 }
+
+String k2tree_walk_preamble_msl() { return k2tree_preamble(Backend::Msl); }
+String k2tree_walk_preamble_cuda() { return k2tree_preamble(Backend::Cuda); }
 
 } // namespace spikecorec::nml

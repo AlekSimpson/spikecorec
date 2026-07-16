@@ -3,6 +3,12 @@
 #include <cassert>
 #include "spikecorec/core/types.h"
 
+#ifdef SPIKECOREC_CUDA
+#include <cuda.h>
+#elif defined(SPIKECOREC_METAL)
+#include <Metal/Metal.hpp>
+#endif
+
 namespace spikecorec {
     // Called once at program startup to initialize the GPU context.
     void initialize_gpu_context();
@@ -125,9 +131,21 @@ namespace spikecorec {
     void synchronize_gpu_work();
 
     // --- kernel lifecycle ---
-    // opaque — MTLComputePipelineState* on Metal,
-    // CUfunction on CUDA
-    struct KernelHandle;
+    // MTLComputePipelineState* on Metal, CUfunction+CUmodule on CUDA. A complete type (not left
+    // opaque) so callers besides backend.cpp can hold one by value and cache it across calls —
+    // ticket #6's master-kernel assembly compiles each assembled kernel once and reuses the
+    // resulting KernelHandle every tick instead of recompiling. Any .cpp file that declares a
+    // KernelHandle variable must #include <cuda.h> / <Metal/Metal.hpp> itself first if it does so
+    // before this header is included elsewhere in the same translation unit (matches GpuPointer<T>
+    // above, which already relies on the same convention for MTL::Buffer).
+    struct KernelHandle {
+    #ifdef SPIKECOREC_CUDA
+        CUfunction cuda_kernel_function{};
+        CUmodule   cuda_module{};
+    #elif defined(SPIKECOREC_METAL)
+        MTL::ComputePipelineState *pipeline_state = nullptr;
+    #endif
+    };
 
     KernelHandle compile_kernel(const char *source, const char *function_name);
 
