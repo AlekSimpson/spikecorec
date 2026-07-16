@@ -106,10 +106,12 @@ WeightMatrix::WeightMatrix(
     // the design memo for why this must be a literal, not a computed value).
     coefficient_vectors.push_back(allocate_coefficient_vector({}));
 
-    // DEFAULT_MATRIX_INDEX's sparse delta buffer (ticket #53/D3): empty, parallel
-    // to the coefficient vector pushed just above — a freshly-constructed
-    // WeightMatrix has no pending Sk updates for any matrix.
-    sparse_delta_buffers.emplace_back();
+    // DEFAULT_MATRIX_INDEX's sparse delta buffer (ticket #53/D3): allocated to
+    // node_count*max_neighbor_count elements and zero-filled, parallel to the
+    // coefficient vector pushed just above — a freshly-constructed WeightMatrix
+    // has no pending Sk updates for any matrix.
+    sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
+    sparse_delta_touched.push_back(false);
 
     log::logger().debug("WeightMatrix constructed: node_count={} rank={} rank_float4_stride={} "
                         "max_neighbor_count={} weight_seed={} check_indexing={}",
@@ -122,6 +124,9 @@ WeightMatrix::~WeightMatrix() {
     deallocate(std::move(V_matrix));
     for (auto &coefficient_vector : coefficient_vectors) {
         deallocate(std::move(coefficient_vector));
+    }
+    for (auto &delta_buffer : sparse_delta_buffers) {
+        deallocate(std::move(delta_buffer));
     }
 }
 
@@ -139,6 +144,12 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
         deallocate(std::move(coefficient_vector));
     }
     coefficient_vectors.clear();
+    // sparse_delta_buffers (ticket #53/D3) is now GpuPointer-backed too — same
+    // deallocate-then-clear hazard-avoidance as coefficient_vectors above.
+    for (auto &delta_buffer : sparse_delta_buffers) {
+        deallocate(std::move(delta_buffer));
+    }
+    sparse_delta_buffers.clear();
 
     // k2tree is a K2Tree sub-object (not a pointer), and K2Tree's own defaulted
     // move-assignment operator has the identical GpuPointer-assert problem as
@@ -152,11 +163,10 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     U_matrix = std::move(other.U_matrix);
     V_matrix = std::move(other.V_matrix);
     coefficient_vectors = std::move(other.coefficient_vectors);
-    // sparse_delta_buffers is plain host memory (std::unordered_map, not a
-    // GpuPointer) — an ordinary vector move-assignment, no GPU-asserting-move
-    // hazard to work around here the way U_matrix/V_matrix/coefficient_vectors
-    // above required.
     sparse_delta_buffers = std::move(other.sparse_delta_buffers);
+    // sparse_delta_touched is plain host memory (vector<bool>) — an ordinary
+    // vector move-assignment, no GPU-asserting-move hazard to work around here.
+    sparse_delta_touched = std::move(other.sparse_delta_touched);
     node_count = other.node_count;
     max_neighbor_count = other.max_neighbor_count;
     rank = other.rank;
@@ -259,42 +269,64 @@ f32 WeightMatrix::reconstruct_entry(s32 source_node, s32 target_node, const f32 
     return dot_product;
 }
 
-s64 WeightMatrix::pack_edge_key(s32 source_node, s32 target_node) {
-    return (static_cast<s64>(source_node) << 32) | static_cast<u32>(target_node);
+GpuPointer<f32> WeightMatrix::allocate_sparse_delta_buffer() const {
+    s64 element_count = node_count * max_neighbor_count;
+    if (element_count <= 0) {
+        // No representable neighbor slots at all (e.g. an edge-free network) —
+        // avoid a zero-byte GPU allocation; nothing can ever be accumulated into
+        // this matrix's Sk, so a null GpuPointer is never read or deallocated.
+        return GpuPointer<f32>();
+    }
+    GpuPointer<f32> delta_buffer = allocate<f32>((usize)element_count * sizeof(f32));
+    // allocate<f32> does not zero-initialize (unlike coefficient_vectors/U/V,
+    // which the constructor explicitly fills every lane of) — "untouched" must
+    // mean all-zero, so zero it explicitly here.
+    memset(delta_buffer.get_contents(), 0, (usize)element_count * sizeof(f32));
+    return delta_buffer;
+}
+
+optional<s64> WeightMatrix::find_neighbor_slot(s32 source_node, s32 target_node) const {
+    vector<s32> neighbor_buffer((usize)max_neighbor_count);
+    s64 degree = k2tree.get_neighbors(source_node, neighbor_buffer.data(), max_neighbor_count);
+    for (s64 slot = 0; slot < degree; ++slot) {
+        if (neighbor_buffer[(usize)slot] == target_node) {
+            return slot;
+        }
+    }
+    return nullopt;
 }
 
 f32 WeightMatrix::lookup_sparse_delta(s64 matrix_index, s32 source_node, s32 target_node) const {
-    const auto &delta_buffer = sparse_delta_buffers[(usize)matrix_index];
-    if (delta_buffer.empty()) {
-        // Fast path: no lookup at all for a Sk-free matrix (see arch §4.3 "Precise
-        // form" — value = U*Ck*V^T + Sk[i,j], and Sk[i,j] is 0 when nothing has ever
-        // been accumulated). This is also what keeps get()/get_for_matrix() bit-for-bit
-        // unchanged for DEFAULT_MATRIX_INDEX (ticket #52's regression guarantee).
+    if (!sparse_delta_touched[(usize)matrix_index]) {
+        // Fast path: no slot search at all for a Sk-free matrix (see arch §4.3
+        // "Precise form" — value = U*Ck*V^T + Sk[i,j], and Sk[i,j] is 0 when
+        // nothing has ever been accumulated). This is also what keeps
+        // get()/get_for_matrix() bit-for-bit unchanged for DEFAULT_MATRIX_INDEX
+        // (ticket #52's regression guarantee).
         return 0.0f;
     }
-    auto delta_iterator = delta_buffer.find(pack_edge_key(source_node, target_node));
-    return (delta_iterator != delta_buffer.end()) ? delta_iterator->second : 0.0f;
+    optional<s64> slot = find_neighbor_slot(source_node, target_node);
+    if (!slot.has_value()) {
+        return 0.0f;
+    }
+    const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+    return delta_data[source_node * max_neighbor_count + *slot];
 }
 
 void WeightMatrix::apply_sparse_delta_overlay(f32 *output_weights, s64 matrix_index) const {
-    const auto &delta_buffer = sparse_delta_buffers[(usize)matrix_index];
-    if (delta_buffer.empty()) {
+    if (!sparse_delta_touched[(usize)matrix_index]) {
         return;
     }
 
-    // Host-side walk over each node's real neighbors (the same k^2-tree
-    // traversal order neighbor_weights_values already relies on matching the GPU
-    // kernel's row layout), adding any Sk contribution on top of the pure
-    // low-rank reconstruction dispatch_neighbor_weights already wrote in.
-    vector<s32> neighbor_buffer((usize)max_neighbor_count);
-    for (s64 node_index = 0; node_index < node_count; ++node_index) {
-        s64 degree = get_neighbors(node_index, neighbor_buffer.data());
-        for (s64 slot = 0; slot < degree; ++slot) {
-            auto delta_iterator = delta_buffer.find(pack_edge_key((s32)node_index, neighbor_buffer[(usize)slot]));
-            if (delta_iterator != delta_buffer.end()) {
-                output_weights[(usize)(node_index * max_neighbor_count + slot)] += delta_iterator->second;
-            }
-        }
+    // sparse_delta_buffers[matrix_index] and output_weights share the exact same
+    // node_count * max_neighbor_count, row-major-by-source-node, same-slot-order
+    // shape (see the header comment on sparse_delta_buffers), so overlaying Sk is
+    // a plain element-wise add — no neighbor walk needed. Slots beyond a node's
+    // real degree, and any real edge never accumulated into, are exactly 0.0f.
+    const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+    s64 total_pair_count = node_count * max_neighbor_count;
+    for (s64 pair_index = 0; pair_index < total_pair_count; ++pair_index) {
+        output_weights[(usize)pair_index] += delta_data[pair_index];
     }
 }
 
@@ -331,10 +363,11 @@ s64 WeightMatrix::add_coefficient_vector(const vector<f32> &coefficients) {
 
     s64 new_matrix_index = (s64)coefficient_vectors.size();
     coefficient_vectors.push_back(allocate_coefficient_vector(coefficients));
-    // Parallel, empty Sk for the new matrix (ticket #53/D3) — see
+    // Parallel, untouched (all-zero) Sk for the new matrix (ticket #53/D3) — see
     // sparse_delta_buffers' header comment for why this stays indexed identically
     // to coefficient_vectors.
-    sparse_delta_buffers.emplace_back();
+    sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
+    sparse_delta_touched.push_back(false);
     log::logger().debug("add_coefficient_vector: matrix_index={}", new_matrix_index);
     return new_matrix_index;
 }
@@ -430,7 +463,24 @@ void WeightMatrix::accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 
                         source_node, target_node));
     }
 
-    sparse_delta_buffers[(usize)matrix_index][pack_edge_key(source_node, target_node)] += delta;
+    // Real k^2-tree edges are normally representable within max_neighbor_count
+    // (the array is sized to the adjacency's own bound), so a slot is expected to
+    // always be found here. The one exception is an explicit max_neighbor_count
+    // override smaller than a node's true degree (a deliberate truncation,
+    // supported elsewhere in this class) — a real edge beyond that truncation
+    // cutoff has no representable slot at all, so this throws rather than write
+    // out of bounds.
+    optional<s64> slot = find_neighbor_slot(source_node, target_node);
+    if (!slot.has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::accumulate_edge_delta: (source_node={}, target_node={}) "
+                        "is a real edge but not representable within max_neighbor_count={}",
+                        source_node, target_node, max_neighbor_count));
+    }
+
+    f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+    delta_data[source_node * max_neighbor_count + *slot] += delta;
+    sparse_delta_touched[(usize)matrix_index] = true;
 }
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {
@@ -586,9 +636,16 @@ void WeightMatrix::load_from_disk(const char *filepath) {
         // Sk (ticket #53/D3) is not persisted by save() (see its own comment below),
         // and every existing Sk entry is keyed against edges/coefficients of the old
         // basis anyway — reset in lockstep with coefficient_vectors above so the two
-        // families stay parallel-indexed.
+        // families stay parallel-indexed. sparse_delta_buffers is GPU-resident now,
+        // so (like coefficient_vectors above) each entry must be deallocated before
+        // the vector is cleared.
+        for (auto &delta_buffer : sparse_delta_buffers) {
+            deallocate(std::move(delta_buffer));
+        }
         sparse_delta_buffers.clear();
-        sparse_delta_buffers.emplace_back();
+        sparse_delta_touched.clear();
+        sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
+        sparse_delta_touched.push_back(false);
     }
 
     file.read(reinterpret_cast<char*>(U_matrix.get_contents()),

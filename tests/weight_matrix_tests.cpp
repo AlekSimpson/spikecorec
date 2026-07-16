@@ -812,8 +812,8 @@ TEST(WeightMatrix, move_assignment_into_a_live_object_transfers_state_without_ab
 
 // ── sparse delta buffer / Sk (ticket #53/D3) ───────────────────────────────────
 
-// A freshly-constructed WeightMatrix's Sk is empty for every matrix, and
-// lookup_sparse_delta's empty-map fast path performs no lookup at all -- so
+// A freshly-constructed WeightMatrix's Sk is untouched for every matrix, and
+// lookup_sparse_delta's untouched fast path performs no slot search at all -- so
 // get()/neighbor_weights() must stay bit-for-bit identical to the exact golden
 // hex patterns ticket #52/D2 pinned before Sk existed at all (see
 // get_reproduces_pre_shared_basis_values_bit_for_bit /
@@ -828,6 +828,55 @@ TEST(WeightMatrix, get_and_neighbor_weights_bit_identical_when_sparse_delta_buff
     weight_matrix.neighbor_weights(weights.data());
     EXPECT_TRUE(bits_equal(weights[0], from_bits(0x3e011f04u)));
     EXPECT_TRUE(bits_equal(weights[5], from_bits(0xc02627beu)));
+}
+
+// Whitebox check of the redesigned Sk storage (ticket #53/D3 rework, replacing
+// the original per-matrix hash map with a GPU-resident, fixed-capacity array):
+// one GpuPointer<f32> per matrix, sized exactly node_count*max_neighbor_count,
+// laid out row-major by source node with position = that neighbor's slot in
+// k2tree.get_neighbors(source_node, ...) enumeration order -- the SAME shape
+// neighbor_weights()'s own output array already uses. An untouched matrix's
+// array is all-zero and sparse_delta_touched reports false; accumulate_edge_delta
+// writes exactly one slot and flips sparse_delta_touched to true, leaving every
+// other slot exactly 0.0f.
+TEST(WeightMatrix, sparse_delta_buffer_uses_position_indexed_gpu_resident_layout) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true, -1, /*weight_seed=*/5);
+
+    ASSERT_EQ(weight_matrix.sparse_delta_buffers.size(), (usize)weight_matrix.matrix_count());
+    ASSERT_EQ(weight_matrix.sparse_delta_touched.size(), (usize)weight_matrix.matrix_count());
+    EXPECT_FALSE(weight_matrix.sparse_delta_touched[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX]);
+
+    s64 total_slots = weight_matrix.node_count * weight_matrix.max_neighbor_count;
+    const f32 *delta_data =
+        weight_matrix.sparse_delta_buffers[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX].get_contents();
+    for (s64 index = 0; index < total_slots; ++index) {
+        EXPECT_EQ(delta_data[index], 0.0f);
+    }
+
+    s32 source_node = 0, target_node = 1;
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    s64 degree = weight_matrix.get_neighbors(source_node, neighbor_buffer.data());
+    s64 expected_slot = -1;
+    for (s64 slot = 0; slot < degree; ++slot) {
+        if (neighbor_buffer[(usize)slot] == target_node) {
+            expected_slot = slot;
+            break;
+        }
+    }
+    ASSERT_NE(expected_slot, -1);
+
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node, target_node, 4.0f);
+    EXPECT_TRUE(weight_matrix.sparse_delta_touched[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX]);
+
+    s64 expected_index = source_node * weight_matrix.max_neighbor_count + expected_slot;
+    for (s64 index = 0; index < total_slots; ++index) {
+        if (index == expected_index) {
+            EXPECT_EQ(delta_data[index], 4.0f);
+        } else {
+            EXPECT_EQ(delta_data[index], 0.0f);
+        }
+    }
 }
 
 // Round-trip proof (ticket #53/D3 acceptance criterion): accumulate_edge_delta
@@ -868,7 +917,7 @@ TEST(WeightMatrix, accumulate_edge_delta_round_trips_multiple_bumps_summing) {
 
 // Bumping matrix A's Sk at an edge must not affect matrix B's (or
 // DEFAULT_MATRIX_INDEX's) read at the same edge -- each matrix's Sk is its own
-// map, never jumbled together (the ticket body's explicit requirement).
+// array, never jumbled together (the ticket body's explicit requirement).
 TEST(WeightMatrix, accumulate_edge_delta_does_not_mix_between_matrices) {
     auto network = square_torus(4);
     WeightMatrix weight_matrix(network, /*rank=*/3, /*check_indexing=*/true, -1, /*weight_seed=*/7);
@@ -923,6 +972,42 @@ TEST(WeightMatrix, accumulate_edge_delta_rejects_bad_matrix_index) {
     auto network = square_torus(4);
     WeightMatrix weight_matrix(network, /*rank=*/4);
     EXPECT_THROW(weight_matrix.accumulate_edge_delta(/*matrix_index=*/5, 0, 1, 1.0f), std::invalid_argument);
+}
+
+// New failure mode introduced by the position-indexed array redesign (ticket
+// #53/D3 rework): an explicit max_neighbor_count override smaller than a node's
+// true degree (already-supported truncation -- see
+// max_neighbor_count_explicit_override_truncates) means some of that node's real
+// edges are not enumerable within the truncated neighbor list at all, even
+// though k2tree.adjacent still reports them as genuine edges. Those edges have
+// no representable array slot, so accumulate_edge_delta must reject them rather
+// than write out of bounds.
+TEST(WeightMatrix, accumulate_edge_delta_rejects_real_edge_not_representable_within_truncated_max_neighbor_count) {
+    auto network = make_irregular_network();
+    // node 2 has real out-degree 4 ({0,1,3,4}); capping max_neighbor_count at 2
+    // makes only the first 2 (in k2tree traversal order) representable.
+    WeightMatrix weight_matrix(network, /*rank=*/4, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/2);
+    ASSERT_EQ(weight_matrix.max_neighbor_count, 2);
+
+    vector<s32> buffer(2);
+    s64 degree = weight_matrix.get_neighbors(2, buffer.data());
+    ASSERT_EQ(degree, 2);
+    unordered_set<s32> representable(buffer.begin(), buffer.begin() + degree);
+
+    s32 unrepresentable_neighbor = -1;
+    for (s32 candidate : {0, 1, 3, 4}) {
+        if (representable.find(candidate) == representable.end()) {
+            unrepresentable_neighbor = candidate;
+            break;
+        }
+    }
+    ASSERT_NE(unrepresentable_neighbor, -1);
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(2, unrepresentable_neighbor)); // genuinely a real edge
+
+    EXPECT_THROW(
+        weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 2, unrepresentable_neighbor, 1.0f),
+        std::invalid_argument);
 }
 
 // neighbor_weights()'s batched output must reflect Sk exactly the way
