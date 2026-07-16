@@ -4,6 +4,7 @@
 #pragma once
 
 #include <vector>
+#include <unordered_map>
 #include <spikecorec/core/types.h>
 #include <spikecorec/core/backend.h>
 #include <spikecorec/core/k2tree.h>
@@ -53,6 +54,23 @@ namespace spikecorec {
         // This is memory compression (see CLAUDE.md's U/V factorization note) — Ck is
         // supplied by the caller, not learned/fit here.
         Vector<GpuPointer<f32>> coefficient_vectors;
+
+        // Per-matrix sparse delta buffer (ticket #53/D3): Sk in arch §4.3. One sparse
+        // map per matrix index (parallel to coefficient_vectors, same indexing),
+        // holding raw per-edge updates that haven't yet been folded back into the
+        // shared U/V plane by the periodic refit (ticket #54/D4, not yet implemented).
+        // Keyed by a packed (source_node, target_node) edge pair (see pack_edge_key);
+        // only ever contains entries for pairs that ARE real k^2-tree edges (see
+        // accumulate_edge_delta) — loadedge/accedge are explicitly edge-scoped IR ops
+        // (IR spec §3.3), unlike the raw, edge-unrestricted U*V lookups get()/update()
+        // already support. A hash map, not a literal CSR/CSC array: K2Tree exposes no
+        // stable per-edge integer index to align a dense values-array against, and the
+        // hot-path accumulate ("Sk[i,j] += x" on every spike arrival) wants O(1)
+        // average-case point updates rather than a fixed, presized sparsity structure.
+        // True CSR/CSC bulk-compaction belongs to the periodic refit (#54), which needs
+        // to iterate ALL of Sk efficiently — not to this per-edge accumulate/read path.
+        Vector<UnorderedMap<s64, f32>> sparse_delta_buffers;
+
         s64 node_count;
         s64 max_neighbor_count;             // upper bound on neighbors per node — bounds the padded
                                             // [node_count * max_neighbor_count] neighbor_weights output;
@@ -128,6 +146,25 @@ namespace spikecorec {
         // Shared GPU dispatch behind neighbor_weights()/neighbor_weights_for_matrix().
         void dispatch_neighbor_weights(f32 *output_weights, const f32 *coefficient_values) const;
 
+        // Packs an edge (source_node, target_node) into sparse_delta_buffers' key
+        // space. Only called once (source_node, target_node) are already known to be
+        // non-negative (validated by accumulate_edge_delta / bounds-checked callers),
+        // so the u32 cast of target_node is safe.
+        static s64 pack_edge_key(s32 source_node, s32 target_node);
+
+        // Returns Sk[matrix_index][source_node, target_node], or 0.0f if no entry
+        // exists (untouched edge, or a Sk-free/freshly-constructed matrix). The
+        // empty-map fast path performs no lookup at all, so a never-touched Sk adds
+        // literally nothing to get()/get_for_matrix() — the bit-compatibility
+        // guarantee ticket #52 established for DEFAULT_MATRIX_INDEX.
+        [[nodiscard]] f32 lookup_sparse_delta(s64 matrix_index, s32 source_node, s32 target_node) const;
+
+        // Shared host-side overlay behind neighbor_weights()/neighbor_weights_for_matrix():
+        // adds each real edge's Sk contribution on top of the GPU's pure low-rank
+        // reconstruction already written into output_weights. Skips all work (no
+        // neighbor walk at all) when matrix_index's Sk is empty.
+        void apply_sparse_delta_overlay(f32 *output_weights, s64 matrix_index) const;
+
     public:
 
         // writes up to max_neighbor_count neighbor indices of node_index into output_buffer
@@ -167,6 +204,18 @@ namespace spikecorec {
         // Same as neighbor_weights(), but reconstructs using matrix_index's coefficient
         // vector instead of the default single-matrix Ck.
         void neighbor_weights_for_matrix(f32 *output_weights, s64 matrix_index) const;
+
+        // ── sparse delta buffer (ticket #53/D3) ──────────────────────────────────
+        // accedge: Sk[matrix_index][source_node, target_node] += delta (arch §4.3
+        // "Update" — cheap and local, never touches U/V or any coefficient vector).
+        // Deliberately edge-scoped, unlike get()/update()'s edge-unrestricted,
+        // bounds-only contract: loadedge/accedge in the IR spec only ever address
+        // real edges, so (source_node, target_node) must be an actual k^2-tree edge
+        // (checked via k2tree.adjacent, independently of the check_indexing flag —
+        // see weight_matrix.cpp for why this doesn't reuse check_index_inbounds) or
+        // this throws std::invalid_argument, the same way validate_matrix_index does
+        // for a bad matrix_index.
+        void accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 target_node, f32 delta);
 
         [[nodiscard]] WeightStats neighbor_weight_stats() const;
 

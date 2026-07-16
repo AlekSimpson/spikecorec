@@ -809,3 +809,231 @@ TEST(WeightMatrix, move_assignment_into_a_live_object_transfers_state_without_ab
     EXPECT_TRUE(approx(destination.get(2, 5), expected));
     EXPECT_EQ(destination.node_count, 16);
 }
+
+// ── sparse delta buffer / Sk (ticket #53/D3) ───────────────────────────────────
+
+// A freshly-constructed WeightMatrix's Sk is empty for every matrix, and
+// lookup_sparse_delta's empty-map fast path performs no lookup at all -- so
+// get()/neighbor_weights() must stay bit-for-bit identical to the exact golden
+// hex patterns ticket #52/D2 pinned before Sk existed at all (see
+// get_reproduces_pre_shared_basis_values_bit_for_bit /
+// neighbor_weights_reproduces_pre_shared_basis_values_bit_for_bit above).
+TEST(WeightMatrix, get_and_neighbor_weights_bit_identical_when_sparse_delta_buffer_untouched) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, true, -1, /*weight_seed=*/42);
+    EXPECT_TRUE(bits_equal(weight_matrix.get(0, 1), from_bits(0x3e011f04u)));
+    EXPECT_TRUE(bits_equal(weight_matrix.get(3, 12), from_bits(0xc0880ba9u)));
+
+    vector<f32> weights((usize)(weight_matrix.node_count * weight_matrix.max_neighbor_count));
+    weight_matrix.neighbor_weights(weights.data());
+    EXPECT_TRUE(bits_equal(weights[0], from_bits(0x3e011f04u)));
+    EXPECT_TRUE(bits_equal(weights[5], from_bits(0xc02627beu)));
+}
+
+// Round-trip proof (ticket #53/D3 acceptance criterion): accumulate_edge_delta
+// then a read of the same edge returns exactly (the pre-update value) + delta.
+TEST(WeightMatrix, accumulate_edge_delta_round_trips_a_single_bump) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true, -1, /*weight_seed=*/7);
+    s32 source_node = 0, target_node = 1;
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(source_node, target_node));
+
+    f32 before = weight_matrix.get(source_node, target_node);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node, target_node, 5.0f);
+    f32 after = weight_matrix.get(source_node, target_node);
+
+    EXPECT_TRUE(bits_equal(after, before + 5.0f));
+}
+
+// Three separate accedge-style bumps to the same edge must sum correctly, in
+// the same left-to-right accumulation order Sk[i,j] += x uses internally.
+TEST(WeightMatrix, accumulate_edge_delta_round_trips_multiple_bumps_summing) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true, -1, /*weight_seed=*/13);
+    s32 source_node = 2, target_node = 3;
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(source_node, target_node));
+
+    f32 before = weight_matrix.get(source_node, target_node);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node, target_node, 2.0f);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node, target_node, -0.5f);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node, target_node, 3.25f);
+    f32 after = weight_matrix.get(source_node, target_node);
+
+    f32 expected_delta = 0.0f;
+    expected_delta += 2.0f;
+    expected_delta += -0.5f;
+    expected_delta += 3.25f;
+    EXPECT_TRUE(bits_equal(after, before + expected_delta));
+}
+
+// Bumping matrix A's Sk at an edge must not affect matrix B's (or
+// DEFAULT_MATRIX_INDEX's) read at the same edge -- each matrix's Sk is its own
+// map, never jumbled together (the ticket body's explicit requirement).
+TEST(WeightMatrix, accumulate_edge_delta_does_not_mix_between_matrices) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/3, /*check_indexing=*/true, -1, /*weight_seed=*/7);
+    vector<f32> coefficients_a = {2.0f, 0.5f, -1.0f};
+    vector<f32> coefficients_b = {-3.0f, 1.0f, 4.0f};
+    s64 matrix_a = weight_matrix.add_coefficient_vector(coefficients_a);
+    s64 matrix_b = weight_matrix.add_coefficient_vector(coefficients_b);
+
+    s32 source_node = 0, target_node = 1;
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(source_node, target_node));
+
+    f32 default_before = weight_matrix.get(source_node, target_node);
+    f32 matrix_a_before = weight_matrix.get_for_matrix(source_node, target_node, matrix_a);
+    f32 matrix_b_before = weight_matrix.get_for_matrix(source_node, target_node, matrix_b);
+
+    weight_matrix.accumulate_edge_delta(matrix_a, source_node, target_node, 10.0f);
+
+    EXPECT_TRUE(bits_equal(weight_matrix.get_for_matrix(source_node, target_node, matrix_a),
+                            matrix_a_before + 10.0f));
+    // matrix_b and DEFAULT_MATRIX_INDEX share the same basis/edge but not matrix
+    // A's Sk -- their reads must be completely unaffected.
+    EXPECT_TRUE(bits_equal(weight_matrix.get_for_matrix(source_node, target_node, matrix_b), matrix_b_before));
+    EXPECT_TRUE(bits_equal(weight_matrix.get(source_node, target_node), default_before));
+}
+
+// loadedge/accedge are edge-scoped IR ops (IR spec §3.3) -- accumulate_edge_delta
+// must reject a bump to a pair that is not a real k^2-tree edge, and must not
+// mutate any state when it does (unlike get()/update(), which are deliberately
+// edge-unrestricted, bounds-only).
+TEST(WeightMatrix, accumulate_edge_delta_rejects_non_edge_and_does_not_mutate_state) {
+    auto network = make_irregular_network();
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    ASSERT_FALSE(weight_matrix.k2tree.adjacent(3, 0)); // node 3 has no outgoing edges at all
+
+    f32 before = weight_matrix.get(3, 0);
+    EXPECT_THROW(weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 3, 0, 100.0f),
+                 std::invalid_argument);
+    f32 after = weight_matrix.get(3, 0);
+    EXPECT_TRUE(bits_equal(before, after));
+}
+
+TEST(WeightMatrix, accumulate_edge_delta_rejects_out_of_bounds_indices) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    EXPECT_THROW(weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, -1, 1, 1.0f),
+                 std::invalid_argument);
+    EXPECT_THROW(weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 4590, 1.0f),
+                 std::invalid_argument);
+}
+
+TEST(WeightMatrix, accumulate_edge_delta_rejects_bad_matrix_index) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_THROW(weight_matrix.accumulate_edge_delta(/*matrix_index=*/5, 0, 1, 1.0f), std::invalid_argument);
+}
+
+// neighbor_weights()'s batched output must reflect Sk exactly the way
+// get()/get_for_matrix()'s single-entry reads do, for every real edge -- not
+// just at the one edge under test above.
+TEST(WeightMatrix, neighbor_weights_reflects_sparse_delta_consistently_with_get) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, true, -1, /*weight_seed=*/11);
+
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 3.0f);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 2, 3, -1.5f);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 5, 9, 0.25f);
+
+    vector<f32> weights((usize)(weight_matrix.node_count * weight_matrix.max_neighbor_count));
+    weight_matrix.neighbor_weights(weights.data());
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            f32 batch_value = weights[(usize)(node * weight_matrix.max_neighbor_count + slot)];
+            f32 single_value = weight_matrix.get((s32)node, neighbor_buffer[(usize)slot]);
+            EXPECT_TRUE(approx(batch_value, single_value, 1e-4f))
+                << "node=" << node << " neighbor=" << neighbor_buffer[(usize)slot];
+        }
+    }
+}
+
+// Same consistency check via neighbor_weights_for_matrix()/get_for_matrix() on
+// a non-default matrix, so the overlay path is proven for both entry points.
+TEST(WeightMatrix, neighbor_weights_for_matrix_reflects_sparse_delta_consistently_with_get_for_matrix) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/6, true, -1, /*weight_seed=*/23);
+    s64 matrix_index = weight_matrix.add_coefficient_vector({1.5f, -0.5f, 2.0f, 0.0f, 1.0f, -1.0f});
+
+    weight_matrix.accumulate_edge_delta(matrix_index, 1, 2, 4.0f);
+    weight_matrix.accumulate_edge_delta(matrix_index, 7, 6, -2.25f);
+
+    vector<f32> weights((usize)(weight_matrix.node_count * weight_matrix.max_neighbor_count));
+    weight_matrix.neighbor_weights_for_matrix(weights.data(), matrix_index);
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            f32 batch_value = weights[(usize)(node * weight_matrix.max_neighbor_count + slot)];
+            f32 single_value = weight_matrix.get_for_matrix((s32)node, neighbor_buffer[(usize)slot], matrix_index);
+            EXPECT_TRUE(approx(batch_value, single_value, 1e-4f))
+                << "node=" << node << " neighbor=" << neighbor_buffer[(usize)slot];
+        }
+    }
+}
+
+TEST(WeightMatrix, move_construction_preserves_sparse_delta_buffer) {
+    auto network = square_torus(4);
+    WeightMatrix original(network, /*rank=*/8, true, -1, /*weight_seed=*/3);
+    original.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 2.5f);
+    f32 expected = original.get(0, 1);
+
+    WeightMatrix moved(std::move(original));
+    EXPECT_TRUE(bits_equal(moved.get(0, 1), expected));
+}
+
+TEST(WeightMatrix, move_assignment_preserves_sparse_delta_buffer) {
+    auto network = square_torus(4);
+    WeightMatrix source(network, /*rank=*/8, true, -1, /*weight_seed=*/3);
+    source.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 2.5f);
+    f32 expected = source.get(0, 1);
+
+    WeightMatrix destination(network, /*rank=*/8);
+    destination = std::move(source);
+    EXPECT_TRUE(bits_equal(destination.get(0, 1), expected));
+}
+
+// save()/load_from_disk() deliberately do not persist Sk (see the design
+// comment on save() in weight_matrix.cpp). The non-reallocating branch (same
+// node_count/rank_float4_stride) must leave the loading instance's own Sk
+// untouched; the reallocating branch must reset it back to a single empty
+// DEFAULT_MATRIX_INDEX slot, in lockstep with coefficient_vectors.
+TEST(WeightMatrix, load_from_disk_does_not_persist_sparse_delta_buffer) {
+    auto network = square_torus(4);
+    WeightMatrix source(network, /*rank=*/8);
+    source.set_constant_weight(0.42f);
+    source.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 5.0f); // never persisted
+
+    const char *path = "/tmp/spikecorec_test_wm_sparse_delta.bin";
+    source.save(path);
+
+    // Non-reallocating load: same node_count/rank_float4_stride as `source`.
+    WeightMatrix destination(network, /*rank=*/8);
+    destination.load_from_disk(path);
+    // Only U/V (0.42 constant weight) came across -- source's +5.0 Sk bump did not.
+    EXPECT_TRUE(approx(destination.get(0, 1), 0.42f));
+}
+
+TEST(WeightMatrix, load_from_disk_resets_sparse_delta_buffer_on_reallocation) {
+    auto small_network = square_torus(3); // 9 nodes, rank_float4_stride=1
+    WeightMatrix source(small_network, /*rank=*/4);
+    source.set_constant_weight(0.42f);
+    source.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 5.0f); // never persisted
+
+    const char *path = "/tmp/spikecorec_test_wm_sparse_delta_realloc.bin";
+    source.save(path);
+
+    auto large_network = square_torus(4); // 16 nodes, rank_float4_stride=3 -- forces reallocation
+    WeightMatrix destination(large_network, /*rank=*/12);
+    ASSERT_TRUE(destination.k2tree.adjacent(0, 1));
+    s64 matrix_b = destination.add_coefficient_vector(vector<f32>(12, 1.0f));
+    destination.accumulate_edge_delta(matrix_b, 0, 1, 3.0f); // pre-load Sk, must be wiped by reallocation
+
+    destination.load_from_disk(path);
+    EXPECT_EQ(destination.matrix_count(), 1); // reset back to just DEFAULT_MATRIX_INDEX
+    EXPECT_TRUE(approx(destination.get(0, 1), 0.42f)); // pure reconstruction, no leftover Sk
+}

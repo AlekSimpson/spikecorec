@@ -106,6 +106,11 @@ WeightMatrix::WeightMatrix(
     // the design memo for why this must be a literal, not a computed value).
     coefficient_vectors.push_back(allocate_coefficient_vector({}));
 
+    // DEFAULT_MATRIX_INDEX's sparse delta buffer (ticket #53/D3): empty, parallel
+    // to the coefficient vector pushed just above — a freshly-constructed
+    // WeightMatrix has no pending Sk updates for any matrix.
+    sparse_delta_buffers.emplace_back();
+
     log::logger().debug("WeightMatrix constructed: node_count={} rank={} rank_float4_stride={} "
                         "max_neighbor_count={} weight_seed={} check_indexing={}",
                         node_count, this->rank, rank_float4_stride, this->max_neighbor_count,
@@ -147,6 +152,11 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     U_matrix = std::move(other.U_matrix);
     V_matrix = std::move(other.V_matrix);
     coefficient_vectors = std::move(other.coefficient_vectors);
+    // sparse_delta_buffers is plain host memory (std::unordered_map, not a
+    // GpuPointer) — an ordinary vector move-assignment, no GPU-asserting-move
+    // hazard to work around here the way U_matrix/V_matrix/coefficient_vectors
+    // above required.
+    sparse_delta_buffers = std::move(other.sparse_delta_buffers);
     node_count = other.node_count;
     max_neighbor_count = other.max_neighbor_count;
     rank = other.rank;
@@ -249,14 +259,54 @@ f32 WeightMatrix::reconstruct_entry(s32 source_node, s32 target_node, const f32 
     return dot_product;
 }
 
+s64 WeightMatrix::pack_edge_key(s32 source_node, s32 target_node) {
+    return (static_cast<s64>(source_node) << 32) | static_cast<u32>(target_node);
+}
+
+f32 WeightMatrix::lookup_sparse_delta(s64 matrix_index, s32 source_node, s32 target_node) const {
+    const auto &delta_buffer = sparse_delta_buffers[(usize)matrix_index];
+    if (delta_buffer.empty()) {
+        // Fast path: no lookup at all for a Sk-free matrix (see arch §4.3 "Precise
+        // form" — value = U*Ck*V^T + Sk[i,j], and Sk[i,j] is 0 when nothing has ever
+        // been accumulated). This is also what keeps get()/get_for_matrix() bit-for-bit
+        // unchanged for DEFAULT_MATRIX_INDEX (ticket #52's regression guarantee).
+        return 0.0f;
+    }
+    auto delta_iterator = delta_buffer.find(pack_edge_key(source_node, target_node));
+    return (delta_iterator != delta_buffer.end()) ? delta_iterator->second : 0.0f;
+}
+
+void WeightMatrix::apply_sparse_delta_overlay(f32 *output_weights, s64 matrix_index) const {
+    const auto &delta_buffer = sparse_delta_buffers[(usize)matrix_index];
+    if (delta_buffer.empty()) {
+        return;
+    }
+
+    // Host-side walk over each node's real neighbors (the same k^2-tree
+    // traversal order neighbor_weights_values already relies on matching the GPU
+    // kernel's row layout), adding any Sk contribution on top of the pure
+    // low-rank reconstruction dispatch_neighbor_weights already wrote in.
+    vector<s32> neighbor_buffer((usize)max_neighbor_count);
+    for (s64 node_index = 0; node_index < node_count; ++node_index) {
+        s64 degree = get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            auto delta_iterator = delta_buffer.find(pack_edge_key((s32)node_index, neighbor_buffer[(usize)slot]));
+            if (delta_iterator != delta_buffer.end()) {
+                output_weights[(usize)(node_index * max_neighbor_count + slot)] += delta_iterator->second;
+            }
+        }
+    }
+}
+
 f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
     log::logger().trace("get: source_node={} target_node={}", source_node, target_node);
     if (!check_index_inbounds(source_node, target_node)) {
         return 0.0;
     }
 
-    return reconstruct_entry(source_node, target_node,
+    f32 reconstructed = reconstruct_entry(source_node, target_node,
                               coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents());
+    return reconstructed + lookup_sparse_delta(DEFAULT_MATRIX_INDEX, source_node, target_node);
 }
 
 f32 WeightMatrix::get_for_matrix(s32 source_node, s32 target_node, s64 matrix_index) const {
@@ -267,8 +317,9 @@ f32 WeightMatrix::get_for_matrix(s32 source_node, s32 target_node, s64 matrix_in
         return 0.0;
     }
 
-    return reconstruct_entry(source_node, target_node,
+    f32 reconstructed = reconstruct_entry(source_node, target_node,
                               coefficient_vectors[(usize)matrix_index].get_contents());
+    return reconstructed + lookup_sparse_delta(matrix_index, source_node, target_node);
 }
 
 s64 WeightMatrix::add_coefficient_vector(const vector<f32> &coefficients) {
@@ -280,6 +331,10 @@ s64 WeightMatrix::add_coefficient_vector(const vector<f32> &coefficients) {
 
     s64 new_matrix_index = (s64)coefficient_vectors.size();
     coefficient_vectors.push_back(allocate_coefficient_vector(coefficients));
+    // Parallel, empty Sk for the new matrix (ticket #53/D3) — see
+    // sparse_delta_buffers' header comment for why this stays indexed identically
+    // to coefficient_vectors.
+    sparse_delta_buffers.emplace_back();
     log::logger().debug("add_coefficient_vector: matrix_index={}", new_matrix_index);
     return new_matrix_index;
 }
@@ -338,11 +393,44 @@ void WeightMatrix::dispatch_neighbor_weights(f32 *output_weights, const f32 *coe
 
 void WeightMatrix::neighbor_weights(f32 *output_weights) const {
     dispatch_neighbor_weights(output_weights, coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents());
+    apply_sparse_delta_overlay(output_weights, DEFAULT_MATRIX_INDEX);
 }
 
 void WeightMatrix::neighbor_weights_for_matrix(f32 *output_weights, s64 matrix_index) const {
     validate_matrix_index(matrix_index);
     dispatch_neighbor_weights(output_weights, coefficient_vectors[(usize)matrix_index].get_contents());
+    apply_sparse_delta_overlay(output_weights, matrix_index);
+}
+
+void WeightMatrix::accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 target_node, f32 delta) {
+    log::logger().trace("accumulate_edge_delta: matrix_index={} source_node={} target_node={} delta={}",
+                        matrix_index, source_node, target_node, delta);
+    validate_matrix_index(matrix_index);
+
+    // Deliberately does not reuse check_index_inbounds()/check_indexing here: those
+    // exist to let the hot, edge-unrestricted get()/update() paths skip bounds work
+    // when the caller has already guaranteed valid indices, and (as written)
+    // check_index_inbounds always reports "out of bounds" whenever check_indexing is
+    // false. accumulate_edge_delta is a new, deliberately edge-scoped operation
+    // (loadedge/accedge in the IR spec only ever address real edges) with its own
+    // contract, independent of that pre-existing knob: a bad (source_node,
+    // target_node) here is always a caller bug worth surfacing loudly, not a
+    // performance-sensitive check to toggle off.
+    bool in_bounds = source_node >= 0 && source_node < node_count &&
+                      target_node >= 0 && target_node < node_count;
+    if (!in_bounds) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::accumulate_edge_delta: (source_node={}, target_node={}) "
+                        "out of bounds for node_count={}", source_node, target_node, node_count));
+    }
+    if (!k2tree.adjacent(source_node, target_node)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::accumulate_edge_delta: (source_node={}, target_node={}) "
+                        "is not a real edge — accedge/loadedge are edge-scoped operations",
+                        source_node, target_node));
+    }
+
+    sparse_delta_buffers[(usize)matrix_index][pack_edge_key(source_node, target_node)] += delta;
 }
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {
@@ -432,6 +520,19 @@ void WeightMatrix::update(
     synchronize_gpu_work();
 }
 
+// save()/load_from_disk() persist only U_matrix/V_matrix — neither the
+// coefficient_vectors family (ticket #52/D2) nor sparse_delta_buffers (ticket
+// #53/D3, Sk) are written to disk. This is a deliberate extension of #52's own
+// choice, for the same reason: there is no production consumer of a
+// saved/reloaded multi-matrix family yet, so persisting a per-matrix Sk (which
+// only makes sense alongside its matching Ck and basis) would be speculative
+// machinery with nothing to exercise it. The periodic refit (#54) is expected
+// to fold Sk back into U/V/Ck before any such consumer exists, at which point
+// Sk's lifetime is transient between refits anyway rather than something that
+// needs to survive a save/load round-trip. If a future ticket needs
+// checkpoint/resume across the full matrix family, extend both save() and
+// load_from_disk() together, matching whatever coefficient_vectors persistence
+// scheme is added then.
 void WeightMatrix::save(const char *filepath) const {
     log::logger().debug("WeightMatrix::save: filepath={} node_count={} rank={} rank_float4_stride={}",
                         filepath, node_count, rank, rank_float4_stride);
@@ -481,6 +582,13 @@ void WeightMatrix::load_from_disk(const char *filepath) {
         }
         coefficient_vectors.clear();
         coefficient_vectors.push_back(allocate_coefficient_vector({}));
+
+        // Sk (ticket #53/D3) is not persisted by save() (see its own comment below),
+        // and every existing Sk entry is keyed against edges/coefficients of the old
+        // basis anyway — reset in lockstep with coefficient_vectors above so the two
+        // families stay parallel-indexed.
+        sparse_delta_buffers.clear();
+        sparse_delta_buffers.emplace_back();
     }
 
     file.read(reinterpret_cast<char*>(U_matrix.get_contents()),
