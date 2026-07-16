@@ -116,6 +116,33 @@ namespace spikecorec {
         // buffers (that's tickets #52-54/#57).
         s64 per_edge_variable_count = 0;
 
+        // Total real edges in the k^2-tree adjacency, computed once at
+        // construction by walking get_neighbors() for every node (so it stays
+        // consistent with an explicitly-truncating max_neighbor_count — see
+        // weight_matrix.cpp). Used by the periodic refit (ticket #54/D4) to
+        // size its point cloud and by max_sparse_delta_occupancy_fraction()
+        // to normalize Sk size into a fraction of the graph.
+        s64 total_edge_count;
+
+        // Refit-interval knob (ticket #54/D4, arch §4.3's "one open knob"):
+        // primary tick-count trigger. A plain, directly-settable field (like
+        // max_neighbor_count/rank above) rather than a constructor parameter,
+        // since it is a runtime-tunable knob, not fixed structure. Default is
+        // a starting-point heuristic (the D4 math memo §5: "low hundreds of
+        // ticks" for typical spiking rates/dt), not a universal constant.
+        s64 refit_every_n_ticks;
+
+        // Optional secondary Sk-occupancy-threshold trigger (memo §5).
+        // Negative = disabled (the default) -- refit is due only via the
+        // tick-count knob above unless the caller opts in by setting this to
+        // a fraction in (0, 1].
+        f32 refit_occupancy_threshold_fraction;
+
+        // Ticks elapsed since the last refit() call (or since construction, if
+        // refit() has never been called). Advanced by advance_tick(), reset to
+        // 0 by refit().
+        s64 ticks_since_last_refit;
+
         WeightMatrix() = delete;
 
         WeightMatrix(const WeightMatrix &) = delete;
@@ -280,6 +307,45 @@ namespace spikecorec {
         // slot] — no map insertion, the slot is guaranteed to exist for a real edge
         // representable within max_neighbor_count (see find_neighbor_slot).
         void accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 target_node, f32 delta);
+
+        // ── periodic refit (ticket #54/D4) ───────────────────────────────────────
+        // Advances the tick counter is_refit_due()'s tick-count trigger reads.
+        // Callers (the future per-tick engine/master-kernel wiring, ticket #61)
+        // invoke this once per tick.
+        void advance_tick();
+
+        // True once either the tick-count interval (refit_every_n_ticks) or, if
+        // enabled, the Sk-occupancy threshold (refit_occupancy_threshold_fraction)
+        // has been reached -- whichever fires first (arch §4.3 / D4 math memo §5).
+        [[nodiscard]] bool is_refit_due() const;
+
+        // The largest fraction of total_edge_count any single matrix's Sk
+        // currently holds an entry for (0 if every Sk is empty, or if the graph
+        // has no edges at all).
+        [[nodiscard]] f32 max_sparse_delta_occupancy_fraction() const;
+
+        // Refit (arch §4.3's "Refit" operation / ticket #54/D4): re-fits U, V,
+        // and every registered matrix's Ck to the current point cloud (the
+        // pre-refit reconstruction + Sk at every real edge, read once before any
+        // mutation), via `sweep_count` warm-started alternating-least-squares
+        // sweeps -- closed-form ridge-regularized normal-equation solves, not an
+        // iterative optimizer (D4 math memo §2.1-2.4) -- then clears every
+        // matrix's Sk and resets the tick-count knob. This is a periodic
+        // memory-compaction/basis-freshening step, not error correction (every
+        // loadedge read was already exact beforehand); it is also not a
+        // learning/training step (see CLAUDE.md's U/V factorization note).
+        //
+        // This legitimately moves EVERY registered matrix's Ck, including
+        // DEFAULT_MATRIX_INDEX's -- the same documented tradeoff
+        // set_coefficient_vector() already establishes (overwriting
+        // DEFAULT_MATRIX_INDEX's Ck trades away the "reduces to plain dot(U,V)"
+        // bit-compatibility guarantee for this instance from that point on).
+        //
+        // U and V are shared across the whole matrix family, so a refit
+        // triggered by drift in ONE matrix's Sk legitimately perturbs every
+        // OTHER matrix's reconstruction too, by a small amount, even matrices
+        // whose own Sk was empty -- expected, not a bug (D4 math memo §6).
+        void refit(s32 sweep_count = 2, f32 ridge_regularization = 1e-4f);
 
         [[nodiscard]] WeightStats neighbor_weight_stats() const;
 

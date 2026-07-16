@@ -28,6 +28,16 @@ using namespace spikecorec;
 static constexpr s64 DEFAULT_WEIGHT_RANK = 64;
 static constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5458;
 
+// Refit-interval knob default (ticket #54/D4, arch §4.3's "one open knob"):
+// a starting-point heuristic, not a universal constant -- see the D4 math
+// memo §5. Typical spiking rates (tens of Hz) with dt on the order of a
+// millisecond mean a given edge is touched roughly every few tens to low
+// hundreds of ticks, so a "low hundreds" interval keeps Sk's occupied
+// fraction bounded to a modest portion of the matrix's edge set between
+// refits without refitting too frequently. Callers should tune
+// refit_every_n_ticks (a plain public field) for their own workload.
+static constexpr s64 DEFAULT_REFIT_EVERY_N_TICKS = 200;
+
 const vector<vector<s32>> &WeightMatrix::validate_network(const vector<vector<s32>> &network) {
     if (network.empty()) {
         log::throw_invalid_argument(log::logger(),
@@ -51,6 +61,10 @@ WeightMatrix::WeightMatrix(
     , constant_weight(0.0f)
     , check_indexing(check_indexing)
     , using_constant_weight(false)
+    , total_edge_count(0)
+    , refit_every_n_ticks(DEFAULT_REFIT_EVERY_N_TICKS)
+    , refit_occupancy_threshold_fraction(-1.0f)
+    , ticks_since_last_refit(0)
 {
     this->max_neighbor_count = max_neighbor_count;
     if (max_neighbor_count == -1) {
@@ -113,6 +127,22 @@ WeightMatrix::WeightMatrix(
     sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
     sparse_delta_touched.push_back(false);
 
+    // total_edge_count (ticket #54/D4): computed via the same get_neighbors()
+    // walk the refit pass itself uses (not a raw sum of `network`'s row
+    // lengths), so it stays consistent with an explicitly-truncating
+    // max_neighbor_count (see max_neighbor_count_explicit_override_truncates
+    // in weight_matrix_tests.cpp) — an edge beyond that cap is already
+    // invisible to neighbor_weights()/apply_sparse_delta_overlay today, and
+    // refit()'s point cloud follows that same established precedent.
+    {
+        vector<s32> total_edge_count_neighbor_buffer((usize)max((s64)1, this->max_neighbor_count));
+        s64 computed_total_edge_count = 0;
+        for (s64 node_index = 0; node_index < node_count; ++node_index) {
+            computed_total_edge_count += get_neighbors(node_index, total_edge_count_neighbor_buffer.data());
+        }
+        total_edge_count = computed_total_edge_count;
+    }
+
     log::logger().debug("WeightMatrix constructed: node_count={} rank={} rank_float4_stride={} "
                         "max_neighbor_count={} weight_seed={} check_indexing={}",
                         node_count, this->rank, rank_float4_stride, this->max_neighbor_count,
@@ -174,6 +204,10 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     constant_weight = other.constant_weight;
     check_indexing = other.check_indexing;
     using_constant_weight = other.using_constant_weight;
+    total_edge_count = other.total_edge_count;
+    refit_every_n_ticks = other.refit_every_n_ticks;
+    refit_occupancy_threshold_fraction = other.refit_occupancy_threshold_fraction;
+    ticks_since_last_refit = other.ticks_since_last_refit;
 
     return *this;
 }
@@ -576,6 +610,387 @@ void WeightMatrix::update(
         iterations
     );
     synchronize_gpu_work();
+}
+
+// ── periodic refit (ticket #54/D4) ──────────────────────────────────────────
+// Implementation notes: no third-party linear algebra library is vendored in
+// this codebase (see the Makefile — only spdlog/googletest/libxml2/metal-cpp),
+// and the D4 math memo §2.1 explicitly calls for a small (dimension ==
+// rank_float4_stride*4, capped at MAX_RANK_FLOAT4_STRIDE*4 == 256) closed-form
+// Cholesky solve, so the helpers below hand-roll it rather than pull in a new
+// dependency for something this small. Accumulation happens in f64 (matrices/
+// vectors below), not f32 — these Gram matrices sum contributions over
+// potentially many edges, and accumulating in the same precision U/V/Ck are
+// stored in risked larger rounding error for no benefit; the final solved
+// values are cast back down to f32 only when written into U_matrix/V_matrix/
+// coefficient_vectors.
+namespace {
+
+// Unpacks a float4 row ([rank_float4_stride] float4 elements) into a flat f64
+// buffer of rank_float4_stride*4 lanes, in the same x/y/z/w order
+// reconstruct_entry already accumulates in.
+void unpack_float4_row_into_buffer(const float4 *row, s64 rank_float4_stride, f64 *destination) {
+    for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
+        const float4 &element = row[float4_index];
+        destination[float4_index * 4 + 0] = (f64)element.x;
+        destination[float4_index * 4 + 1] = (f64)element.y;
+        destination[float4_index * 4 + 2] = (f64)element.z;
+        destination[float4_index * 4 + 3] = (f64)element.w;
+    }
+}
+
+// Inverse of unpack_float4_row_into_buffer: writes a flat f64 buffer back into
+// a float4 row, casting each lane down to f32.
+void pack_buffer_into_float4_row(const f64 *source, s64 rank_float4_stride, float4 *destination_row) {
+    for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
+        destination_row[float4_index].x = (f32)source[float4_index * 4 + 0];
+        destination_row[float4_index].y = (f32)source[float4_index * 4 + 1];
+        destination_row[float4_index].z = (f32)source[float4_index * 4 + 2];
+        destination_row[float4_index].w = (f32)source[float4_index * 4 + 3];
+    }
+}
+
+// Ridge-regularized normal-equation solve (D4 math memo §2.1: "Ck ← (ΦᵀΦ +
+// λI)⁻¹ Φᵀy", §2.2/§2.3 identical in shape for U's/V's row updates). `gram_matrix`
+// is `dimension*dimension`, row-major, with only its lower triangle (row >=
+// col) populated by the caller; this mirrors it into the upper triangle, adds
+// `ridge_regularization` to the diagonal (which alone guarantees strict
+// positive-definiteness, so a plain Cholesky factorization with no pivoting
+// always exists — memo §2.2's "load-bearing for low-degree nodes"), factors
+// it in place (the lower triangle becomes L, where gram_matrix == L·Lᵀ), then
+// solves L·y = right_hand_side followed by Lᵀ·x = y, leaving the solution in
+// right_hand_side.
+void solve_ridge_regularized_normal_equations(
+    vector<f64> &gram_matrix,
+    vector<f64> &right_hand_side,
+    s64 dimension,
+    f64 ridge_regularization
+) {
+    for (s64 row = 0; row < dimension; ++row) {
+        for (s64 col = 0; col < row; ++col) {
+            gram_matrix[(usize)(col * dimension + row)] = gram_matrix[(usize)(row * dimension + col)];
+        }
+        gram_matrix[(usize)(row * dimension + row)] += ridge_regularization;
+    }
+
+    // In-place Cholesky factorization: the lower triangle of gram_matrix becomes L.
+    for (s64 col = 0; col < dimension; ++col) {
+        f64 diagonal_sum = gram_matrix[(usize)(col * dimension + col)];
+        for (s64 inner_index = 0; inner_index < col; ++inner_index) {
+            f64 value = gram_matrix[(usize)(col * dimension + inner_index)];
+            diagonal_sum -= value * value;
+        }
+        f64 diagonal_value = sqrt(max(diagonal_sum, 1e-300));
+        gram_matrix[(usize)(col * dimension + col)] = diagonal_value;
+        for (s64 row = col + 1; row < dimension; ++row) {
+            f64 sum = gram_matrix[(usize)(row * dimension + col)];
+            for (s64 inner_index = 0; inner_index < col; ++inner_index) {
+                sum -= gram_matrix[(usize)(row * dimension + inner_index)] * gram_matrix[(usize)(col * dimension + inner_index)];
+            }
+            gram_matrix[(usize)(row * dimension + col)] = sum / diagonal_value;
+        }
+    }
+
+    // Forward substitution: L·y = right_hand_side, result overwrites right_hand_side.
+    for (s64 row = 0; row < dimension; ++row) {
+        f64 sum = right_hand_side[(usize)row];
+        for (s64 inner_index = 0; inner_index < row; ++inner_index) {
+            sum -= gram_matrix[(usize)(row * dimension + inner_index)] * right_hand_side[(usize)inner_index];
+        }
+        right_hand_side[(usize)row] = sum / gram_matrix[(usize)(row * dimension + row)];
+    }
+    // Back substitution: Lᵀ·x = y, result overwrites right_hand_side.
+    for (s64 row = dimension - 1; row >= 0; --row) {
+        f64 sum = right_hand_side[(usize)row];
+        for (s64 inner_index = row + 1; inner_index < dimension; ++inner_index) {
+            sum -= gram_matrix[(usize)(inner_index * dimension + row)] * right_hand_side[(usize)inner_index];
+        }
+        right_hand_side[(usize)row] = sum / gram_matrix[(usize)(row * dimension + row)];
+    }
+}
+
+} // namespace
+
+void WeightMatrix::advance_tick() {
+    ++ticks_since_last_refit;
+}
+
+f32 WeightMatrix::max_sparse_delta_occupancy_fraction() const {
+    if (total_edge_count == 0) {
+        return 0.0f;
+    }
+
+    // sparse_delta_buffers is a fixed-capacity GPU-resident array per matrix
+    // (ticket #53/D3 rework), not a hash map -- there is no O(1) "number of
+    // entries" to read off a container anymore, so occupancy is counted
+    // directly: a slot "holds an entry" iff its stored value is nonzero
+    // (matching how lookup_sparse_delta/apply_sparse_delta_overlay already
+    // treat 0.0f as "no delta" for that slot, whether never touched or
+    // accumulated back down to exactly zero). Skips the scan entirely for a
+    // matrix whose Sk has never been touched at all.
+    s64 total_slot_count = node_count * max_neighbor_count;
+    s64 largest_occupied_slot_count = 0;
+    for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+        if (!sparse_delta_touched[(usize)matrix_index]) {
+            continue;
+        }
+        const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+        s64 occupied_slot_count = 0;
+        for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
+            if (delta_data[slot_index] != 0.0f) {
+                ++occupied_slot_count;
+            }
+        }
+        largest_occupied_slot_count = max(largest_occupied_slot_count, occupied_slot_count);
+    }
+    return (f32)largest_occupied_slot_count / (f32)total_edge_count;
+}
+
+bool WeightMatrix::is_refit_due() const {
+    if (ticks_since_last_refit >= refit_every_n_ticks) {
+        return true;
+    }
+    // Negative refit_occupancy_threshold_fraction = disabled (see its header
+    // comment) — the tick-count knob above is the only trigger unless the
+    // caller opts in to this secondary one (D4 math memo §5).
+    if (refit_occupancy_threshold_fraction >= 0.0f &&
+        max_sparse_delta_occupancy_fraction() >= refit_occupancy_threshold_fraction) {
+        return true;
+    }
+    return false;
+}
+
+void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
+    log::logger().debug("refit: sweep_count={} ridge_regularization={} matrix_count={} node_count={} "
+                        "total_edge_count={}", sweep_count, ridge_regularization, matrix_count(),
+                        node_count, total_edge_count);
+
+    if (sweep_count <= 0) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::refit: sweep_count must be positive (got {})", sweep_count));
+    }
+    if (!(ridge_regularization > 0.0f)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::refit: ridge_regularization must be positive (got {})",
+                        ridge_regularization));
+    }
+
+    // Nothing to fit against — still complete the bookkeeping half of the
+    // contract (Sk is trivially already all-zero with zero edges, since
+    // accumulate_edge_delta requires a real k^2-tree edge to ever populate
+    // it). sparse_delta_buffers is a fixed-capacity GPU-resident array per
+    // matrix (ticket #53/D3 rework), not a hash map -- "clearing" means
+    // zeroing every slot's contents (allocate_sparse_delta_buffer's own
+    // zero-fill convention) and resetting sparse_delta_touched to false, not
+    // calling a (nonexistent) container-clear method. Guarded by
+    // node_count*max_neighbor_count > 0 since a matrix with no representable
+    // neighbor slots at all has a null (never-allocated) buffer whose
+    // get_contents() must never be dereferenced.
+    if (total_edge_count == 0) {
+        s64 delta_buffer_element_count = node_count * max_neighbor_count;
+        for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+            if (delta_buffer_element_count > 0) {
+                memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
+                       (usize)delta_buffer_element_count * sizeof(f32));
+            }
+            sparse_delta_touched[(usize)matrix_index] = false;
+        }
+        ticks_since_last_refit = 0;
+        return;
+    }
+
+    const s64 effective_lane_count = rank_float4_stride * 4; // the padded dimensionality
+                                                              // reconstruct_entry actually
+                                                              // sums over (see its header
+                                                              // comment) — the fit must
+                                                              // match what reconstruction
+                                                              // computes, not just the
+                                                              // caller-facing logical rank.
+    const s64 registered_matrix_count = matrix_count();
+
+    // ---- Build the flat edge list once (CSR-style row_start per source node),
+    // via the same get_neighbors() walk total_edge_count was computed with (so
+    // it agrees exactly under an explicitly-truncating max_neighbor_count). ----
+    vector<s32> edge_source((usize)total_edge_count);
+    vector<s32> edge_target((usize)total_edge_count);
+    vector<s64> row_start((usize)(node_count + 1), 0);
+    {
+        vector<s32> neighbor_buffer((usize)max((s64)1, max_neighbor_count));
+        s64 edge_cursor = 0;
+        for (s64 node_index = 0; node_index < node_count; ++node_index) {
+            row_start[(usize)node_index] = edge_cursor;
+            s64 degree = get_neighbors(node_index, neighbor_buffer.data());
+            for (s64 slot = 0; slot < degree; ++slot) {
+                edge_source[(usize)edge_cursor] = (s32)node_index;
+                edge_target[(usize)edge_cursor] = neighbor_buffer[(usize)slot];
+                ++edge_cursor;
+            }
+        }
+        row_start[(usize)node_count] = edge_cursor;
+    }
+
+    // ---- Transient reverse-adjacency index (in-edges bucketed by target node),
+    // needed for the V update (§2.3) — K2Tree exposes no reverse enumeration of
+    // its own (see its header), so this is built fresh here and discarded at
+    // the end of this function; it is not added to K2Tree itself. ----
+    vector<vector<s64>> in_edge_indices((usize)node_count);
+    for (s64 edge_index = 0; edge_index < total_edge_count; ++edge_index) {
+        in_edge_indices[(usize)edge_target[(usize)edge_index]].push_back(edge_index);
+    }
+
+    // ---- Read the WHOLE point cloud BEFORE mutating anything (§1/§7: a
+    // read-after-write bug here would silently corrupt the fit). Per this
+    // ticket's simplification of the memo's per-matrix E_k framing, every
+    // matrix's point cloud spans the SAME full edge set (this codebase has no
+    // mechanism to scope a matrix to an edge subset). ----
+    vector<vector<f32>> observed_values(
+        (usize)registered_matrix_count, vector<f32>((usize)total_edge_count));
+    for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
+        const f32 *coefficient_values = coefficient_vectors[(usize)matrix_index].get_contents();
+        for (s64 edge_index = 0; edge_index < total_edge_count; ++edge_index) {
+            f32 reconstructed = reconstruct_entry(
+                edge_source[(usize)edge_index], edge_target[(usize)edge_index], coefficient_values);
+            observed_values[(usize)matrix_index][(usize)edge_index] =
+                reconstructed + lookup_sparse_delta(
+                    matrix_index, edge_source[(usize)edge_index], edge_target[(usize)edge_index]);
+        }
+    }
+
+    // ---- ALS sweeps: warm-started from the CURRENT U, V, Ck (§3 — never
+    // reinitialize randomly); each sweep updates Ck, then U, then V, in that
+    // cheapest-first order (§2.4). Each block's update uses the observed_values
+    // snapshot above as its fixed target, but the OTHER two blocks' most
+    // recently updated values (Gauss-Seidel-style, not Jacobi) — standard
+    // block-coordinate ALS. ----
+    float4 *u_data = U_matrix.get_contents();
+    float4 *v_data = V_matrix.get_contents();
+
+    vector<f64> gram_matrix((usize)(effective_lane_count * effective_lane_count));
+    vector<f64> right_hand_side((usize)effective_lane_count);
+    vector<f64> feature_vector((usize)effective_lane_count);
+    vector<f64> row_buffer((usize)effective_lane_count);
+
+    for (s32 sweep_index = 0; sweep_index < sweep_count; ++sweep_index) {
+        // --- §2.1: update each Ck, fixing U and V ---
+        for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
+            fill(gram_matrix.begin(), gram_matrix.end(), 0.0);
+            fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
+            const vector<f32> &matrix_observed_values = observed_values[(usize)matrix_index];
+
+            for (s64 edge_index = 0; edge_index < total_edge_count; ++edge_index) {
+                const float4 *u_row = u_data + edge_source[(usize)edge_index] * rank_float4_stride;
+                const float4 *v_row = v_data + edge_target[(usize)edge_index] * rank_float4_stride;
+                for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
+                    feature_vector[(usize)(float4_index * 4 + 0)] = (f64)u_row[float4_index].x * (f64)v_row[float4_index].x;
+                    feature_vector[(usize)(float4_index * 4 + 1)] = (f64)u_row[float4_index].y * (f64)v_row[float4_index].y;
+                    feature_vector[(usize)(float4_index * 4 + 2)] = (f64)u_row[float4_index].z * (f64)v_row[float4_index].z;
+                    feature_vector[(usize)(float4_index * 4 + 3)] = (f64)u_row[float4_index].w * (f64)v_row[float4_index].w;
+                }
+                f64 observed = (f64)matrix_observed_values[(usize)edge_index];
+                for (s64 row = 0; row < effective_lane_count; ++row) {
+                    right_hand_side[(usize)row] += feature_vector[(usize)row] * observed;
+                    for (s64 col = 0; col <= row; ++col) {
+                        gram_matrix[(usize)(row * effective_lane_count + col)] +=
+                            feature_vector[(usize)row] * feature_vector[(usize)col];
+                    }
+                }
+            }
+
+            solve_ridge_regularized_normal_equations(
+                gram_matrix, right_hand_side, effective_lane_count, (f64)ridge_regularization);
+
+            f32 *coefficient_data = coefficient_vectors[(usize)matrix_index].get_contents();
+            for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+                coefficient_data[lane_index] = (f32)right_hand_side[(usize)lane_index];
+            }
+        }
+
+        // --- §2.2: update U row-by-row, fixing V and {Ck}, pooling every
+        // matrix's out-edges from source node `node_index` (every matrix
+        // shares the same edge set here — see this ticket's E_k simplification) ---
+        for (s64 node_index = 0; node_index < node_count; ++node_index) {
+            fill(gram_matrix.begin(), gram_matrix.end(), 0.0);
+            fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
+
+            for (s64 edge_index = row_start[(usize)node_index]; edge_index < row_start[(usize)node_index + 1]; ++edge_index) {
+                const float4 *v_row = v_data + edge_target[(usize)edge_index] * rank_float4_stride;
+                unpack_float4_row_into_buffer(v_row, rank_float4_stride, row_buffer.data());
+                for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
+                    const f32 *coefficient_values = coefficient_vectors[(usize)matrix_index].get_contents();
+                    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+                        feature_vector[(usize)lane_index] = (f64)coefficient_values[lane_index] * row_buffer[(usize)lane_index];
+                    }
+                    f64 observed = (f64)observed_values[(usize)matrix_index][(usize)edge_index];
+                    for (s64 row = 0; row < effective_lane_count; ++row) {
+                        right_hand_side[(usize)row] += feature_vector[(usize)row] * observed;
+                        for (s64 col = 0; col <= row; ++col) {
+                            gram_matrix[(usize)(row * effective_lane_count + col)] +=
+                                feature_vector[(usize)row] * feature_vector[(usize)col];
+                        }
+                    }
+                }
+            }
+
+            // A node with zero out-edges has no data term at all here — the
+            // ridge term alone (§2.2) then correctly drives its U row to zero,
+            // a well-defined (not NaN/Inf) result; that row is never consulted
+            // by reconstruct_entry() at any real edge anyway (get() itself
+            // remains edge-unrestricted and unaffected — see its own contract).
+            solve_ridge_regularized_normal_equations(
+                gram_matrix, right_hand_side, effective_lane_count, (f64)ridge_regularization);
+            pack_buffer_into_float4_row(right_hand_side.data(), rank_float4_stride, u_data + node_index * rank_float4_stride);
+        }
+
+        // --- §2.3: update V row-by-row, fixing U and {Ck}, pooling every
+        // matrix's in-edges into target node `node_index`, via the transient
+        // reverse index built above ---
+        for (s64 node_index = 0; node_index < node_count; ++node_index) {
+            fill(gram_matrix.begin(), gram_matrix.end(), 0.0);
+            fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
+
+            for (s64 edge_index : in_edge_indices[(usize)node_index]) {
+                const float4 *u_row = u_data + edge_source[(usize)edge_index] * rank_float4_stride;
+                unpack_float4_row_into_buffer(u_row, rank_float4_stride, row_buffer.data());
+                for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
+                    const f32 *coefficient_values = coefficient_vectors[(usize)matrix_index].get_contents();
+                    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+                        feature_vector[(usize)lane_index] = (f64)coefficient_values[lane_index] * row_buffer[(usize)lane_index];
+                    }
+                    f64 observed = (f64)observed_values[(usize)matrix_index][(usize)edge_index];
+                    for (s64 row = 0; row < effective_lane_count; ++row) {
+                        right_hand_side[(usize)row] += feature_vector[(usize)row] * observed;
+                        for (s64 col = 0; col <= row; ++col) {
+                            gram_matrix[(usize)(row * effective_lane_count + col)] +=
+                                feature_vector[(usize)row] * feature_vector[(usize)col];
+                        }
+                    }
+                }
+            }
+
+            solve_ridge_regularized_normal_equations(
+                gram_matrix, right_hand_side, effective_lane_count, (f64)ridge_regularization);
+            pack_buffer_into_float4_row(right_hand_side.data(), rank_float4_stride, v_data + node_index * rank_float4_stride);
+        }
+    }
+
+    // ---- Clear every matrix's Sk (the memory-reclaiming half of the
+    // acceptance criterion) and reset the tick-count knob. sparse_delta_buffers
+    // is a fixed-capacity GPU-resident array per matrix (ticket #53/D3
+    // rework), not a hash map -- "clearing" means zeroing every slot's
+    // contents (allocate_sparse_delta_buffer's own zero-fill convention) and
+    // resetting sparse_delta_touched to false, not calling a (nonexistent)
+    // container-clear method. ----
+    s64 delta_buffer_element_count = node_count * max_neighbor_count;
+    for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+        if (delta_buffer_element_count > 0) {
+            memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
+                   (usize)delta_buffer_element_count * sizeof(f32));
+        }
+        sparse_delta_touched[(usize)matrix_index] = false;
+    }
+    ticks_since_last_refit = 0;
+
+    log::logger().debug("refit: complete");
 }
 
 // save()/load_from_disk() persist only U_matrix/V_matrix — neither the

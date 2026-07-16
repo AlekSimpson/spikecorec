@@ -51,6 +51,51 @@ vector<vector<s32>> make_irregular_network() {
     };
 }
 
+// Deterministic, RNG-free "true" row for the known-low-rank refit fixture
+// below -- a simple arithmetic pattern, not randomly generated, so the fixture
+// is fully reproducible without needing to seed/carry a generator.
+vector<f32> deterministic_row(s64 node_index, s64 lane_count, s64 row_seed) {
+    vector<f32> row((usize)lane_count);
+    for (s64 lane_index = 0; lane_index < lane_count; ++lane_index) {
+        s64 pattern = (node_index * 7 + lane_index * 13 + row_seed * 31) % 11;
+        row[(usize)lane_index] = (f32)pattern - 5.0f;
+    }
+    return row;
+}
+
+// Σ_lane u_row[lane]·coefficients[lane]·v_row[lane] -- the same reconstruction
+// formula WeightMatrix::reconstruct_entry implements, computed test-side
+// against the fixture's own "true" rows/coefficients.
+f32 low_rank_dot(const vector<f32> &u_row, const vector<f32> &coefficients, const vector<f32> &v_row) {
+    f32 sum = 0.0f;
+    for (usize lane_index = 0; lane_index < u_row.size(); ++lane_index) {
+        sum += u_row[lane_index] * coefficients[lane_index] * v_row[lane_index];
+    }
+    return sum;
+}
+
+// Whitebox check for whether a matrix's Sk currently holds no accumulated
+// deltas at all. sparse_delta_buffers is a fixed-capacity GPU-resident array
+// per matrix (ticket #53/D3 rework), not a hash map, so there is no
+// container-level .empty() to call -- this instead reads the raw contents
+// directly (the same way sparse_delta_buffer_uses_position_indexed_gpu_resident_layout
+// above does) and confirms every slot is exactly 0.0f, matching the old map's
+// "no entries" semantics. Returns true trivially when the matrix has no
+// representable neighbor slots at all (its buffer is never allocated).
+bool sparse_delta_buffer_contents_are_all_zero(const WeightMatrix &weight_matrix, s64 matrix_index) {
+    s64 total_slot_count = weight_matrix.node_count * weight_matrix.max_neighbor_count;
+    if (total_slot_count == 0) {
+        return true;
+    }
+    const f32 *delta_data = weight_matrix.sparse_delta_buffers[(usize)matrix_index].get_contents();
+    for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
+        if (delta_data[slot_index] != 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 TEST(WeightMatrix, construction) {
@@ -1121,4 +1166,297 @@ TEST(WeightMatrix, load_from_disk_resets_sparse_delta_buffer_on_reallocation) {
     destination.load_from_disk(path);
     EXPECT_EQ(destination.matrix_count(), 1); // reset back to just DEFAULT_MATRIX_INDEX
     EXPECT_TRUE(approx(destination.get(0, 1), 0.42f)); // pure reconstruction, no leftover Sk
+}
+
+// ── total_edge_count (ticket #54/D4) ──────────────────────────────────────────
+
+TEST(WeightMatrix, total_edge_count_matches_the_network) {
+    auto network = square_torus(4); // 16 nodes, out-degree 4 each
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_EQ(weight_matrix.total_edge_count, 16 * 4);
+}
+
+TEST(WeightMatrix, total_edge_count_respects_max_neighbor_count_truncation) {
+    // node 2's real out-degree is 4; capping max_neighbor_count at 2 truncates
+    // it to 2 for get_neighbors() -- total_edge_count must agree (it is
+    // computed via the same get_neighbors() walk, not a raw sum of the
+    // adjacency list's row lengths -- see the constructor's comment).
+    auto network = make_irregular_network();
+    WeightMatrix truncated(network, /*rank=*/4, /*check_indexing=*/true, /*max_neighbor_count=*/2);
+    // node0: min(3,2)=2, node1: min(1,2)=1, node2: min(4,2)=2, node3: 0, node4: min(1,2)=1.
+    EXPECT_EQ(truncated.total_edge_count, 2 + 1 + 2 + 0 + 1);
+}
+
+// ── periodic refit (ticket #54/D4) ────────────────────────────────────────────
+//
+// D4 math memo §6 is explicit that refit is an approximation-quality claim,
+// not an exactness claim (unlike ticket #52's Ck=1 bit-exactness bar) -- these
+// tests check relative fit quality / near-no-op behavior against tolerances,
+// not bit-for-bit reproduction.
+
+TEST(WeightMatrix, refit_recovers_a_known_low_rank_fixture_within_tolerance) {
+    // rank=4 -> rank_float4_stride=1 -> effective_lane_count (the padded
+    // dimensionality reconstruct_entry actually sums over) equals the logical
+    // rank exactly, so this fixture's "true" rows/coefficients are exactly
+    // what refit() fits against -- no float4 padding lanes to complicate it.
+    //
+    // A single matrix (DEFAULT_MATRIX_INDEX) is used here -- deliberately, not
+    // an oversight -- to isolate "does the ALS implementation converge to a
+    // known rank-4 factorization" from any additional joint-convergence
+    // difficulty a cold-started MULTI-matrix coupled fit can introduce (see
+    // refit_couples_matrices_through_the_shared_basis below for the
+    // multi-matrix coupling behavior itself, which is a qualitative check, not
+    // a quantitative recovery one). This also matches the ticket body's own
+    // phrasing: "pick a 'true' U*, V*, Ck*" -- singular Ck.
+    auto network = random_fixed_outdegree(/*side_length=*/4, /*fanout=*/8, /*seed=*/123); // 16 nodes, out-degree 8
+    const s64 rank = 4;
+    WeightMatrix weight_matrix(network, rank, /*check_indexing=*/true, -1, /*weight_seed=*/7);
+
+    vector<f32> coefficients_default = deterministic_row(0, rank, /*row_seed=*/100);
+    weight_matrix.set_coefficient_vector(WeightMatrix::DEFAULT_MATRIX_INDEX, coefficients_default);
+
+    vector<vector<f32>> true_rows((usize)weight_matrix.node_count);
+    vector<vector<f32>> true_columns((usize)weight_matrix.node_count);
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        true_rows[(usize)node_index] = deterministic_row(node_index, rank, /*row_seed=*/node_index * 3 + 1);
+        true_columns[(usize)node_index] = deterministic_row(node_index, rank, /*row_seed=*/node_index * 5 + 2);
+    }
+
+    // Inject the fixture's "true" values as an Sk delta (true - current
+    // reconstruction), so every get_for_matrix() read returns exactly the true
+    // value pre-refit -- this is a one-shot full-signal injection (unlike a
+    // typical small warm-start perturbation between refits in production
+    // usage), so a larger-than-default sweep_count is used below for THIS
+    // test to let ALS actually converge from what is effectively a cold start
+    // relative to the injected signal (D4 math memo §3/§5 explicitly support
+    // tuning sweep_count up for atypically large accumulated drift).
+    for (s64 source_node = 0; source_node < weight_matrix.node_count; ++source_node) {
+        for (s32 target_node : network[(usize)source_node]) {
+            f32 true_value = low_rank_dot(true_rows[(usize)source_node], coefficients_default, true_columns[(usize)target_node]);
+            f32 current_value = weight_matrix.get_for_matrix((s32)source_node, target_node, WeightMatrix::DEFAULT_MATRIX_INDEX);
+            weight_matrix.accumulate_edge_delta(
+                WeightMatrix::DEFAULT_MATRIX_INDEX, (s32)source_node, target_node, true_value - current_value);
+        }
+    }
+
+    weight_matrix.refit(/*sweep_count=*/80, /*ridge_regularization=*/1e-4f);
+
+    f64 squared_error_sum = 0.0;
+    f64 squared_true_sum = 0.0;
+    s64 edge_count = 0;
+    for (s64 source_node = 0; source_node < weight_matrix.node_count; ++source_node) {
+        for (s32 target_node : network[(usize)source_node]) {
+            f32 true_value = low_rank_dot(true_rows[(usize)source_node], coefficients_default, true_columns[(usize)target_node]);
+            f32 reconstructed = weight_matrix.get_for_matrix((s32)source_node, target_node, WeightMatrix::DEFAULT_MATRIX_INDEX);
+            f64 error = (f64)reconstructed - (f64)true_value;
+            squared_error_sum += error * error;
+            squared_true_sum += (f64)true_value * (f64)true_value;
+            ++edge_count;
+        }
+    }
+    f64 true_rms = std::sqrt(squared_true_sum / (f64)edge_count);
+    f64 relative_rms_error = std::sqrt(squared_error_sum / (f64)edge_count) / (true_rms > 1e-6 ? true_rms : 1e-6);
+    EXPECT_LT(relative_rms_error, 0.05);
+}
+
+TEST(WeightMatrix, refit_clears_sparse_delta_buffer_for_every_matrix) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4, /*check_indexing=*/true, -1, /*weight_seed=*/5);
+    s64 matrix_a = weight_matrix.add_coefficient_vector({1.0f, 2.0f, -1.0f, 0.5f});
+
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 3.0f);
+    weight_matrix.accumulate_edge_delta(matrix_a, 2, 3, -2.0f);
+    ASSERT_FALSE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, WeightMatrix::DEFAULT_MATRIX_INDEX));
+    ASSERT_FALSE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_a));
+
+    weight_matrix.refit();
+
+    for (s64 matrix_index = 0; matrix_index < weight_matrix.matrix_count(); ++matrix_index) {
+        EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_index));
+        EXPECT_FALSE(weight_matrix.sparse_delta_touched[(usize)matrix_index]);
+    }
+}
+
+TEST(WeightMatrix, refit_is_a_near_no_op_on_an_untouched_sparse_delta_buffer) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4, /*check_indexing=*/true, -1, /*weight_seed=*/9);
+    s64 matrix_a = weight_matrix.add_coefficient_vector({1.0f, -0.5f, 2.0f, 0.25f});
+
+    vector<pair<s32, s32>> probe_edges = {{0, 1}, {5, 9}, {12, 8}};
+    for (const auto &probe_edge : probe_edges) {
+        ASSERT_TRUE(weight_matrix.k2tree.adjacent(probe_edge.first, probe_edge.second));
+    }
+
+    vector<f32> default_before, matrix_a_before;
+    for (const auto &probe_edge : probe_edges) {
+        default_before.push_back(weight_matrix.get_for_matrix(probe_edge.first, probe_edge.second, WeightMatrix::DEFAULT_MATRIX_INDEX));
+        matrix_a_before.push_back(weight_matrix.get_for_matrix(probe_edge.first, probe_edge.second, matrix_a));
+    }
+
+    // Sk is empty for every matrix here -- nothing has been accumulate_edge_delta'd
+    // since construction. A single sweep from a point already at a stationary
+    // point of the unregularized loss should leave U/V/Ck numerically close to
+    // where they started (D4 math memo §6) -- the small ridge term perturbs
+    // them slightly, but not "meaningfully."
+    weight_matrix.refit();
+
+    for (usize index = 0; index < probe_edges.size(); ++index) {
+        f32 default_after = weight_matrix.get_for_matrix(probe_edges[index].first, probe_edges[index].second, WeightMatrix::DEFAULT_MATRIX_INDEX);
+        f32 matrix_a_after = weight_matrix.get_for_matrix(probe_edges[index].first, probe_edges[index].second, matrix_a);
+        EXPECT_TRUE(approx(default_after, default_before[index], 0.05f));
+        EXPECT_TRUE(approx(matrix_a_after, matrix_a_before[index], 0.05f));
+    }
+}
+
+TEST(WeightMatrix, refit_couples_matrices_through_the_shared_basis) {
+    // Bumping only DEFAULT_MATRIX_INDEX's Sk and refitting legitimately
+    // perturbs matrix_b's reconstruction too, by a small amount -- because U/V
+    // are shared and refit against pooled data across the whole matrix family
+    // (D4 math memo §6). This is EXPECTED behavior, not a bug -- a future
+    // reader should not file this as a correctness defect.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4, /*check_indexing=*/true, -1, /*weight_seed=*/11);
+    s64 matrix_b = weight_matrix.add_coefficient_vector({1.0f, -1.0f, 0.5f, 2.0f});
+
+    s32 probe_source = 0, probe_target = 1;
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(probe_source, probe_target));
+    f32 matrix_b_before = weight_matrix.get_for_matrix(probe_source, probe_target, matrix_b);
+
+    // Bump ONLY DEFAULT_MATRIX_INDEX's Sk, substantially, across every real edge.
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX,
+                (s32)node, neighbor_buffer[(usize)slot], 25.0f);
+        }
+    }
+    ASSERT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_b)); // matrix_b itself untouched
+
+    weight_matrix.refit();
+
+    f32 matrix_b_after = weight_matrix.get_for_matrix(probe_source, probe_target, matrix_b);
+    f32 change_magnitude = std::fabs(matrix_b_after - matrix_b_before);
+    EXPECT_GT(change_magnitude, 1e-4f)
+        << "matrix_b's reconstruction should move -- U/V are shared and refit pooled across "
+        << "every matrix, even though matrix_b's own Sk was empty (expected, see comment above)";
+    EXPECT_LT(change_magnitude, 12.5f)
+        << "the coupling should be a small perturbation relative to the +25.0 bump directly "
+        << "applied to the OTHER matrix, not a comparably large change";
+}
+
+TEST(WeightMatrix, refit_handles_degenerate_low_degree_nodes_without_producing_nan_or_inf) {
+    // node 1: out-degree 1 (< rank); node 3: out-degree 0 (isolated for
+    // outgoing edges, though still a target of node 0's edge) -- both exercise
+    // the ridge term's necessity for a rank-deficient Gram matrix (D4 math
+    // memo §2.2).
+    auto network = make_irregular_network();
+    WeightMatrix weight_matrix(network, /*rank=*/4, /*check_indexing=*/true, -1, /*weight_seed=*/13);
+    s64 matrix_a = weight_matrix.add_coefficient_vector({1.5f, -2.0f, 0.5f, 3.0f});
+
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 4.0f);
+    weight_matrix.accumulate_edge_delta(matrix_a, 2, 3, -3.5f);
+
+    weight_matrix.refit();
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            f32 default_value = weight_matrix.get_for_matrix((s32)node, neighbor_buffer[(usize)slot], WeightMatrix::DEFAULT_MATRIX_INDEX);
+            f32 matrix_a_value = weight_matrix.get_for_matrix((s32)node, neighbor_buffer[(usize)slot], matrix_a);
+            EXPECT_TRUE(std::isfinite(default_value)) << "node=" << node;
+            EXPECT_TRUE(std::isfinite(matrix_a_value)) << "node=" << node;
+        }
+    }
+
+    for (s64 matrix_index = 0; matrix_index < weight_matrix.matrix_count(); ++matrix_index) {
+        EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_index));
+    }
+}
+
+TEST(WeightMatrix, refit_on_a_graph_with_no_edges_is_a_safe_no_op) {
+    vector<vector<s32>> network(5); // 5 isolated nodes, no edges anywhere
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_EQ(weight_matrix.total_edge_count, 0);
+
+    weight_matrix.advance_tick();
+    weight_matrix.refit(); // must not crash (e.g. divide-by-zero building an empty point cloud)
+    EXPECT_EQ(weight_matrix.ticks_since_last_refit, 0);
+    for (s64 matrix_index = 0; matrix_index < weight_matrix.matrix_count(); ++matrix_index) {
+        EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix, matrix_index));
+    }
+}
+
+TEST(WeightMatrix, refit_rejects_invalid_arguments) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_THROW(weight_matrix.refit(/*sweep_count=*/0), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.refit(/*sweep_count=*/-1), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.refit(/*sweep_count=*/2, /*ridge_regularization=*/0.0f), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.refit(/*sweep_count=*/2, /*ridge_regularization=*/-1e-4f), std::invalid_argument);
+}
+
+// ── refit-interval knob (ticket #54/D4) ───────────────────────────────────────
+
+TEST(WeightMatrix, refit_interval_knob_default_and_tick_count_trigger) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+
+    EXPECT_EQ(weight_matrix.refit_every_n_ticks, 200); // documented default (D4 math memo §5)
+    EXPECT_FALSE(weight_matrix.is_refit_due());         // fresh construction: 0 ticks elapsed
+
+    for (s64 tick = 0; tick < weight_matrix.refit_every_n_ticks - 1; ++tick) {
+        weight_matrix.advance_tick();
+    }
+    EXPECT_FALSE(weight_matrix.is_refit_due());
+
+    weight_matrix.advance_tick(); // reaches refit_every_n_ticks
+    EXPECT_TRUE(weight_matrix.is_refit_due());
+
+    weight_matrix.refit();
+    EXPECT_FALSE(weight_matrix.is_refit_due()); // ticks_since_last_refit reset by refit()
+}
+
+TEST(WeightMatrix, refit_occupancy_threshold_is_disabled_by_default) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_LT(weight_matrix.refit_occupancy_threshold_fraction, 0.0f); // disabled sentinel
+
+    // Fill Sk to full occupancy -- with the threshold disabled, is_refit_due()
+    // must still only key off the tick-count trigger (D4 math memo §5: "default
+    // this to disabled... unless the caller opts in").
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX,
+                (s32)node, neighbor_buffer[(usize)slot], 1.0f);
+        }
+    }
+    EXPECT_TRUE(approx(weight_matrix.max_sparse_delta_occupancy_fraction(), 1.0f, 1e-3f));
+    EXPECT_FALSE(weight_matrix.is_refit_due());
+}
+
+TEST(WeightMatrix, refit_occupancy_threshold_triggers_early_when_enabled) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    weight_matrix.refit_occupancy_threshold_fraction = 0.1f; // opt in
+
+    EXPECT_FALSE(weight_matrix.is_refit_due()); // nothing accumulated yet, 0 ticks elapsed
+
+    // Bump enough distinct edges to exceed 10% of total_edge_count.
+    s64 target_bump_count = (s64)(weight_matrix.total_edge_count * 0.15) + 1;
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    s64 bumped_count = 0;
+    for (s64 node = 0; node < weight_matrix.node_count && bumped_count < target_bump_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree && bumped_count < target_bump_count; ++slot) {
+            weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX,
+                (s32)node, neighbor_buffer[(usize)slot], 1.0f);
+            ++bumped_count;
+        }
+    }
+
+    EXPECT_TRUE(weight_matrix.is_refit_due()); // occupancy trigger fired, even with 0 ticks elapsed
 }
