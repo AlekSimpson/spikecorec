@@ -206,12 +206,29 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     } else {
         // Per-edge: `forall neuron_in { loadedge ...; ... }` (IR spec §4's
         // NMDA example). No explicit per-edge decay instruction is emitted
-        // (see synapse_lowering.h's header comment) -- each peredge state
-        // variable is `loadedge`'d into a name derived from the variable
-        // itself (`edge_<name>`, never a `tN` temp) so it stays valid across
+        // (see synapse_lowering.h's header comment for why this is
+        // spec-conformant, not an oversight) -- each peredge state variable
+        // is `loadedge`'d into a name derived from the variable itself
+        // (`edge_<name>`, never a `tN` temp) so it stays valid across
         // however many subsequent statements the forall body's own
         // DerivedVariable computations need, without colliding with their
         // OWN per-statement-reset `tN` counter.
+        //
+        // A per-edge synapse that actually declares a `TimeDerivative` has
+        // it silently dropped from `.tick` below (unlike every other
+        // unsupported shape in this file, which throws) -- the current
+        // behavior is intentional/spec-conformant (see synapse_lowering.h),
+        // but a silent drop is still worth a diagnostic so a future real
+        // per-edge synapse with genuine decay dynamics doesn't lose it
+        // without at least a build-time signal.
+        for (const auto &time_derivative : synapse.time_derivatives) {
+            log::logger().warn(
+                "synapse_lowering: '{}' is per-edge and declares a TimeDerivative for '{}' -- its decay is "
+                "NOT lowered into '.tick' (Phase-1 per-edge time-evolution is deferred/unspecified, matching "
+                "the provisional IR spec's own NMDA example, which never decays its per-edge 'g' either)",
+                synapse_entry.component_type_name, time_derivative.variable);
+        }
+
         Vector<TickInstruction> forall_body;
         UnorderedMap<String, String> peredge_aliases;
         for (const auto &state_variable : synapse.state_variables) {

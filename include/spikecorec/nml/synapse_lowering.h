@@ -41,10 +41,18 @@ namespace spikecorec::nml {
 // real `plasticityFactor`/`blockFactor`) throws -- out of Phase-1 scope, per
 // the IR spec's own NMDA example eliding the Mg-block. A per-edge
 // (`peredge`) state variable's own `TimeDerivative` is not lowered into an
-// explicit decay instruction -- its time-evolution lives in the shared
-// low-rank-basis + sparse-delta-buffer's own engine-owned refit mechanism
-// (arch §4.3), matching the locked IR spec's own NMDA example (which
-// declares `param tau` but never references it in `.tick`).
+// explicit decay instruction -- arch §4.3's shared low-rank-basis +
+// sparse-delta-buffer scheme is pure memory compression (Read
+// `U·diag(Ck)·Vᵀ + Sk`, Update `Sk[edge]+=x`, Refit re-fits the plane to
+// current values and clears the scratchpad -- none of the three integrates
+// an ODE), so it does NOT already provide per-edge decay; a `peredge`
+// variable's time-evolution is simply deferred/unspecified in Phase 1,
+// matching the provisional IR spec's own NMDA example (which declares
+// `param tau` but never references it in `.tick`, and likewise never decays
+// its per-edge `g`). A per-edge synapse that actually declares a
+// `TimeDerivative` gets a build-time warning (not a throw -- the emitted IR
+// is still spec-conformant) so a future real per-edge synapse with genuine
+// decay dynamics doesn't lose it silently; see synapse_lowering.cpp.
 
 // Lowers one Synapse-category `TypeLibraryEntry` to its `IrProgram`. Throws
 // std::runtime_error if `synapse_entry.category != TypeLibraryCategory::Synapse`,
