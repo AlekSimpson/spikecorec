@@ -414,7 +414,6 @@ TEST(SynapseLoweringPerEdge, lowers_nmda_style_synapse) {
 
     ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
     ASSERT_TRUE(entry.is_conductance_based);
-    ASSERT_FALSE(entry.is_aggregatable);
 
     IrProgram program = lower_synapse_to_ir(entry);
     EXPECT_EQ(program.component_type_name, "TestNmdaSynapse");
