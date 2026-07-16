@@ -83,12 +83,25 @@ TEST(K2Tree, adjacent_batch) {
 }
 
 TEST(K2Tree, single_node_and_bounds) {
+    // A single-node graph must still be able to represent its one possible edge --
+    // the self-loop (0,0) -- which needs a one-level tree (tree_height=1), not zero
+    // levels; compute_tree_parameters previously special-cased node_count<=1 to
+    // tree_height=0, producing an entirely empty bit array that could represent no
+    // edge at all, including this self-loop. Fixed alongside ticket SC-52/D2.
     vector<vector<s32>> single = {{0}};
     K2Tree one = *K2Tree::from_adjacency_list(single, 1);
-    EXPECT_EQ(one.tree_height, 0);
+    EXPECT_EQ(one.tree_height, 1);
     vector<s32> buffer(4);
-    EXPECT_EQ(one.adjacent(0, 0), 0);
-    EXPECT_EQ(one.get_neighbors(0, buffer.data(), 4), 0);
+    EXPECT_EQ(one.adjacent(0, 0), 1);
+    EXPECT_EQ(one.get_neighbors(0, buffer.data(), 4), 1);
+    EXPECT_EQ(buffer[0], 0);
+
+    // An isolated single node (no self-loop declared) correctly reports no edge.
+    vector<vector<s32>> single_isolated = {{}};
+    K2Tree isolated = *K2Tree::from_adjacency_list(single_isolated, 1);
+    EXPECT_EQ(isolated.tree_height, 1);
+    EXPECT_EQ(isolated.adjacent(0, 0), 0);
+    EXPECT_EQ(isolated.get_neighbors(0, buffer.data(), 4), 0);
 
     K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
     EXPECT_EQ(tree.adjacent(-1, 0), 0);

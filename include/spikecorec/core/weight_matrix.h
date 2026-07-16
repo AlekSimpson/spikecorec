@@ -33,9 +33,26 @@ namespace spikecorec {
 
     class WeightMatrix {
     public:
+        // Matrix index reserved for the default/single-matrix Ck used implicitly by
+        // get()/neighbor_weights()/update()/etc. — always all-ones, so those methods
+        // stay bit-compatible with the pre-shared-basis (single-matrix) behavior.
+        static constexpr s64 DEFAULT_MATRIX_INDEX = 0;
+
         K2Tree k2tree;
         GpuPointer<float4> U_matrix;        // row-major [node_count][rank_float4_stride]
         GpuPointer<float4> V_matrix;
+
+        // Shared-basis generalization (ticket #52/D2): U_matrix/V_matrix above are the
+        // one shared low-rank basis for a whole family of logical matrices (the
+        // connection weight, plus future per-edge synapse state variables). Each
+        // matrix `k` in the family has its own coefficient vector Ck (rank_float4_stride*4
+        // scalar f32 elements — the same effective lane count get()/neighbor_weights_kernel
+        // already sum over, including the padding lanes beyond the logical `rank`); entry
+        // (i,j) of matrix k reconstructs as Σ U[i,r]·Ck[r]·V[j,r]. Index DEFAULT_MATRIX_INDEX
+        // is the reserved single-matrix slot: all-ones, so that reduces to today's dot(U,V).
+        // This is memory compression (see CLAUDE.md's U/V factorization note) — Ck is
+        // supplied by the caller, not learned/fit here.
+        Vector<GpuPointer<f32>> coefficient_vectors;
         s64 node_count;
         s64 max_neighbor_count;             // upper bound on neighbors per node — bounds the padded
                                             // [node_count * max_neighbor_count] neighbor_weights output;
@@ -54,7 +71,12 @@ namespace spikecorec {
 
         WeightMatrix(WeightMatrix &&) = default;
 
-        WeightMatrix &operator=(WeightMatrix &&) = default;
+        // Explicit (not defaulted): the implicitly-defaulted move-assignment operator
+        // would move-assign each GpuPointer member via GpuPointer::operator=(GpuPointer&&),
+        // which asserts the destination pointer is null — always false for a live
+        // WeightMatrix, since its default constructor is deleted. This deallocates the
+        // destination's own GPU buffers first, then move-constructs the incoming state in.
+        WeightMatrix &operator=(WeightMatrix &&other) noexcept;
 
         // network:           adjacency list — network[i] is the list of neighbors of node i
         // rank:              latent factor dimensionality; -1 → min(64, node_count)
@@ -83,6 +105,29 @@ namespace spikecorec {
         // ahead of it rather than as a body-level check after the fact.
         static const vector<vector<s32>> &validate_network(const vector<vector<s32>> &network);
 
+        // Fatally exits if matrix_index is not a currently-registered coefficient
+        // vector index (i.e. not in [0, coefficient_vectors.size())).
+        void validate_matrix_index(s64 matrix_index) const;
+
+        // Allocates one coefficient vector of length rank_float4_stride*4: the first
+        // logical_coefficients.size() lanes copy logical_coefficients verbatim, every
+        // remaining lane (the padding lanes beyond the logical `rank` that get()/
+        // neighbor_weights_kernel still sum over — see the coefficient_vectors comment
+        // in the header) is set to the literal 1.0f (a neutral multiplier, matching how
+        // those padding lanes behave for the default/single-matrix case). Called with an
+        // empty vector for the reserved default slot, so every lane is exactly 1.0f.
+        [[nodiscard]] GpuPointer<f32> allocate_coefficient_vector(const vector<f32> &logical_coefficients) const;
+
+        // Shared math behind get()/get_for_matrix(): the U*Ck*V reconstruction, with
+        // Ck folded inline into the same accumulation loop/position as the plain U*V
+        // dot product this replaces — see weight_matrix.cpp for why that placement is
+        // what makes the DEFAULT_MATRIX_INDEX (all-ones Ck) case bit-identical to the
+        // pre-D2 dot(U,V).
+        [[nodiscard]] f32 reconstruct_entry(s32 source_node, s32 target_node, const f32 *coefficient_values) const;
+
+        // Shared GPU dispatch behind neighbor_weights()/neighbor_weights_for_matrix().
+        void dispatch_neighbor_weights(f32 *output_weights, const f32 *coefficient_values) const;
+
     public:
 
         // writes up to max_neighbor_count neighbor indices of node_index into output_buffer
@@ -95,6 +140,33 @@ namespace spikecorec {
         // writes node_count * max_neighbor_count dot products into output_weights, row-major
         // by source node; slots beyond a node's actual neighbor count are sentinel-padded
         void neighbor_weights(f32 *output_weights) const;
+
+        // ── shared-basis family (ticket #52/D2) ──────────────────────────────────
+        // Registers a new matrix sharing this instance's U/V basis, with coefficient
+        // vector `coefficients` (must have exactly `rank` elements — the logical rank
+        // passed to the constructor). Returns the new matrix's index, to pass to
+        // get_for_matrix()/neighbor_weights_for_matrix(). This is memory-compression
+        // bookkeeping only (see CLAUDE.md's U/V factorization note): Ck is supplied by
+        // the caller, not fit/learned here (a future refit, ticket #54, may recompute it).
+        s64 add_coefficient_vector(const vector<f32> &coefficients);
+
+        // Overwrites the coefficient vector for an already-registered matrix_index
+        // (must have exactly `rank` elements). Note: matrix_index DEFAULT_MATRIX_INDEX
+        // is the reserved all-ones slot get()/neighbor_weights() rely on for
+        // bit-compatibility — overwriting it breaks that guarantee for this instance.
+        void set_coefficient_vector(s64 matrix_index, const vector<f32> &coefficients);
+
+        // Number of matrices currently sharing this instance's U/V basis (always >= 1;
+        // index DEFAULT_MATRIX_INDEX is the built-in default/single-matrix slot).
+        [[nodiscard]] s64 matrix_count() const;
+
+        // Same as get(), but reconstructs (source_node, target_node) using matrix_index's
+        // coefficient vector instead of the default single-matrix Ck.
+        [[nodiscard]] f32 get_for_matrix(s32 source_node, s32 target_node, s64 matrix_index) const;
+
+        // Same as neighbor_weights(), but reconstructs using matrix_index's coefficient
+        // vector instead of the default single-matrix Ck.
+        void neighbor_weights_for_matrix(f32 *output_weights, s64 matrix_index) const;
 
         [[nodiscard]] WeightStats neighbor_weight_stats() const;
 

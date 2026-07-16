@@ -25,7 +25,14 @@ using namespace spikecorec;
 using namespace spikecorec::log;
 
 static pair<s32, s32> compute_tree_parameters(s32 node_count, s32 branching_factor) {
-    if (node_count <= 1) return {0, 1};
+    if (node_count <= 0) return {0, 1};
+
+    // A single-node graph still needs a one-level tree (not zero levels), or its
+    // only possible edge -- the self-loop (0,0) -- has nowhere to live: the general
+    // loop below would leave tree_height at 0 here too (padded_size=1 already >=
+    // node_count=1), producing an entirely empty bit array that can represent no
+    // edge at all. Found by the SC-52/D2 test-hardening pass; fixed here.
+    if (node_count == 1) return {1, branching_factor};
 
     s32 tree_height = 0, padded_size = 1;
     while (padded_size < node_count) {

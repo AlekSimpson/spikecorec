@@ -32,6 +32,15 @@ bool bits_equal(f32 first, f32 second) {
     return std::memcmp(&first, &second, sizeof(f32)) == 0;
 }
 
+// Reconstructs an f32 from an exact bit pattern — used for the golden-value
+// regression tests below, so the expected value is pinned to an exact bit
+// pattern rather than a decimal literal (which could round differently on parse).
+f32 from_bits(uint32_t bits) {
+    f32 value;
+    std::memcpy(&value, &bits, sizeof(f32));
+    return value;
+}
+
 vector<vector<s32>> make_irregular_network() {
     return {
         {1, 2, 3},    // node 0: out-degree 3
@@ -272,17 +281,16 @@ TEST(WeightMatrix, node_count_one_with_self_loop) {
     EXPECT_TRUE(std::isfinite(value));
     EXPECT_TRUE(bits_equal(weight_matrix.get(0, 0), value));
 
-    // NOTE (discovered, not fixed here -- out of scope for this test-only round):
-    // K2Tree::compute_tree_parameters special-cases node_count<=1 to tree_height=0,
-    // which (per build_tree_arrays) builds an entirely empty internal/leaf bit
-    // array. A single-node graph therefore cannot represent ANY edge in its
-    // k^2-tree -- including the self-loop this adjacency list declares --
-    // regardless of what was passed to from_adjacency_list: both
-    // weight_matrix.k2tree.adjacent(0, 0) and weight_matrix.get_neighbors(0, ...)
-    // report "no edge" here even though network[0] == {0, 0, 0, 0}. This looks
-    // like a genuine edge-case bug in the node_count==1 path shared by K2Tree
-    // and WeightMatrix -- flagged for the team rather than asserted as correct
-    // behavior in this suite.
+    // Fixed alongside ticket SC-52/D2: K2Tree::compute_tree_parameters now gives a
+    // single-node graph a one-level tree (tree_height=1) instead of tree_height=0,
+    // so its only possible edge -- the self-loop this adjacency list declares -- is
+    // representable. Both the k^2-tree query and get_neighbors() now correctly
+    // report it (previously both reported "no edge" here even though
+    // network[0] == {0, 0, 0, 0}; see K2Tree.single_node_and_bounds).
+    EXPECT_EQ(weight_matrix.k2tree.adjacent(0, 0), 1);
+    vector<s32> neighbor_buffer(4);
+    EXPECT_EQ(weight_matrix.get_neighbors(0, neighbor_buffer.data()), 1);
+    EXPECT_EQ(neighbor_buffer[0], 0);
 }
 
 TEST(WeightMatrix, max_rank_boundary_allowed_and_rejected) {
@@ -362,6 +370,143 @@ TEST(WeightMatrix, get_and_neighbor_weights_agree_closely) {
                 << "node=" << node << " slot=" << slot << " gpu=" << gpu_value << " cpu=" << cpu_value;
         }
     }
+}
+
+// ── shared-basis (#52/D2): DEFAULT_MATRIX_INDEX must reproduce pre-#52 values
+// bit-for-bit ───────────────────────────────────────────────────────────────
+//
+// The hex bit patterns below were captured by running this exact
+// WeightMatrix(...)/get()/neighbor_weights() call sequence against the
+// pre-#52 implementation (git-stashed back to the commit before the
+// shared-basis change was made), for a representative spread of
+// configurations: rank=1 (smallest possible, 3 unused-but-populated padding
+// lanes), rank=8 (multiple of 4, no padding), rank=6 and rank=10 (not
+// multiples of 4, so padding lanes are exercised), and node_count=1. This is
+// the literal enforcement of "single-matrix Ck=1 reproduces current weights
+// bit-for-bit" -- not just a self-consistency check, but a real comparison
+// against the values the pre-shared-basis dot(U,V) actually produced.
+TEST(WeightMatrix, get_reproduces_pre_shared_basis_values_bit_for_bit) {
+    {
+        // rank=1: rank_float4_stride=1, 3 unused-but-populated lanes.
+        auto network = square_torus(4);
+        WeightMatrix weight_matrix(network, /*rank=*/1, true, -1, /*weight_seed=*/42);
+        EXPECT_TRUE(bits_equal(weight_matrix.get(0, 1), from_bits(0x3eb25f3au)));
+        EXPECT_TRUE(bits_equal(weight_matrix.get(3, 12), from_bits(0x40242ee2u)));
+    }
+    {
+        // rank=8: multiple of 4, no padding.
+        auto network = square_torus(4);
+        WeightMatrix weight_matrix(network, /*rank=*/8, true, -1, /*weight_seed=*/42);
+        EXPECT_TRUE(bits_equal(weight_matrix.get(0, 1), from_bits(0x3e011f04u)));
+        EXPECT_TRUE(bits_equal(weight_matrix.get(3, 12), from_bits(0xc0880ba9u)));
+    }
+    {
+        // rank=6: not a multiple of 4, rank_float4_stride=2, 2 padding lanes.
+        auto network = square_torus(4);
+        WeightMatrix weight_matrix(network, /*rank=*/6, true, -1, /*weight_seed=*/42);
+        EXPECT_TRUE(bits_equal(weight_matrix.get(0, 1), from_bits(0x3e011f04u)));
+        EXPECT_TRUE(bits_equal(weight_matrix.get(3, 12), from_bits(0xc0880ba9u)));
+    }
+    {
+        // rank=10: not a multiple of 4, rank_float4_stride=3, 2 padding lanes.
+        auto network = square_torus(4);
+        WeightMatrix weight_matrix(network, /*rank=*/10, true, -1, /*weight_seed=*/42);
+        EXPECT_TRUE(bits_equal(weight_matrix.get(0, 1), from_bits(0xc02378a2u)));
+        EXPECT_TRUE(bits_equal(weight_matrix.get(3, 12), from_bits(0xbfffe81bu)));
+    }
+    {
+        // node_count=1.
+        auto network = square_torus(1);
+        WeightMatrix weight_matrix(network, /*rank=*/-1, true, -1, /*weight_seed=*/42);
+        EXPECT_TRUE(bits_equal(weight_matrix.get(0, 0), from_bits(0x3dad54c2u)));
+    }
+}
+
+TEST(WeightMatrix, neighbor_weights_reproduces_pre_shared_basis_values_bit_for_bit) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, true, -1, /*weight_seed=*/42);
+    vector<f32> weights((usize)(weight_matrix.node_count * weight_matrix.max_neighbor_count));
+    weight_matrix.neighbor_weights(weights.data());
+    EXPECT_TRUE(bits_equal(weights[0], from_bits(0x3e011f04u)));
+    EXPECT_TRUE(bits_equal(weights[5], from_bits(0xc02627beu)));
+}
+
+// ── shared-basis (#52/D2): multiple matrices sharing one basis ────────────────
+
+TEST(WeightMatrix, multiple_matrices_share_one_basis_and_reconstruct_distinctly) {
+    // rank=3 (small, hand-checkable), a fixed weight_seed for reproducible U/V.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/3, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/7);
+    ASSERT_EQ(weight_matrix.matrix_count(), 1); // just DEFAULT_MATRIX_INDEX so far
+
+    vector<f32> coefficients_a = {2.0f, 0.5f, -1.0f};
+    vector<f32> coefficients_b = {-3.0f, 1.0f, 4.0f};
+    s64 matrix_a = weight_matrix.add_coefficient_vector(coefficients_a);
+    s64 matrix_b = weight_matrix.add_coefficient_vector(coefficients_b);
+    EXPECT_NE(matrix_a, matrix_b);
+    EXPECT_EQ(weight_matrix.matrix_count(), 3);
+
+    s32 source_node = 0, target_node = 1;
+    f32 default_value = weight_matrix.get(source_node, target_node);
+    f32 value_a = weight_matrix.get_for_matrix(source_node, target_node, matrix_a);
+    f32 value_b = weight_matrix.get_for_matrix(source_node, target_node, matrix_b);
+
+    // Hand-computed expected values: U[0] and V[1]'s actual float4 components for
+    // this exact fixture (rank=3, weight_seed=7, square_torus(4)) were read out and
+    // the Σ U[0,r]·Ck[r]·V[1,r] sums computed externally (rank=3 -> rank_float4_stride=1,
+    // so the padding lane -- the 4th component, un-specified by coefficients_a/b above
+    // and padded to 1.0f by add_coefficient_vector -- still contributes u.w*v.w in
+    // full, same as it does for DEFAULT_MATRIX_INDEX):
+    //   U[0] = (1.06929338, -0.69152844, -0.0486776829, 0.377959013)
+    //   V[1] = (-0.014391955, 3.40045786, 0.38932386, 0.801111579)
+    //   default (Ck=1):        Σ U[0,r]·V[1,r]         = -2.0830665831
+    //   matrix_a (Ck={2,0.5,-1}): Σ U[0,r]·Ck[r]·V[1,r] = -0.8847963789
+    //   matrix_b (Ck={-3,1,4}):   Σ U[0,r]·Ck[r]·V[1,r] = -2.0783638445
+    EXPECT_TRUE(approx(default_value, -2.0830665831f, 1e-4f));
+    EXPECT_TRUE(approx(value_a, -0.8847963789f, 1e-4f));
+    EXPECT_TRUE(approx(value_b, -2.0783638445f, 1e-4f));
+
+    // Distinct, non-trivial Ck vectors sharing one basis must reconstruct to
+    // distinct values (proving the basis is genuinely shared and Ck genuinely
+    // differentiates), and each must differ from the default (Ck=1) value too.
+    EXPECT_FALSE(approx(value_a, value_b, 1e-6f));
+    EXPECT_FALSE(approx(value_a, default_value, 1e-6f));
+    EXPECT_FALSE(approx(value_b, default_value, 1e-6f));
+
+    // neighbor_weights_for_matrix must agree with get_for_matrix at real edges.
+    vector<f32> weights_a((usize)(weight_matrix.node_count * weight_matrix.max_neighbor_count));
+    weight_matrix.neighbor_weights_for_matrix(weights_a.data(), matrix_a);
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            f32 gpu_value = weights_a[(usize)(node * weight_matrix.max_neighbor_count + slot)];
+            f32 cpu_value = weight_matrix.get_for_matrix((s32)node, neighbor_buffer[(usize)slot], matrix_a);
+            EXPECT_TRUE(approx(gpu_value, cpu_value, 1e-5f));
+        }
+    }
+
+    // set_coefficient_vector overwrites a registered matrix's Ck in place.
+    vector<f32> coefficients_a_updated = {1.0f, 1.0f, 1.0f};
+    weight_matrix.set_coefficient_vector(matrix_a, coefficients_a_updated);
+    EXPECT_TRUE(approx(weight_matrix.get_for_matrix(source_node, target_node, matrix_a), default_value, 1e-5f));
+}
+
+TEST(WeightMatrix, add_coefficient_vector_rejects_wrong_length) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_THROW(weight_matrix.add_coefficient_vector({1.0f, 2.0f}), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.set_coefficient_vector(WeightMatrix::DEFAULT_MATRIX_INDEX, {1.0f, 2.0f}),
+                 std::invalid_argument);
+}
+
+TEST(WeightMatrix, matrix_index_out_of_range_throws) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    EXPECT_THROW(weight_matrix.get_for_matrix(0, 1, /*matrix_index=*/1), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.set_coefficient_vector(/*matrix_index=*/5, {1.0f, 1.0f, 1.0f, 1.0f}),
+                 std::invalid_argument);
 }
 
 // ── weight_seed reproducibility (constructor parameter previously untested) ────
@@ -572,20 +717,33 @@ TEST(WeightMatrix, extreme_magnitude_constant_weight) {
     EXPECT_TRUE(approx(weight_matrix.get(0, 1), 1e-10f, 1e-2f));
 }
 
-// ── save/load across a dimension change (the reallocation branch of load_from_disk) ──
+// ── set_constant_weight: exact reconstruction regardless of rank%4 ────────────
 //
-// NOTE (discovered, not fixed here -- out of scope for this test-only round):
-// set_constant_weight()'s scale factor is derived from the logical `rank`
-// (sqrtf(|value| / rank)), but the fill loop writes that scale into all
-// rank_float4_stride * 4 lanes, and get()/neighbor_weights() sum over every one
-// of those lanes. When rank is a multiple of 4, rank_float4_stride * 4 == rank
-// and everything cancels out correctly. When it is NOT (e.g. rank=3, so
-// rank_float4_stride=1 but 4 lanes actually get filled), the extra padding
-// lane(s) still contribute full signal to the dot product, and get() reproduces
-// value * (rank_float4_stride * 4) / rank instead of value -- e.g. rank=3
-// inflates 0.42 to ~0.56. Ranks below use multiples of 4 to isolate what this
-// test is actually about (the load_from_disk reallocation branch) from that
-// separate discrepancy, which is flagged for the team instead.
+// Fixed alongside ticket SC-52/D2 (discovered by the test-hardening pass): the
+// scale factor used to be derived from the logical `rank` (sqrtf(|value| / rank)),
+// but the fill loop writes that scale into all rank_float4_stride * 4 lanes, and
+// get()/neighbor_weights() sum over every one of those lanes. When rank was a
+// multiple of 4, rank_float4_stride * 4 == rank and everything canceled out
+// correctly; otherwise (e.g. rank=3) the extra padding lane(s) still contributed
+// full signal to the dot product, and get() overshot value * (rank_float4_stride *
+// 4) / rank instead of value (e.g. rank=3 inflated 0.42 to ~0.56). The scale
+// factor is now derived from rank_float4_stride * 4 (the true lane count actually
+// filled/summed), so this holds regardless of rank % 4.
+TEST(WeightMatrix, constant_weight_exact_regardless_of_rank_padding) {
+    auto network = square_torus(3); // 9 nodes
+
+    WeightMatrix rank_multiple_of_four(network, /*rank=*/4); // rank_float4_stride=1, no padding
+    rank_multiple_of_four.set_constant_weight(0.42f);
+    EXPECT_TRUE(approx(rank_multiple_of_four.get(0, 1), 0.42f, 1e-5f));
+    EXPECT_TRUE(approx(rank_multiple_of_four.get(5, 8), 0.42f, 1e-5f));
+
+    WeightMatrix rank_not_multiple_of_four(network, /*rank=*/3); // rank_float4_stride=1, 1 padding lane
+    rank_not_multiple_of_four.set_constant_weight(0.42f);
+    EXPECT_TRUE(approx(rank_not_multiple_of_four.get(0, 1), 0.42f, 1e-5f));
+    EXPECT_TRUE(approx(rank_not_multiple_of_four.get(5, 8), 0.42f, 1e-5f));
+}
+
+// ── save/load across a dimension change (the reallocation branch of load_from_disk) ──
 
 TEST(WeightMatrix, save_load_reallocates_on_dimension_change) {
     auto small_network = square_torus(3); // 9 nodes
@@ -609,15 +767,6 @@ TEST(WeightMatrix, save_load_reallocates_on_dimension_change) {
 }
 
 // ── move semantics ──────────────────────────────────────────────────────────────
-// NOTE: WeightMatrix's move-ASSIGNMENT operator (`operator=(WeightMatrix&&) = default`)
-// is deliberately not exercised here. Assigning into any live WeightMatrix instance --
-// the only kind reachable through the public API, since the default constructor is
-// deleted -- trips the assert in GpuPointer::operator=(GpuPointer&&) ("... would leak
-// an existing ... allocation") and aborts the whole process; confirmed with a standalone
-// repro outside this suite. Encoding that as a passing/expected-crash test here would
-// lock in what looks like a latent design bug as if it were the intended contract, so
-// it is flagged in the report instead of tested. Move-CONSTRUCTION has no such issue
-// (GpuPointer's move constructor never asserts) and is exercised below.
 
 TEST(WeightMatrix, move_construction_preserves_state) {
     auto network = square_torus(4);
@@ -628,4 +777,25 @@ TEST(WeightMatrix, move_construction_preserves_state) {
     WeightMatrix moved(std::move(original));
     EXPECT_TRUE(approx(moved.get(2, 5), expected));
     EXPECT_EQ(moved.node_count, 16);
+}
+
+// Fixed alongside ticket SC-52/D2 (discovered by the test-hardening pass):
+// WeightMatrix's move-ASSIGNMENT operator used to be `= default`, which move-
+// assigned each GpuPointer member via GpuPointer::operator=(GpuPointer&&) --
+// asserting the destination pointer is null, which is never true for a live
+// WeightMatrix (its default constructor is deleted) and aborted the whole
+// process. WeightMatrix now has an explicit move-assignment operator that
+// deallocates its own existing GPU buffers first.
+TEST(WeightMatrix, move_assignment_into_a_live_object_transfers_state_without_aborting) {
+    auto network = square_torus(4);
+    WeightMatrix source(network, /*rank=*/8);
+    source.set_constant_weight(0.6f);
+    f32 expected = source.get(2, 5);
+
+    WeightMatrix destination(network, /*rank=*/8);
+    destination.set_constant_weight(-0.25f); // distinct pre-assignment state
+
+    destination = std::move(source); // must not abort
+    EXPECT_TRUE(approx(destination.get(2, 5), expected));
+    EXPECT_EQ(destination.node_count, 16);
 }
