@@ -35,6 +35,16 @@ String write_temp_file(const String &filename, const String &contents) {
     return path;
 }
 
+// Finds the first direct child of `node` with the given tag name, or nullptr.
+// Used to make assertions about merged-tree shape readable without depending
+// on exact child ordering across includes.
+const NML_Node *find_child_by_tag(const NML_Node &node, const String &tag) {
+    for (const auto &child : node.body) {
+        if (child.tag_name == tag) return &child;
+    }
+    return nullptr;
+}
+
 } // namespace
 
 // ── NML_Node ─────────────────────────────────────────────────
@@ -310,4 +320,143 @@ TEST(NmlParserParse, ingest_file_on_a_missing_path_does_not_crash_or_set_root) {
     NML_Parser parser;
     EXPECT_NO_THROW(parser.ingest_file("/definitely/does/not/exist_xyz.nml", false));
     EXPECT_EQ(parser.root_node, nullptr);
+}
+
+// ── Phase-1 example models (ticket #2 [A3] acceptance criteria) ─────────
+//
+// CLAUDE.md's Phase 1 scope is "GLIF cells with the full synapse model,
+// single cell through networks". GLIF ComponentTypes are user-authored LEMS
+// (they are not part of the vendored NeuroML2CoreTypes bundle), so these
+// fixtures model that real-world shape: a user-defined GLIF1 cell (mirroring
+// the GLIF1 example in docs/nml_ir_spec.md §4) pulled in via `<include href>`,
+// alongside instances of vendored std-lib synapse types.
+
+// Example A: a single GLIF1 cell, defined and instantiated in one included
+// file, wired into a top-level document via one level of <include>.
+TEST(NmlParserParsePhase1Example, parses_single_glif_cell_model_with_merged_include) {
+    write_temp_file("spikecorec_phase1_glif1_cell_type.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Phase1GLIF1CellType\">"
+        "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "      <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn) / C\"/>"
+        "      <OnStart>"
+        "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+        "      </OnStart>"
+        "      <OnCondition test=\"v .gt. vth\">"
+        "        <EventOut port=\"spike\"/>"
+        "        <StateAssignment variable=\"v\" value=\"vreset\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <GLIF1Cell id=\"glif1CellInstance\" C=\"1.0e-10\" gL=\"1.0e-8\" EL=\"-0.07\" vth=\"-0.05\" vreset=\"-0.07\"/>"
+        "</neuroml>");
+
+    String top_path = write_temp_file("spikecorec_phase1_glif1_single_cell.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Phase1GLIF1SingleCell\">"
+        "  <include href=\"spikecorec_phase1_glif1_cell_type.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    EXPECT_NO_THROW(parser.parse(top_path));
+
+    // The user-defined GLIF1Cell ComponentType, from the included file,
+    // merged into the parser's library alongside the (already loaded) A1
+    // std-lib bundle.
+    ASSERT_EQ(parser.library.count("GLIF1Cell"), 1u);
+    NML_Node &glif1_cell_type = parser.library.at("GLIF1Cell");
+    EXPECT_TRUE(find_child_by_tag(glif1_cell_type, "Dynamics") != nullptr);
+    EXPECT_GT(parser.library.count("iafCell"), 0u);
+
+    // The GLIF1Cell instance (a non-ComponentType tag) is spliced into the
+    // shared tree, not cataloged into `library`.
+    const NML_Node *cell_instance = find_child_by_tag(*parser.root_node, "GLIF1Cell");
+    ASSERT_NE(cell_instance, nullptr);
+    EXPECT_EQ(get_string_attribute(*cell_instance, "id"), "glif1CellInstance");
+}
+
+// Example B: a GLIF excitatory/inhibitory network — the cell type file
+// itself includes a synapse-instances file, so following the include graph
+// two levels deep is required for a full merge. Exercises current-based
+// (alphaCurrentSynapse), conductance-based (expOneSynapse), and per-edge
+// (blockingPlasticSynapse / NMDA) synapses from the A1 std-lib bundle
+// alongside a projection wiring two populations of the user-defined cell.
+TEST(NmlParserParsePhase1Example, parses_glif_network_model_with_nested_includes_merged) {
+    write_temp_file("spikecorec_phase1_synapse_instances.xml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Phase1SynapseInstances\">"
+        "  <expOneSynapse id=\"glifExcSynapse\" gbase=\"1nS\" erev=\"0mV\" tauDecay=\"3ms\"/>"
+        "  <alphaCurrentSynapse id=\"glifCurrSynapse\" tau=\"2ms\" ibase=\"0.1nA\"/>"
+        "  <blockingPlasticSynapse id=\"glifNmdaSynapse\" gbase=\"1nS\" erev=\"0mV\" tauRise=\"1ms\" tauDecay=\"50ms\"/>"
+        "</neuroml>");
+
+    write_temp_file("spikecorec_phase1_glif1_network_cell_type.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Phase1GLIF1NetworkCellType\">"
+        "  <include href=\"spikecorec_phase1_synapse_instances.xml\"/>"
+        "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+        "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\" select=\"synapses[*]/i\" reduce=\"add\"/>"
+        "      <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn) / C\"/>"
+        "      <OnStart>"
+        "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+        "      </OnStart>"
+        "      <OnCondition test=\"v .gt. vth\">"
+        "        <EventOut port=\"spike\"/>"
+        "        <StateAssignment variable=\"v\" value=\"vreset\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <GLIF1Cell id=\"glif1ExcCellInstance\" C=\"1.0e-10\" gL=\"1.0e-8\" EL=\"-0.07\" vth=\"-0.05\" vreset=\"-0.07\"/>"
+        "  <GLIF1Cell id=\"glif1InhCellInstance\" C=\"1.0e-10\" gL=\"1.2e-8\" EL=\"-0.065\" vth=\"-0.05\" vreset=\"-0.065\"/>"
+        "</neuroml>");
+
+    String top_path = write_temp_file("spikecorec_phase1_glif_network.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Phase1GLIFNetwork\">"
+        "  <include href=\"spikecorec_phase1_glif1_network_cell_type.nml\"/>"
+        "  <network id=\"GLIFExcInhNet\">"
+        "    <population id=\"ExcPop\" component=\"glif1ExcCellInstance\" size=\"80\"/>"
+        "    <population id=\"InhPop\" component=\"glif1InhCellInstance\" size=\"20\"/>"
+        "    <projection id=\"ExcToInh\" presynapticPopulation=\"ExcPop\" postsynapticPopulation=\"InhPop\" synapse=\"glifExcSynapse\">"
+        "      <connection id=\"0\" preCellId=\"../ExcPop/0/glif1ExcCellInstance\" postCellId=\"../InhPop/0/glif1InhCellInstance\"/>"
+        "    </projection>"
+        "  </network>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    EXPECT_NO_THROW(parser.parse(top_path));
+
+    // The user-defined cell type, merged from two include levels deep.
+    ASSERT_EQ(parser.library.count("GLIF1Cell"), 1u);
+    EXPECT_TRUE(find_child_by_tag(parser.library.at("GLIF1Cell"), "Dynamics") != nullptr);
+
+    // The A1 std-lib synapse types (current-based, conductance-based, and
+    // per-edge/NMDA) are all still available alongside the user's types.
+    EXPECT_GT(parser.library.count("alphaCurrentSynapse"), 0u);
+    EXPECT_GT(parser.library.count("expOneSynapse"), 0u);
+    EXPECT_GT(parser.library.count("blockingPlasticSynapse"), 0u);
+
+    // The whole include graph (top-level network, the cell-type file, and
+    // its own nested synapse-instances include) is spliced into one shared
+    // tree hanging off root_node.
+    const NML_Node *network = find_child_by_tag(*parser.root_node, "network");
+    ASSERT_NE(network, nullptr);
+    const NML_Node *exc_population = find_child_by_tag(*network, "population");
+    ASSERT_NE(exc_population, nullptr);
+    EXPECT_EQ(get_string_attribute(*exc_population, "component"), "glif1ExcCellInstance");
+    EXPECT_NE(find_child_by_tag(*network, "projection"), nullptr);
+
+    EXPECT_NE(find_child_by_tag(*parser.root_node, "GLIF1Cell"), nullptr);
+    EXPECT_NE(find_child_by_tag(*parser.root_node, "expOneSynapse"), nullptr);
+    EXPECT_NE(find_child_by_tag(*parser.root_node, "blockingPlasticSynapse"), nullptr);
 }
