@@ -109,7 +109,8 @@ struct OnConditionActions {
 OnConditionActions lower_on_condition_actions(
     const NML_Node &on_condition_node, LoweringContext &context,
     const UnorderedMap<String, s32> &regime_index_of,
-    const UnorderedMap<String, Vector<const NML_Node *>> &on_entry_assignments_of_regime
+    const UnorderedMap<String, Vector<const NML_Node *>> &on_entry_assignments_of_regime,
+    const String &context_label
 ) {
     OnConditionActions actions;
     for (const auto &child : on_condition_node.body) {
@@ -136,10 +137,19 @@ OnConditionActions lower_on_condition_actions(
                     lower_state_assignment_into(*state_assignment_node, actions.reset_instructions, context);
                 }
             }
+        } else {
+            // Any other child tag is not part of arch §3.2's OnCondition body
+            // (StateAssignment/EventOut/Transition are the only three legal ones) -- NOT lowered
+            // into `.tick` at all, same class of gap as synapse_lowering.cpp's unrecognized
+            // TimeDerivative decay shape warning: a silent drop here would leave a real cell's
+            // OnCondition action missing from the generated kernel with no build-time signal, so
+            // this at least warns with enough to locate it (which cell, which OnCondition, which
+            // child tag) even though lowering it is out of Phase-1 scope.
+            log::logger().warn(
+                "cell_lowering: {} has an unsupported OnCondition child '<{}>' (only "
+                "StateAssignment/EventOut/Transition are lowered -- this child is NOT lowered into '.tick')",
+                context_label, child.tag_name);
         }
-        // Any other child tag is not part of arch §3.2's OnCondition body
-        // (StateAssignment/EventOut/Transition are the only three) and is
-        // ignored here.
     }
     return actions;
 }
@@ -326,7 +336,8 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
         tick.detect.push_back(BinaryInstruction{parsed_condition.opcode, condition_name, left_operand, right_operand});
 
         OnConditionActions actions = lower_on_condition_actions(
-            on_condition.body, context, regime_index_of, on_entry_assignments_of_regime);
+            on_condition.body, context, regime_index_of, on_entry_assignments_of_regime,
+            "cell '" + cell_entry.component_type_name + "'s OnCondition '" + on_condition.test + "'");
         if (actions.emit_port_name.has_value()) {
             tick.emit.push_back(IfInstruction{condition_name, {EmitInstruction{*actions.emit_port_name}}, {}, std::nullopt});
         }
@@ -354,7 +365,9 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
             tick.detect.push_back(BinaryInstruction{BinaryOpcode::And, fire_name, is_regime_name, raw_test_name});
 
             OnConditionActions actions = lower_on_condition_actions(
-                *on_condition.body_node, context, regime_index_of, on_entry_assignments_of_regime);
+                *on_condition.body_node, context, regime_index_of, on_entry_assignments_of_regime,
+                "cell '" + cell_entry.component_type_name + "'s regime '" + regime.name + "' OnCondition '" +
+                on_condition.test_text + "'");
             if (actions.emit_port_name.has_value()) {
                 tick.emit.push_back(IfInstruction{fire_name, {EmitInstruction{*actions.emit_port_name}}, {}, std::nullopt});
             }

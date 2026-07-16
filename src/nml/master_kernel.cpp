@@ -5,6 +5,7 @@
 #endif
 
 #include <cstring>
+#include <stdexcept>
 #include <unordered_set>
 
 #include "spikecorec/nml/master_kernel.h"
@@ -514,6 +515,23 @@ AssembledMasterKernelSource assemble_master_kernel_source(const ModelSpecificati
 }
 
 // ── compile + cache + dispatch ──────────────────────────────────────────────────────────────────
+//
+// (see master_kernel.h's own doc comment for compile_kernel_or_throw_with_source)
+
+KernelHandle compile_kernel_or_throw_with_source(const String &source_text, const String &function_name,
+                                                  const String &kernel_label, const String &ir_dump) {
+    try {
+        return compile_kernel(source_text.c_str(), function_name.c_str());
+    } catch (const std::exception &compile_error) {
+        String message = "master_kernel: compile_kernel failed for " + kernel_label + " (kernel function '" +
+                          function_name + "'): " + compile_error.what() +
+                          "\n--- generated GPU source that failed to compile ---\n" + source_text;
+        if (!ir_dump.empty()) {
+            message += "\n--- IR program ('.alloc'/'.tick') that produced it ---\n" + ir_dump;
+        }
+        log::throw_runtime_error(log::logger(), message);
+    }
+}
 
 AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs) {
     AssembledMasterKernelSource assembled = assemble_master_kernel_source(model, type_library_ir_programs);
@@ -536,19 +554,24 @@ AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrP
 
         info.has_kernel = true;
         info.parameter_names_in_order = source.functions[0].parameter_names_in_order;
-        info.handle = compile_kernel(source_text_for_this_backend(source).c_str(),
-                                      source.functions[0].function_name.c_str());
+        const IrProgram &program = type_library_ir_programs[(usize)population.type_library_index];
+        info.handle = compile_kernel_or_throw_with_source(
+            source_text_for_this_backend(source), source.functions[0].function_name,
+            "population '" + population.id + "' (ComponentType '" + program.component_type_name + "')",
+            print_ir_program(program));
     }
 
     drain_parameter_names_ = assembled.drain_network_inputs_source.functions.at(0).parameter_names_in_order;
-    drain_kernel_handle_ =
-        compile_kernel(source_text_for_this_backend(assembled.drain_network_inputs_source).c_str(),
-                        assembled.drain_network_inputs_source.functions.at(0).function_name.c_str());
+    drain_kernel_handle_ = compile_kernel_or_throw_with_source(
+        source_text_for_this_backend(assembled.drain_network_inputs_source),
+        assembled.drain_network_inputs_source.functions.at(0).function_name,
+        "the engine-fixed deliver-drain kernel", "");
 
     propagate_parameter_names_ = assembled.propagate_source.functions.at(0).parameter_names_in_order;
-    propagate_kernel_handle_ =
-        compile_kernel(source_text_for_this_backend(assembled.propagate_source).c_str(),
-                        assembled.propagate_source.functions.at(0).function_name.c_str());
+    propagate_kernel_handle_ = compile_kernel_or_throw_with_source(
+        source_text_for_this_backend(assembled.propagate_source),
+        assembled.propagate_source.functions.at(0).function_name,
+        "the engine-fixed propagate kernel", "");
 }
 
 AssembledModel::~AssembledModel() {

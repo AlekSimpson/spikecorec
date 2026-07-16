@@ -363,6 +363,24 @@ TEST(ValidateAgainstSchema, rejects_a_document_with_an_unknown_element) {
     EXPECT_FALSE(parser.validate_against_schema(path));
 }
 
+// ticket #60 [X1]: a schema validation failure must be located (name the
+// offending element), not a generic "does not validate" message -- libxml2's
+// default error handler only prints to stderr, invisible to both this
+// exception and this codebase's own logger, so validate_against_schema must
+// capture it into `last_schema_validation_errors` itself.
+TEST(ValidateAgainstSchema, captures_the_offending_element_and_line_in_last_schema_validation_errors) {
+    String path = write_temp_file("spikecorec_invalid_captured_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TestDoc\">"
+        "  <thisTagDoesNotExistInSchema id=\"oops\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    EXPECT_FALSE(parser.validate_against_schema(path));
+
+    EXPECT_NE(parser.last_schema_validation_errors.find("thisTagDoesNotExistInSchema"), String::npos);
+    EXPECT_NE(parser.last_schema_validation_errors.find("line"), String::npos);
+}
+
 // A LEMS file (root <Lems>) is a real, well-formed XML document, but it is
 // not a NeuroML2 document — validating it against the NeuroML2 XSD must
 // still fail rather than silently pass.
@@ -476,6 +494,26 @@ TEST(NmlParserParse, throws_on_schema_invalid_top_level_file) {
 
     NML_Parser parser;
     EXPECT_THROW(parser.parse(path), std::runtime_error);
+}
+
+// ticket #60 [X1]: the thrown exception's own message (not just a side-channel
+// log line) must name the offending element -- a caller that only inspects
+// `.what()` must still be able to locate the failure.
+TEST(NmlParserParse, schema_invalid_top_level_file_exception_names_the_offending_element) {
+    String path = write_temp_file("spikecorec_parse_invalid_schema_message_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TestDoc\">"
+        "  <thisTagDoesNotExistInSchema id=\"oops\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    try {
+        parser.parse(path);
+        FAIL() << "expected parser.parse to throw on a schema-invalid top-level file";
+    } catch (const std::runtime_error &error) {
+        String message = error.what();
+        EXPECT_NE(message.find(path), String::npos);
+        EXPECT_NE(message.find("thisTagDoesNotExistInSchema"), String::npos);
+    }
 }
 
 TEST(NmlParserParse, ingest_file_on_a_missing_path_does_not_crash_or_set_root) {

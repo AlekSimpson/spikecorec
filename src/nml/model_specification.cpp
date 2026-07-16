@@ -193,11 +193,28 @@ s32 get_or_create_type_library_entry(
     }
     const ResolvedInstance &bound_instance = *instance_iterator->second;
 
+    // Two distinct failure shapes, given separate messages rather than one collapsed "not a
+    // cataloged Dynamics ComponentType": an uncataloged name is a typo/missing-<include>, while a
+    // cataloged-but-Structure-bucket name is either a population/projection type used where a
+    // Dynamics type is required, or a real ComponentType category this pipeline doesn't classify
+    // into Cell/Synapse/Inputs at all (ion channels, morphology, biophysical properties -- Phase 3,
+    // not yet supported) -- see NML_Parser::classify_component_type, which leaves exactly those
+    // reaching none of its anchors as the bare (Structure-bucketed) ComponentTypeBase.
     auto type_iterator = resolved.types.find(bound_instance.tag_name);
-    if (type_iterator == resolved.types.end() || type_iterator->second.bucket != ComponentTypeBucket::Dynamics) {
+    if (type_iterator == resolved.types.end()) {
+        log::throw_runtime_error(log::logger(),
+            "model_specification: bound component '" + bound_instance.id + "' names type '" +
+            bound_instance.tag_name + "', which is not a cataloged ComponentType at all (check for a "
+            "typo, or a missing <include> of the file that declares it)");
+    }
+    if (type_iterator->second.bucket != ComponentTypeBucket::Dynamics) {
         log::throw_runtime_error(log::logger(),
             "model_specification: bound component '" + bound_instance.id + "' is of type '" +
-            bound_instance.tag_name + "', which is not a cataloged Dynamics ComponentType");
+            bound_instance.tag_name + "', which is cataloged but not as a Cell/Synapse/Inputs "
+            "Dynamics ComponentType -- either it is a population/projection (Structure) type "
+            "referenced where a Dynamics type is required, or it is a ComponentType category this "
+            "pipeline does not yet classify (ion channels, morphology, biophysical properties -- "
+            "Phase 3, not yet supported)");
     }
     const ResolvedComponentType &type = type_iterator->second;
 
@@ -411,12 +428,27 @@ ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 
             // valid), an unresolved or out-of-range recording target is kept
             // as the documented -1 diagnostic sentinel rather than thrown --
             // recordings are read-only/informational, not something engine
-            // memory safety depends on.
+            // memory safety depends on. Left completely silent, though, that
+            // sentinel is indistinguishable from a legitimately-unset field
+            // to anyone not already reading this source file, so it is also
+            // warned here (naming the recording id, its raw path, and why)
+            // instead of being a purely silent drop.
             if (target_population != population_index_by_name.end()) {
                 const PopulationEntry &population = specification.populations[target_population->second];
                 if (parsed_path.local_index >= 0 && parsed_path.local_index < population.size) {
                     recording.target_neuron_index = population.neuron_index_begin + parsed_path.local_index;
+                } else {
+                    log::logger().warn(
+                        "model_specification: recording '{}' path '{}' names index {} in population '{}' "
+                        "(size {}) -- out of range, target_neuron_index left unresolved (-1)",
+                        recording.id, recording.quantity_path, parsed_path.local_index,
+                        parsed_path.population_name, population.size);
                 }
+            } else {
+                log::logger().warn(
+                    "model_specification: recording '{}' path '{}' names population '{}', which was "
+                    "never cataloged -- target_neuron_index left unresolved (-1)",
+                    recording.id, recording.quantity_path, parsed_path.population_name);
             }
             recording.exposure_name = parsed_path.trailing;
         }

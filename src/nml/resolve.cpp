@@ -119,9 +119,14 @@ void apply_fixed_pins(const Vector<FixedDecl> &pending_fixed, UnorderedMap<Strin
         try {
             fixed_parameter_values[fixed.parameter] = time::unit_value_to_si(fixed.value);
         } catch (const std::invalid_argument &conversion_error) {
-            log::logger().error("resolve: Fixed parameter '{}' has an unconvertible value '{}': {}",
-                                 fixed.parameter, fixed.value, conversion_error.what());
-            throw;
+            // Throws a NEW exception carrying the parameter name (a bare `throw;` here would
+            // propagate only `conversion_error`'s own message -- the unresolvable value text, but
+            // not which Fixed parameter it belonged to -- leaving that context visible only to
+            // whatever happened to log it, not to a caller that just inspects the exception's
+            // `.what()`). log::throw_invalid_argument logs this same fuller message before throwing.
+            log::throw_invalid_argument(log::logger(),
+                "resolve: Fixed parameter '" + fixed.parameter + "' has an unconvertible value '" +
+                fixed.value + "': " + conversion_error.what());
         }
     }
 }
@@ -319,9 +324,12 @@ ResolvedInstance resolve_instance(const NML_Node &node, const SymbolTable &symbo
         try {
             result.numeric_attributes[attribute_name] = time::unit_value_to_si(value_text);
         } catch (const std::invalid_argument &conversion_error) {
-            log::logger().error("resolve: attribute '{}' on <{}> has an unresolvable value '{}': {}",
-                                 attribute_name, node.tag_name, value_text, conversion_error.what());
-            throw;
+            // Throws a NEW exception carrying the attribute/element context (a bare `throw;` here
+            // would propagate only `conversion_error`'s own message, not which attribute/element it
+            // was on -- see apply_fixed_pins's matching fix above for the same class of gap).
+            log::throw_invalid_argument(log::logger(),
+                "resolve: attribute '" + attribute_name + "' on <" + node.tag_name + "> has an "
+                "unresolvable value '" + value_text + "': " + conversion_error.what());
         }
     }
 

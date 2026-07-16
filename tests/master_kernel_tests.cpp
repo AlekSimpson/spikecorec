@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -110,6 +111,49 @@ TypeLibraryEntry build_lif_equivalent_type_entry(const String &type_name, const 
 }
 
 } // namespace
+
+// ── compile-failure surfacing (ticket #60 [X1]) ──────────────────────────────────────────────────
+//
+// compile_kernel itself only reports the raw backend compiler diagnostic (Metal newLibrary's
+// NSError text) against a source string the caller never sees again once compile_kernel returns --
+// not enough to debug a bad ComponentType lowering without also seeing WHAT was actually emitted.
+// This deliberately feeds compile_kernel_or_throw_with_source (the wrapper AssembledModel's
+// constructor uses for every kernel it compiles) genuinely invalid Metal source, exercising the
+// REAL runtime Metal compiler on this machine (no toolchain stub), and asserts the thrown message
+// carries the label, the offending generated source, and the IR dump -- not just "compilation
+// failed".
+TEST(MasterKernel, compile_kernel_or_throw_with_source_surfaces_label_source_and_ir_on_compile_failure) {
+    String bogus_source = "kernel void this_is_not_valid_metal_source( { totally not C++ at all !!! }";
+
+    try {
+        compile_kernel_or_throw_with_source(bogus_source, "bogus_function_name",
+                                             "ComponentType 'TestBrokenComponentType'", "some ir dump text");
+        FAIL() << "expected compile_kernel_or_throw_with_source to throw on invalid GPU source";
+    } catch (const std::runtime_error &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("ComponentType 'TestBrokenComponentType'"), String::npos);
+        EXPECT_NE(message.find("bogus_function_name"), String::npos);
+        EXPECT_NE(message.find(bogus_source), String::npos);
+        EXPECT_NE(message.find("some ir dump text"), String::npos);
+    }
+}
+
+// The same wrapper called with an empty `ir_dump` (the two engine-fixed scaffold kernels' own
+// call sites) must still surface the label and source, just without an "IR program" section.
+TEST(MasterKernel, compile_kernel_or_throw_with_source_omits_ir_section_when_ir_dump_is_empty) {
+    String bogus_source = "kernel void another_invalid_kernel( { still not valid !!! }";
+
+    try {
+        compile_kernel_or_throw_with_source(bogus_source, "bogus_function_name_2",
+                                             "the engine-fixed deliver-drain kernel", "");
+        FAIL() << "expected compile_kernel_or_throw_with_source to throw on invalid GPU source";
+    } catch (const std::runtime_error &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("the engine-fixed deliver-drain kernel"), String::npos);
+        EXPECT_NE(message.find(bogus_source), String::npos);
+        EXPECT_EQ(message.find("IR program"), String::npos);
+    }
+}
 
 // ── acceptance criterion 1: a resolved model compiles to one runnable master kernel ─────────────
 

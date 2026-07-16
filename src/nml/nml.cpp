@@ -44,6 +44,22 @@ Vector<const NML_Node *> find_children(const NML_Node &node, const String &tag) 
     return matches;
 }
 
+// xmlSchemaSetValidStructuredErrors callback: collects each reported validation error's line number
+// and message (libxml2's error messages already name the offending element, e.g. "Element
+// 'thisTagDoesNotExistInSchema': No matching global declaration available for the validation
+// root.") into `*user_data`, joined by " | " -- see validate_against_schema's own comment for why
+// this replaces relying on libxml2's default (stderr-only) error handler.
+void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
+    if (!error || !error->message) return;
+
+    String message(error->message);
+    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) message.pop_back();
+
+    String *destination = static_cast<String *>(user_data);
+    if (!destination->empty()) *destination += " | ";
+    *destination += "line " + std::to_string(error->line) + ": " + message;
+}
+
 Vector<ParameterDecl> extract_parameters(const NML_Node &node) {
     Vector<ParameterDecl> result;
     for (const auto *child : find_children(node, "Parameter")) {
@@ -313,8 +329,9 @@ void NML_Parser::parse(const String &nml_input_file) {
 // validation there would be a false positive, not a real error.
 void NML_Parser::ingest_file(const String &nml_file_path, bool run_schema_validation) {
     if (run_schema_validation && !validate_against_schema(nml_file_path)) {
-        log::logger().error("{} does not validate against the NeuroML2 XSD schema", nml_file_path);
-        throw std::runtime_error(nml_file_path + " does not validate against the NeuroML2 XSD schema");
+        String detail = last_schema_validation_errors.empty() ? "" : (": " + last_schema_validation_errors);
+        log::logger().error("{} does not validate against the NeuroML2 XSD schema{}", nml_file_path, detail);
+        throw std::runtime_error(nml_file_path + " does not validate against the NeuroML2 XSD schema" + detail);
     }
 
     xmlDocPtr document = xmlReadFile(nml_file_path.c_str(), nullptr, XML_PARSE_NOBLANKS);
@@ -583,9 +600,16 @@ bool NML_Parser::validate_against_schema(const String &nml_file_path) {
         return false;
     }
 
-    // xmlSchemaValidateFile: 0 = valid, >0 = validation errors (already
-    // printed to stderr by libxml2's default handler, located by element and
-    // line number), <0 = internal/API error.
+    // Route every validation error through collect_schema_validation_error instead of libxml2's
+    // default handler (which only prints to stderr, invisible to both the caller's exception and
+    // this codebase's own logger) -- populates last_schema_validation_errors with each error's line
+    // number and message (already naming the offending element) so ingest_file's thrown exception
+    // can report exactly what failed and where.
+    last_schema_validation_errors.clear();
+    xmlSchemaSetValidStructuredErrors(valid_context, collect_schema_validation_error, &last_schema_validation_errors);
+
+    // xmlSchemaValidateFile: 0 = valid, >0 = validation errors (captured above, by element and line
+    // number), <0 = internal/API error.
     int result = xmlSchemaValidateFile(valid_context, nml_file_path.c_str(), 0);
 
     xmlSchemaFreeValidCtxt(valid_context);
