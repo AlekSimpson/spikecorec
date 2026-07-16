@@ -107,6 +107,15 @@ namespace spikecorec {
         bool check_indexing;
         bool using_constant_weight;
 
+        // Number of per-edge synapse-state variables (arch §4.3's `Ck`/`Sk` family)
+        // this WeightMatrix's shared U/V basis is configured to support, on top of
+        // the weight itself — set by configure_per_edge_variable_count() (ticket #5
+        // [C2], from a model's `.alloc` `peredge` directive count, IR spec §2). This
+        // is only the COUNT the engine has committed to; it does not yet allocate or
+        // seed any real per-matrix `Ck` coefficient vectors or sparse `Sk` delta
+        // buffers (that's tickets #52-54/#57).
+        s64 per_edge_variable_count = 0;
+
         // Total real edges in the k^2-tree adjacency, computed once at
         // construction by walking get_neighbors() for every node (so it stays
         // consistent with an explicitly-truncating max_neighbor_count — see
@@ -133,15 +142,6 @@ namespace spikecorec {
         // refit() has never been called). Advanced by advance_tick(), reset to
         // 0 by refit().
         s64 ticks_since_last_refit;
-
-        // Number of per-edge synapse-state variables (arch §4.3's `Ck`/`Sk` family)
-        // this WeightMatrix's shared U/V basis is configured to support, on top of
-        // the weight itself — set by configure_per_edge_variable_count() (ticket #5
-        // [C2], from a model's `.alloc` `peredge` directive count, IR spec §2). This
-        // is only the COUNT the engine has committed to; it does not yet allocate or
-        // seed any real per-matrix `Ck` coefficient vectors or sparse `Sk` delta
-        // buffers (that's tickets #52-54/#57).
-        s64 per_edge_variable_count = 0;
 
         WeightMatrix() = delete;
 

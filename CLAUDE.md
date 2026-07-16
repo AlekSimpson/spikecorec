@@ -1,5 +1,19 @@
 # spikecorec — project conventions
 
+## agent roles
+- coder subagent: implements tickets, never merges, never opens PRs
+- reviewer subagent: read only, runs build/test/lint, never edits code
+- task_master (this session): claims tickets, orchestrates coder and reviewer, opens PRs
+
+## branch naming
+`SC-<ticket_number>_<ticket_title_camel_case>`, e.g. `SC-1234_ImplementBandpassFilter`, enforced by the `enforce_git_rules.py` hook (configured globally in `~/.claude/settings.json`, not part of this repo). The coder subagent creates the branch, not task_master.
+
+## pull requests
+a PR's base branch may be anything except `main`, `master`, or any branch starting with `preprod_`, enforced by the same hook
+task_master opens all PRs against `nightly`. A PR's base branch may never be `main`, `master`, or any branch starting with `preprod_`, enforced by the globally-configured `enforce_git_rules.py` hook, but `nightly` is the only base task_master should actually use day to day. Refactoring `nightly` into a `preprod_` branch and merging that to `master` is a manual step you do yourself, task_master never opens or targets those PRs.
+
+## project overview
+
 spikecorec is a GPU spiking-neural-network **simulation engine** (Metal on macOS, CUDA elsewhere).
 Today it runs a single hardcoded leaky-integrate-and-fire (LIF) cell over a compressed adjacency
 graph. The **current major effort is a NeuroML → GPU codegen path** (epic #1) so the engine can
@@ -115,8 +129,7 @@ never a hand-written kernel.
 
 **Three phases** (each additive):
 - **Phase 1** — GLIF cells (GLIF1–GLIF5 in full) + the full synapse model (current-based and
-  conductance-based, both realized via uniform per-edge shared-basis storage), single cell
-  through networks.
+  conductance-based, both uniformly via per-edge shared-basis storage), single cell through networks.
 - **Phase 2** — nonlinear point cells (izhikevich/AdEx/…), spike delays, on-device generators,
   within-population heterogeneity.
 - **Phase 3** — biophysical / multicompartment (HH channels, concentrations, kinetic schemes,
@@ -185,3 +198,5 @@ make clean
   parent's children via `.../issues/<P>/sub_issues` (the REST issue object has no `.parent` field).
 - Heads up: the auto-mode Bash gate blocks **bulk/loop** `gh issue create`; create/edit issues with
   explicit per-issue commands, not shell loops.
+
+

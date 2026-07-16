@@ -80,7 +80,7 @@ Vector<IrProgram> build_type_library_ir_programs(const ModelSpecification &model
 // `v`/`refractoryTimeElapsed`, a refractory Regime pair, and an exposed-but-
 // never-stored `iSyn` DerivedVariable) plus a custom per-edge NMDA synapse
 // (synapse_lowering_tests.cpp's TestNmdaSynapse fixture verbatim) and the two
-// real aggregatable synapse types (expOneSynapse/alphaCurrentSynapse) wired
+// real vendored synapse types (expOneSynapse/alphaCurrentSynapse) wired
 // into a 2-population, 3-projection network.
 String write_allocator_fixture() {
     write_temp_file("spikecorec_allocator_content.nml",
