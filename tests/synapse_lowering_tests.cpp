@@ -4,14 +4,18 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/synapse_lowering.h"
+#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -75,6 +79,29 @@ const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specifi
     }
     throw std::runtime_error("no type library entry for '" + bound_instance_id + "'");
 }
+
+// Temporarily attaches an in-memory sink to the shared `log::logger()` so a
+// test can assert on a specific warning firing (review follow-up on ticket
+// #51: the per-edge-synapse-declares-a-TimeDerivative diagnostic). Removes
+// itself in the destructor -- the sink holds a reference to `captured_text_`,
+// a member of THIS object, so it must not outlive it.
+class ScopedLogCapture {
+public:
+    ScopedLogCapture() : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(captured_text_)) {
+        log::logger().sinks().push_back(sink_);
+    }
+
+    ~ScopedLogCapture() {
+        auto &sinks = log::logger().sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
+    }
+
+    String text() const { return captured_text_.str(); }
+
+private:
+    std::ostringstream captured_text_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+};
 
 const String DUMMY_CELL_COMPONENT_TYPE =
     "  <ComponentType name=\"DummyCell\" extends=\"baseCell\">"
@@ -413,11 +440,60 @@ TEST(SynapseLoweringPerEdge, lowers_nmda_style_synapse) {
     // spec's own `t0`/`t1` reuse) and in omitting an explicit per-edge decay
     // instruction -- see synapse_lowering.h's header comment for why: `g`'s
     // TimeDerivative (`-g/tau`) is intentionally NOT lowered for a `peredge`
-    // variable, since its time-evolution lives in the shared low-rank-basis +
-    // sparse-delta-buffer's own engine-owned refit mechanism (arch §4.3),
-    // exactly matching the locked spec's own example (it declares `param tau`
-    // but never references it in `.tick` either).
+    // variable -- arch §4.3's shared-basis scheme is pure memory compression
+    // (Read/Update/Refit, none of which integrates an ODE), so per-edge
+    // time-evolution is simply deferred/unspecified in Phase 1, matching the
+    // provisional IR spec's own NMDA example (it declares `param tau` but
+    // never references it in `.tick`, and never decays its per-edge `g`
+    // either). `TestNmdaSynapse` DOES declare this TimeDerivative (see the
+    // fixture above), so this test also exercises the accompanying
+    // diagnostic (warns_when_per_edge_synapse_declares_a_time_derivative,
+    // below, asserts the warning text itself -- this test only pins the
+    // resulting `.tick` shape).
     EXPECT_EQ(print_ir_program(program), expected);
+}
+
+// The `TestNmdaSynapse` fixture above declares a `TimeDerivative` for its
+// per-edge `g` (`-g / tau`) that the lowering intentionally does not emit
+// into `.tick` (see this file's and synapse_lowering.h's comments on why).
+// Every OTHER unsupported shape in synapse_lowering.cpp throws; this one
+// silent drop instead logs a warning (review follow-up on ticket #51) so a
+// future real per-edge synapse with genuine decay dynamics is at least
+// observable, not silently lost. Asserts both halves: the warning fires,
+// AND the resulting `.tick` is unchanged (still the same shape as
+// `lowers_nmda_style_synapse` above -- the diagnostic is additive, not a
+// behavior change).
+TEST(SynapseLoweringPerEdge, warns_when_per_edge_synapse_declares_a_time_derivative) {
+    TypeLibraryEntry entry = build_synapse_type_library_entry(
+        "nmda_warning", TEST_NMDA_SYNAPSE_COMPONENT_TYPE, "TestNmdaSynapse",
+        "gbase=\"1nS\" erev=\"0mV\" tau=\"50ms\" weight=\"1\"");
+    ASSERT_FALSE(entry.is_aggregatable);
+    ASSERT_TRUE(std::holds_alternative<SynapseType>(entry.dynamics.flattened));
+    const SynapseType &synapse = std::get<SynapseType>(entry.dynamics.flattened);
+    ASSERT_EQ(synapse.time_derivatives.size(), 1u);
+    ASSERT_EQ(synapse.time_derivatives[0].variable, "g");
+
+    ScopedLogCapture log_capture;
+    IrProgram program = lower_synapse_to_ir(entry);
+    String captured_log_text = log_capture.text();
+
+    EXPECT_NE(captured_log_text.find("TestNmdaSynapse"), String::npos);
+    EXPECT_NE(captured_log_text.find("'g'"), String::npos);
+    EXPECT_NE(captured_log_text.find("TimeDerivative"), String::npos);
+
+    // Behavior is unchanged: the TimeDerivative is still correctly omitted
+    // (no `expdecay` anywhere, and `tau` is declared in `.alloc` but never
+    // read in `.tick`), exactly matching lowers_nmda_style_synapse's own
+    // pinned expected text above.
+    String rendered_program = print_ir_program(program);
+    EXPECT_NE(rendered_program.find("peredge g"), String::npos);
+    EXPECT_NE(rendered_program.find("param tau"), String::npos);
+    EXPECT_EQ(rendered_program.find("expdecay"), String::npos);
+
+    usize tick_section_start = rendered_program.find(".tick");
+    ASSERT_NE(tick_section_start, String::npos);
+    String tick_section = rendered_program.substr(tick_section_start);
+    EXPECT_EQ(tick_section.find("tau"), String::npos);
 }
 
 // ── Error handling ────────────────────────────────────────────────────────
