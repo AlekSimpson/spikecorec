@@ -147,6 +147,14 @@ bool WeightMatrix::check_index_inbounds(s32 node_index) const {
             node_index >= 0 && node_index < node_count);
 }
 
+void WeightMatrix::configure_per_edge_variable_count(s64 count) {
+    if (count < 0) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::configure_per_edge_variable_count: count must be >= 0 (got {})", count));
+    }
+    per_edge_variable_count = count;
+}
+
 bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
     return (check_indexing &&
             source >= 0 && source < node_count &&
