@@ -4,6 +4,7 @@
 #pragma once
 
 #include <vector>
+#include <optional>
 #include <spikecorec/core/types.h>
 #include <spikecorec/core/backend.h>
 #include <spikecorec/core/k2tree.h>
@@ -53,6 +54,49 @@ namespace spikecorec {
         // This is memory compression (see CLAUDE.md's U/V factorization note) — Ck is
         // supplied by the caller, not learned/fit here.
         Vector<GpuPointer<f32>> coefficient_vectors;
+
+        // Per-matrix sparse delta buffer (ticket #53/D3): Sk in arch §4.3. One
+        // GPU-resident, fixed-capacity array per matrix index (parallel to
+        // coefficient_vectors, same indexing), holding raw per-edge updates that
+        // haven't yet been folded back into the shared U/V plane by the periodic
+        // refit (ticket #54/D4, not yet implemented).
+        //
+        // Position-indexed, not a hash map: each array is sized exactly
+        // node_count * max_neighbor_count elements — the SAME shape and indexing
+        // convention neighbor_weights()'s own output array already uses (row-major
+        // by source node; within a source node's row, position = that neighbor's
+        // slot in the same order k2tree.get_neighbors(source_node, ...) enumerates
+        // it). This is deliberate: a std::unordered_map cannot be read or written
+        // from inside a Metal/CUDA compute kernel at all, and ticket #55 (IR→GPU
+        // source compilation) needs to generate real loadedge/accedge kernel code
+        // against Sk the same way neighbor_weights_kernel already reads
+        // U_matrix/V_matrix/coefficient_vectors directly on-device. The IR-level
+        // consumers of loadedge/accedge always walk adjacency inside a
+        // neighbor-enumeration loop and already know their current slot index (the
+        // loop counter), so the GPU hot path never searches — it indexes
+        // sparse_delta_buffers[matrix_index][source_node * max_neighbor_count +
+        // current_slot] directly, O(1). Only the standalone host-side point-query
+        // API (get()/get_for_matrix()/accumulate_edge_delta(), called with an
+        // arbitrary (source_node, target_node) pair outside a loop context) needs to
+        // locate a slot by searching — see find_neighbor_slot.
+        //
+        // Only ever written at slots that correspond to real k^2-tree edges (see
+        // accumulate_edge_delta) — loadedge/accedge are explicitly edge-scoped IR
+        // ops (IR spec §3.3), unlike the raw, edge-unrestricted U*V lookups
+        // get()/update() already support. Every other slot (padding beyond a node's
+        // real degree, and any real edge never accumulated into) stays exactly
+        // 0.0f, matching the old map's "absent key -> 0" semantics.
+        Vector<GpuPointer<f32>> sparse_delta_buffers;
+
+        // Parallel to sparse_delta_buffers: whether accumulate_edge_delta has ever
+        // been called for this matrix index. A zeroed dense array can't cheaply
+        // answer "has anything ever been written here" the way an empty map could,
+        // so this tracks it explicitly — preserving the original "no lookup/scan at
+        // all for an untouched matrix" fast path (both for get()/get_for_matrix()'s
+        // bit-compatibility guarantee and to avoid apply_sparse_delta_overlay's scan
+        // over the whole array in the common untouched case).
+        Vector<bool> sparse_delta_touched;
+
         s64 node_count;
         s64 max_neighbor_count;             // upper bound on neighbors per node — bounds the padded
                                             // [node_count * max_neighbor_count] neighbor_weights output;
@@ -141,6 +185,46 @@ namespace spikecorec {
         // Shared GPU dispatch behind neighbor_weights()/neighbor_weights_for_matrix().
         void dispatch_neighbor_weights(f32 *output_weights, const f32 *coefficient_values) const;
 
+        // Allocates one sparse delta buffer of node_count * max_neighbor_count
+        // elements, zero-filled (allocate<f32> does not zero-initialize itself —
+        // see weight_matrix.cpp). Returns a default-constructed (null) GpuPointer
+        // when node_count * max_neighbor_count is 0 (e.g. an edge-free network),
+        // to avoid a zero-byte GPU allocation — deallocate()/get_contents() are
+        // never invoked on that buffer, since a matrix with no representable
+        // neighbor slots can never have anything accumulated into it.
+        [[nodiscard]] GpuPointer<f32> allocate_sparse_delta_buffer() const;
+
+        // Host-side-only slot search: returns target_node's position within
+        // source_node's neighbor list (the same order k2tree.get_neighbors
+        // enumerates it, and the same slot convention sparse_delta_buffers/
+        // neighbor_weights() use), or nullopt if target_node is not one of
+        // source_node's (representable, within max_neighbor_count) neighbors. A
+        // bounded linear scan over at most max_neighbor_count entries — this is the
+        // ONLY place a slot is searched for; the GPU-kernel hot path (loadedge/
+        // accedge inside a neighbor-enumeration loop) already knows its current
+        // slot as the loop counter and never calls this. Used only by the
+        // standalone host-side point-query API (get()/get_for_matrix()/
+        // accumulate_edge_delta()), never on a per-tick bulk path.
+        [[nodiscard]] optional<s64> find_neighbor_slot(s32 source_node, s32 target_node) const;
+
+        // Returns Sk[matrix_index][source_node, target_node], or 0.0f if
+        // target_node is not a (representable) neighbor of source_node, or if
+        // matrix_index's Sk has never been touched. The untouched fast path
+        // performs no slot search at all, so a never-touched Sk adds literally
+        // nothing to get()/get_for_matrix() — the bit-compatibility guarantee
+        // ticket #52 established for DEFAULT_MATRIX_INDEX.
+        [[nodiscard]] f32 lookup_sparse_delta(s64 matrix_index, s32 source_node, s32 target_node) const;
+
+        // Shared host-side overlay behind neighbor_weights()/neighbor_weights_for_matrix():
+        // adds each real edge's Sk contribution on top of the GPU's pure low-rank
+        // reconstruction already written into output_weights. sparse_delta_buffers
+        // and output_weights share the exact same node_count * max_neighbor_count,
+        // row-major-by-source-node, same-slot-order shape, so this is a plain
+        // element-wise add (no neighbor walk needed) — padding/never-accumulated
+        // slots are exactly 0.0f, contributing nothing. Skips all work (no read at
+        // all) when matrix_index's Sk is untouched.
+        void apply_sparse_delta_overlay(f32 *output_weights, s64 matrix_index) const;
+
     public:
 
         // writes up to max_neighbor_count neighbor indices of node_index into output_buffer
@@ -180,6 +264,22 @@ namespace spikecorec {
         // Same as neighbor_weights(), but reconstructs using matrix_index's coefficient
         // vector instead of the default single-matrix Ck.
         void neighbor_weights_for_matrix(f32 *output_weights, s64 matrix_index) const;
+
+        // ── sparse delta buffer (ticket #53/D3) ──────────────────────────────────
+        // accedge: Sk[matrix_index][source_node, target_node] += delta (arch §4.3
+        // "Update" — cheap and local, never touches U/V or any coefficient vector).
+        // Deliberately edge-scoped, unlike get()/update()'s edge-unrestricted,
+        // bounds-only contract: loadedge/accedge in the IR spec only ever address
+        // real edges, so (source_node, target_node) must be an actual k^2-tree edge
+        // (checked via k2tree.adjacent, independently of the check_indexing flag —
+        // see weight_matrix.cpp for why this doesn't reuse check_index_inbounds) or
+        // this throws std::invalid_argument, the same way validate_matrix_index does
+        // for a bad matrix_index. Locates the target's array slot via
+        // find_neighbor_slot and adds delta directly at
+        // sparse_delta_buffers[matrix_index][source_node * max_neighbor_count +
+        // slot] — no map insertion, the slot is guaranteed to exist for a real edge
+        // representable within max_neighbor_count (see find_neighbor_slot).
+        void accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 target_node, f32 delta);
 
         [[nodiscard]] WeightStats neighbor_weight_stats() const;
 
