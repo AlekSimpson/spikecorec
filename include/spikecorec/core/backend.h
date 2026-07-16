@@ -201,6 +201,10 @@ namespace spikecorec {
     // row-major by source node. Adjacency is resolved via the bit-packed k^2-tree — each thread
     // walks its source node's row in the tree to discover up to max_neighbor_count targets;
     // slots beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
+    // `coefficients` is the shared-basis coefficient vector Ck (rank_float4_stride*4 scalar f32
+    // elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r], with the
+    // WeightMatrix::DEFAULT_MATRIX_INDEX case's all-ones coefficients reducing this to the
+    // original dot(U,V).
     void gpu_neighbor_weights(
         const float4 *U,
         const float4 *V,
@@ -216,6 +220,7 @@ namespace spikecorec {
         s64           node_count,
         s64           max_neighbor_count,
         s64           rank_float4_stride,
+        const f32    *coefficients,
         f32          *output_weights
     );
 

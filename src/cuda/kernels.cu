@@ -194,6 +194,12 @@ __device__ __forceinline__ s32 k2t_next_neighbor(
 // up to max_neighbor_count targets, then dot-products U[source]·V[target]. Slots
 // beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
 
+// `coefficients` is the shared-basis Ck vector (rank_float4_stride*4 scalar f32
+// elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r], with
+// the Ck multiply folded inline into the same per-lane multiply-accumulate as the
+// plain U*V dot product this replaces, so that WeightMatrix::DEFAULT_MATRIX_INDEX's
+// all-ones coefficients reduce this to today's `u4.x * v4.x + ...` bit-for-bit
+// (1.0f * v4.x is exactly v4.x under IEEE-754).
 __global__ void neighbor_weights_kernel(
     const float4 *__restrict__ U,
     const float4 *__restrict__ V,
@@ -209,6 +215,7 @@ __global__ void neighbor_weights_kernel(
     s64 node_count,
     s64 max_neighbor_count,
     s64 rank_float4_stride,
+    const f32 *__restrict__ coefficients,
     f32 *__restrict__ output_weights
 ) {
     s64 pair_index = static_cast<s64>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -235,7 +242,9 @@ __global__ void neighbor_weights_kernel(
     for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
         float4 u4 = u_row[lane];
         float4 v4 = v_row[lane];
-        dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;
+        const f32 *lane_coefficients = coefficients + lane * 4;
+        dot_product += u4.x * (lane_coefficients[0] * v4.x) + u4.y * (lane_coefficients[1] * v4.y)
+                     + u4.z * (lane_coefficients[2] * v4.z) + u4.w * (lane_coefficients[3] * v4.w);
     }
     output_weights[pair_index] = dot_product;
 }

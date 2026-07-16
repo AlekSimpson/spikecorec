@@ -10,6 +10,7 @@
 #include <vector>
 #include <limits>
 #include <cstdint>
+#include <new>
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda_runtime.h>
@@ -98,6 +99,13 @@ WeightMatrix::WeightMatrix(
     prefetch_to_gpu(U_matrix, matrix_byte_size);
     prefetch_to_gpu(V_matrix, matrix_byte_size);
 
+    // DEFAULT_MATRIX_INDEX's coefficient vector: every lane literally 1.0f (see
+    // allocate_coefficient_vector — called here with an empty logical_coefficients,
+    // so every lane falls into its literal-1.0f branch), so get()/neighbor_weights()
+    // stay bit-compatible with the pre-shared-basis dot(U,V) (ticket #52/D2, see §2 of
+    // the design memo for why this must be a literal, not a computed value).
+    coefficient_vectors.push_back(allocate_coefficient_vector({}));
+
     log::logger().debug("WeightMatrix constructed: node_count={} rank={} rank_float4_stride={} "
                         "max_neighbor_count={} weight_seed={} check_indexing={}",
                         node_count, this->rank, rank_float4_stride, this->max_neighbor_count,
@@ -107,6 +115,47 @@ WeightMatrix::WeightMatrix(
 WeightMatrix::~WeightMatrix() {
     deallocate(std::move(U_matrix));
     deallocate(std::move(V_matrix));
+    for (auto &coefficient_vector : coefficient_vectors) {
+        deallocate(std::move(coefficient_vector));
+    }
+}
+
+WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    // Deallocate this instance's own live GPU buffers before moving the incoming
+    // object's state in — see the header comment on this operator for why the
+    // implicitly-defaulted version aborts instead.
+    deallocate(std::move(U_matrix));
+    deallocate(std::move(V_matrix));
+    for (auto &coefficient_vector : coefficient_vectors) {
+        deallocate(std::move(coefficient_vector));
+    }
+    coefficient_vectors.clear();
+
+    // k2tree is a K2Tree sub-object (not a pointer), and K2Tree's own defaulted
+    // move-assignment operator has the identical GpuPointer-assert problem as
+    // WeightMatrix's did — assigning into it here would abort just the same.
+    // K2Tree's move CONSTRUCTOR has no such issue (GpuPointer's move constructor
+    // never asserts), so destroy this instance's k2tree and move-construct the
+    // incoming one in its place instead of going through operator=.
+    k2tree.~K2Tree();
+    new (&k2tree) K2Tree(std::move(other.k2tree));
+
+    U_matrix = std::move(other.U_matrix);
+    V_matrix = std::move(other.V_matrix);
+    coefficient_vectors = std::move(other.coefficient_vectors);
+    node_count = other.node_count;
+    max_neighbor_count = other.max_neighbor_count;
+    rank = other.rank;
+    rank_float4_stride = other.rank_float4_stride;
+    constant_weight = other.constant_weight;
+    check_indexing = other.check_indexing;
+    using_constant_weight = other.using_constant_weight;
+
+    return *this;
 }
 
 bool spikecorec::can_safely_cast_s64_to_s32(s64 value) {
@@ -125,8 +174,13 @@ s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
 
 void WeightMatrix::set_constant_weight(f32 value) {
     log::logger().debug("set_constant_weight: value={}", value);
-    // U filled with sqrt(|val|/rank), V filled with ±same based on sign of val
-    f32 scale = (value != 0.0f) ? sqrtf(fabsf(value) / (f32)rank) : 0.0f;
+    // U and V are filled across every rank_float4_stride*4 lane below, and
+    // get()/neighbor_weights_kernel sum over that same effective lane count (not
+    // just the logical `rank` lanes) — so the scale factor must be derived from
+    // rank_float4_stride*4 too, or get() overshoots `value` whenever rank isn't a
+    // multiple of 4 (bug found by the SC-52/D2 test-hardening pass; fixed here).
+    f32 effective_lane_count = (f32)(rank_float4_stride * 4);
+    f32 scale = (value != 0.0f) ? sqrtf(fabsf(value) / effective_lane_count) : 0.0f;
     float4 u_fill = {scale, scale, scale, scale};
     f32 v_fill_value = (value >= 0.0f) ? scale : -scale;
     float4 v_fill = {v_fill_value, v_fill_value, v_fill_value, v_fill_value};
@@ -161,25 +215,106 @@ bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
             target >= 0 && target < node_count);
 }
 
+void WeightMatrix::validate_matrix_index(s64 matrix_index) const {
+    if (matrix_index < 0 || matrix_index >= (s64)coefficient_vectors.size()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix: matrix_index {} out of range [0, {})",
+                        matrix_index, coefficient_vectors.size()));
+    }
+}
+
+GpuPointer<f32> WeightMatrix::allocate_coefficient_vector(const vector<f32> &logical_coefficients) const {
+    s64 effective_lane_count = rank_float4_stride * 4;
+    GpuPointer<f32> coefficient_vector = allocate<f32>((usize)effective_lane_count * sizeof(f32));
+    f32 *coefficient_data = coefficient_vector.get_contents();
+    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+        coefficient_data[lane_index] = (lane_index < (s64)logical_coefficients.size())
+            ? logical_coefficients[(usize)lane_index]
+            : 1.0f;
+    }
+    return coefficient_vector;
+}
+
+// The U*Ck*V reconstruction. For DEFAULT_MATRIX_INDEX, coefficient_values[...] is
+// exactly the literal 1.0f in every lane (see allocate_coefficient_vector), so each
+// `lane_coefficients[...] * v_row[...].x` below is `1.0f * v.x`, which IEEE-754
+// guarantees is bit-identical to `v.x` itself — making this expression, term for
+// term and in the same left-to-right accumulation order, bit-identical to the
+// pre-D2 `u.x * v.x + u.y * v.y + ...` dot product it replaces (ticket #52/D2,
+// see the design memo §2 for why this inline placement — not a separate
+// "reweight V, then dot" pass — is what makes that guarantee hold).
+f32 WeightMatrix::reconstruct_entry(s32 source_node, s32 target_node, const f32 *coefficient_values) const {
+    const float4 *u_row = U_matrix.get_contents() + source_node * rank_float4_stride;
+    const float4 *v_row = V_matrix.get_contents() + target_node * rank_float4_stride;
+    f32 dot_product = 0.0f;
+    for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
+        const f32 *lane_coefficients = coefficient_values + float4_index * 4;
+        dot_product += u_row[float4_index].x * (lane_coefficients[0] * v_row[float4_index].x)
+                     + u_row[float4_index].y * (lane_coefficients[1] * v_row[float4_index].y)
+                     + u_row[float4_index].z * (lane_coefficients[2] * v_row[float4_index].z)
+                     + u_row[float4_index].w * (lane_coefficients[3] * v_row[float4_index].w);
+    }
+    return dot_product;
+}
+
 f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
     log::logger().trace("get: source_node={} target_node={}", source_node, target_node);
     if (!check_index_inbounds(source_node, target_node)) {
         return 0.0;
     }
 
-    const float4 *u_row = U_matrix.get_contents() + source_node * rank_float4_stride;
-    const float4 *v_row = V_matrix.get_contents() + target_node * rank_float4_stride;
-    f32 dot_product = 0.0f;
-    for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
-        dot_product += u_row[float4_index].x * v_row[float4_index].x
-                     + u_row[float4_index].y * v_row[float4_index].y
-                     + u_row[float4_index].z * v_row[float4_index].z
-                     + u_row[float4_index].w * v_row[float4_index].w;
-    }
-    return dot_product;
+    return reconstruct_entry(source_node, target_node,
+                              coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents());
 }
 
-void WeightMatrix::neighbor_weights(f32 *output_weights) const {
+f32 WeightMatrix::get_for_matrix(s32 source_node, s32 target_node, s64 matrix_index) const {
+    log::logger().trace("get_for_matrix: source_node={} target_node={} matrix_index={}",
+                        source_node, target_node, matrix_index);
+    validate_matrix_index(matrix_index);
+    if (!check_index_inbounds(source_node, target_node)) {
+        return 0.0;
+    }
+
+    return reconstruct_entry(source_node, target_node,
+                              coefficient_vectors[(usize)matrix_index].get_contents());
+}
+
+s64 WeightMatrix::add_coefficient_vector(const vector<f32> &coefficients) {
+    if ((s64)coefficients.size() != rank) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::add_coefficient_vector: coefficients must have exactly "
+                        "rank ({}) elements (got {})", rank, coefficients.size()));
+    }
+
+    s64 new_matrix_index = (s64)coefficient_vectors.size();
+    coefficient_vectors.push_back(allocate_coefficient_vector(coefficients));
+    log::logger().debug("add_coefficient_vector: matrix_index={}", new_matrix_index);
+    return new_matrix_index;
+}
+
+void WeightMatrix::set_coefficient_vector(s64 matrix_index, const vector<f32> &coefficients) {
+    validate_matrix_index(matrix_index);
+    if ((s64)coefficients.size() != rank) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_coefficient_vector: coefficients must have exactly "
+                        "rank ({}) elements (got {})", rank, coefficients.size()));
+    }
+
+    s64 effective_lane_count = rank_float4_stride * 4;
+    f32 *coefficient_data = coefficient_vectors[(usize)matrix_index].get_contents();
+    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+        coefficient_data[lane_index] = (lane_index < (s64)coefficients.size())
+            ? coefficients[(usize)lane_index]
+            : 1.0f;
+    }
+    log::logger().debug("set_coefficient_vector: matrix_index={}", matrix_index);
+}
+
+s64 WeightMatrix::matrix_count() const {
+    return (s64)coefficient_vectors.size();
+}
+
+void WeightMatrix::dispatch_neighbor_weights(f32 *output_weights, const f32 *coefficient_values) const {
     s64 total_pair_count = node_count * max_neighbor_count;
     if (total_pair_count <= 0) return;
 
@@ -200,12 +335,22 @@ void WeightMatrix::neighbor_weights(f32 *output_weights) const {
         node_count,
         max_neighbor_count,
         rank_float4_stride,
+        coefficient_values,
         device_weights.get_contents()
     );
     synchronize_gpu_work();
     prefetch_to_cpu(device_weights, (usize)total_pair_count * sizeof(f32));
     memcpy(output_weights, device_weights.get_contents(), (usize)total_pair_count * sizeof(f32));
     deallocate(std::move(device_weights));
+}
+
+void WeightMatrix::neighbor_weights(f32 *output_weights) const {
+    dispatch_neighbor_weights(output_weights, coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents());
+}
+
+void WeightMatrix::neighbor_weights_for_matrix(f32 *output_weights, s64 matrix_index) const {
+    validate_matrix_index(matrix_index);
+    dispatch_neighbor_weights(output_weights, coefficient_vectors[(usize)matrix_index].get_contents());
 }
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {
@@ -334,6 +479,16 @@ void WeightMatrix::load_from_disk(const char *filepath) {
         node_count = saved_node_count;
         rank = saved_rank;
         rank_float4_stride = saved_rank_float4_stride;
+
+        // rank_float4_stride changing invalidates every coefficient vector's length
+        // (rank_float4_stride*4 lanes) — and any non-default matrix's Ck was defined
+        // against the old shared basis anyway, so it's meaningless once U/V above are
+        // reallocated. Reset the family back to just the fresh default (all-ones) slot.
+        for (auto &coefficient_vector : coefficient_vectors) {
+            deallocate(std::move(coefficient_vector));
+        }
+        coefficient_vectors.clear();
+        coefficient_vectors.push_back(allocate_coefficient_vector({}));
     }
 
     file.read(reinterpret_cast<char*>(U_matrix.get_contents()),

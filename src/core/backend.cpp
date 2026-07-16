@@ -454,6 +454,7 @@ void gpu_neighbor_weights(
     s64 node_count,
     s64 max_neighbor_count,
     s64 rank_float4_stride,
+    const f32 *coefficients,
     f32 *output_weights
 ) {
     s64 total_pairs = node_count * max_neighbor_count;
@@ -469,7 +470,7 @@ void gpu_neighbor_weights(
         U, V,
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        node_count, max_neighbor_count, rank_float4_stride, output_weights
+        node_count, max_neighbor_count, rank_float4_stride, coefficients, output_weights
     );
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -486,16 +487,16 @@ void gpu_neighbor_weights(
         &internal_node_words, &leaf_node_words, &rank_superblock_table, &rank_subblock_table,
         &branching_factor, &superblock_size_words, &padded_node_count, &tree_height, &internal_bit_count,
         &node_count, &max_neighbor_count, &rank_float4_stride,
-        &output_weights
+        &coefficients, &output_weights
     };
     const usize arg_sizes[] = {
         sizeof(void*), sizeof(void*),
         sizeof(void*), sizeof(void*), sizeof(void*), sizeof(void*),
         sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
         sizeof(s64), sizeof(s64), sizeof(s64),
-        sizeof(void*)
+        sizeof(void*), sizeof(void*)
     };
-    metal_dispatch(kernel_handle, config, args, arg_sizes, 15);
+    metal_dispatch(kernel_handle, config, args, arg_sizes, 16);
 
 #endif
 }
