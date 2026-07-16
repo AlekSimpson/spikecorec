@@ -464,9 +464,10 @@ TEST(CellLoweringGlifFamily, lowers_glif2_voltage_dependent_reset_rule) {
         "    }\n"
         "  @reset\n"
         "    if fire_integrating {\n"
-        "      sub v, v, vth\n"
-        "      mul v, resetScale, v\n"
-        "      add v, vreset, v\n"
+        "      sub t0, v, vth\n"
+        "      mul t0, resetScale, t0\n"
+        "      add t0, vreset, t0\n"
+        "      mov v, t0\n"
         "      set_regime r, 1\n"
         "      mov refractoryTimeElapsed, 0\n"
         "    }\n"
@@ -474,6 +475,13 @@ TEST(CellLoweringGlifFamily, lowers_glif2_voltage_dependent_reset_rule) {
         "      set_regime r, 0\n"
         "    }\n";
 
+    // `v = vreset + resetScale*(v - vth)` reads `v` itself inside a compound
+    // sibling (`resetScale*(v-vth)`) while being assigned back into `v` --
+    // exactly the self-reference shape LoweringContext::emit_expression's
+    // guard exists for (see its own doc comment), so this now goes through
+    // an independent `t0` and a final `mov` rather than accumulating
+    // straight into `v`. Still correct either way, but this is the actual
+    // path the guard takes, not just a same-answer coincidence.
     EXPECT_EQ(print_ir_program(program), expected);
 
     // `refractoryTimeElapsed` has no OnStart in this fixture (unlike GLIF1's)
@@ -877,4 +885,142 @@ TEST(CellLoweringGlifFamily, lower_all_cell_types_skips_non_cell_type_library_en
     Vector<IrProgram> programs = lower_all_cell_types_to_ir(specification);
     ASSERT_EQ(programs.size(), 1u);
     EXPECT_EQ(programs[0].component_type_name, "GLIF1Cell");
+}
+
+// ── Register-aliasing guard (review follow-up on ticket #50) ─────────────
+//
+// `LoweringContext::emit_expression` accumulates a compound operand directly
+// into the destination register requested by its caller (see its own doc
+// comment) -- if that destination aliases an identifier ALSO read elsewhere
+// in the same expression (a self-referential update, e.g. a saturating
+// synapse's `g <- g + gbase*(1-g)`), accumulating the compound sibling
+// straight into that shared register would clobber the identifier's value
+// before the rest of the expression reads it. This is exactly the shape
+// ticket #51's synapse lowering will need (a bounded conductance update),
+// not just a contrived cell fixture -- reproduced here as a minimal
+// standalone CellType instead of a full GLIF variant, since the hazard is a
+// property of `emit_expression` itself, independent of GLIF.
+
+TEST(CellLoweringRegisterAliasingGuard, self_referential_saturating_update_lowers_correctly) {
+    const String component_type =
+        "  <ComponentType name=\"SaturatingResetCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"gbase\" dimension=\"none\"/>"
+        "    <Parameter name=\"threshold\" dimension=\"none\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"g\" dimension=\"none\" exposure=\"g\"/>"
+        "      <OnCondition test=\"g .gt. threshold\">"
+        "        <StateAssignment variable=\"g\" value=\"g + gbase * (1 - g)\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>";
+
+    TypeLibraryEntry entry = build_cell_type_library_entry(
+        "saturating", component_type, "SaturatingResetCell", "gbase=\"0.1\" threshold=\"0.5\"");
+
+    IrProgram program = lower_cell_to_ir(entry);
+
+    // Correct lowering evaluates the whole right-hand side into an
+    // independent temporary FIRST (so the read of `g` inside `1 - g` still
+    // observes the pre-update value), then copies the result into `g` --
+    // never accumulating directly into `g` mid-computation. The buggy
+    // (pre-fix) behavior would instead emit `sub g,1,g / mul g,gbase,g /
+    // add g,g,g`, silently computing `2*gbase*(1-g)` instead of
+    // `g + gbase*(1-g)`.
+    String expected =
+        ".alloc\n"
+        "  state g : f32\n"
+        "  param gbase = 0.10000000000000001\n"
+        "  param threshold = 0.5\n"
+        "  expose g\n"
+        ".tick\n"
+        "  @detect\n"
+        "    gt spiked, g, threshold\n"
+        "  @reset\n"
+        "    if spiked {\n"
+        "      sub t0, 1, g\n"
+        "      mul t0, gbase, t0\n"
+        "      add t0, g, t0\n"
+        "      mov g, t0\n"
+        "    }\n";
+
+    EXPECT_EQ(print_ir_program(program), expected);
+}
+
+// Same hazard, arithmetic-only shape (the reviewer's own minimal example):
+// `v <- v + v*k` written back into `v` -- `v` appears both as a plain leaf
+// operand and, separately, inside the compound sibling.
+TEST(CellLoweringRegisterAliasingGuard, self_multiplying_reset_lowers_correctly) {
+    const String component_type =
+        "  <ComponentType name=\"SelfMultiplyResetCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"k\" dimension=\"none\"/>"
+        "    <Parameter name=\"threshold\" dimension=\"none\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"none\" exposure=\"v\"/>"
+        "      <OnCondition test=\"v .gt. threshold\">"
+        "        <StateAssignment variable=\"v\" value=\"v + v * k\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>";
+
+    TypeLibraryEntry entry = build_cell_type_library_entry(
+        "selfmultiply", component_type, "SelfMultiplyResetCell", "k=\"0.2\" threshold=\"0.5\"");
+
+    IrProgram program = lower_cell_to_ir(entry);
+
+    String expected =
+        ".alloc\n"
+        "  state v : f32\n"
+        "  param k = 0.20000000000000001\n"
+        "  param threshold = 0.5\n"
+        "  expose v\n"
+        ".tick\n"
+        "  @detect\n"
+        "    gt spiked, v, threshold\n"
+        "  @reset\n"
+        "    if spiked {\n"
+        "      mul t0, v, k\n"
+        "      add t0, v, t0\n"
+        "      mov v, t0\n"
+        "    }\n";
+
+    EXPECT_EQ(print_ir_program(program), expected);
+}
+
+// A same-identifier, both-leaf self-reference (`asc1 <- asc1 + ascAdd1`,
+// already exercised inline within the GLIF3/5 fixtures above) must NOT be
+// pessimized by the guard -- a single leaf-leaf combine is atomic and safe
+// regardless of aliasing, so it should stay a one-instruction `add`.
+TEST(CellLoweringRegisterAliasingGuard, leaf_only_self_reference_stays_a_single_instruction) {
+    const String component_type =
+        "  <ComponentType name=\"LeafBumpResetCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"bumpAmount\" dimension=\"none\"/>"
+        "    <Parameter name=\"threshold\" dimension=\"none\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"g\" dimension=\"none\" exposure=\"g\"/>"
+        "      <OnCondition test=\"g .gt. threshold\">"
+        "        <StateAssignment variable=\"g\" value=\"g + bumpAmount\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>";
+
+    TypeLibraryEntry entry = build_cell_type_library_entry(
+        "leafbump", component_type, "LeafBumpResetCell", "bumpAmount=\"0.1\" threshold=\"0.5\"");
+
+    IrProgram program = lower_cell_to_ir(entry);
+
+    String expected =
+        ".alloc\n"
+        "  state g : f32\n"
+        "  param bumpAmount = 0.10000000000000001\n"
+        "  param threshold = 0.5\n"
+        "  expose g\n"
+        ".tick\n"
+        "  @detect\n"
+        "    gt spiked, g, threshold\n"
+        "  @reset\n"
+        "    if spiked {\n"
+        "      add g, g, bumpAmount\n"
+        "    }\n";
+
+    EXPECT_EQ(print_ir_program(program), expected);
 }

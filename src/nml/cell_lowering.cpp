@@ -323,6 +323,21 @@ ParsedCondition parse_condition_text(const String &condition_text) {
 
 const std::unordered_set<String> RESERVED_ENGINE_NAMES = {"dt", "tick", "network_inputs"};
 
+// Whether `identifier_name` is read anywhere inside `node`'s subtree. Used
+// both by the integration-method shape detector below and by
+// `LoweringContext::emit_expression`'s self-reference guard (a name defined
+// ahead of that class since both need it).
+bool references_identifier(const ExpressionNode &node, const String &identifier_name) {
+    switch (node.kind) {
+        case ExpressionNodeKind::Identifier: return node.text == identifier_name;
+        case ExpressionNodeKind::Number: return false;
+        case ExpressionNodeKind::Negate: return references_identifier(*node.left, identifier_name);
+        case ExpressionNodeKind::Binary:
+            return references_identifier(*node.left, identifier_name) || references_identifier(*node.right, identifier_name);
+    }
+    return false;
+}
+
 // Holds everything needed to turn one cell type's parsed expressions into
 // `.tick` instructions: which names are legal to reference (state variables,
 // parameters, plain-value derived variables), which names are aliases for
@@ -369,19 +384,43 @@ public:
     // BOTH operands are compound does a second, independent temporary get
     // allocated (matching the NMDA example's `t0`/`t1` pair).
     //
-    // Known, deliberately-accepted limitation (documented, not fixed --
-    // none of GLIF1-5's expressions below trigger it): if the SAME
-    // identifier appears both as a plain leaf operand and, separately,
-    // inside a compound sibling operand, while `preferred_destination`
-    // aliases that identifier's own name, the leaf read observes the
-    // sibling's already-clobbered value instead of the original (e.g.
-    // lowering `v + v*k` directly into `v` would miscompute). Avoiding this
-    // in general needs either always snapshotting self-referential reads
-    // into a temporary first, or refusing to alias `preferred_destination`
-    // to a repeated identifier -- unneeded generality for the expressions
-    // GLIF1-5 actually use, and out of this ticket's minimal-parser scope.
+    // Self-reference guard (fixes a register-aliasing hazard flagged in
+    // ticket #50's review): a single leaf-leaf combine emits exactly one
+    // `dst,a,b` instruction, so it is always safe regardless of aliasing --
+    // reads and the write happen atomically. The hazard only exists once a
+    // COMPOUND operand needs its own multi-instruction evaluation and that
+    // evaluation is accumulated directly into `*preferred_destination`: if
+    // `*preferred_destination`'s name is read anywhere else in `node` (a
+    // plain sibling leaf with that same name, or a reference buried inside
+    // the OTHER, not-yet-evaluated operand), that read would silently
+    // observe the compound evaluation's clobbered intermediate value instead
+    // of the true original -- e.g. a saturating-synapse-style update
+    // `g <- g + gbase*(1-g)`, or `v <- v + v*k`, lowered directly into `g`/
+    // `v`, would each silently miscompute (concretely: `g <- 2*gbase*(1-g)`
+    // instead of `g <- g + gbase*(1-g)`) with no error thrown. Whenever this
+    // is possible, the whole node is instead evaluated into an independent
+    // fresh temporary -- a `tN` name the lowering itself introduces and so
+    // can never collide with a real LEMS identifier, making it unconditionally
+    // safe -- and the result is copied into the real destination with one
+    // final `mov`. This costs one extra instruction only in the (narrow)
+    // self-referential-and-compound case; every other shape (including a
+    // self-referential but purely leaf-leaf combine like `asc1 <- asc1 +
+    // ascAdd1`) is untouched and keeps the single-instruction form.
     String emit_expression(const ExpressionNode &node, Vector<TickInstruction> &output,
                            std::optional<String> preferred_destination) {
+        if (preferred_destination.has_value() && node.kind == ExpressionNodeKind::Binary) {
+            bool left_is_leaf = node.left->kind == ExpressionNodeKind::Number || node.left->kind == ExpressionNodeKind::Identifier;
+            bool right_is_leaf = node.right->kind == ExpressionNodeKind::Number || node.right->kind == ExpressionNodeKind::Identifier;
+            bool has_a_compound_operand = !left_is_leaf || !right_is_leaf;
+            if (has_a_compound_operand && references_identifier(node, *preferred_destination)) {
+                String scratch_result = emit_expression(node, output, std::nullopt);
+                if (scratch_result != *preferred_destination) {
+                    output.push_back(MoveInstruction{*preferred_destination, scratch_result});
+                }
+                return *preferred_destination;
+            }
+        }
+
         switch (node.kind) {
             case ExpressionNodeKind::Number: {
                 if (!preferred_destination) return node.text;
@@ -469,17 +508,6 @@ struct LinearDecayShape {
     String target;
     String time_constant;
 };
-
-bool references_identifier(const ExpressionNode &node, const String &identifier_name) {
-    switch (node.kind) {
-        case ExpressionNodeKind::Identifier: return node.text == identifier_name;
-        case ExpressionNodeKind::Number: return false;
-        case ExpressionNodeKind::Negate: return references_identifier(*node.left, identifier_name);
-        case ExpressionNodeKind::Binary:
-            return references_identifier(*node.left, identifier_name) || references_identifier(*node.right, identifier_name);
-    }
-    return false;
-}
 
 // Recognizes exactly two shapes (arch §3.2 TimeDerivative; ticket #50's
 // "keep it simple and pattern-based" instruction -- not a general symbolic
