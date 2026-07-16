@@ -110,6 +110,44 @@ TypeLibraryEntry build_lif_equivalent_type_entry(const String &type_name, const 
     return entry;
 }
 
+// ── ticket #62 [F1] fixtures: a synthetic, TEST-ONLY nonlinear cell program ──────────────────────
+//
+// No real Phase-2 nonlinear point-cell ComponentType (izhikevich/AdEx/...) is lowerable yet
+// (ticket #63's own job) -- this hand-built IrProgram is this file's own analogue of
+// build_lif_equivalent_program above, extended with one `v * v` self-product term in its own
+// `@integrate` (a state variable multiplied by itself -- the same shape a real nonlinear cell's
+// quadratic term would take, see cell_lowering_tests.cpp's own
+// NONLINEAR_TEST_ONLY_COMPONENT_TYPE), with `closed_form_advanceable` explicitly set false (this
+// file builds IrPrograms by hand rather than through lower_cell_to_ir, so nothing computes this
+// tag automatically the way cell_lowering.cpp's own classification does for a real lowered type --
+// see this file's own doc comment above for why hand-built IrProgram fixtures are this file's
+// established pattern).
+IrProgram build_nonlinear_test_only_program(const String &type_name, f32 gL, f32 EL, f32 vth) {
+    IrProgram program;
+    program.component_type_name = type_name;
+    program.closed_form_advanceable = false;
+    program.alloc = {
+        StateDirective{"v", "f32", nullopt},
+        ParamConstantDirective{"C", String("1.0")},
+        ParamConstantDirective{"gL", precise_float_literal(gL)},
+        ParamConstantDirective{"EL", precise_float_literal(EL)},
+        ParamConstantDirective{"vth", precise_float_literal(vth)},
+    };
+    program.tick.integrate = {
+        BinaryInstruction{BinaryOpcode::Sub, "t0", "EL", "v"},
+        BinaryInstruction{BinaryOpcode::Mul, "t0", "gL", "t0"},
+        BinaryInstruction{BinaryOpcode::Add, "t0", "network_inputs", "t0"},
+        BinaryInstruction{BinaryOpcode::Mul, "t1", "v", "v"},
+        BinaryInstruction{BinaryOpcode::Sub, "t0", "t0", "t1"},
+        BinaryInstruction{BinaryOpcode::Div, "t0", "t0", "C"},
+        BinaryInstruction{BinaryOpcode::Mul, "t0", "t0", "dt"},
+        BinaryInstruction{BinaryOpcode::Add, "v", "v", "t0"},
+    };
+    program.tick.detect = {BinaryInstruction{BinaryOpcode::Gt, "spiked", "v", "vth"}};
+    program.tick.emit = {IfInstruction{"spiked", {EmitInstruction{"spike"}}, {}, nullopt}};
+    return program;
+}
+
 } // namespace
 
 // ── compile-failure surfacing (ticket #60 [X1]) ──────────────────────────────────────────────────
@@ -618,4 +656,143 @@ TEST(MasterKernel, a_genuine_zero_constant_weight_propagates_exactly_zero_not_th
 
     EXPECT_TRUE(last_spiked.get_contents()[0] == 1) << "neuron 0 did not spike on tick 1 as expected";
     EXPECT_EQ(network_inputs.get_contents()[1], 0.0f);
+}
+
+// ── ticket #62 [F1]: active-set x nonlinear-dynamics correctness rule ────────────────────────────
+//
+// AssembledModel::step_tick dispatches every population's kernel over its own FULL neuron range
+// every tick regardless of closed_form_advanceable (see master_kernel.h/.cpp's own doc comments) --
+// so "never fast-forwarded" is a property of ITS OWN per-tick dispatch, testable by comparing the
+// assembled model's own trajectory against a plain, tick-by-tick C++ transcription of the exact
+// same `.tick.integrate` instructions run once per tick with no batching. This is the master-kernel
+// side of this ticket's acceptance criterion; the SEPARATE "a linear cell's skipped neuron still
+// fast-forwards via closed-form apply_decay" side is the hardcoded engine's own, pre-existing,
+// untouched mechanism -- verified in engine_tests.cpp's own
+// `active_set_skip_then_revisit_matches_per_tick_decay_equivalence`, not here (this file has no
+// notion of a hardcoded LIF's active-set skip at all -- see this ticket's own report for why).
+
+TEST(MasterKernelActiveSetNonlinearRule, population_is_closed_form_advanceable_reflects_each_type_tag) {
+    ModelSpecification model;
+    model.total_neuron_count = 2;
+    model.type_library.push_back(build_lif_equivalent_type_entry("LinearCell", "linearInstance", 1.0f, 0.1f, 0.0f, 1.0f));
+    model.type_library.push_back(build_lif_equivalent_type_entry("NonlinearCell", "nonlinearInstance", 1.0f, 0.1f, 0.0f, 1.0f));
+
+    PopulationEntry linear_population;
+    linear_population.id = "LinearPop";
+    linear_population.type_library_index = 0;
+    linear_population.size = 1;
+    linear_population.neuron_index_begin = 0;
+    linear_population.neuron_index_end = 1;
+    model.populations.push_back(linear_population);
+
+    PopulationEntry nonlinear_population;
+    nonlinear_population.id = "NonlinearPop";
+    nonlinear_population.type_library_index = 1;
+    nonlinear_population.size = 1;
+    nonlinear_population.neuron_index_begin = 1;
+    nonlinear_population.neuron_index_end = 2;
+    model.populations.push_back(nonlinear_population);
+
+    IrProgram linear_program = build_lif_equivalent_program("LinearCell", 0.1f, 0.0f, 1.0f);
+    linear_program.closed_form_advanceable = true; // matches what lower_cell_to_ir would tag a real GLIF-shaped cell
+    spikecorec::Vector<IrProgram> programs = {
+        linear_program,
+        build_nonlinear_test_only_program("NonlinearCell", 0.1f, 0.0f, 1.0f),
+    };
+
+    AssembledModel assembled_model(model, programs);
+    EXPECT_TRUE(assembled_model.population_is_closed_form_advanceable(0));
+    EXPECT_FALSE(assembled_model.population_is_closed_form_advanceable(1));
+}
+
+TEST(MasterKernelActiveSetNonlinearRule, nonlinear_population_never_receives_a_closed_form_multi_tick_jump) {
+    const f32 gL = 0.1f;
+    const f32 EL = 0.0f;
+    const f32 vth = 1000.0f; // never spikes -- isolates the pure integrate step from reset/regime noise
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 2; // neuron 0 is this test's own subject; neuron 1 is an unused peer
+
+    vector<vector<s32>> adjacency = {{}, {}}; // no edges at all -- neuron 0 never receives network_inputs
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(
+        build_lif_equivalent_type_entry("NonlinearTestOnlyCell", "nonlinearTestOnlyInstance", 1.0f, gL, EL, vth));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    spikecorec::Vector<IrProgram> programs = {build_nonlinear_test_only_program("NonlinearTestOnlyCell", gL, EL, vth)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count, EL);
+
+    WeightMatrix weights(adjacency, /*rank=*/1);
+
+    AssembledModel assembled_model(model, programs);
+    ASSERT_FALSE(assembled_model.population_is_closed_form_advanceable(0));
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    // A one-time pulse on tick 1 raises v off resting; every tick after that (tick 2 onward) neuron
+    // 0 receives NEITHER external stimulus NOR any network_inputs (no edges exist at all) -- exactly
+    // the "some neurons going quiet (inactive) for multiple ticks" scenario this ticket's acceptance
+    // criterion describes. A closed-form multi-tick jump would show up as a DIVERGENCE from the
+    // plain per-tick reference computed below the moment more than one quiet tick has elapsed.
+    const f32 external_pulse = 0.3f;
+    const s64 tick_count = 6;
+
+    f32 reference_v = EL;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        f32 this_tick_external_input = (tick == 1) ? external_pulse : 0.0f;
+
+        allocation.cell_state.get_contents()[0] += this_tick_external_input;
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+
+        // Plain, unbatched, exactly-one-dt-per-tick transcription of
+        // build_nonlinear_test_only_program's own `@integrate` instructions -- network_inputs is
+        // always 0.0f here (no edges ever scatter into it).
+        reference_v += this_tick_external_input;
+        f32 t0 = EL - reference_v;
+        t0 = gL * t0;
+        t0 = 0.0f + t0;
+        f32 t1 = reference_v * reference_v;
+        t0 = t0 - t1;
+        t0 = t0 / 1.0f; // C
+        t0 = t0 * dt;
+        reference_v = reference_v + t0;
+
+        EXPECT_NEAR(allocation.cell_state.get_contents()[0], reference_v, 1e-4f) << "tick=" << tick;
+    }
+
+    // Sanity: the reference trajectory actually moved (a comparison that never left EL would be
+    // vacuous), and neuron 0 never spiked (vth is unreachable here, keeping this test purely about
+    // @integrate).
+    EXPECT_NE(reference_v, EL);
+    EXPECT_EQ(last_spiked.get_contents()[0], 0);
 }

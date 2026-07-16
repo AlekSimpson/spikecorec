@@ -573,3 +573,79 @@ TEST(SpikeEngine, active_set_optimization_disabled_spike_propagation_equivalence
             << "expected neuron " << index << " to spike at tick " << index;
     }
 }
+
+// ── ticket #62 [F1]: active-set x nonlinear-dynamics correctness rule -- the LINEAR side ─────────
+//
+// The hardcoded engine's own leaky-integrate-and-fire dynamics (kernels.metal/kernels.cu's
+// `apply_decay`) are exactly the "all of GLIF (linear)" case arch §0.5 describes -- untouched by
+// this ticket. This test is a regression safety net demonstrating that side of the ticket's own
+// acceptance criterion (the SEPARATE "nonlinear population never gets a closed-form multi-tick
+// jump" side lives in master_kernel_tests.cpp's own
+// `nonlinear_population_never_receives_a_closed_form_multi_tick_jump`, since no notion of "cell
+// type"/IR exists on this hardcoded path): a neuron that falls out of the active set (no edges, so
+// nothing ever scatters into its own `network_inputs`; subthreshold, so it never spikes and is
+// never self-re-enqueued -- see kernels.metal's own `step`, whose re-enqueue code only runs past
+// the spike branch) and is skipped for several ticks, then reactivated with no new stimulus, must
+// land on EXACTLY the membrane potential produced by decaying it one tick at a time the whole way
+// -- i.e. `apply_decay`'s closed-form multi-tick jump is mathematically equivalent to N
+// single-tick decays, not an approximation of them. Reuses this file's own
+// `active_set_optimization_disabled_spike_propagation_equivalence` precedent immediately above
+// (a `run(active_set_optimization_enabled)` closure comparing the SAME two dispatch paths --
+// `step`'s active-set-gated skip vs. `step_no_active_optimization`'s always-dispatch-every-neuron
+// path), applied to membrane-potential decay instead of spike timing.
+
+TEST(SpikeEngine, active_set_skip_then_revisit_matches_per_tick_decay_equivalence) {
+    vector<vector<s32>> network = {{}, {}}; // two isolated neurons, no edges at all
+    const f32 resting_mp = 0.0f;
+    const f32 decay_rate = 0.1f;
+    const s64 quiet_tick_count = 4; // ticks 1..quiet_tick_count: neuron 0 receives nothing at all
+    const s64 revisit_tick = quiet_tick_count + 1;
+
+    auto run = [&](bool active_set_optimization_enabled) -> f32 {
+        SpikeEngine engine(&network, {2, 1}, /*rank=*/1, resting_mp, decay_rate,
+                           /*learning_rate=*/0.0f, /*plasticity_enabled=*/false,
+                           active_set_optimization_enabled);
+        engine.spike_threshold = 1000.0f; // never spikes -- isolates pure decay from reset/emit
+        // Both `step`/`step_no_active_optimization` also force membrane_potentials back to
+        // resting_mp whenever `tick - last_spiked == spike_period` (an orthogonal "periodic forced
+        // reset" quirk, see master_kernel_tests.cpp's own comment on it) -- last_spiked defaults to
+        // 0, which would spuriously fire that branch at tick == spike_period even though this
+        // neuron never actually spikes. seed_never_spiked pushes it far enough into the past that
+        // this test's own short tick horizon can never coincide, isolating pure decay.
+        seed_never_spiked(engine);
+        engine.set_input_neurons({0});
+
+        // Tick 0: a subthreshold external pulse forces neuron 0 into the active set (both dispatch
+        // paths process it identically here).
+        engine.step_simulation({0.5f}, /*tick=*/0, /*override_input_neurons=*/{0});
+
+        // Ticks 1..quiet_tick_count: no external input, no override. With the optimization enabled,
+        // neuron 0 was never re-enqueued after tick 0 (subthreshold, no edges), so `step` never
+        // dispatches to it at all here -- it is genuinely skipped, not merely "processed with zero
+        // input." With the optimization disabled, `step_no_active_optimization` keeps dispatching to
+        // (and re-decaying) it every tick regardless.
+        for (s64 tick = 1; tick <= quiet_tick_count; ++tick) {
+            engine.step_simulation({0.0f}, tick);
+        }
+
+        // Revisit tick: force neuron 0 back into the active set (a no-op under
+        // active_set_optimization_enabled=false, which never stopped dispatching to it) with no
+        // additional external stimulus -- this is where the optimization-enabled path's own
+        // closed-form apply_decay bridges the whole quiet_tick_count-tick gap in one shot.
+        engine.step_simulation({0.0f}, revisit_tick, /*override_input_neurons=*/{0});
+
+        f32 result = engine.membrane_potentials.get_contents()[0];
+        engine.shutdown();
+        return result;
+    };
+
+    f32 with_optimization = run(/*active_set_optimization_enabled=*/true);
+    f32 without_optimization = run(/*active_set_optimization_enabled=*/false);
+
+    EXPECT_NEAR(with_optimization, without_optimization, 1e-4f);
+
+    // Sanity: this is a genuine decay-over-time comparison, not a vacuous match at some
+    // already-settled fixed point.
+    EXPECT_LT(with_optimization, 0.5f);
+    EXPECT_GT(with_optimization, resting_mp);
+}

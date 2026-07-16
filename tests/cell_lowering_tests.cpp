@@ -433,6 +433,11 @@ TEST(CellLoweringGlifFamily, lowers_glif1_leaky_integrate_and_fire_with_refracto
         "    }\n";
 
     EXPECT_EQ(print_ir_program(program), expected);
+
+    // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): GLIF1's `v`
+    // dynamics is affine in its own state variables (v, refractoryTimeElapsed), so it must be
+    // tagged closed_form_advanceable -- "all of GLIF" keeps the engine's closed-form lazy advance.
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // ── GLIF2: LIF + a reset rule that depends on the pre-spike voltage ──────
@@ -525,6 +530,11 @@ TEST(CellLoweringGlifFamily, lowers_glif2_voltage_dependent_reset_rule) {
         }
     }
     EXPECT_TRUE(found_refractory_timer_without_initial_value);
+
+    // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): the
+    // voltage-dependent reset rule only affects @reset, not the `v`/`refractoryTimeElapsed`
+    // TimeDerivatives themselves, so GLIF2 is still affine and must stay closed_form_advanceable.
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // ── GLIF3: LIF + two after-spike currents ────────────────────────────────
@@ -607,6 +617,11 @@ TEST(CellLoweringGlifFamily, lowers_glif3_after_spike_currents) {
         "    }\n";
 
     EXPECT_EQ(print_ir_program(program), expected);
+
+    // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): `v`'s coupled
+    // `ascSum` term and the ASCs' own `-asc_k/tauAsc_k` decays are all affine in
+    // {v, asc1, asc2, refractoryTimeElapsed}, so GLIF3 stays closed_form_advanceable.
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // ── GLIF4: LIF + an adaptive (state-variable) threshold ──────────────────
@@ -687,6 +702,12 @@ TEST(CellLoweringGlifFamily, lowers_glif4_adaptive_threshold) {
     // Threshold-vs-state-variable acceptance criterion: the detect stage
     // compares `v` against `theta` (a StateVariable), not a Parameter.
     EXPECT_NE(print_ir_program(program).find("gt test_integrating, v, theta"), String::npos);
+
+    // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): `theta`'s own
+    // decay is affine in {v, theta, refractoryTimeElapsed} (theta appears in `detect`'s comparison,
+    // not inside a TimeDerivative right-hand side, so it doesn't affect this classification), so
+    // GLIF4 stays closed_form_advanceable.
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // ── GLIF5: GLIF3 + GLIF4 combined ────────────────────────────────────────
@@ -778,6 +799,11 @@ TEST(CellLoweringGlifFamily, lowers_glif5_after_spike_currents_and_adaptive_thre
         "    }\n";
 
     EXPECT_EQ(print_ir_program(program), expected);
+
+    // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): GLIF5 combines
+    // GLIF3's ASCs and GLIF4's adaptive threshold, all still affine in the cell's own state
+    // variables, so it stays closed_form_advanceable too.
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // ── Fidelity check: a Regime-less LIF cell reproduces the locked IR spec's
@@ -849,6 +875,10 @@ TEST(CellLoweringGlifFamily, lowers_regime_less_lif_cell_matching_locked_ir_spec
     // section (its `.alloc` elides literal values as bare `param` names;
     // here they're baked, per ticket #7's Phase-1 rule).
     EXPECT_EQ(print_ir_program(program), expected);
+
+    // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): the regime-less
+    // pure-LIF `v` dynamics is affine in `v`, so it stays closed_form_advanceable.
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // ── Error handling ────────────────────────────────────────────────────────
@@ -1071,6 +1101,90 @@ TEST(CellLoweringRegisterAliasingGuard, self_multiplying_reset_lowers_correctly)
         "    }\n";
 
     EXPECT_EQ(print_ir_program(program), expected);
+}
+
+// ── Active-set x nonlinear-dynamics classification (ticket #62 [F1]; arch §0.5) ──────────────────
+//
+// No real Phase-2 nonlinear point-cell ComponentType (izhikevich/AdEx/...) is lowerable yet --
+// that's ticket #63's own job, not yet built. This fixture is a synthetic, TEST-ONLY
+// ComponentType, never vendored or wired into any real model, built purely to exercise
+// cell_dynamics_are_closed_form_advanceable's structural affine-in-state-variables check on a
+// TimeDerivative shape it must correctly reject: a `v * v` self-product term, the same kind of
+// quadratic RHS a real nonlinear cell (e.g. izhikevich2007Cell's `0.04*v^2 + 5*v + 140 - u + I`)
+// would need -- our own minimal expression parser has no `^`, so `v * v` stands in for it.
+
+namespace {
+
+const String NONLINEAR_TEST_ONLY_COMPONENT_TYPE =
+    "  <ComponentType name=\"NonlinearTestOnlyCell\" extends=\"baseCell\">"
+    "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+    "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+    "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+    "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>"
+    "    <Dynamics>"
+    "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+    "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\" select=\"synapses[*]/i\" reduce=\"add\"/>"
+    "      <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn - v * v) / C\"/>"
+    "      <OnStart>"
+    "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+    "      </OnStart>"
+    "      <OnCondition test=\"v .gt. vth\">"
+    "        <EventOut port=\"spike\"/>"
+    "        <StateAssignment variable=\"v\" value=\"vreset\"/>"
+    "      </OnCondition>"
+    "    </Dynamics>"
+    "  </ComponentType>";
+
+} // namespace
+
+TEST(CellLoweringActiveSetNonlinearRule, quadratic_self_product_time_derivative_is_not_closed_form_advanceable) {
+    TypeLibraryEntry entry = build_cell_type_library_entry(
+        "nonlinear", NONLINEAR_TEST_ONLY_COMPONENT_TYPE, "NonlinearTestOnlyCell",
+        "C=\"1.0\" gL=\"0.1\" EL=\"0.0\" vth=\"1.0\" vreset=\"0.0\"");
+
+    IrProgram program = lower_cell_to_ir(entry);
+
+    EXPECT_FALSE(program.closed_form_advanceable)
+        << "a v*v self-product TimeDerivative must NOT be tagged closed_form_advanceable -- it has "
+           "no analytically closed-form multi-tick advance, so the engine's active-set optimization "
+           "must integrate it exactly one dt per active tick (arch §0.5)";
+}
+
+// Sanity companion: dropping the `- v * v` term from the same fixture (leaving it algebraically
+// identical to a plain LIF) must flip the classification back to true -- proves the check actually
+// keys off the nonlinear term, not some other property of this fixture (e.g. its lack of a Regime).
+TEST(CellLoweringActiveSetNonlinearRule, same_fixture_without_the_quadratic_term_is_closed_form_advanceable) {
+    const String linear_component_type =
+        "  <ComponentType name=\"LinearTestOnlyCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+        "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\" select=\"synapses[*]/i\" reduce=\"add\"/>"
+        "      <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn) / C\"/>"
+        "      <OnStart>"
+        "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+        "      </OnStart>"
+        "      <OnCondition test=\"v .gt. vth\">"
+        "        <EventOut port=\"spike\"/>"
+        "        <StateAssignment variable=\"v\" value=\"vreset\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>";
+
+    TypeLibraryEntry entry = build_cell_type_library_entry(
+        "linearcontrol", linear_component_type, "LinearTestOnlyCell",
+        "C=\"1.0\" gL=\"0.1\" EL=\"0.0\" vth=\"1.0\" vreset=\"0.0\"");
+
+    IrProgram program = lower_cell_to_ir(entry);
+
+    EXPECT_TRUE(program.closed_form_advanceable);
 }
 
 // A same-identifier, both-leaf self-reference (`asc1 <- asc1 + ascAdd1`,

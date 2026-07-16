@@ -173,7 +173,27 @@ public:
     // at construction time (a copy of the type-library IR programs, each population's neuron range
     // and type-library index), matching "recompile only when the model changes": building a new
     // AssembledModel is the only way this cached information changes.
+    //
+    // Active-set x nonlinear rule (arch §0.5, ticket #62 [F1]): every population's kernel above runs
+    // over its FULL neuron range every tick, regardless of population_is_closed_form_advanceable
+    // below (see master_kernel.cpp's own header comment on this ticket's still-deliberate scope
+    // boundary) -- this is unconditionally correct for BOTH tags. A nonlinear-tagged population must
+    // never receive a closed-form multi-tick skip; running its full range every tick trivially
+    // satisfies that (no skip ever happens for anyone here). A closed_form_advanceable-tagged
+    // population's own SEPARATE closed-form fast-forward is kernels.metal/kernels.cu's pre-existing
+    // `apply_decay` + active-set mechanism on the hardcoded SpikeEngine path -- untouched by this
+    // ticket. A future skip-dispatch fast path for THIS master-kernel path (deferred by ticket #6,
+    // see master_kernel.h's own header comment) MUST gate on population_is_closed_form_advanceable
+    // and must never apply a multi-tick skip to a population for which it returns false.
     void step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick, s64 next_tick);
+
+    // Whether `model.populations[population_index]`'s cell type was tagged
+    // closed_form_advanceable (arch §0.5, ticket #62 [F1]) at construction time -- false for a
+    // population with no per-neuron kernel (has_kernel == false; e.g. an empty-IR cell type, see
+    // AssembledMasterKernelSource's own doc comment), matching IrProgram's own "not applicable"
+    // default. Exposed so a caller (or a future skip-dispatch implementer) can consult the tag
+    // without re-deriving it from the model/IR programs it already handed to the constructor.
+    bool population_is_closed_form_advanceable(usize population_index) const;
 
 private:
     struct PopulationRuntimeInfo {
