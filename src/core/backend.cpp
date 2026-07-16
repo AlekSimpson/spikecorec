@@ -387,6 +387,56 @@ void metal_dispatch(
 #endif
 }
 
+// ── cuda_dispatch ─────────────────────────────────────────────────────────────
+
+void cuda_dispatch(
+    KernelHandle handle,
+    LaunchConfig config,
+    const void *const *args,
+    const usize *arg_sizes,
+    u32 arg_count,
+    MetalCommandBatch *batch
+) {
+#ifdef SPIKECOREC_CUDA
+    (void)arg_sizes; // unused: args[i] already holds each argument's storage exactly
+                      // as cuLaunchKernel's kernelParams expects — no Metal-style
+                      // buffer-object resolution is needed on CUDA (see GpuPointer)
+    (void)batch;      // no CUDA analog of Metal command-buffer batching in this
+                      // codebase — every launch is synchronous (see below)
+
+    log::logger().trace("cuda dispatch: grid_size={} block_size={} arg_count={}",
+                        config.grid_size, config.block_size, arg_count);
+
+    check_cuda_driver_result(
+        cuLaunchKernel(
+            handle.cuda_kernel_function,
+            config.grid_size, 1, 1,
+            config.block_size, 1, 1,
+            0,       // sharedMemBytes
+            nullptr, // hStream — default stream
+            // cuLaunchKernel only reads through kernelParams, never writes it, so
+            // discarding constness here is safe
+            const_cast<void **>(args),
+            nullptr  // extra
+        ),
+        "cuLaunchKernel"
+    );
+
+    // block until the launch completes, matching metal_dispatch's
+    // waitUntilCompleted() on the batch == nullptr path
+    synchronize_gpu_work();
+
+#else
+    // no-op on Metal — mirrors metal_dispatch's #ifdef SPIKECOREC_METAL-only body
+    (void)handle;
+    (void)config;
+    (void)args;
+    (void)arg_sizes;
+    (void)arg_count;
+    (void)batch;
+#endif
+}
+
 // ── kernel wrappers: WeightMatrix + K2Tree ───────────────────────────────────
 
 void gpu_neighbor_weights(

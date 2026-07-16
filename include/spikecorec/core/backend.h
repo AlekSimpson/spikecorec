@@ -168,6 +168,28 @@ namespace spikecorec {
         MetalCommandBatch *batch = nullptr
     );
 
+    // CUDA analog of metal_dispatch — generic launch of an arbitrary runtime-compiled
+    // (NVRTC/compile_kernel) CUfunction, wrapping cuLaunchKernel.
+    // - args[i] already points to the argument's storage in exactly the layout
+    //   cuLaunchKernel's kernelParams expects, so (unlike Metal) no buffer-object
+    //   resolution is needed: a pointer-typed argument's storage already holds a
+    //   raw device pointer (see GpuPointer's CUDA branch)
+    // - arg_sizes/arg_count are accepted only for signature parity with
+    //   metal_dispatch; cuLaunchKernel needs neither (the parameter count/layout
+    //   is implicit in the compiled kernel itself)
+    // - batch is Metal-specific command-buffer batching; CUDA has no analogous
+    //   batching concept in this codebase, so it is accepted only for signature
+    //   parity and ignored — every launch is synchronous, matching the
+    //   batch == nullptr path of metal_dispatch
+    void cuda_dispatch(
+        KernelHandle handle,
+        LaunchConfig config,
+        const void *const *args,
+        const usize *arg_sizes,
+        u32 arg_count,
+        MetalCommandBatch *batch = nullptr
+    );
+
     // --- atomic ops (for backends that need explicit support) ---
     //void atomic_add_f32(f32 *address, f32 value);
 
