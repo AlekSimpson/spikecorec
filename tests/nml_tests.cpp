@@ -277,6 +277,64 @@ TEST(NmlComponentTypeClassification, leaves_out_of_scope_types_unclassified) {
     EXPECT_FALSE(std::get<ComponentTypeBase>(entry).raw.body.empty());
 }
 
+// Regression test for an order-dependent misclassification bug: PyNN.xml's
+// cell/synapse types chain through an intermediate, non-anchor base type
+// declared in a DIFFERENT std-lib file — `IF_curr_alpha` extends
+// `basePyNNIaFCell` extends `basePyNNCell` extends `baseCellMembPot`
+// (Cells.xml) extends `baseSpikingCell` extends `baseCell`; `expCondSynapse`
+// extends `basePynnSynapse` extends `baseVoltageDepSynapse` (Synapses.xml)
+// extends `baseSynapse`. Classifying eagerly per-node, interleaved with
+// std::filesystem::directory_iterator's unspecified per-file visitation
+// order, could silently misclassify these as the unclassified
+// ComponentTypeBase fallback whenever PyNN.xml happened to be visited before
+// Cells.xml/Synapses.xml. classify_all_cataloged_types's two-phase
+// ingest-then-classify design makes this order-independent: this must pass
+// regardless of directory_iterator's actual visitation order.
+TEST(NmlComponentTypeClassification, classifies_pynn_types_regardless_of_std_lib_file_load_order) {
+    NML_Parser parser;
+    ASSERT_FALSE(parser.load_standard_library());
+
+    ComponentTypeEntry &cell_entry = parser.get_type_by_name("IF_curr_alpha");
+    ASSERT_TRUE(std::holds_alternative<CellType>(cell_entry));
+    CellType &if_curr_alpha = std::get<CellType>(cell_entry);
+    EXPECT_GT(if_curr_alpha.state_variables.size(), 0u);
+    EXPECT_GT(if_curr_alpha.attachments.size(), 0u);
+
+    ComponentTypeEntry &synapse_entry = parser.get_type_by_name("expCondSynapse");
+    ASSERT_TRUE(std::holds_alternative<SynapseType>(synapse_entry));
+    SynapseType &exp_cond_synapse = std::get<SynapseType>(synapse_entry);
+    EXPECT_GT(exp_cond_synapse.state_variables.size(), 0u);
+    EXPECT_GT(exp_cond_synapse.on_events.size(), 0u);
+}
+
+// A deterministic, environment-independent version of the same failure
+// class: a derived type declared textually BEFORE its (non-anchor)
+// intermediate base, in one file processed via `parse()`/`ingest_file()`
+// (not dependent on the real filesystem's unspecified directory-iteration
+// order at all). Under the old eager-per-node classification this would
+// have failed the moment ForwardRefDerivedCell was cataloged, since
+// ForwardRefIntermediateBase — its extends parent — wasn't cataloged yet.
+TEST(NmlComponentTypeClassification, classifies_type_declared_before_its_non_anchor_base_in_same_file) {
+    String path = write_temp_file("spikecorec_forward_reference_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"ForwardReferenceTestDoc\">"
+        "  <ComponentType name=\"ForwardRefDerivedCell\" extends=\"ForwardRefIntermediateBase\">"
+        "    <Parameter name=\"x\" dimension=\"none\"/>"
+        "  </ComponentType>"
+        "  <ComponentType name=\"ForwardRefIntermediateBase\" extends=\"baseCell\">"
+        "    <Parameter name=\"y\" dimension=\"none\"/>"
+        "  </ComponentType>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    ASSERT_EQ(parser.library.count("ForwardRefDerivedCell"), 1u);
+    EXPECT_TRUE(std::holds_alternative<CellType>(parser.library.at("ForwardRefDerivedCell")));
+
+    ASSERT_EQ(parser.library.count("ForwardRefIntermediateBase"), 1u);
+    EXPECT_TRUE(std::holds_alternative<CellType>(parser.library.at("ForwardRefIntermediateBase")));
+}
+
 // ── NML_Parser::validate_against_schema (ticket #8 [A2]) ────
 
 TEST(ValidateAgainstSchema, schema_path_is_baked_and_exists) {

@@ -279,6 +279,18 @@ void NML_Parser::parse(const String &nml_input_file) {
     }
 
     ingest_file(nml_input_file, true);
+
+    // ingest_file's own recursion fully resolves the whole <include> graph
+    // before returning, so every ComponentType this run will ever see (std
+    // lib + every included file) is now in raw_component_types — safe to
+    // classify the newly-ingested user/include types (the std-lib ones are
+    // already classified from inside load_standard_library() and are left
+    // untouched). Once done, raw_component_types has served its only purpose
+    // for this run, so it's dropped rather than left holding a second copy
+    // of every node library's entries already own.
+    classify_all_cataloged_types();
+    raw_component_types.clear();
+
     xmlCleanupParser();
 }
 
@@ -337,7 +349,7 @@ void NML_Parser::ingest_file(const String &nml_file_path, bool run_schema_valida
             continue;
         }
 
-        catalog_component_type(child, nml_file_path);
+        catalog_raw_component_type(child, nml_file_path);
     }
 
     xmlFreeDoc(document);
@@ -401,7 +413,7 @@ bool NML_Parser::load_standard_library() {
 
             NML_Node component_type = xml_node_to_nml_node(node);
 
-            if (!catalog_component_type(component_type, file_path)) {
+            if (!catalog_raw_component_type(component_type, file_path)) {
                 library_failed_to_load = true;
             }
         }
@@ -409,15 +421,22 @@ bool NML_Parser::load_standard_library() {
         xmlFreeDoc(document);
     }
 
+    // The directory scan above (across every std-lib file, in whatever order
+    // std::filesystem::directory_iterator happens to visit them) is fully
+    // done at this point, so every std-lib ComponentType is now in
+    // raw_component_types — safe to classify the whole batch in one pass.
+    classify_all_cataloged_types();
+
     xmlCleanupParser();
     return library_failed_to_load;
 }
 
-// Catalogs a parsed `<ComponentType>` node into `library` (classified) and
-// `raw_component_types` (raw, for classify_component_type's `extends`-chain
-// lookups). Duplicate names are dropped silently (first-cataloged-wins,
-// matching the original flat-library behavior) — that is not a failure.
-bool NML_Parser::catalog_component_type(const NML_Node &component_type_node, const String &source_path) {
+// Records a parsed `<ComponentType>` node's raw form into
+// `raw_component_types`. Duplicate names are dropped silently
+// (first-cataloged-wins, matching the original flat-library behavior) —
+// that is not a failure. Classification is deferred — see
+// classify_all_cataloged_types.
+bool NML_Parser::catalog_raw_component_type(const NML_Node &component_type_node, const String &source_path) {
     auto name_attribute = component_type_node.attributes.find("name");
     if (name_attribute == component_type_node.attributes.end()) {
         log::logger().warn("ComponentType in {} has no name attribute, skipping", source_path);
@@ -436,9 +455,26 @@ bool NML_Parser::catalog_component_type(const NML_Node &component_type_node, con
         return true; // already cataloged — first-cataloged-wins, not a failure
     }
 
-    auto inserted = raw_component_types.emplace(type_name, component_type_node);
-    library.emplace(type_name, classify_component_type(inserted.first->second));
+    raw_component_types.emplace(type_name, component_type_node);
     return true;
+}
+
+// Classifies every node in raw_component_types not yet in `library`. Called
+// only at the end of a whole ingestion phase (load_standard_library()'s full
+// directory scan; parse()'s whole <include> graph), so every call sees every
+// node cataloged during that phase — the fix for the order-dependent
+// misclassification eager per-node classification had, since a chain walk
+// can now never give up on a parent merely because it hasn't been reached
+// yet. Deliberately additive (never clears/rebuilds `library`): a type
+// classified correctly on an earlier call (e.g. by load_standard_library(),
+// before parse() goes on to ingest more files) stays classified without its
+// entry's address changing — re-running classify_component_type on it here
+// would just recompute the identical result, so it's skipped instead.
+void NML_Parser::classify_all_cataloged_types() {
+    for (const auto &[type_name, raw_node] : raw_component_types) {
+        if (library.find(type_name) != library.end()) continue;
+        library.emplace(type_name, classify_component_type(raw_node));
+    }
 }
 
 // Classifies `node` into one of the five ComponentType categories (nml.h)
@@ -505,7 +541,7 @@ ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
     return make_base(node, extends);
 }
 
-ComponentTypeEntry &NML_Parser::get_type_by_name(String name) {
+ComponentTypeEntry &NML_Parser::get_type_by_name(const String &name) {
     auto entry = library.find(name);
     if (entry == library.end()) {
         log::logger().error("NML Standard Library type {} could not be found.", name);

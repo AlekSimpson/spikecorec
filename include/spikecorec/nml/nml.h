@@ -291,22 +291,43 @@ struct NML_Parser {
 
     bool load_standard_library();
 
-    ComponentTypeEntry &get_type_by_name(String name);
+    ComponentTypeEntry &get_type_by_name(const String &name);
 
 private:
-    // Raw `<ComponentType>` nodes cataloged so far, keyed by name — kept
-    // alongside `library` purely to let classify_component_type() walk an
-    // `extends` chain by name lookup (arch §3.1 `ComponentType`'s `extends`).
+    // Raw `<ComponentType>` nodes cataloged so far, keyed by name. Classifying
+    // is deliberately deferred (see classify_all_cataloged_types): a single
+    // eager classification pass per node, run as each node is cataloged,
+    // would make classification order-dependent on the unspecified order
+    // std::filesystem::directory_iterator visits std-lib files in (and on
+    // physical declaration order for any intra-file forward reference) —
+    // an `extends` chain that hops through a not-yet-cataloged intermediate
+    // parent would silently misclassify as the unclassified fallback. Instead
+    // every raw node is ingested first, then classify_all_cataloged_types()
+    // classifies the whole batch at once, so every chain walk always sees
+    // every parent cataloged so far, regardless of ingestion order. Cleared
+    // once parse() finishes (see there); not needed once classification for
+    // that whole run is done, so it doesn't just double the memory `library`
+    // already holds via each entry's own `.raw` copy.
     UnorderedMap<String, NML_Node> raw_component_types;
 
-    // Catalogs one parsed `<ComponentType>` node: classifies it (see
-    // classify_component_type) and records it into both `library` and
+    // Records one parsed `<ComponentType>` node's raw form into
     // `raw_component_types`, unless a type of that name is already cataloged
     // (first-cataloged-wins, matching the original flat-library behavior).
-    // `source_path` is only used for the warning/error log messages. Returns
-    // false iff the node's `name` attribute is missing/non-string (a
-    // malformed ComponentType) — a duplicate name is not a failure.
-    bool catalog_component_type(const NML_Node &component_type_node, const String &source_path);
+    // Does not classify — see classify_all_cataloged_types. `source_path` is
+    // only used for the warning/error log messages. Returns false iff the
+    // node's `name` attribute is missing/non-string (a malformed
+    // ComponentType) — a duplicate name is not a failure.
+    bool catalog_raw_component_type(const NML_Node &component_type_node, const String &source_path);
+
+    // Classifies every node in `raw_component_types` not yet in `library`
+    // (additive — never clears/rebuilds `library`, so an already-classified
+    // entry's address stays stable across repeated calls). Safe to call
+    // repeatedly as more raw types are cataloged (load_standard_library()
+    // calls it once its whole directory scan is done; parse() calls it again
+    // once ingest_file()'s whole include graph is done) — each call sees
+    // every raw type cataloged so far, so a chain walk never gives up on a
+    // parent merely because it hasn't been reached yet.
+    void classify_all_cataloged_types();
 
     // Determines which of the five categories `node` belongs to by walking
     // its `extends` chain (through `raw_component_types`) up to one of the
