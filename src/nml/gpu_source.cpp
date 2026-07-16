@@ -224,6 +224,21 @@ bool contains_forall(const Vector<TickInstruction> &instructions) {
     return false;
 }
 
+// Whether this instruction list contains a `loadedge` anywhere (inside a forall body, or directly
+// inside an onevent body -- `emit_loadedge` accepts `@edge` in either lexical context). A
+// `loadedge` always needs the shared-basis reconstruction (`U`/`V`/`rank_float4_stride`/
+// `coefficients_<name>`), independent of whether the k^2-tree WALK block is needed (an onevent
+// body's `loadedge` already has its one, specific edge given directly as parameters -- no walk --
+// but still needs the basis to reconstruct that edge's value).
+bool contains_loadedge(const Vector<TickInstruction> &instructions) {
+    bool found = false;
+    for_each_leaf_instruction(instructions, Overloaded{
+        [&](const LoadEdgeInstruction &) { found = true; },
+        [&](const auto &) {},
+    });
+    return found;
+}
+
 // ── operand scan: which reserved/`.alloc` names a function body touches, plus the ordered,
 //    typed list of local (`t0,t1,...` / compare-destination) variables it needs hoisted ────────
 
@@ -429,10 +444,20 @@ String render_cuda_param(const ParamDescriptor &parameter) {
 // Builds every parameter this function needs EXCEPT the trailing dispatch-bound parameter(s)
 // (`neuron_count` for a per-neuron function; the edge-event arrays + `event_count` for a deliver
 // function) -- callers append those themselves, since they differ by function kind.
+//
+// `needs_tree_walk_block` and `needs_shared_basis_block` are deliberately separate flags (rather
+// than one combined "edge-walk" flag): a `forall`/whole-set edge op needs BOTH the k^2-tree walk
+// buffers (to discover the neighbor at all) and the shared basis (if it also does a `loadedge`);
+// an `onevent`/deliver body's `loadedge` already has its one, specific edge given directly as
+// parameters (`source_node`/`target_node`/`edge_slot`, no walk needed) but still needs the shared
+// basis to reconstruct that edge's value -- so it sets `needs_shared_basis_block` alone. Both
+// flags being true together (the per-neuron function's own case whenever it uses `forall`) is what
+// this function still emits identically to before this distinction existed.
 Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
                                                  const unordered_set<String> &edge_variable_names_referenced,
-                                                 bool needs_edge_walk_block, bool needs_rng,
-                                                 const Vector<String> &emit_ports, const AllocIndex &alloc_index,
+                                                 bool needs_tree_walk_block, bool needs_shared_basis_block,
+                                                 bool needs_rng, const Vector<String> &emit_ports,
+                                                 const AllocIndex &alloc_index,
                                                  const Vector<AllocDirective> &alloc_in_order) {
     Vector<ParamDescriptor> parameters;
 
@@ -501,7 +526,10 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
         if (edge_variable_names_referenced.count(name)) peredge_names_touched.push_back(name);
     }
 
-    if (needs_edge_walk_block) {
+    // The k^2-tree walk buffers: only needed to DISCOVER a neighbor at all (`forall`/a whole-set
+    // edge op) -- an onevent body's `loadedge`/`accedge` already has its one, specific edge given
+    // directly as parameters and never walks.
+    if (needs_tree_walk_block) {
         parameters.push_back({"uint", "unsigned int", "internal_node_words", ParamKind::ConstArray});
         parameters.push_back({"uint", "unsigned int", "leaf_node_words", ParamKind::ConstArray});
         parameters.push_back({"uint", "unsigned int", "rank_superblock_table", ParamKind::ConstArray});
@@ -512,22 +540,28 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
         parameters.push_back({"int", "int", "tree_height", ParamKind::Scalar});
         parameters.push_back({"int", "int", "internal_bit_count", ParamKind::Scalar});
         parameters.push_back({"long", "long long", "node_count", ParamKind::Scalar});
+    }
+
+    // Sk's index stride + the per-touched-name sparse delta buffer itself: needed by BOTH
+    // `loadedge` (the Sk-overlay term) and `accedge` (Sk[row,slot] += value) on a peredge var,
+    // whether or not the shared basis below is also needed (weight_matrix.h's
+    // accumulate_edge_delta doc: "Cheap and local -- no basis touched").
+    if (needs_tree_walk_block || !peredge_names_touched.empty()) {
         parameters.push_back({"long", "long long", "max_neighbor_count", ParamKind::Scalar});
+    }
+
+    // The shared basis: needed whenever this function reconstructs a peredge value at all --
+    // `forall` bodies that also `loadedge` (NMDA's `@integrate`), or an onevent body that
+    // `loadedge`s the edge it already knows (no walk, but still needs U/V/Ck to reconstruct it).
+    if (needs_shared_basis_block) {
         parameters.push_back({"long", "long long", "rank_float4_stride", ParamKind::Scalar});
         parameters.push_back({"float4", "float4", "U", ParamKind::ConstArray});
         parameters.push_back({"float4", "float4", "V", ParamKind::ConstArray});
-        for (const String &name : peredge_names_touched) {
-            parameters.push_back({"float", "float", "coefficients_" + name, ParamKind::ConstArray});
-            parameters.push_back({"float", "float", "sparse_delta_" + name, ParamKind::MutableArray});
-        }
-    } else if (!peredge_names_touched.empty()) {
-        // Pure onevent-context accedge on a peredge var: O(1), never touches U/V/Ck (weight_matrix.h's
-        // accumulate_edge_delta doc: "Cheap and local -- no basis touched"), so only Sk + the index
-        // stride are needed, not the full basis/tree-walk block.
-        parameters.push_back({"long", "long long", "max_neighbor_count", ParamKind::Scalar});
-        for (const String &name : peredge_names_touched) {
-            parameters.push_back({"float", "float", "sparse_delta_" + name, ParamKind::MutableArray});
-        }
+    }
+
+    for (const String &name : peredge_names_touched) {
+        if (needs_shared_basis_block) parameters.push_back({"float", "float", "coefficients_" + name, ParamKind::ConstArray});
+        parameters.push_back({"float", "float", "sparse_delta_" + name, ParamKind::MutableArray});
     }
 
     return parameters;
@@ -1202,8 +1236,12 @@ std::optional<FunctionResult> generate_per_neuron_function(const IrProgram &prog
         collect_emit_ports(*stage.second, emit_ports, emit_ports_seen);
     }
 
-    Vector<ParamDescriptor> parameters = build_common_parameters(
-        scan, edge_variable_names_referenced, needs_edge_walk_block, needs_rng, emit_ports, alloc_index, program.alloc);
+    // A per-neuron function's only edge context is `forall`/a whole-set edge op (there is no
+    // onevent-style "already-known edge" here) -- so the tree-walk block and the shared basis are
+    // needed together, whenever either is needed at all.
+    Vector<ParamDescriptor> parameters =
+        build_common_parameters(scan, edge_variable_names_referenced, needs_edge_walk_block, needs_edge_walk_block,
+                                 needs_rng, emit_ports, alloc_index, program.alloc);
     parameters.push_back({"long", "long long", "neuron_count", ParamKind::Scalar});
 
     String function_name = program.component_type_name + "_tick";
@@ -1254,10 +1292,15 @@ FunctionResult generate_deliver_function(const IrProgram &program, const AllocIn
         fail("forall / whole-set edge ops inside an onevent/deliver body are not supported by this ticket's "
              "lowering (the edge is already known from the delivered spike -- no walk is needed)");
     }
+    // An onevent body's edge is already known (source_node/target_node/edge_slot, no walk) -- but a
+    // `loadedge` on a peredge var there still needs the shared basis (U/V/rank_float4_stride/
+    // coefficients_<name>) to reconstruct that edge's value; `accedge` alone never does
+    // (weight_matrix.h: Sk accumulate is O(1), no basis touched).
+    bool needs_shared_basis_block = contains_loadedge(onevent.body);
 
-    Vector<ParamDescriptor> parameters = build_common_parameters(
-        scan, edge_variable_names_referenced, /*needs_edge_walk_block=*/false, needs_rng, emit_ports, alloc_index,
-        program.alloc);
+    Vector<ParamDescriptor> parameters =
+        build_common_parameters(scan, edge_variable_names_referenced, /*needs_tree_walk_block=*/false,
+                                 needs_shared_basis_block, needs_rng, emit_ports, alloc_index, program.alloc);
     parameters.push_back({"int", "int", "source_node_indices", ParamKind::ConstArray});
     parameters.push_back({"int", "int", "target_node_indices", ParamKind::ConstArray});
     parameters.push_back({"int", "int", "edge_slot_indices", ParamKind::ConstArray});

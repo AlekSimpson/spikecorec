@@ -230,6 +230,32 @@ IrProgram build_scatter_probe() {
     return program;
 }
 
+// Regression fixture (review finding on ticket #55): `loadedge` on a `peredge` variable directly
+// inside an `onevent` block, not just `accedge` -- e.g. a Mg-block-style synapse that reads its own
+// current value on spike arrival before updating it. `gpu_source.h` documents `onevent` as a valid
+// `loadedge` context; this is the case that needs the shared-basis buffers (`U`/`V`/
+// `rank_float4_stride`/`coefficients_g`) surfaced on the deliver function even though no `forall`/
+// k^2-tree walk is involved (the edge is already known from the delivered spike).
+IrProgram build_loadedge_in_deliver_probe() {
+    IrProgram program;
+    program.component_type_name = "LoadEdgeInDeliverProbe";
+    program.alloc = {
+        PeredgeDirective{"g"},
+        ParamConstantDirective{"weight", nullopt},
+    };
+    program.tick.deliver = {
+        OnEventInstruction{
+            "in",
+            {
+                LoadEdgeInstruction{"t0", "g", EdgeSetReference::CurrentEdge},
+                BinaryInstruction{BinaryOpcode::Add, "t1", "t0", "weight"},
+                AccumulateEdgeInstruction{"g", EdgeSetReference::CurrentEdge, "t1"},
+            },
+        },
+    };
+    return program;
+}
+
 } // namespace
 
 TEST(GpuSource, glif1_leaky_integrate_and_fire_compiles) {
@@ -300,6 +326,31 @@ TEST(GpuSource, scatter_probe_whole_set_accedge_compiles) {
 
     EXPECT_NE(source.cuda_source.find("downstream_accumulator[forall_neighbor_node_0] += scatter_value;"),
               String::npos);
+}
+
+// Regression test (review finding on ticket #55): a `loadedge` directly inside an `onevent` body
+// (no `forall`, no k^2-tree walk -- the edge is already known as source_node/target_node/edge_slot)
+// must still get the shared-basis buffers the reconstruction needs. Before the fix,
+// generate_deliver_function hardcoded needs_edge_walk_block=false unconditionally, so this would
+// have emitted a reference to undeclared U/V/coefficients_g/rank_float4_stride.
+TEST(GpuSource, loadedge_inside_onevent_deliver_body_compiles) {
+    GpuSource source = lower_ir_program_to_gpu_source(build_loadedge_in_deliver_probe());
+    EXPECT_NE(source.msl_source.find("kernel void LoadEdgeInDeliverProbe_deliver_in("), String::npos);
+    EXPECT_NE(source.msl_source.find("const device float4 *U"), String::npos);
+    EXPECT_NE(source.msl_source.find("const device float4 *V"), String::npos);
+    EXPECT_NE(source.msl_source.find("const device float *coefficients_g"), String::npos);
+    EXPECT_NE(source.msl_source.find("constant long &rank_float4_stride"), String::npos);
+    EXPECT_NE(source.msl_source.find("edge_basis_u_row = U + (long)source_node * rank_float4_stride;"),
+              String::npos);
+    EXPECT_NE(source.msl_source.find("edge_basis_v_row = V + (long)target_node * rank_float4_stride;"),
+              String::npos);
+    EXPECT_NE(source.msl_source.find("sparse_delta_g[(long)source_node * max_neighbor_count + edge_slot] += t1;"),
+              String::npos);
+    EXPECT_TRUE(compiles_as_msl(source.msl_source, "loadedge_in_deliver"));
+
+    EXPECT_NE(source.cuda_source.find("__global__ void LoadEdgeInDeliverProbe_deliver_in("), String::npos);
+    EXPECT_NE(source.cuda_source.find("const float4 *U"), String::npos);
+    EXPECT_NE(source.cuda_source.find("const float4 *V"), String::npos);
 }
 
 TEST(GpuSource, peredge_variable_used_as_plain_operand_is_rejected) {

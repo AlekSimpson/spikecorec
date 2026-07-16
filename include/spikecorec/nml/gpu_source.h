@@ -166,20 +166,34 @@ namespace spikecorec::nml {
 // Every generated function's parameter list is derived structurally from `program.alloc`, in
 // `.alloc`'s own declaration order, filtered to only the names that function's own instructions
 // actually reference (so the per-neuron `..._tick` function and each `..._deliver_<port>` function
-// typically have different, independently-minimal signatures) -- followed by `rng_state` (if used)
-// then one `emit_<port>` per port (if used), then the per-edge-walk block (`U`, `V`,
-// `internal_node_words`, `leaf_node_words`, `rank_superblock_table`, `rank_subblock_table`,
-// `branching_factor`, `superblock_size_words`, `padded_node_count`, `tree_height`,
-// `internal_bit_count`, `node_count`, `max_neighbor_count`, `rank_float4_stride`, then one
-// `coefficients_<name>`/`sparse_delta_<name>` pair per referenced `peredge` name -- present only if
-// this function uses `forall`/a whole-set edge op/`loadedge`/`accedge` on a `peredge` name), then
-// the dispatch-bound parameter (`neuron_count` for the per-neuron function; `source_node_indices`/
-// `target_node_indices`/`edge_slot_indices`/`event_count` for a deliver function). MSL parameters
-// carry sequential `[[ buffer(N) ]]` indices in this same order (mirroring every existing kernel in
-// src/metal/kernels.metal); CUDA parameters are positional in the same order. When #6 assembles
-// many types' functions together, the shared preamble (k^2-tree walk helpers, RNG helpers) should
-// be emitted once for the whole assembled file, not once per type -- this ticket emits it per
-// program since each example here is compiled as its own standalone translation unit.
+// typically have different, independently-minimal signatures) -- followed by `rng_state` (if used),
+// then one `emit_<port>` per port (if used), then up to three independently-gated peredge-related
+// groups (a function can need any combination of these, not just "all or nothing"):
+//   1. the k^2-tree WALK buffers (`internal_node_words`, `leaf_node_words`, `rank_superblock_table`,
+//      `rank_subblock_table`, `branching_factor`, `superblock_size_words`, `padded_node_count`,
+//      `tree_height`, `internal_bit_count`, `node_count`) -- present only if this function
+//      discovers a neighbor via `forall`/a whole-set edge op (never true for a deliver function --
+//      an onevent body's edge is already given directly as parameters, see below);
+//   2. `max_neighbor_count` -- present whenever (1) is needed, or any `peredge` name is touched by
+//      `loadedge`/`accedge` at all (it's the Sk index stride, needed even for an O(1) `accedge`
+//      that never touches the basis);
+//   3. the shared basis (`rank_float4_stride`, `U`, `V`, then one `coefficients_<name>` per
+//      `loadedge`/`accedge`-touched `peredge` name) -- present whenever this function does a
+//      `loadedge` on a peredge var ANYWHERE, whether or not (1) is also needed: a `forall` body's
+//      `loadedge` (NMDA's `@integrate`) needs both the walk (to find the neighbor) and the basis
+//      (to reconstruct its value); an `onevent` body's `loadedge` (e.g. a synapse reading its own
+//      current value on spike arrival before updating it) needs only the basis -- its edge is
+//      already known, so no walk. Each touched `peredge` name's own `sparse_delta_<name>` (Sk) is
+//      always emitted (accumulate target for `accedge`, overlay term for `loadedge`), independent
+//      of whether the basis is present.
+// ...then the dispatch-bound parameter (`neuron_count` for the per-neuron function;
+// `source_node_indices`/`target_node_indices`/`edge_slot_indices`/`event_count` for a deliver
+// function). MSL parameters carry sequential `[[ buffer(N) ]]` indices in this same order
+// (mirroring every existing kernel in src/metal/kernels.metal); CUDA parameters are positional in
+// the same order. When #6 assembles many types' functions together, the shared preamble (k^2-tree
+// walk helpers, RNG helpers) should be emitted once for the whole assembled file, not once per type
+// -- this ticket emits it per program since each example here is compiled as its own standalone
+// translation unit.
 struct GpuSource {
     String msl_source;
     String cuda_source;
