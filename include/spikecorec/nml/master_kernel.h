@@ -118,7 +118,10 @@ struct ModelRuntimeBuffers {
     f32 *network_inputs = nullptr;         // [total_neuron_count]
     s64 *last_spiked = nullptr;            // [total_neuron_count]
     s32 *next_active_neuron_indices = nullptr; // [total_neuron_count] -- active-set enqueue target
-    s32 *next_active_neuron_count = nullptr;   // [1]
+    s32 *next_active_neuron_count = nullptr;   // [1] -- step_tick resets this to 0 at the start of
+                                                // every call (matching SpikeEngine::step_simulation's
+                                                // own per-tick reset, src/core/engine.cpp), so a
+                                                // caller need only zero-initialize it once up front
     s32 *active_generation = nullptr;          // [total_neuron_count]
 
     // One flag buffer per distinct EventPort name emitted anywhere in the model's Cell-category

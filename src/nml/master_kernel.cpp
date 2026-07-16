@@ -5,7 +5,6 @@
 #endif
 
 #include <cstring>
-#include <type_traits>
 #include <unordered_set>
 
 #include "spikecorec/nml/master_kernel.h"
@@ -26,6 +25,16 @@ void fail(const String &message) {
     log::throw_runtime_error(log::logger(), "master_kernel: " + message);
 }
 
+// std::visit helper matching the SAME idiom already used at every other std::visit site in this
+// codebase (ir.cpp, gpu_source.cpp) -- keeps this file's visitor style consistent with the rest of
+// the NML pipeline rather than introducing its own `if constexpr` alternative.
+template <class... Alternatives>
+struct Overloaded : Alternatives... {
+    using Alternatives::operator()...;
+};
+template <class... Alternatives>
+Overloaded(Alternatives...) -> Overloaded<Alternatives...>;
+
 // ── emit-port discovery (a small, independent scan -- see master_kernel.h's own header comment
 // for why this is intentionally NOT sourced from gpu_source.cpp's internal bookkeeping the way the
 // per-neuron-function parameter list is: a mismatch here only means "propagate looks at the wrong
@@ -35,23 +44,28 @@ void collect_emit_ports_recursive(const Vector<TickInstruction> &instructions, V
                                    unordered_set<String> &seen) {
     for (const auto &instruction : instructions) {
         std::visit(
-            [&](const auto &operation) {
-                using T = std::decay_t<decltype(operation)>;
-                if constexpr (std::is_same_v<T, EmitInstruction>) {
-                    if (seen.insert(operation.port_name).second) ports_in_order.push_back(operation.port_name);
-                } else if constexpr (std::is_same_v<T, IfInstruction>) {
-                    collect_emit_ports_recursive(operation.then_body, ports_in_order, seen);
-                    for (const auto &branch : operation.else_if_branches) {
+            Overloaded{
+                [&](const EmitInstruction &emit_instruction) {
+                    if (seen.insert(emit_instruction.port_name).second) {
+                        ports_in_order.push_back(emit_instruction.port_name);
+                    }
+                },
+                [&](const IfInstruction &if_instruction) {
+                    collect_emit_ports_recursive(if_instruction.then_body, ports_in_order, seen);
+                    for (const auto &branch : if_instruction.else_if_branches) {
                         collect_emit_ports_recursive(branch.body, ports_in_order, seen);
                     }
-                    if (operation.else_body.has_value()) {
-                        collect_emit_ports_recursive(*operation.else_body, ports_in_order, seen);
+                    if (if_instruction.else_body.has_value()) {
+                        collect_emit_ports_recursive(*if_instruction.else_body, ports_in_order, seen);
                     }
-                } else if constexpr (std::is_same_v<T, ForAllInstruction>) {
-                    collect_emit_ports_recursive(operation.body, ports_in_order, seen);
-                } else if constexpr (std::is_same_v<T, OnEventInstruction>) {
-                    collect_emit_ports_recursive(operation.body, ports_in_order, seen);
-                }
+                },
+                [&](const ForAllInstruction &for_all_instruction) {
+                    collect_emit_ports_recursive(for_all_instruction.body, ports_in_order, seen);
+                },
+                [&](const OnEventInstruction &on_event_instruction) {
+                    collect_emit_ports_recursive(on_event_instruction.body, ports_in_order, seen);
+                },
+                [&](const auto &) {},
             },
             instruction.operation);
     }
@@ -297,23 +311,24 @@ GpuSource build_propagate_kernel_gpu_source() {
         "    const device float4  *V                          [[ buffer(3) ]],\n"
         "    constant long        &rank_float4_stride         [[ buffer(4) ]],\n"
         "    constant float       &constant_weight            [[ buffer(5) ]],\n"
-        "    const device uint    *internal_node_words        [[ buffer(6) ]],\n"
-        "    const device uint    *leaf_node_words             [[ buffer(7) ]],\n"
-        "    const device uint    *rank_superblock_table      [[ buffer(8) ]],\n"
-        "    const device ushort  *rank_subblock_table        [[ buffer(9) ]],\n"
-        "    constant int         &branching_factor           [[ buffer(10) ]],\n"
-        "    constant int         &superblock_size_words      [[ buffer(11) ]],\n"
-        "    constant int         &padded_node_count          [[ buffer(12) ]],\n"
-        "    constant int         &tree_height                [[ buffer(13) ]],\n"
-        "    constant int         &internal_bit_count         [[ buffer(14) ]],\n"
-        "    constant long        &neuron_count               [[ buffer(15) ]],\n"
-        "    constant long        &max_neighbor_count         [[ buffer(16) ]],\n"
-        "    device float         *network_inputs             [[ buffer(17) ]],\n"
-        "    device long          *last_spiked                [[ buffer(18) ]],\n"
-        "    device int           *next_active_neuron_indices [[ buffer(19) ]],\n"
-        "    device int           *next_active_neuron_count   [[ buffer(20) ]],\n"
-        "    device int           *active_generation          [[ buffer(21) ]],\n"
-        "    device bool          *emit_spike                 [[ buffer(22) ]],\n"
+        "    constant int         &using_constant_weight      [[ buffer(6) ]],\n"
+        "    const device uint    *internal_node_words        [[ buffer(7) ]],\n"
+        "    const device uint    *leaf_node_words             [[ buffer(8) ]],\n"
+        "    const device uint    *rank_superblock_table      [[ buffer(9) ]],\n"
+        "    const device ushort  *rank_subblock_table        [[ buffer(10) ]],\n"
+        "    constant int         &branching_factor           [[ buffer(11) ]],\n"
+        "    constant int         &superblock_size_words      [[ buffer(12) ]],\n"
+        "    constant int         &padded_node_count          [[ buffer(13) ]],\n"
+        "    constant int         &tree_height                [[ buffer(14) ]],\n"
+        "    constant int         &internal_bit_count         [[ buffer(15) ]],\n"
+        "    constant long        &neuron_count               [[ buffer(16) ]],\n"
+        "    constant long        &max_neighbor_count         [[ buffer(17) ]],\n"
+        "    device float         *network_inputs             [[ buffer(18) ]],\n"
+        "    device long          *last_spiked                [[ buffer(19) ]],\n"
+        "    device int           *next_active_neuron_indices [[ buffer(20) ]],\n"
+        "    device int           *next_active_neuron_count   [[ buffer(21) ]],\n"
+        "    device int           *active_generation          [[ buffer(22) ]],\n"
+        "    device bool          *emit_spike                 [[ buffer(23) ]],\n"
         "    uint thread_id [[ thread_position_in_grid ]]\n"
         ") {\n"
         "    long neuron_index = (long)thread_id;\n"
@@ -335,7 +350,7 @@ GpuSource build_propagate_kernel_gpu_source() {
         "        if (child < 0) continue;\n"
         "\n"
         "        float weight = constant_weight;\n"
-        "        if (constant_weight == 0.0f) {\n"
+        "        if (using_constant_weight == 0) {\n"
         "            const device float4 *v_row = V + (long)child * rank_float4_stride;\n"
         "            float dot_product = 0.0f;\n"
         "            for (long lane = 0; lane < rank_float4_stride; ++lane) {\n"
@@ -377,6 +392,7 @@ GpuSource build_propagate_kernel_gpu_source() {
         "    const float4          *V,\n"
         "    long long             rank_float4_stride,\n"
         "    float                 constant_weight,\n"
+        "    int                   using_constant_weight,\n"
         "    const unsigned int    *internal_node_words,\n"
         "    const unsigned int    *leaf_node_words,\n"
         "    const unsigned int    *rank_superblock_table,\n"
@@ -414,7 +430,7 @@ GpuSource build_propagate_kernel_gpu_source() {
         "        if (child < 0) continue;\n"
         "\n"
         "        float weight = constant_weight;\n"
-        "        if (constant_weight == 0.0f) {\n"
+        "        if (using_constant_weight == 0) {\n"
         "            const float4 *v_row = V + (long long)child * rank_float4_stride;\n"
         "            float dot_product = 0.0f;\n"
         "            for (long long lane = 0; lane < rank_float4_stride; ++lane) {\n"
@@ -445,10 +461,10 @@ GpuSource build_propagate_kernel_gpu_source() {
 
     source.functions = {GpuFunctionSignature{
         MASTER_KERNEL_PROPAGATE_NAME,
-        {"tick", "next_tick", "U", "V", "rank_float4_stride", "constant_weight", "internal_node_words",
-         "leaf_node_words", "rank_superblock_table", "rank_subblock_table", "branching_factor",
-         "superblock_size_words", "padded_node_count", "tree_height", "internal_bit_count", "neuron_count",
-         "max_neighbor_count", "network_inputs", "last_spiked", "next_active_neuron_indices",
+        {"tick", "next_tick", "U", "V", "rank_float4_stride", "constant_weight", "using_constant_weight",
+         "internal_node_words", "leaf_node_words", "rank_superblock_table", "rank_subblock_table",
+         "branching_factor", "superblock_size_words", "padded_node_count", "tree_height", "internal_bit_count",
+         "neuron_count", "max_neighbor_count", "network_inputs", "last_spiked", "next_active_neuron_indices",
          "next_active_neuron_count", "active_generation", "emit_spike"}}};
     return source;
 }
@@ -584,6 +600,16 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         builder.dispatch(drain_kernel_handle_, launch_config_for(total_neuron_count_));
     }
 
+    // Reset the active-set enqueue counter to 0 before this tick's propagate dispatches run --
+    // matches the real engine's own per-tick reset (src/core/engine.cpp resets
+    // next_active_neuron_count to 0 once per tick, before the dispatch that performs the enqueue).
+    // The propagate kernel's `active_generation` dedup only prevents re-enqueuing the SAME neuron
+    // WITHIN this tick (it compares against next_tick, which is constant for the whole tick); it
+    // does nothing to bound the counter ACROSS ticks. Without this reset, `position` grows without
+    // bound tick over tick and eventually writes past next_active_neuron_indices's own
+    // [total_neuron_count] allocation.
+    *buffers.next_active_neuron_count = 0;
+
     // fixed k^2-tree propagate/scatter + active-set-enqueue (stage 6/9): one dispatch per distinct
     // emit-port name, each over the WHOLE model's neuron range (a spiking neuron's downstream
     // targets come from the model-wide k^2-tree/WeightMatrix, not a population-scoped one).
@@ -601,7 +627,8 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         builder.add_pointer(buffers.weights->U_matrix.get_contents());
         builder.add_pointer(buffers.weights->V_matrix.get_contents());
         builder.add_s64(buffers.weights->rank_float4_stride);
-        builder.add_f32(buffers.weights->using_constant_weight ? buffers.weights->constant_weight : 0.0f);
+        builder.add_f32(buffers.weights->constant_weight);
+        builder.add_s32(buffers.weights->using_constant_weight ? 1 : 0);
         builder.add_pointer(buffers.weights->k2tree.internal_node_words.get_contents());
         builder.add_pointer(buffers.weights->k2tree.leaf_node_words.get_contents());
         builder.add_pointer(buffers.weights->k2tree.rank_superblock_table.get_contents());

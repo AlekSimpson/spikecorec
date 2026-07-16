@@ -390,3 +390,188 @@ TEST(MasterKernel, reproduces_hardcoded_lif_membrane_trajectory_and_spike_timing
     }
     EXPECT_TRUE(any_spike_recorded);
 }
+
+// ── regression: next_active_neuron_count must be reset every tick, not accumulated ────────────────
+//
+// Isolates AssembledModel::step_tick's own active-set-enqueue bookkeeping (no reference SpikeEngine
+// needed here) and asserts the counter's exact value every tick, rather than relying on the
+// out-of-bounds write a missing reset causes: a regression back to "never reset" corrupts memory
+// past next_active_neuron_indices's own [total_neuron_count] allocation, but Metal buffers are
+// page-padded, so that corruption would NOT reliably crash or fail any assertion that doesn't
+// directly inspect the counter -- this test inspects it directly, every tick.
+
+TEST(MasterKernel, next_active_neuron_count_is_reset_every_tick_not_accumulated_across_ticks) {
+    const f32 resting_mp = 0.0f;
+    const f32 decay_rate = 0.1f;
+    const f32 spike_threshold = 1.0f;
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 3;
+
+    // No edges at all (unlike the equivalence test above): this isolates the reset property from
+    // the k^2-tree scatter/dedup logic entirely -- neuron 0 is the only neuron that ever receives
+    // input (the external pulse below), so its own membrane trajectory is the only one that needs
+    // hand-verifying, and every spike enqueues exactly itself (no downstream child).
+    vector<vector<s32>> adjacency = {{}, {}, {}};
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(
+        build_lif_equivalent_type_entry("LifEquivalentCell", "lifEquivalentInstance", 1.0f, decay_rate, resting_mp,
+                                         spike_threshold));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    spikecorec::Vector<IrProgram> programs = {
+        build_lif_equivalent_program("LifEquivalentCell", decay_rate, resting_mp, spike_threshold)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count,
+              resting_mp);
+
+    WeightMatrix weights(adjacency, /*rank=*/1);
+
+    AssembledModel assembled_model(model, programs);
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    const f32 external_pulse = 1.5f;
+
+    // Neuron 0's own membrane trajectory (matching the equivalence test's own worked arithmetic
+    // above): v = 1.35, 1.215, 1.0935 on ticks 1/2/3 (each > vth = 1.0, so it spikes and enqueues
+    // exactly itself -- no children, since this fixture has no edges), then 0.98415, 0.885735 on
+    // ticks 4/5 (sub-threshold, no spike, no enqueue).
+    const vector<s32> expected_next_active_count_by_tick = {0, 1, 1, 1, 0, 0};
+
+    for (s64 tick = 0; tick < (s64)expected_next_active_count_by_tick.size(); ++tick) {
+        f32 this_tick_external_input = (tick == 1) ? external_pulse : 0.0f;
+        allocation.cell_state.get_contents()[0] += this_tick_external_input;
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+
+        EXPECT_EQ(*buffers.next_active_neuron_count, expected_next_active_count_by_tick[(usize)tick])
+            << "tick=" << tick;
+        // Never exceeds the buffer's own allocated element count regardless of how many neurons
+        // spiked this tick -- the property a missing reset violates.
+        ASSERT_LE(*buffers.next_active_neuron_count, (s32)total_neuron_count) << "tick=" << tick;
+    }
+}
+
+// ── regression: a genuine constant weight of exactly 0 must not fall back to the U/V basis ────────
+//
+// `using_constant_weight` must be threaded through as its own explicit flag rather than overloaded
+// onto `constant_weight == 0.0f`. Note that set_constant_weight(0.0f) alone would NOT discriminate
+// between the two implementations here: it deliberately fills U/V so their own dot product already
+// reconstructs the same constant_weight value (weight_matrix.cpp's own comment on
+// set_constant_weight explains this is so get()/neighbor_weights() stay correct too) -- so a
+// sentinel-based `constant_weight == 0.0f` check would coincidentally still compute 0 in that exact
+// state. This test instead leaves U/V at their construction-time random values (a fixed weight_seed
+// for reproducibility) and sets `constant_weight`/`using_constant_weight` directly (both are public
+// fields, unlike the set_constant_weight() setter, which would re-sync U/V to match) -- so U.V for
+// edge (0,1) is a real nonzero value while constant_weight is genuinely 0, and the propagated
+// weight must come out exactly 0.0f (from constant_weight), not that nonzero U.V dot product.
+
+TEST(MasterKernel, a_genuine_zero_constant_weight_propagates_exactly_zero_not_the_uv_basis) {
+    const f32 resting_mp = 0.0f;
+    const f32 decay_rate = 0.1f;
+    const f32 spike_threshold = 1.0f;
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 3;
+
+    vector<vector<s32>> adjacency = {{1}, {}, {}}; // neuron 0 -> neuron 1 only
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(
+        build_lif_equivalent_type_entry("LifEquivalentCell", "lifEquivalentInstance", 1.0f, decay_rate, resting_mp,
+                                         spike_threshold));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    spikecorec::Vector<IrProgram> programs = {
+        build_lif_equivalent_program("LifEquivalentCell", decay_rate, resting_mp, spike_threshold)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count,
+              resting_mp);
+
+    // A fixed weight_seed leaves U/V at deterministic, real (non-zero) random-normal values (see
+    // WeightMatrix::WeightMatrix) -- i.e. deliberately NOT calling set_constant_weight(), so U/V
+    // for edge (0,1) do not happen to reconstruct 0.
+    WeightMatrix weights(adjacency, /*rank=*/1, /*check_indexing=*/true, /*max_neighbor_count=*/-1,
+                         /*weight_seed=*/42);
+    ASSERT_NE(weights.get(0, 1), 0.0f) << "U/V for edge (0,1) coincidentally reconstruct 0 -- this "
+                                           "test's own premise depends on a genuinely nonzero U.V "
+                                           "dot product to disagree with constant_weight=0";
+
+    // Both fields are public (unlike set_constant_weight(), which would also re-sync U/V to match
+    // this value) -- so U/V stay at the real, nonzero values checked above while constant_weight is
+    // genuinely 0.
+    weights.constant_weight = 0.0f;
+    weights.using_constant_weight = true;
+
+    AssembledModel assembled_model(model, programs);
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    const f32 external_pulse = 1.5f; // raises neuron 0 above threshold on tick 1's own integrate step
+
+    // Tick 0: zero-input priming tick, no spike. Tick 1: external pulse drives neuron 0 to v=1.35 >
+    // vth=1.0, so it spikes and propagate scatters its (genuinely zero) weight into network_inputs[1].
+    assembled_model.step_tick(buffers, dt, /*tick=*/0, /*next_tick=*/1);
+    allocation.cell_state.get_contents()[0] += external_pulse;
+    assembled_model.step_tick(buffers, dt, /*tick=*/1, /*next_tick=*/2);
+
+    EXPECT_TRUE(last_spiked.get_contents()[0] == 1) << "neuron 0 did not spike on tick 1 as expected";
+    EXPECT_EQ(network_inputs.get_contents()[1], 0.0f);
+}
