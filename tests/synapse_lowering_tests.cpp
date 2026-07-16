@@ -120,7 +120,8 @@ const String DUMMY_CELL_COMPONENT_TYPE =
 
 // Wraps one synapse ComponentType (either a real std-lib tag with an empty
 // `synapse_component_type_xml`, or a custom inline declaration) plus one
-// bound instance into a minimal one-neuron self-loop network, runs it
+// bound instance into a minimal two-neuron network (node 0 -> node 1; K2Tree
+// rejects self-loops, so pre and post must be distinct nodes), runs it
 // through parse -> resolve_and_lower -> build_model_specification, and
 // returns the resulting synapse TypeLibraryEntry.
 TypeLibraryEntry build_synapse_type_library_entry(
@@ -134,9 +135,9 @@ TypeLibraryEntry build_synapse_type_library_entry(
         + synapse_component_type_xml +
         "  <" + synapse_tag + " id=\"synapseInstance\" " + synapse_instance_attributes + "/>"
         "  <network id=\"Net\">"
-        "    <population id=\"Pop\" component=\"dummyCellInstance\" size=\"1\"/>"
-        "    <projection id=\"SelfLoop\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"synapseInstance\">"
-        "      <connection id=\"0\" preCellId=\"Pop/0/dummyCellInstance\" postCellId=\"Pop/0/dummyCellInstance\"/>"
+        "    <population id=\"Pop\" component=\"dummyCellInstance\" size=\"2\"/>"
+        "    <projection id=\"Proj\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"synapseInstance\">"
+        "      <connection id=\"0\" preCellId=\"Pop/0/dummyCellInstance\" postCellId=\"Pop/1/dummyCellInstance\"/>"
         "    </projection>"
         "  </network>"
         "</neuroml>");
@@ -558,9 +559,9 @@ TEST(SynapseLoweringErrors, lower_all_synapse_types_skips_non_synapse_type_libra
         "  <DummyCell id=\"dummyCellInstance\" C=\"1.0e-10\"/>"
         "  <expOneSynapse id=\"synapseInstance\" gbase=\"1nS\" erev=\"0mV\" tauDecay=\"3ms\"/>"
         "  <network id=\"Net\">"
-        "    <population id=\"Pop\" component=\"dummyCellInstance\" size=\"1\"/>"
-        "    <projection id=\"SelfLoop\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"synapseInstance\">"
-        "      <connection id=\"0\" preCellId=\"Pop/0/dummyCellInstance\" postCellId=\"Pop/0/dummyCellInstance\"/>"
+        "    <population id=\"Pop\" component=\"dummyCellInstance\" size=\"2\"/>"
+        "    <projection id=\"Proj\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"synapseInstance\">"
+        "      <connection id=\"0\" preCellId=\"Pop/0/dummyCellInstance\" postCellId=\"Pop/1/dummyCellInstance\"/>"
         "    </projection>"
         "  </network>"
         "</neuroml>");

@@ -865,9 +865,9 @@ TEST(CellLoweringGlifFamily, lower_all_cell_types_skips_non_cell_type_library_en
         "  <GLIF1Cell id=\"glif1Instance\" C=\"1.0e-10\" gL=\"1.0e-8\" EL=\"-70mV\" vth=\"-50mV\" vreset=\"-70mV\" t_ref=\"5ms\"/>"
         "  <expOneSynapse id=\"excSynapse\" gbase=\"1nS\" erev=\"0mV\" tauDecay=\"3ms\"/>"
         "  <network id=\"Net\">"
-        "    <population id=\"Pop\" component=\"glif1Instance\" size=\"1\"/>"
-        "    <projection id=\"SelfLoop\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"excSynapse\">"
-        "      <connection id=\"0\" preCellId=\"Pop/0/glif1Instance\" postCellId=\"Pop/0/glif1Instance\"/>"
+        "    <population id=\"Pop\" component=\"glif1Instance\" size=\"2\"/>"
+        "    <projection id=\"Proj\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"excSynapse\">"
+        "      <connection id=\"0\" preCellId=\"Pop/0/glif1Instance\" postCellId=\"Pop/1/glif1Instance\"/>"
         "    </projection>"
         "  </network>"
         "</neuroml>");
