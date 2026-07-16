@@ -38,19 +38,21 @@ namespace spikecorec::nml {
 // (Children-based sub-mechanism composition, e.g. `blockingPlasticSynapse`'s
 // real `plasticityFactor`/`blockFactor`) throws -- out of Phase-1 scope, per
 // the IR spec's own NMDA example eliding the Mg-block. A `peredge` state
-// variable's own `TimeDerivative` is not lowered into an explicit decay
-// instruction -- arch §4.3's shared low-rank-basis + sparse-delta-buffer
-// scheme is pure memory compression (Read `U·diag(Ck)·Vᵀ + Sk`, Update
-// `Sk[edge]+=x`, Refit re-fits the plane to current values and clears the
-// scratchpad -- none of the three integrates an ODE), so it does NOT
-// already provide per-edge decay; a `peredge` variable's time-evolution is
-// simply deferred/unspecified in Phase 1, matching the provisional IR
-// spec's own NMDA example (which declares `param tau` but never references
-// it in `.tick`, and likewise never decays its per-edge `g`). A synapse
-// that actually declares a `TimeDerivative` gets a build-time warning (not
-// a throw -- the emitted IR is still spec-conformant) so a future synapse
-// with genuine decay dynamics doesn't lose it silently; see
-// synapse_lowering.cpp.
+// variable's own `TimeDerivative` IS lowered -- but only when its
+// right-hand side matches the recognized linear-decay shape
+// (`detect_linear_decay_shape`, shared with cell_lowering.cpp's own
+// direct-mutation case). Per-edge storage is accumulate-only (arch §4.3:
+// `accedge` is `Sk[edge]+=value`; there is no direct "set" op), so a decay
+// can't be applied in place the way cell-side lowering does -- instead it's
+// expressed as read-decay-writeback-delta: `loadedge` the current value,
+// compute what it decays to, `accedge` the DIFFERENCE back so the
+// reconstructed read reflects the decayed value next tick (see
+// synapse_lowering.cpp). A `TimeDerivative` that does NOT match the
+// recognized decay shape still gets a build-time warning (not a throw --
+// the emitted IR is still spec-conformant) and is silently dropped from
+// `.tick`, matching the old behavior -- a general per-edge forward-Euler
+// integration for an arbitrary right-hand side is out of this ticket's
+// scope.
 
 // Lowers one Synapse-category `TypeLibraryEntry` to its `IrProgram`. Throws
 // std::runtime_error if `synapse_entry.category != TypeLibraryCategory::Synapse`,

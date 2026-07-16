@@ -135,6 +135,30 @@ private:
 void lower_time_derivative(const String &state_variable_name, const String &right_hand_side_text,
                             Vector<TickInstruction> &output, LoweringContext &context);
 
+// ── Linear-decay-shape detection (IR spec §3.3 `expdecay dst,a,tau` =
+// `a*exp(-dt/tau)`) -- exposed (ticket #51 revision) so synapse_lowering.cpp
+// can drive its own per-edge accumulate-only decay writeback (`loadedge` the
+// old value, `expdecay`/target-shift to the new one, `accedge` the delta)
+// off the exact same recognized shape `lower_time_derivative` uses for the
+// direct-mutation cell-side case. ────────────────────────────────────────
+
+// A right-hand side recognized as exponential decay: `target` is `"0"` for
+// `-state/tau`, else the identifier/literal a `(target-state)/tau` shape
+// decays toward.
+struct LinearDecayShape {
+    String target;
+    String time_constant;
+};
+
+// Recognizes exactly two shapes (arch §3.2 TimeDerivative; "keep it simple
+// and pattern-based" -- not a general symbolic linearity prover):
+//   1. `(target - state) / tau`, where `target`/`tau` are each a bare
+//      identifier or number literal that isn't `state` itself and doesn't
+//      reference `network_inputs`.
+//   2. `-state / tau` (equivalent to target 0 -- after-spike-current decay).
+// Returns nullopt for anything else.
+std::optional<LinearDecayShape> detect_linear_decay_shape(const ExpressionNode &right_hand_side, const String &state_variable_name);
+
 // Renders an f64 back to a literal token suitable for a `.alloc`
 // `ParamConstantDirective`/`.tick` operand (`%.17g`, round-trippable).
 String format_literal(f64 value);

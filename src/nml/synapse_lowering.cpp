@@ -182,32 +182,41 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     // a conductance synapse's `g·(erev−v)` needs no special cell-side case
     // -- it is just this type's own DerivedVariable exposing "i") -- always
     // `forall neuron_in { loadedge ...; ... }` (IR spec §4's NMDA example),
-    // uniformly for every synapse now (see this file's header comment). No
-    // explicit per-edge decay instruction is emitted (see
-    // synapse_lowering.h's header comment for why this is spec-conformant,
-    // not an oversight) -- each peredge state variable is `loadedge`'d into
-    // a name derived from the variable itself (`edge_<name>`, never a `tN`
-    // temp) so it stays valid across however many subsequent statements the
-    // forall body's own DerivedVariable computations need (this is also
-    // what folds a conductance-based synapse's `require v`-driven
-    // `g·(erev−v)` into the exact same generic path a current-based
-    // synapse's trivial `i = g` identity takes -- `lower_all_derived_variables`
-    // below has no conductance-vs-current special case; it just evaluates
-    // whichever expression the type's own `i` DerivedVariable declares),
-    // without colliding with their OWN per-statement-reset `tN` counter.
+    // uniformly for every synapse now (see this file's header comment). Each
+    // peredge state variable is `loadedge`'d into a name derived from the
+    // variable itself (`edge_<name>`, never a `tN` temp) so it stays valid
+    // across however many subsequent statements the forall body's own
+    // DerivedVariable computations need (this is also what folds a
+    // conductance-based synapse's `require v`-driven `g·(erev−v)` into the
+    // exact same generic path a current-based synapse's trivial `i = g`
+    // identity takes -- `lower_all_derived_variables` below has no
+    // conductance-vs-current special case; it just evaluates whichever
+    // expression the type's own `i` DerivedVariable declares), without
+    // colliding with their OWN per-statement-reset `tN` counter.
     //
-    // A synapse that actually declares a `TimeDerivative` has it silently
-    // dropped from `.tick` below (unlike every other unsupported shape in
-    // this file, which throws) -- the current behavior is intentional/
-    // spec-conformant (see synapse_lowering.h), but a silent drop is still
-    // worth a diagnostic so a future synapse with genuine decay dynamics
-    // doesn't lose it without at least a build-time signal.
+    // A state variable whose `TimeDerivative` matches the recognized
+    // linear-decay shape (`detect_linear_decay_shape`, shared with
+    // cell_lowering.cpp's direct-mutation case via expression_lowering.h) IS
+    // now lowered -- per-edge storage is accumulate-only (arch §4.3:
+    // `accedge` is `Sk[edge]+=value`, there is no direct "set" op), so decay
+    // is expressed as read-decay-writeback-delta: `loadedge` the current
+    // value, `expdecay` (or the 3-instruction non-zero-target form) it to
+    // what it should decay to, `accedge` the DIFFERENCE back so the next
+    // tick's `loadedge` reconstructs the decayed value. The decayed result is
+    // written into the same `edge_<name>` register `peredge_aliases` already
+    // points every later reference of this variable at, so it decays BEFORE
+    // the DerivedVariable computations below read it (mirroring how the old
+    // aggregatable path decayed `g` before contributing it). A
+    // `TimeDerivative` that does NOT match the recognized shape is still
+    // silently dropped from `.tick` (unlike every other unsupported shape in
+    // this file, which throws) -- general per-edge forward-Euler integration
+    // for an arbitrary right-hand side is out of this ticket's scope -- but a
+    // silent drop is still worth a diagnostic so a future synapse with
+    // genuine non-decay dynamics doesn't lose it without at least a
+    // build-time signal.
+    UnorderedMap<String, String> time_derivative_rhs_of_variable;
     for (const auto &time_derivative : synapse.time_derivatives) {
-        log::logger().warn(
-            "synapse_lowering: '{}' declares a TimeDerivative for '{}' -- its decay is NOT lowered "
-            "into '.tick' (Phase-1 per-edge time-evolution is deferred/unspecified, matching the "
-            "provisional IR spec's own NMDA example, which never decays its per-edge 'g' either)",
-            synapse_entry.component_type_name, time_derivative.variable);
+        time_derivative_rhs_of_variable[time_derivative.variable] = time_derivative.value;
     }
 
     Vector<TickInstruction> forall_body;
@@ -218,9 +227,43 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     LoweringContext forall_context(known_names, peredge_aliases);
 
     for (const auto &state_variable : synapse.state_variables) {
-        forall_body.push_back(LoadEdgeInstruction{
-            "edge_" + state_variable.name, state_variable.name, EdgeSetReference::CurrentEdge});
+        String edge_local_name = "edge_" + state_variable.name;
+
+        auto time_derivative_entry = time_derivative_rhs_of_variable.find(state_variable.name);
+        std::optional<LinearDecayShape> decay_shape;
+        if (time_derivative_entry != time_derivative_rhs_of_variable.end()) {
+            ExpressionNodePointer right_hand_side = parse_arithmetic_text(
+                time_derivative_entry->second, "TimeDerivative '" + state_variable.name + "'");
+            decay_shape = detect_linear_decay_shape(*right_hand_side, state_variable.name);
+        }
+
+        if (!decay_shape) {
+            forall_body.push_back(LoadEdgeInstruction{edge_local_name, state_variable.name, EdgeSetReference::CurrentEdge});
+            if (time_derivative_entry != time_derivative_rhs_of_variable.end()) {
+                log::logger().warn(
+                    "synapse_lowering: '{}' declares a TimeDerivative for '{}' that isn't a recognized "
+                    "linear-decay shape ('(target-state)/tau' or '-state/tau') -- its decay is NOT lowered "
+                    "into '.tick' (general per-edge forward-Euler integration for an arbitrary right-hand "
+                    "side is out of Phase-1 scope)",
+                    synapse_entry.component_type_name, state_variable.name);
+            }
+            continue;
+        }
+
+        String old_value_name = edge_local_name + "_old";
+        forall_body.push_back(LoadEdgeInstruction{old_value_name, state_variable.name, EdgeSetReference::CurrentEdge});
+        if (decay_shape->target == "0") {
+            forall_body.push_back(BinaryInstruction{BinaryOpcode::ExpDecay, edge_local_name, old_value_name, decay_shape->time_constant});
+        } else {
+            forall_body.push_back(BinaryInstruction{BinaryOpcode::Sub, edge_local_name, old_value_name, decay_shape->target});
+            forall_body.push_back(BinaryInstruction{BinaryOpcode::ExpDecay, edge_local_name, edge_local_name, decay_shape->time_constant});
+            forall_body.push_back(BinaryInstruction{BinaryOpcode::Add, edge_local_name, edge_local_name, decay_shape->target});
+        }
+        String delta_name = edge_local_name + "_delta";
+        forall_body.push_back(BinaryInstruction{BinaryOpcode::Sub, delta_name, edge_local_name, old_value_name});
+        forall_body.push_back(AccumulateEdgeInstruction{state_variable.name, EdgeSetReference::CurrentEdge, delta_name});
     }
+
     lower_all_derived_variables(synapse, forall_body, forall_context);
     forall_body.push_back(BinaryInstruction{BinaryOpcode::Add, "network_inputs", "network_inputs", current_derived_variable.name});
 
