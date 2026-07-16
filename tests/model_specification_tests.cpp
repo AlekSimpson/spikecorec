@@ -4,16 +4,20 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <vector>
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
+#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -28,6 +32,29 @@ String write_temp_file(const String &filename, const String &contents) {
     out.close();
     return path;
 }
+
+// Temporarily attaches an in-memory sink to the shared `log::logger()` so a
+// test can assert on a specific warning firing (ticket #60 [X1]) -- same
+// helper as synapse_lowering_tests.cpp's/cell_lowering_tests.cpp's own.
+// Removes itself in the destructor -- the sink holds a reference to
+// `captured_text_`, a member of THIS object, so it must not outlive it.
+class ScopedLogCapture {
+public:
+    ScopedLogCapture() : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(captured_text_)) {
+        log::logger().sinks().push_back(sink_);
+    }
+
+    ~ScopedLogCapture() {
+        auto &sinks = log::logger().sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
+    }
+
+    String text() const { return captured_text_.str(); }
+
+private:
+    std::ostringstream captured_text_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+};
 
 const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specification, const String &bound_instance_id) {
     for (const auto &entry : specification.type_library) {
@@ -404,4 +431,118 @@ TEST(ModelSpecification, throws_on_slash_form_path_with_non_numeric_trailing_tok
     ResolvedModel resolved = resolve_and_lower(parser);
 
     EXPECT_THROW(build_model_specification(resolved), std::runtime_error);
+}
+
+// ── Silent-drop diagnostics (ticket #60 [X1]) ────────────────────────────
+//
+// A recording whose path names an uncataloged population (or an in-range
+// population but an out-of-range index) is deliberately NOT fatal (arch's
+// own documented rationale, RecordingEntry::target_neuron_index's header
+// comment: recordings are read-only/informational, unlike a connection/
+// stimulus target) -- it's kept as the -1 diagnostic sentinel. Left
+// completely silent, though, that sentinel is indistinguishable from a
+// legitimately-unset field to anyone not reading this source file; these
+// assert the warning fires instead, naming the recording and its raw path.
+
+TEST(ModelSpecification, warns_when_a_recording_path_names_an_uncataloged_population) {
+    String path = write_single_population_recording_fixture("NoSuchPop[0]/v");
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    ScopedLogCapture log_capture;
+    ModelSpecification specification = build_model_specification(resolved);
+    String captured_log_text = log_capture.text();
+
+    ASSERT_EQ(specification.recordings.size(), 1u);
+    EXPECT_EQ(specification.recordings[0].target_neuron_index, -1);
+
+    EXPECT_NE(captured_log_text.find("badCol"), String::npos);
+    EXPECT_NE(captured_log_text.find("NoSuchPop"), String::npos);
+}
+
+TEST(ModelSpecification, warns_when_a_recording_path_names_an_out_of_range_index) {
+    String path = write_single_population_recording_fixture("ExcPop[99]/v");
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    ScopedLogCapture log_capture;
+    ModelSpecification specification = build_model_specification(resolved);
+    String captured_log_text = log_capture.text();
+
+    ASSERT_EQ(specification.recordings.size(), 1u);
+    EXPECT_EQ(specification.recordings[0].target_neuron_index, -1);
+
+    EXPECT_NE(captured_log_text.find("badCol"), String::npos);
+    EXPECT_NE(captured_log_text.find("ExcPop"), String::npos);
+    EXPECT_NE(captured_log_text.find("99"), String::npos);
+}
+
+// A bound component (population `component` IDref) naming an instance whose
+// element tag is not a cataloged ComponentType AT ALL (a typo, or a missing
+// <include>) must say so distinctly from the "cataloged but wrong category"
+// case below -- collapsing both into one message hides which fix applies.
+TEST(ModelSpecification, bound_component_names_an_uncataloged_type_gets_a_distinct_error) {
+    write_temp_file("spikecorec_model_spec_uncataloged_type_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"UncatalogedTypeContent\">"
+        "  <NotARealComponentType id=\"bogusInstance\"/>"
+        "  <network id=\"Net\">"
+        "    <population id=\"Pop1\" component=\"bogusInstance\" size=\"1\"/>"
+        "  </network>"
+        "</neuroml>");
+    String top_path = write_temp_file("spikecorec_model_spec_uncataloged_type_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"UncatalogedTypeTop\">"
+        "  <include href=\"spikecorec_model_spec_uncataloged_type_content.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    try {
+        build_model_specification(resolved);
+        FAIL() << "expected build_model_specification to throw on an uncataloged bound component type";
+    } catch (const std::runtime_error &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("NotARealComponentType"), String::npos);
+        EXPECT_NE(message.find("not a cataloged ComponentType at all"), String::npos);
+    }
+}
+
+// A bound component naming a REAL, cataloged ComponentType that is not in
+// the Dynamics bucket (here: one whose `extends` chain reaches none of
+// NML_Parser::classify_component_type's anchors, so it stays the bare,
+// Structure-bucketed ComponentTypeBase -- ion channels/morphology/
+// biophysical properties are exactly this shape in a real model, Phase 3)
+// must get the OTHER distinct message, naming the Phase-3 boundary instead
+// of a generic "not a cataloged Dynamics ComponentType".
+TEST(ModelSpecification, bound_component_names_a_non_dynamics_type_gets_a_phase_boundary_error) {
+    write_temp_file("spikecorec_model_spec_non_dynamics_type_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"NonDynamicsTypeContent\">"
+        "  <ComponentType name=\"MysteriousComponentType\"/>"
+        "  <MysteriousComponentType id=\"mysteryInstance\"/>"
+        "  <network id=\"Net\">"
+        "    <population id=\"Pop1\" component=\"mysteryInstance\" size=\"1\"/>"
+        "  </network>"
+        "</neuroml>");
+    String top_path = write_temp_file("spikecorec_model_spec_non_dynamics_type_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"NonDynamicsTypeTop\">"
+        "  <include href=\"spikecorec_model_spec_non_dynamics_type_content.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    try {
+        build_model_specification(resolved);
+        FAIL() << "expected build_model_specification to throw on a non-Dynamics bound component type";
+    } catch (const std::runtime_error &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("MysteriousComponentType"), String::npos);
+        EXPECT_NE(message.find("Phase 3"), String::npos);
+    }
 }

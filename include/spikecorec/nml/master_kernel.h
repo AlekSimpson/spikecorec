@@ -103,6 +103,18 @@ AssembledMasterKernelSource assemble_master_kernel_source(
 
 // ── compile + cache + dispatch ──────────────────────────────────────────────────────────────────
 
+// Wraps backend::compile_kernel so a compile failure's thrown message carries the generated GPU
+// source that failed to compile, plus (where applicable) the IR program it was lowered from --
+// ticket #60 [X1] (arch §0.4/§1.3). compile_kernel itself only reports the raw backend compiler
+// diagnostic (Metal newLibrary's NSError text / NVRTC's compile log) against a source string the
+// caller never sees again once compile_kernel returns -- not enough to debug a bad ComponentType
+// lowering without also seeing WHAT was actually emitted. `kernel_label` identifies which kernel
+// this is for in the thrown message (e.g. a population id + ComponentType name); `ir_dump` is the
+// empty string for a kernel with no per-ComponentType IR to show (the two engine-fixed scaffold
+// kernels). Exported (used by AssembledModel's constructor below, and independently testable).
+KernelHandle compile_kernel_or_throw_with_source(const String &source_text, const String &function_name,
+                                                  const String &kernel_label, const String &ir_dump);
+
 // The engine-owned, implicit per-neuron buffers ir_spec.md §2 says `.alloc` never declares
 // (`network_inputs`, `last_spiked`, the active-set arrays, the k^2-tree/shared-basis WeightMatrix --
 // arch §0.1) plus the one buffer family this ticket itself introduces and owns the allocation

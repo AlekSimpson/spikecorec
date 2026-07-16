@@ -4,14 +4,18 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/cell_lowering.h"
+#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -83,6 +87,30 @@ const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specifi
     }
     throw std::runtime_error("no type library entry for '" + bound_instance_id + "'");
 }
+
+// Temporarily attaches an in-memory sink to the shared `log::logger()` so a
+// test can assert on a specific warning firing -- same helper as
+// synapse_lowering_tests.cpp's own (ticket #60 [X1]'s cell_lowering.cpp
+// counterpart to that ticket's unrecognized-TimeDerivative-shape warning).
+// Removes itself in the destructor -- the sink holds a reference to
+// `captured_text_`, a member of THIS object, so it must not outlive it.
+class ScopedLogCapture {
+public:
+    ScopedLogCapture() : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(captured_text_)) {
+        log::logger().sinks().push_back(sink_);
+    }
+
+    ~ScopedLogCapture() {
+        auto &sinks = log::logger().sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
+    }
+
+    String text() const { return captured_text_.str(); }
+
+private:
+    std::ostringstream captured_text_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+};
 
 // Wraps one ComponentType fixture + one bound instance into a minimal
 // single-neuron network, runs it through parse -> resolve_and_lower ->
@@ -854,6 +882,65 @@ TEST(CellLoweringErrors, throws_when_lowering_a_non_cell_type_library_entry) {
     ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
 
     EXPECT_THROW(lower_cell_to_ir(entry), std::runtime_error);
+}
+
+// ── Silent-drop diagnostics (ticket #60 [X1]) ────────────────────────────
+//
+// An OnCondition child other than StateAssignment/EventOut/Transition (arch
+// §3.2's only three legal ones) is not lowered into `.tick` at all -- general
+// support for it is out of Phase-1 scope, same class of gap as
+// synapse_lowering.cpp's unrecognized-TimeDerivative-decay-shape warning.
+// Left silent, a real cell declaring one would have that action vanish from
+// the generated kernel with zero build-time signal; this asserts the warning
+// fires instead, naming the cell, the OnCondition, and the unsupported tag.
+
+TEST(CellLoweringErrors, warns_and_skips_an_unsupported_on_condition_child) {
+    const String component_type =
+        "  <ComponentType name=\"UnsupportedOnConditionChildCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+        "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "      <OnCondition test=\"v .gt. vth\">"
+        "        <EventOut port=\"spike\"/>"
+        "        <StateAssignment variable=\"v\" value=\"vreset\"/>"
+        "        <SomeUnsupportedAction customAttribute=\"foo\"/>"
+        "      </OnCondition>"
+        "    </Dynamics>"
+        "  </ComponentType>";
+
+    TypeLibraryEntry entry = build_cell_type_library_entry(
+        "unsupported_on_condition_child", component_type, "UnsupportedOnConditionChildCell",
+        "vth=\"-50mV\" vreset=\"-70mV\"");
+
+    ScopedLogCapture log_capture;
+    IrProgram program = lower_cell_to_ir(entry);
+    String captured_log_text = log_capture.text();
+
+    EXPECT_NE(captured_log_text.find("UnsupportedOnConditionChildCell"), String::npos);
+    EXPECT_NE(captured_log_text.find("SomeUnsupportedAction"), String::npos);
+    EXPECT_NE(captured_log_text.find("OnCondition"), String::npos);
+
+    // The other two (supported) actions still lower normally -- only the
+    // unrecognized child is dropped, not the whole OnCondition.
+    String expected =
+        ".alloc\n"
+        "  state v : f32\n"
+        "  param vth = -0.050000000000000003\n"
+        "  param vreset = -0.070000000000000007\n"
+        "  expose v\n"
+        ".tick\n"
+        "  @detect\n"
+        "    gt spiked, v, vth\n"
+        "  @emit\n"
+        "    if spiked {\n"
+        "      emit spike\n"
+        "    }\n"
+        "  @reset\n"
+        "    if spiked {\n"
+        "      mov v, vreset\n"
+        "    }\n";
+    EXPECT_EQ(print_ir_program(program), expected);
 }
 
 // ── lower_all_cell_types_to_ir: only Cell-category entries get lowered ───

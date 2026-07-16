@@ -262,6 +262,31 @@ TEST(ResolveAndLower, throws_a_clear_error_on_an_unresolved_idref) {
     EXPECT_THROW(resolve_and_lower(parser), std::runtime_error);
 }
 
+// ticket #60 [X1]: the exception's own message (what a caller actually
+// inspects, not just the side-channel log line) must name the offending
+// IDref value, the attribute it was on, and the element it was on.
+TEST(ResolveAndLower, unresolved_idref_exception_names_the_value_attribute_and_element) {
+    String path = write_temp_file("spikecorec_resolve_unresolved_idref_message_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"ResolveUnresolvedIdrefMessageTestDoc\">"
+        "  <network id=\"TestNet\">"
+        "    <population id=\"Pop1\" component=\"thisInstanceDoesNotExist\" size=\"10\"/>"
+        "  </network>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    try {
+        resolve_and_lower(parser);
+        FAIL() << "expected resolve_and_lower to throw on an unresolved IDref";
+    } catch (const std::runtime_error &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("thisInstanceDoesNotExist"), String::npos);
+        EXPECT_NE(message.find("component"), String::npos);
+        EXPECT_NE(message.find("population"), String::npos);
+    }
+}
+
 // ── Units → SI errors (acceptance criterion: unrecognized unit = clear error) ──
 
 TEST(ResolveAndLower, throws_a_clear_error_on_an_unrecognized_unit) {
@@ -287,6 +312,74 @@ TEST(ResolveAndLower, throws_a_clear_error_on_an_unrecognized_unit) {
     parser.parse(top_path);
 
     EXPECT_THROW(resolve_and_lower(parser), std::invalid_argument);
+}
+
+// ticket #60 [X1]: same requirement as the unresolved-IDref case above, but
+// for a unit-conversion failure -- the exception's own message must name the
+// attribute, the element, and the unresolvable value, not just the bare
+// "unknown unit symbol" text unit_value_to_si itself produces (which knows
+// nothing about which attribute/element it was called for).
+TEST(ResolveAndLower, unrecognized_unit_exception_names_the_attribute_element_and_value) {
+    write_temp_file("spikecorec_resolve_bad_unit_types_message.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"ResolveBadUnitTypesMessage\">"
+        "  <ComponentType name=\"BadUnitTestCellMessage\" extends=\"baseCell\">"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "  </ComponentType>"
+        "  <BadUnitTestCellMessage id=\"badUnitInstanceMessage\" EL=\"-70zorkmids\"/>"
+        "</neuroml>");
+
+    String top_path = write_temp_file("spikecorec_resolve_bad_unit_top_message.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"ResolveBadUnitTopMessage\">"
+        "  <include href=\"spikecorec_resolve_bad_unit_types_message.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+
+    try {
+        resolve_and_lower(parser);
+        FAIL() << "expected resolve_and_lower to throw on an unrecognized unit";
+    } catch (const std::invalid_argument &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("EL"), String::npos);
+        EXPECT_NE(message.find("BadUnitTestCellMessage"), String::npos);
+        EXPECT_NE(message.find("zorkmids"), String::npos);
+    }
+}
+
+// ticket #60 [X1]: same class of gap, but for a `Fixed` pin's value
+// (apply_fixed_pins) rather than an instance attribute's -- the exception's
+// own message must name the Fixed parameter and its unconvertible value.
+// Flattening every cataloged ComponentType (not just ones an instance
+// actually uses) happens unconditionally in resolve_and_lower's own pass 2,
+// so this fires with no instance of BadFixedTestCell required at all.
+TEST(ResolveAndLower, unconvertible_fixed_parameter_value_exception_names_the_parameter_and_value) {
+    write_temp_file("spikecorec_resolve_bad_fixed_types.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"ResolveBadFixedTypes\">"
+        "  <ComponentType name=\"BadFixedBaseCell\" extends=\"baseCell\">"
+        "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+        "  </ComponentType>"
+        "  <ComponentType name=\"BadFixedTestCell\" extends=\"BadFixedBaseCell\">"
+        "    <Fixed parameter=\"EL\" value=\"-70zorkmids\"/>"
+        "  </ComponentType>"
+        "</neuroml>");
+
+    String top_path = write_temp_file("spikecorec_resolve_bad_fixed_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"ResolveBadFixedTop\">"
+        "  <include href=\"spikecorec_resolve_bad_fixed_types.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+
+    try {
+        resolve_and_lower(parser);
+        FAIL() << "expected resolve_and_lower to throw on an unconvertible Fixed value";
+    } catch (const std::invalid_argument &error) {
+        String message = error.what();
+        EXPECT_NE(message.find("EL"), String::npos);
+        EXPECT_NE(message.find("zorkmids"), String::npos);
+    }
 }
 
 // ── Regression: ancestor-only `OnStart` survives flattening (review finding #1) ──

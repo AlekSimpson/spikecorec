@@ -292,6 +292,14 @@ struct NML_Parser {
     const String STANDARD_LIBRARY_PATH = SPIKECOREC_NML_STD_LIB_DIR;
     const String NML_SCHEMA_PATH = SPIKECOREC_NML_SCHEMA_PATH;
 
+    // Every element/line/message libxml2's XSD validator reported for the most recent
+    // validate_against_schema() call, joined into one string (empty if that call found no errors,
+    // or hasn't been made yet). libxml2's default error handler only prints validation errors to
+    // stderr (invisible to both a caller catching ingest_file's exception and this codebase's own
+    // logger) -- validate_against_schema captures them here instead, so ingest_file's thrown
+    // exception can name exactly which element/line failed and why (ticket #60 [X1]).
+    String last_schema_validation_errors;
+
     NML_Parser() {};
 
     bool validate_against_schema(const String &nml_file_path);
