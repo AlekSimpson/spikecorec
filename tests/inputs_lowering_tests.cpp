@@ -231,12 +231,16 @@ TEST(InputsLowering, spike_source_poisson_lowers_to_a_rand_driven_spike_source_a
 // renewal processes over 5s), so the SAMPLE mean spike count has standard deviation
 // sqrt(expected_count) ~= sqrt(5000) ~= 71 by the Poisson-process count-variance identity. A +-25%
 // band (+-1250, ~17.6 standard deviations) is deliberately far more generous than a strict
-// statistical test would need -- it is sized to absorb: (a) the one-tick startup transient common
-// to every neuron (`tnext` zero-initializes rather than seeding from a random first ISI, since
+// statistical test would need -- it is sized to absorb: (a) the onset transient common to every
+// neuron (`tnext` zero-initializes rather than seeding from a random first ISI, since
 // allocate_model never applies a `StateDirective`'s `initial_value` -- ticket #65 does not change
-// that pre-existing, documented gap, see ir.h's own comment), which guarantees an extra,
-// non-Poisson-distributed spike very early for every neuron (~50 extra spikes total, ~1% of
-// expected -- comfortably inside this band on its own), and (b) `spikecorec_rand_uniform`'s
+// that pre-existing, documented gap, see ir.h's own comment), which fires every neuron once per
+// tick from the window's own onset (`start`) until `tnext` accumulates past the current time --
+// at `start=0` (this test) that is a SINGLE extra, non-Poisson-distributed spike per neuron (~50
+// extra spikes total, ~1% of expected -- comfortably inside this band on its own); at a nonzero
+// `start` the burst instead scales as roughly `start*rate` extra spikes per neuron, which this
+// tolerance is NOT sized to absorb -- on-device Poisson with `start > 0` should be treated as
+// unverified until `initial_value` wiring lands, and (b) `spikecorec_rand_uniform`'s
 // xorshift32 + top-24-bits construction being a fast, minimal-quality PRNG (ticket #55's own
 // documented choice) rather than a rigorously-vetted one, not something this ticket should demand
 // perfect statistical fidelity from.

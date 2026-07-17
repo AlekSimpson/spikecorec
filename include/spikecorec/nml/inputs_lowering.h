@@ -68,6 +68,14 @@ namespace spikecorec::nml {
 //   likewise replaced by an ordinary boolean AND gate over `tick*dt` against `start`/`start+duration`
 //   -- behaviorally equivalent, expressed with existing compare/boolean ops instead of inventing an
 //   `H()` op no other ComponentType needs.
+//   Known gap: the real ComponentType seeds `tnextUsed` at OnStart as `start - log(random)/rate`;
+//   this simplified `tnext` zero-initializes instead (allocate_model never applies a
+//   `StateDirective`'s `initial_value` yet -- a pre-existing, documented gap, not introduced here).
+//   At `start=0` this costs one benign extra spike per neuron. At `start > 0` it instead fires
+//   every neuron once per tick from window onset until `tnext` accumulates past the current time --
+//   a burst of roughly `start*rate` spurious spikes concentrated right after onset. On-device
+//   Poisson with a nonzero `start` should be treated as unverified until `initial_value` wiring
+//   lands; this ticket's own acceptance test only exercises `start=0`.
 //
 // ── NOT supported: `poissonFiringSynapse` / `compoundInput` (documented judgment call) ──────────
 // Both require summing current over an arbitrary, model-specific list of CHILD sub-components
