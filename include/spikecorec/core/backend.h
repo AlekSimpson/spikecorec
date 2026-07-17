@@ -5,6 +5,7 @@
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda.h>
+#include <cuda_runtime.h>
 #elif defined(SPIKECOREC_METAL)
 #include <Metal/Metal.hpp>
 #endif
