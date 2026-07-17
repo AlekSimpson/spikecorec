@@ -325,21 +325,28 @@ namespace spikecorec {
         [[nodiscard]] f32 max_sparse_delta_occupancy_fraction() const;
 
         // Refit (arch §4.3's "Refit" operation / ticket #54/D4): re-fits U, V,
-        // and every registered matrix's Ck to the current point cloud (the
-        // pre-refit reconstruction + Sk at every real edge, read once before any
-        // mutation), via `sweep_count` warm-started alternating-least-squares
-        // sweeps -- closed-form ridge-regularized normal-equation solves, not an
-        // iterative optimizer (D4 math memo §2.1-2.4) -- then clears every
-        // matrix's Sk and resets the tick-count knob. This is a periodic
-        // memory-compaction/basis-freshening step, not error correction (every
-        // loadedge read was already exact beforehand); it is also not a
-        // learning/training step (see CLAUDE.md's U/V factorization note).
+        // and every registered matrix's Ck EXCEPT DEFAULT_MATRIX_INDEX's, to the
+        // current point cloud (the pre-refit reconstruction + Sk at every real
+        // edge, read once before any mutation), via `sweep_count` warm-started
+        // alternating-least-squares sweeps -- closed-form ridge-regularized
+        // normal-equation solves, not an iterative optimizer (D4 math memo
+        // §2.1-2.4) -- then clears every matrix's Sk and resets the tick-count
+        // knob. This is a periodic memory-compaction/basis-freshening step, not
+        // error correction (every loadedge read was already exact beforehand);
+        // it is also not a learning/training step (see CLAUDE.md's U/V
+        // factorization note).
         //
-        // This legitimately moves EVERY registered matrix's Ck, including
-        // DEFAULT_MATRIX_INDEX's -- the same documented tradeoff
-        // set_coefficient_vector() already establishes (overwriting
-        // DEFAULT_MATRIX_INDEX's Ck trades away the "reduces to plain dot(U,V)"
-        // bit-compatibility guarantee for this instance from that point on).
+        // DEFAULT_MATRIX_INDEX's Ck is deliberately NEVER re-fit here (ticket
+        // #103): it stays pinned at all-ones for the whole lifetime of a
+        // WeightMatrix, matching every other method's bit-compatibility
+        // assumption and the live GPU propagate kernel (master_kernel.cpp),
+        // which never reads a coefficient vector for the default matrix and
+        // hardcodes the all-ones assumption unconditionally. U and V are still
+        // fit using the default matrix's real edge data (they are shared across
+        // the whole matrix family) -- only its own Ck update is skipped. (A
+        // caller can still move DEFAULT_MATRIX_INDEX's Ck away from all-ones by
+        // calling set_coefficient_vector() directly on it -- see that method's
+        // own header comment -- but refit() itself never does.)
         //
         // U and V are shared across the whole matrix family, so a refit
         // triggered by drift in ONE matrix's Sk legitimately perturbs every

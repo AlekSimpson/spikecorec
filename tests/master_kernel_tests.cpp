@@ -4,12 +4,14 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -472,6 +474,136 @@ TEST(MasterKernel, reproduces_hardcoded_lif_membrane_trajectory_and_spike_timing
         if (engine.last_spiked.get_contents()[neuron_index] != 0) any_spike_recorded = true;
     }
     EXPECT_TRUE(any_spike_recorded);
+}
+
+// ── regression: WeightMatrix::refit() must not desync Ck[DEFAULT_MATRIX_INDEX] from the live
+// propagate kernel's all-ones assumption (ticket #103) ───────────────────────────────────────────
+//
+// The propagate kernel above (see its own header comment) reconstructs an edge's weight via a raw
+// `dot(u_row, v_row)` with no `coefficient_vectors`/Ck parameter at all -- it hardcodes the
+// DEFAULT_MATRIX_INDEX-is-all-ones invariant unconditionally. Before ticket #103's fix,
+// WeightMatrix::refit() re-fit Ck[DEFAULT_MATRIX_INDEX] like any other registered matrix, so a
+// refit() call could silently desync the host-side WeightMatrix::get() reconstruction (which reads
+// whatever Ck[DEFAULT_MATRIX_INDEX] refit() left behind) from this live GPU kernel (which never
+// reads it). This constructs a WeightMatrix with real accumulated Sk deltas (via
+// accumulate_edge_delta()) on both DEFAULT_MATRIX_INDEX and a second registered matrix, calls
+// refit(), then compares WeightMatrix::get()'s reconstruction against a REAL GPU dispatch of the
+// propagate stage (via AssembledModel/compile_kernel, not a hand-simulated comparison) -- this
+// exact scenario is what ticket #101 hit.
+
+TEST(MasterKernel, refit_default_matrix_reconstruction_stays_synced_with_a_real_propagate_kernel_dispatch) {
+    // A small, irregular network -- some nodes with multiple out-edges, one isolated sink -- so the
+    // propagate dispatch below exercises more than a single trivial edge.
+    vector<vector<s32>> network = {{1, 2}, {2}, {3}, {}};
+    const s64 total_neuron_count = 4;
+    const s64 rank = 4;
+
+    WeightMatrix weight_matrix(network, rank, /*check_indexing=*/true, -1, /*weight_seed=*/4242);
+
+    // Register a second matrix (ticket #52/D2) sharing the same U/V basis, with its own accumulated
+    // Sk -- refit()'s full multi-matrix Ck/U/V sweep must run (not a single-matrix shortcut), and
+    // this bug only reproduces when DEFAULT_MATRIX_INDEX itself has real Sk to fit against.
+    s64 matrix_b = weight_matrix.add_coefficient_vector({1.0f, -0.5f, 2.0f, 0.25f});
+
+    for (s64 source_node = 0; source_node < total_neuron_count; ++source_node) {
+        for (s32 target_node : network[(usize)source_node]) {
+            weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, (s32)source_node, target_node, 0.75f);
+            weight_matrix.accumulate_edge_delta(matrix_b, (s32)source_node, target_node, -1.25f);
+        }
+    }
+
+    weight_matrix.refit(/*sweep_count=*/4, /*ridge_regularization=*/1e-4f);
+
+    // Host-side expected reconstruction for every real edge, post-refit -- WeightMatrix::get()
+    // reconstructs via DEFAULT_MATRIX_INDEX's Ck (see reconstruct_entry).
+    vector<pair<s32, s32>> real_edges;
+    vector<f32> expected_edge_weights;
+    for (s64 source_node = 0; source_node < total_neuron_count; ++source_node) {
+        for (s32 target_node : network[(usize)source_node]) {
+            real_edges.emplace_back((s32)source_node, target_node);
+            expected_edge_weights.push_back(weight_matrix.get((s32)source_node, target_node));
+        }
+    }
+
+    // ── a real GPU dispatch of the propagate stage against this SAME WeightMatrix ──
+    //
+    // A minimal cell type whose @detect is an unconditional literal comparison (0.0 > -1.0, always
+    // true) -- every neuron spikes on the very first dispatch, so one step_tick call exercises the
+    // propagate kernel's real dot(U,V) scatter for every real edge in the network at once.
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    TypeLibraryEntry type_entry;
+    type_entry.component_type_name = "AlwaysSpikeCell";
+    type_entry.bound_instance_id = "alwaysSpikeInstance";
+    type_entry.category = TypeLibraryCategory::Cell;
+    type_entry.state_variable_count = 1;
+    model.type_library.push_back(type_entry);
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    IrProgram program;
+    program.component_type_name = "AlwaysSpikeCell";
+    program.alloc = {StateDirective{"v", "f32", nullopt}};
+    program.tick.detect = {BinaryInstruction{BinaryOpcode::Gt, "spiked", "0.0", "-1.0"}};
+    program.tick.emit = {IfInstruction{"spiked", {EmitInstruction{"spike"}}, {}, nullopt}};
+    spikecorec::Vector<IrProgram> programs = {program};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    AssembledModel assembled_model(model, programs);
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weight_matrix;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    assembled_model.step_tick(buffers, /*dt=*/1.0f, /*tick=*/0, /*next_tick=*/1);
+
+    vector<f32> expected_network_inputs((usize)total_neuron_count, 0.0f);
+    for (usize edge_index = 0; edge_index < real_edges.size(); ++edge_index) {
+        expected_network_inputs[(usize)real_edges[edge_index].second] += expected_edge_weights[edge_index];
+    }
+
+    const f32 *gpu_network_inputs = network_inputs.get_contents();
+    for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
+        f32 expected = expected_network_inputs[(usize)neuron_index];
+        f32 tolerance = std::fabs(expected) * 1e-3f;
+        if (tolerance < 1e-3f) tolerance = 1e-3f;
+        EXPECT_NEAR(expected, gpu_network_inputs[neuron_index], tolerance)
+            << "neuron_index=" << neuron_index
+            << " -- host WeightMatrix::get() reconstruction and a real GPU propagate kernel "
+               "dispatch disagree on the default matrix's weight after refit() (ticket #103)";
+    }
+
+    // Sanity: every real edge actually contributed something nonzero -- otherwise this test would
+    // vacuously pass even with the bug present.
+    bool any_nonzero_input = false;
+    for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
+        if (gpu_network_inputs[neuron_index] != 0.0f) any_nonzero_input = true;
+    }
+    EXPECT_TRUE(any_nonzero_input);
 }
 
 // ── regression: next_active_neuron_count must be reset every tick, not accumulated ────────────────

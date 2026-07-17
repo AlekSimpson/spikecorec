@@ -873,6 +873,20 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     for (s32 sweep_index = 0; sweep_index < sweep_count; ++sweep_index) {
         // --- §2.1: update each Ck, fixing U and V ---
         for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
+            // DEFAULT_MATRIX_INDEX's Ck must stay pinned at all-ones for the whole
+            // lifetime of a WeightMatrix (weight_matrix.h's own documented
+            // invariant) -- get()/get_for_matrix()/neighbor_weights() all rely on
+            // it, and so does the live GPU propagate kernel (master_kernel.cpp),
+            // which never reads a coefficient vector for the default matrix at
+            // all and hardcodes the all-ones assumption unconditionally (ticket
+            // #103). Skip re-fitting it here; the U/V updates below still pool
+            // the default matrix's real edge data into the shared basis (U/V are
+            // shared across the whole matrix family) -- only THIS Ck update is
+            // skipped for DEFAULT_MATRIX_INDEX.
+            if (matrix_index == DEFAULT_MATRIX_INDEX) {
+                continue;
+            }
+
             fill(gram_matrix.begin(), gram_matrix.end(), 0.0);
             fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
             const vector<f32> &matrix_observed_values = observed_values[(usize)matrix_index];
