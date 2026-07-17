@@ -285,7 +285,10 @@ GpuSource build_drain_kernel_gpu_source() {
         "    network_inputs[neuron_index] = 0.0f;\n"
         "}\n";
     source.cuda_source =
-        "__global__ void spikecorec_master_drain_network_inputs(\n"
+        // extern "C": cuModuleGetFunction (src/core/backend.cpp's compile_kernel) looks this
+        // kernel up by its plain, unmangled name -- nvcc/NVRTC C++-mangle __global__ symbols by
+        // default (see gpu_source.cpp's render_signature_and_prologue for the same fix).
+        "extern \"C\" __global__ void spikecorec_master_drain_network_inputs(\n"
         "    float *network_inputs,\n"
         "    long long neuron_count\n"
         ") {\n"
@@ -393,7 +396,9 @@ GpuSource build_propagate_kernel_gpu_source() {
     source.msl_source = "#include <metal_stdlib>\nusing namespace metal;\n" + k2tree_walk_preamble_msl() + "\n" + msl_body;
 
     String cuda_body =
-        "__global__ void spikecorec_master_propagate(\n"
+        // extern "C": see build_drain_kernel_gpu_source's own comment above -- same
+        // cuModuleGetFunction plain-name-lookup requirement.
+        "extern \"C\" __global__ void spikecorec_master_propagate(\n"
         "    long long             tick,\n"
         "    long long             next_tick,\n"
         "    const float4          *U,\n"
@@ -519,7 +524,9 @@ GpuSource build_drain_ring_kernel_gpu_source() {
         "    network_inputs_ring[current_slot * neuron_count + neuron_index] = 0.0f;\n"
         "}\n";
     source.cuda_source =
-        "__global__ void spikecorec_master_drain_network_inputs_ring(\n"
+        // extern "C": see build_drain_kernel_gpu_source's own comment above -- same
+        // cuModuleGetFunction plain-name-lookup requirement.
+        "extern \"C\" __global__ void spikecorec_master_drain_network_inputs_ring(\n"
         "    float *network_inputs_ring,\n"
         "    long long neuron_count,\n"
         "    long long current_slot\n"
@@ -628,7 +635,9 @@ GpuSource build_propagate_ring_kernel_gpu_source() {
     source.msl_source = "#include <metal_stdlib>\nusing namespace metal;\n" + k2tree_walk_preamble_msl() + "\n" + msl_body;
 
     String cuda_body =
-        "__global__ void spikecorec_master_propagate_ring(\n"
+        // extern "C": see build_drain_kernel_gpu_source's own comment above -- same
+        // cuModuleGetFunction plain-name-lookup requirement.
+        "extern \"C\" __global__ void spikecorec_master_propagate_ring(\n"
         "    long long             tick,\n"
         "    long long             ring_slot_count,\n"
         "    const float4          *U,\n"

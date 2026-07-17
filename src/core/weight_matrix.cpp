@@ -90,9 +90,9 @@ WeightMatrix::WeightMatrix(
     }
 
     // allocate U and V in unified memory — shape [node_count][rank_float4_stride]
-    usize matrix_byte_size = (usize)node_count * (usize)rank_float4_stride * sizeof(float4);
-    U_matrix = allocate<float4>(matrix_byte_size);
-    V_matrix = allocate<float4>(matrix_byte_size);
+    usize matrix_byte_size = (usize)node_count * (usize)rank_float4_stride * sizeof(spikecorec::float4);
+    U_matrix = allocate<spikecorec::float4>(matrix_byte_size);
+    V_matrix = allocate<spikecorec::float4>(matrix_byte_size);
 
     // initialize with independent random normal values (mean=0, std=1).
     // weight_seed >= 0 gives reproducible weights (deterministic runs/tests);
@@ -102,8 +102,8 @@ WeightMatrix::WeightMatrix(
         : random_device{}();
     mt19937 rng(resolved_weight_seed);
     normal_distribution<f32> normal_dist(0.0f, 1.0f);
-    float4* u_data = U_matrix.get_contents();
-    float4* v_data = V_matrix.get_contents();
+    spikecorec::float4* u_data = U_matrix.get_contents();
+    spikecorec::float4* v_data = V_matrix.get_contents();
     s64 total_float4_element_count = node_count * rank_float4_stride;
     for (s64 element_index = 0; element_index < total_float4_element_count; element_index++) {
         u_data[element_index] = {normal_dist(rng), normal_dist(rng), normal_dist(rng), normal_dist(rng)};
@@ -235,12 +235,12 @@ void WeightMatrix::set_constant_weight(f32 value) {
     // multiple of 4 (bug found by the SC-52/D2 test-hardening pass; fixed here).
     f32 effective_lane_count = (f32)(rank_float4_stride * 4);
     f32 scale = (value != 0.0f) ? sqrtf(fabsf(value) / effective_lane_count) : 0.0f;
-    float4 u_fill = {scale, scale, scale, scale};
+    spikecorec::float4 u_fill = {scale, scale, scale, scale};
     f32 v_fill_value = (value >= 0.0f) ? scale : -scale;
-    float4 v_fill = {v_fill_value, v_fill_value, v_fill_value, v_fill_value};
+    spikecorec::float4 v_fill = {v_fill_value, v_fill_value, v_fill_value, v_fill_value};
 
-    float4 *u_data = U_matrix.get_contents();
-    float4 *v_data = V_matrix.get_contents();
+    spikecorec::float4 *u_data = U_matrix.get_contents();
+    spikecorec::float4 *v_data = V_matrix.get_contents();
     s64 total_float4_element_count = node_count * rank_float4_stride;
     for (s64 index = 0; index < total_float4_element_count; ++index) {
         u_data[index] = u_fill;
@@ -298,8 +298,8 @@ GpuPointer<f32> WeightMatrix::allocate_coefficient_vector(const vector<f32> &log
 // see the design memo §2 for why this inline placement — not a separate
 // "reweight V, then dot" pass — is what makes that guarantee hold).
 f32 WeightMatrix::reconstruct_entry(s32 source_node, s32 target_node, const f32 *coefficient_values) const {
-    const float4 *u_row = U_matrix.get_contents() + source_node * rank_float4_stride;
-    const float4 *v_row = V_matrix.get_contents() + target_node * rank_float4_stride;
+    const spikecorec::float4 *u_row = U_matrix.get_contents() + source_node * rank_float4_stride;
+    const spikecorec::float4 *v_row = V_matrix.get_contents() + target_node * rank_float4_stride;
     f32 dot_product = 0.0f;
     for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
         const f32 *lane_coefficients = coefficient_values + float4_index * 4;
@@ -629,9 +629,9 @@ namespace {
 // Unpacks a float4 row ([rank_float4_stride] float4 elements) into a flat f64
 // buffer of rank_float4_stride*4 lanes, in the same x/y/z/w order
 // reconstruct_entry already accumulates in.
-void unpack_float4_row_into_buffer(const float4 *row, s64 rank_float4_stride, f64 *destination) {
+void unpack_float4_row_into_buffer(const spikecorec::float4 *row, s64 rank_float4_stride, f64 *destination) {
     for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
-        const float4 &element = row[float4_index];
+        const spikecorec::float4 &element = row[float4_index];
         destination[float4_index * 4 + 0] = (f64)element.x;
         destination[float4_index * 4 + 1] = (f64)element.y;
         destination[float4_index * 4 + 2] = (f64)element.z;
@@ -641,7 +641,7 @@ void unpack_float4_row_into_buffer(const float4 *row, s64 rank_float4_stride, f6
 
 // Inverse of unpack_float4_row_into_buffer: writes a flat f64 buffer back into
 // a float4 row, casting each lane down to f32.
-void pack_buffer_into_float4_row(const f64 *source, s64 rank_float4_stride, float4 *destination_row) {
+void pack_buffer_into_float4_row(const f64 *source, s64 rank_float4_stride, spikecorec::float4 *destination_row) {
     for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
         destination_row[float4_index].x = (f32)source[float4_index * 4 + 0];
         destination_row[float4_index].y = (f32)source[float4_index * 4 + 1];
@@ -862,8 +862,8 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     // snapshot above as its fixed target, but the OTHER two blocks' most
     // recently updated values (Gauss-Seidel-style, not Jacobi) — standard
     // block-coordinate ALS. ----
-    float4 *u_data = U_matrix.get_contents();
-    float4 *v_data = V_matrix.get_contents();
+    spikecorec::float4 *u_data = U_matrix.get_contents();
+    spikecorec::float4 *v_data = V_matrix.get_contents();
 
     vector<f64> gram_matrix((usize)(effective_lane_count * effective_lane_count));
     vector<f64> right_hand_side((usize)effective_lane_count);
@@ -892,8 +892,8 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
             const vector<f32> &matrix_observed_values = observed_values[(usize)matrix_index];
 
             for (s64 edge_index = 0; edge_index < total_edge_count; ++edge_index) {
-                const float4 *u_row = u_data + edge_source[(usize)edge_index] * rank_float4_stride;
-                const float4 *v_row = v_data + edge_target[(usize)edge_index] * rank_float4_stride;
+                const spikecorec::float4 *u_row = u_data + edge_source[(usize)edge_index] * rank_float4_stride;
+                const spikecorec::float4 *v_row = v_data + edge_target[(usize)edge_index] * rank_float4_stride;
                 for (s64 float4_index = 0; float4_index < rank_float4_stride; ++float4_index) {
                     feature_vector[(usize)(float4_index * 4 + 0)] = (f64)u_row[float4_index].x * (f64)v_row[float4_index].x;
                     feature_vector[(usize)(float4_index * 4 + 1)] = (f64)u_row[float4_index].y * (f64)v_row[float4_index].y;
@@ -927,7 +927,7 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
             fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
 
             for (s64 edge_index = row_start[(usize)node_index]; edge_index < row_start[(usize)node_index + 1]; ++edge_index) {
-                const float4 *v_row = v_data + edge_target[(usize)edge_index] * rank_float4_stride;
+                const spikecorec::float4 *v_row = v_data + edge_target[(usize)edge_index] * rank_float4_stride;
                 unpack_float4_row_into_buffer(v_row, rank_float4_stride, row_buffer.data());
                 for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
                     const f32 *coefficient_values = coefficient_vectors[(usize)matrix_index].get_contents();
@@ -963,7 +963,7 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
             fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
 
             for (s64 edge_index : in_edge_indices[(usize)node_index]) {
-                const float4 *u_row = u_data + edge_source[(usize)edge_index] * rank_float4_stride;
+                const spikecorec::float4 *u_row = u_data + edge_source[(usize)edge_index] * rank_float4_stride;
                 unpack_float4_row_into_buffer(u_row, rank_float4_stride, row_buffer.data());
                 for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
                     const f32 *coefficient_values = coefficient_vectors[(usize)matrix_index].get_contents();
@@ -1028,12 +1028,12 @@ void WeightMatrix::save(const char *filepath) const {
     file.write(reinterpret_cast<const char*>(&node_count), sizeof(s64));
     file.write(reinterpret_cast<const char*>(&rank), sizeof(s64));
     file.write(reinterpret_cast<const char*>(&rank_float4_stride), sizeof(s64));
-    const float4* u_data = U_matrix.get_contents();
-    const float4* v_data = V_matrix.get_contents();
+    const spikecorec::float4* u_data = U_matrix.get_contents();
+    const spikecorec::float4* v_data = V_matrix.get_contents();
     file.write(reinterpret_cast<const char*>(u_data),
-               (streamsize)(node_count * rank_float4_stride * sizeof(float4)));
+               (streamsize)(node_count * rank_float4_stride * sizeof(spikecorec::float4)));
     file.write(reinterpret_cast<const char*>(v_data),
-               (streamsize)(node_count * rank_float4_stride * sizeof(float4)));
+               (streamsize)(node_count * rank_float4_stride * sizeof(spikecorec::float4)));
 }
 
 void WeightMatrix::load_from_disk(const char *filepath) {
@@ -1053,9 +1053,9 @@ void WeightMatrix::load_from_disk(const char *filepath) {
                             node_count, saved_node_count, rank_float4_stride, saved_rank_float4_stride);
         deallocate(std::move(U_matrix));
         deallocate(std::move(V_matrix));
-        usize matrix_byte_size = (usize)saved_node_count * (usize)saved_rank_float4_stride * sizeof(float4);
-        U_matrix = allocate<float4>(matrix_byte_size);
-        V_matrix = allocate<float4>(matrix_byte_size);
+        usize matrix_byte_size = (usize)saved_node_count * (usize)saved_rank_float4_stride * sizeof(spikecorec::float4);
+        U_matrix = allocate<spikecorec::float4>(matrix_byte_size);
+        V_matrix = allocate<spikecorec::float4>(matrix_byte_size);
         node_count = saved_node_count;
         rank = saved_rank;
         rank_float4_stride = saved_rank_float4_stride;
@@ -1086,9 +1086,9 @@ void WeightMatrix::load_from_disk(const char *filepath) {
     }
 
     file.read(reinterpret_cast<char*>(U_matrix.get_contents()),
-              (streamsize)(node_count * rank_float4_stride * sizeof(float4)));
+              (streamsize)(node_count * rank_float4_stride * sizeof(spikecorec::float4)));
     file.read(reinterpret_cast<char*>(V_matrix.get_contents()),
-              (streamsize)(node_count * rank_float4_stride * sizeof(float4)));
+              (streamsize)(node_count * rank_float4_stride * sizeof(spikecorec::float4)));
 
     log::logger().debug("WeightMatrix::load_from_disk: loaded node_count={} rank={} rank_float4_stride={} magic={:#x}",
                         node_count, rank, rank_float4_stride, magic);
