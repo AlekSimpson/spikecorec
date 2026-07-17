@@ -243,11 +243,6 @@ TEST(MasterKernel, assembles_a_two_population_two_cell_type_model_and_compiles_e
         assembled.propagate_source.msl_source.find(String("kernel void ") + MASTER_KERNEL_PROPAGATE_NAME + "("),
         String::npos);
 
-    EXPECT_TRUE(compiles_as_msl(assembled.population_gpu_sources[0].msl_source, "excitatory_population"));
-    EXPECT_TRUE(compiles_as_msl(assembled.population_gpu_sources[1].msl_source, "inhibitory_population"));
-    EXPECT_TRUE(compiles_as_msl(assembled.drain_network_inputs_source.msl_source, "drain"));
-    EXPECT_TRUE(compiles_as_msl(assembled.propagate_source.msl_source, "propagate"));
-
     // CUDA: structural check only -- no CUDA toolchain on this machine (the ticket's own
     // documented testing constraint); mirrors gpu_source_tests.cpp's own approach exactly.
     EXPECT_NE(assembled.population_gpu_sources[0].cuda_source.find("__global__ void ExcitatoryLifCell_tick("),
@@ -268,6 +263,18 @@ TEST(MasterKernel, assembles_a_two_population_two_cell_type_model_and_compiles_e
         AssembledModel assembled_model(model, programs);
         (void)assembled_model;
     });
+
+    // MSL compile verification is gated last (after the backend-agnostic/CUDA checks above already
+    // ran and recorded their own pass/fail) so that on a non-Metal build, a genuinely unrelated
+    // failure above still surfaces as FAILED rather than being masked by this skip -- GTEST_SKIP()
+    // only actually yields a SKIPPED result when no prior part of the test has already failed.
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
+    EXPECT_TRUE(compiles_as_msl(assembled.population_gpu_sources[0].msl_source, "excitatory_population"));
+    EXPECT_TRUE(compiles_as_msl(assembled.population_gpu_sources[1].msl_source, "inhibitory_population"));
+    EXPECT_TRUE(compiles_as_msl(assembled.drain_network_inputs_source.msl_source, "drain"));
+    EXPECT_TRUE(compiles_as_msl(assembled.propagate_source.msl_source, "propagate"));
 }
 
 TEST(MasterKernel, a_population_whose_cell_type_has_no_per_neuron_tick_content_is_skipped_not_fatal) {
@@ -970,6 +977,9 @@ TEST(MasterKernelDelayRing, ring_kernel_sources_compile_as_msl) {
               String::npos);
     EXPECT_NE(propagate_ring_source.msl_source.find("kernel void spikecorec_master_propagate_ring("), String::npos);
 
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(drain_ring_source.msl_source, "drain_ring"));
     EXPECT_TRUE(compiles_as_msl(propagate_ring_source.msl_source, "propagate_ring"));
 

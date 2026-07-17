@@ -263,6 +263,9 @@ TEST(GpuSource, glif1_leaky_integrate_and_fire_compiles) {
     EXPECT_NE(source.msl_source.find("kernel void GLIF1_tick("), String::npos);
     EXPECT_NE(source.msl_source.find("network_inputs[neuron_index]"), String::npos);
     EXPECT_NE(source.msl_source.find("emit_spike[neuron_index] = true;"), String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "glif1"));
 
     EXPECT_NE(source.cuda_source.find("__global__ void GLIF1_tick("), String::npos);
@@ -273,6 +276,9 @@ TEST(GpuSource, exp_one_current_based_aggregatable_synapse_compiles) {
     EXPECT_NE(source.msl_source.find("kernel void expOne_tick("), String::npos);
     EXPECT_NE(source.msl_source.find("kernel void expOne_deliver_in("), String::npos);
     EXPECT_NE(source.msl_source.find("g[target_node] += weight;"), String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "exp_one"));
 
     EXPECT_NE(source.cuda_source.find("__global__ void expOne_deliver_in("), String::npos);
@@ -288,6 +294,9 @@ TEST(GpuSource, nmda_conductance_per_edge_synapse_compiles) {
     EXPECT_NE(source.msl_source.find("edge_reconstruction += dot(edge_basis_u_row[lane], "
                                       "lane_coefficients * edge_basis_v_row[lane]);"),
               String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "nmda"));
 
     EXPECT_NE(source.cuda_source.find("__global__ void NMDA_tick("), String::npos);
@@ -298,6 +307,9 @@ TEST(GpuSource, iaf_ref_cell_refractory_regime_compiles) {
     GpuSource source = lower_ir_program_to_gpu_source(build_iaf_ref_cell());
     EXPECT_NE(source.msl_source.find("kernel void iafRefCell_tick("), String::npos);
     EXPECT_NE(source.msl_source.find("r[neuron_index] = 1;"), String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "iaf_ref_cell"));
 
     EXPECT_NE(source.cuda_source.find("__global__ void iafRefCell_tick("), String::npos);
@@ -309,6 +321,9 @@ TEST(GpuSource, op_coverage_probe_compiles) {
     EXPECT_NE(source.msl_source.find("spikecorec_rand_uniform(rng_state[neuron_index]);"), String::npos);
     EXPECT_NE(source.msl_source.find("spikecorec_randn(rng_state[neuron_index]);"), String::npos);
     EXPECT_NE(source.msl_source.find("const float scale = 2.0;"), String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "op_coverage_probe"));
 
     EXPECT_NE(source.cuda_source.find("spikecorec_randn(rng_state[neuron_index]);"), String::npos);
@@ -322,6 +337,9 @@ TEST(GpuSource, scatter_probe_whole_set_accedge_compiles) {
     EXPECT_NE(source.msl_source.find("sparse_delta_downstream_trace[(long)neuron_index * max_neighbor_count + "
                                       "forall_slot_1] += scatter_value;"),
               String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "scatter_probe"));
 
     EXPECT_NE(source.cuda_source.find("downstream_accumulator[forall_neighbor_node_0] += scatter_value;"),
@@ -346,6 +364,9 @@ TEST(GpuSource, loadedge_inside_onevent_deliver_body_compiles) {
               String::npos);
     EXPECT_NE(source.msl_source.find("sparse_delta_g[(long)source_node * max_neighbor_count + edge_slot] += t1;"),
               String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "loadedge_in_deliver"));
 
     EXPECT_NE(source.cuda_source.find("__global__ void LoadEdgeInDeliverProbe_deliver_in("), String::npos);
