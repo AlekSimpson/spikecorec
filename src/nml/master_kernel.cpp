@@ -220,7 +220,8 @@ void append_cell_tick_argument(DispatchArgumentBuilder &builder, const String &p
         if (const auto *regime = std::get_if<RegimeDirective>(&directive)) {
             if (regime->name != parameter_name) continue;
             if (!allocation.has_regime_index) fail("regime '" + parameter_name + "' has no allocated regime_indices buffer");
-            builder.add_pointer(allocation.regime_indices.get_contents() + neuron_index_begin);
+            s32 *base = allocation.regime_indices.get_contents() + neuron_index_begin;
+            builder.add_pointer(base);
             return;
         }
         if (const auto *expose = std::get_if<ExposeDirective>(&directive)) {

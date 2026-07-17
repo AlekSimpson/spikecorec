@@ -469,21 +469,35 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
         parameters.push_back({"float", "float", "network_inputs", ParamKind::MutableArray});
     }
 
+    // A name can legitimately appear on more than one `.alloc` directive -- most commonly a
+    // `StateVariable` whose own name is ALSO its `expose` name (arch §4.1: "if a STORED
+    // StateVariable is exposed, recording reads it directly", i.e. no separate scratch slot is
+    // needed -- cell_lowering.cpp emits exactly this shape for every real GLIF cell's own `v`, e.g.
+    // both `state v` and `expose v`). Without this guard the loop below would emit two DIFFERENT
+    // kernel parameters both named `v` (a duplicate-parameter compile failure) since each directive
+    // is visited independently; this dedupes by name across every category, first directive wins --
+    // the state/accum/etc. slot IS the exposure's own storage, so subsequent directives for the
+    // same name need no parameter of their own.
+    unordered_set<String> alloc_parameter_names_added;
+
     for (const auto &directive : alloc_in_order) {
         std::visit(Overloaded{
             [&](const ParamConstantDirective &param) {
                 if (scan.alloc_names_referenced.count(param.name) == 0) return;
                 if (param.literal_value.has_value()) return; // baked as a local const, not a parameter
+                if (!alloc_parameter_names_added.insert(param.name).second) return;
                 parameters.push_back({"float", "float", param.name, ParamKind::Scalar});
             },
             [&](const ParamDynamicDirective &param) {
                 if (scan.alloc_names_referenced.count(param.name) == 0) return;
+                if (!alloc_parameter_names_added.insert(param.name).second) return;
                 parameters.push_back({dtype_to_backend_type(param.dtype, Backend::Msl),
                                        dtype_to_backend_type(param.dtype, Backend::Cuda), param.name,
                                        ParamKind::MutableArray});
             },
             [&](const StateDirective &state) {
                 if (scan.alloc_names_referenced.count(state.name) == 0) return;
+                if (!alloc_parameter_names_added.insert(state.name).second) return;
                 parameters.push_back({dtype_to_backend_type(state.dtype, Backend::Msl),
                                        dtype_to_backend_type(state.dtype, Backend::Cuda), state.name,
                                        ParamKind::MutableArray});
@@ -496,6 +510,7 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
                 bool referenced = scan.alloc_names_referenced.count(accum.name) > 0 ||
                                    edge_variable_names_referenced.count(accum.name) > 0;
                 if (!referenced) return;
+                if (!alloc_parameter_names_added.insert(accum.name).second) return;
                 parameters.push_back({dtype_to_backend_type(accum.dtype, Backend::Msl),
                                        dtype_to_backend_type(accum.dtype, Backend::Cuda), accum.name,
                                        ParamKind::MutableArray});
@@ -503,14 +518,17 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
             [&](const PeredgeDirective &) { /* handled below, alongside the edge-walk block */ },
             [&](const RegimeDirective &regime) {
                 if (scan.alloc_names_referenced.count(regime.name) == 0) return;
+                if (!alloc_parameter_names_added.insert(regime.name).second) return;
                 parameters.push_back({"int", "int", regime.name, ParamKind::MutableArray});
             },
             [&](const ExposeDirective &expose) {
                 if (scan.alloc_names_referenced.count(expose.name) == 0) return;
+                if (!alloc_parameter_names_added.insert(expose.name).second) return;
                 parameters.push_back({"float", "float", expose.name, ParamKind::MutableArray});
             },
             [&](const RequireDirective &require) {
                 if (scan.alloc_names_referenced.count(require.name) == 0) return;
+                if (!alloc_parameter_names_added.insert(require.name).second) return;
                 parameters.push_back({"float", "float", require.name, ParamKind::MutableArray});
             },
         }, directive);
