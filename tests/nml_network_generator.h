@@ -33,10 +33,6 @@ String glif_component_type_name(GlifVariant variant);
 // The full `<ComponentType name="GLIF<N>Cell" ...>` declaration for `variant`.
 String glif_component_type_xml(GlifVariant variant);
 
-// Total declared `<StateVariable>` count for `variant` (2/2/4/3/5 for GLIF1-5 respectively --
-// matches cell_lowering_tests.cpp's own state_variable_count assertions).
-s32 glif_state_variable_count(GlifVariant variant);
-
 // The declared-order slot index (0-based) of state variable `state_variable_name` within
 // `variant`'s own `<Dynamics>` -- e.g. "v" -> 0 for every variant, "asc1" -> 2 for GLIF3/GLIF5,
 // "theta" -> 1 for GLIF4/GLIF5. A population's cell_state chunk is structure-of-arrays across the

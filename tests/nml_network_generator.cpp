@@ -270,17 +270,6 @@ String glif_component_type_xml(GlifVariant variant) {
     throw std::runtime_error("nml_network_generator: unknown GlifVariant");
 }
 
-s32 glif_state_variable_count(GlifVariant variant) {
-    switch (variant) {
-        case GlifVariant::Glif1: return 2;
-        case GlifVariant::Glif2: return 2;
-        case GlifVariant::Glif3: return 4;
-        case GlifVariant::Glif4: return 3;
-        case GlifVariant::Glif5: return 5;
-    }
-    throw std::runtime_error("nml_network_generator: unknown GlifVariant");
-}
-
 s32 glif_state_variable_slot(GlifVariant variant, const String &state_variable_name) {
     static const UnorderedMap<String, s32> GLIF1_SLOTS = {{"v", 0}, {"refractoryTimeElapsed", 1}};
     static const UnorderedMap<String, s32> GLIF2_SLOTS = {{"v", 0}, {"refractoryTimeElapsed", 1}};
