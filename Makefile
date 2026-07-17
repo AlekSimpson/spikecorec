@@ -115,6 +115,10 @@ else
   # Core .cpp files (compiled with g++) include <cuda_runtime.h>/<cuda.h>, so the
   # CUDA headers must be on the include path for the host compiler too — not just nvcc.
   CXXFLAGS   += -DSPIKECOREC_CUDA -I$(CUDA_PATH)/include
+  # NVRTC (runtime kernel compilation, backend.cpp's compile_kernel) has no default include
+  # search path of its own — baked in here from the same CUDA_PATH so nvrtcCompileProgram can
+  # resolve any CUDA header a generated kernel source #includes (ticket #119).
+  CXXFLAGS   += -DSPIKECOREC_CUDA_INCLUDE_DIR=\"$(CUDA_PATH)/include\"
 endif
 
 # Auto-select default backend

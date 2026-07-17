@@ -775,13 +775,13 @@ TEST(SimpleAccumulatorNetwork,
     for (usize edge_index = 0; edge_index < connections.size(); ++edge_index) {
         const GeneratedConnection &connection = connections[edge_index];
         f32 root = std::sqrt((f32)intended_weight[edge_index]);
-        float4 *u_row = weights.U_matrix.get_contents() + (s64)connection.source_neuron_index * weights.rank_float4_stride;
-        float4 *v_row = weights.V_matrix.get_contents() + (s64)connection.target_neuron_index * weights.rank_float4_stride;
-        u_row[0] = float4{root, 0.0f, 0.0f, 0.0f};
-        v_row[0] = float4{root, 0.0f, 0.0f, 0.0f};
+        spikecorec::float4 *u_row = weights.U_matrix.get_contents() + (s64)connection.source_neuron_index * weights.rank_float4_stride;
+        spikecorec::float4 *v_row = weights.V_matrix.get_contents() + (s64)connection.target_neuron_index * weights.rank_float4_stride;
+        u_row[0] = spikecorec::float4{root, 0.0f, 0.0f, 0.0f};
+        v_row[0] = spikecorec::float4{root, 0.0f, 0.0f, 0.0f};
         for (s64 lane = 1; lane < weights.rank_float4_stride; ++lane) {
-            u_row[lane] = float4{0.0f, 0.0f, 0.0f, 0.0f};
-            v_row[lane] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+            u_row[lane] = spikecorec::float4{0.0f, 0.0f, 0.0f, 0.0f};
+            v_row[lane] = spikecorec::float4{0.0f, 0.0f, 0.0f, 0.0f};
         }
     }
 

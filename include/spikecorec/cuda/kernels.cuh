@@ -22,6 +22,10 @@ LaunchConfig default_launch_config(usize n, usize threads_per_block = 256);
 // row-major by source node. Adjacency is resolved via the bit-packed k^2-tree — each thread
 // walks its source node's row in the tree to discover up to max_neighbor_count targets;
 // slots beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
+// `coefficients` is the shared-basis coefficient vector Ck (rank_float4_stride*4 scalar f32
+// elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r], with the
+// WeightMatrix::DEFAULT_MATRIX_INDEX case's all-ones coefficients reducing this to the
+// original dot(U,V) — mirrors gpu_neighbor_weights' own parameter (backend.h).
 void launch_neighbor_weights(
     const float4 *U,
     const float4 *V,
@@ -37,6 +41,7 @@ void launch_neighbor_weights(
     s64           node_count,
     s64           max_neighbor_count,
     s64           rank_float4_stride,
+    const f32    *coefficients,
     f32          *output_weights,
     cudaStream_t  stream = nullptr
 );
@@ -99,6 +104,41 @@ void launch_step(
     s32          *next_active_neuron_indices,
     s32          *next_active_neuron_count,
     s32          *active_generation,
+    s32           thread_count_per_block,
+    s32           block_count,
+    cudaStream_t  stream = nullptr
+);
+
+// Same tick as launch_step, without the active-set optimization: one thread per
+// neuron (not per active neuron) and no next-tick active-set bookkeeping. Backs
+// gpu_step's active_set_optimization_enabled == false path
+// (step_kernel_no_active_optimization).
+void launch_step_no_active_optimization(
+    s64           tick,
+    s64           next_tick,
+    s32           spike_period,
+    f32           spike_threshold,
+    f32           learning_rate,
+    f32           decay_rate,
+    f32           resting_mp,
+    float4       *U,
+    float4       *V,
+    s64           rank_float4_stride,
+    f32           constant_weight,
+    const u32    *internal_node_words,
+    const u32    *leaf_node_words,
+    const u32    *rank_superblock_table,
+    const u16    *rank_subblock_table,
+    s32           branching_factor,
+    s32           superblock_size_words,
+    s32           padded_node_count,
+    s32           tree_height,
+    s32           internal_bit_count,
+    s64           neuron_count,
+    f32          *network_inputs,
+    f32          *membrane_potentials,
+    s64          *last_spiked,
+    s64          *last_tick_updated,
     s32           thread_count_per_block,
     s32           block_count,
     cudaStream_t  stream = nullptr
