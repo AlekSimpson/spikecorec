@@ -1,0 +1,12 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="DelayedCouplingNetworkTop">
+  <!--
+    A thin <include>-only wrapper so spikecorec's own front-end
+    (tests/exit_model_validation_tests.cpp) parses
+    delayed_coupling_network.nml without XSD-validating it as a TOP-LEVEL
+    file - see glif3_single_cell_top.nml's own header comment for why.
+    jNeuroML/jLEMS never sees this file - it consumes
+    delayed_coupling_network.nml directly via
+    LEMS_delayed_coupling_network.xml.
+  -->
+  <include href="delayed_coupling_network.nml"/>
+</neuroml>

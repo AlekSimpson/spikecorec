@@ -1,0 +1,139 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/master/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="DelayedCouplingNetworkExitModel">
+
+  <!--
+    Phase-2 exit model #2 (ticket #67 [H2], arch §5 Phase 2): a delayed-
+    coupling network, exercising the delay-ring subsystem
+    (include/spikecorec/nml/delay_ring.h, ticket #64 [F3]). Two single-
+    neuron GLIF1Cell populations (the SAME custom ComponentType and
+    per-instance parameters glif_ei_network.nml's own header comment
+    documents, reused verbatim here for the same reason: proven-exact
+    reproduction against jLEMS, ticket #61) - "SourcePop", directly driven
+    by a sustained pulseGenerator current step into repeated periodic
+    firing (GLIF1Cell has no after-spike-current adaptation, so under a
+    constant suprathreshold step it fires at an essentially constant rate -
+    a clean, multi-spike source train to exercise the delay ring against
+    more than one delivery), and "TargetPop", receiving ONLY the ONE
+    `connectionWD` below's delayed contribution (no direct stimulus at all)
+    - so ANY departure of TargetPop's own membrane potential from its
+    resting value EL is attributable exclusively to that one delayed
+    connection.
+
+    `connectionWD`'s own `delay="10ms"` (100 ticks at this fixture's own
+    step="0.1ms") is the "real, non-trivial delay value" this exit model's
+    whole point is validating - jLEMS applies it natively (a genuine
+    per-connection event delay, not a stand-in); spikecorec's own delay
+    ring (allocate_delay_ring/DelayRingAllocation, AssembledModel's
+    enable_delay_ring=true path) is what this exit model's own comparison
+    test (tests/exit_model_validation_tests.cpp) checks reproduces the SAME
+    delivery timing.
+
+    As with izhikevich_network.nml, populations use `type="populationList"`
+    + `<instance>` + `<inputList>`/`<connectionWD>` (glif_ei_network.nml's
+    own proven-working shape against this exact jLEMS build), and
+    alphaCurrentSynapse (real, vendored, current-based - already used and
+    verified in glif_ei_network.nml) is the synapse type, though this exit
+    model's own validation target is delivery TIMING (when TargetPop first
+    receives the delayed contribution), not the synapse's own full
+    dynamics reproduction - AssembledModel's fixed propagate stage still
+    does not invoke a real per-edge synapse ComponentType's own dynamics
+    (exit_model_validation_tests.cpp's documented known limitation #3,
+    carried over unchanged from ticket #61), so TargetPop's own voltage
+    MAGNITUDE in spikecorec is not expected to match jLEMS's - only the
+    ARRIVAL TICK (source_spike_tick + delay_ticks), which the delay ring
+    computes from the connection's own delay independent of any synapse's
+    intrinsic dynamics, is this exit model's real comparison target.
+
+    pulseGenerator's own duration (6ms) is deliberately short - long enough
+    to cross SourcePop's own threshold exactly ONCE (a GLIF1Cell under this
+    step's own steady-state voltage climbs from EL=-70mV to threshold
+    vth=-50mV in ~5.1ms, tau_m=C/gL=10ms) but ends (at 6ms) while SourcePop
+    is still inside its own 2ms refractory clamp (5.1ms+2ms=7.1ms), so a
+    second threshold crossing is impossible before the step itself ends -
+    mirroring master_kernel_tests.cpp's own MasterKernelDelayRing
+    established "one pulse -> one spike -> one delayed delivery" acceptance
+    pattern (delay_ring.h), now validated against real jLEMS output instead
+    of a synthetic fixture. delaySynapse's own `ibase` is deliberately weak
+    (50pA, not glif_ei_network.nml's own 2nA) so the single delivery
+    perturbs TargetPop's own voltage by only a few mV (observable, but far
+    below its own vth) rather than triggering a SECOND (TargetPop's own)
+    spike train that would make "the first tick TargetPop's own voltage
+    departs from EL" ambiguous (an earlier, since-reverted draft of this
+    fixture used the same 2nA ibase glif_ei_network.nml's own current-based
+    synapse uses, which drove TargetPop into its own repeated, overlapping
+    self-triggered spiking - observable but not a clean single arrival
+    signal).
+  -->
+  <ComponentType name="GLIF1Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Exposure name="iSyn" dimension="current"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+        <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
+        <OnCondition test="v .gt. vth">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF1Cell id="glif1CellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV" t_ref="2ms"/>
+
+  <alphaCurrentSynapse id="delaySynapse" tau="2ms" ibase="50pA"/>
+
+  <pulseGenerator id="pulseGen1" delay="10ms" duration="6ms" amplitude="0.5nA"/>
+
+  <network id="DelayedCouplingNet">
+    <population id="SourcePop" component="glif1CellInstance" type="populationList" size="1">
+      <instance id="0"><location x="0" y="0" z="0"/></instance>
+    </population>
+    <population id="TargetPop" component="glif1CellInstance" type="populationList" size="1">
+      <instance id="0"><location x="1" y="0" z="0"/></instance>
+    </population>
+    <inputList id="stimList" component="pulseGen1" population="SourcePop">
+      <input id="0" target="../SourcePop/0/glif1CellInstance" destination="synapses"/>
+    </inputList>
+    <projection id="SourceToTarget" presynapticPopulation="SourcePop" postsynapticPopulation="TargetPop" synapse="delaySynapse">
+      <connectionWD id="0" preCellId="../SourcePop/0/glif1CellInstance" postCellId="../TargetPop/0/glif1CellInstance" weight="1" delay="10ms"/>
+    </projection>
+  </network>
+
+  <Simulation id="sim1" length="60ms" step="0.1ms" target="DelayedCouplingNet">
+    <OutputFile id="membraneTrace" fileName="delayed_coupling_network_membrane_trace.dat">
+      <OutputColumn id="v_source" quantity="SourcePop/0/glif1CellInstance/v"/>
+      <OutputColumn id="v_target" quantity="TargetPop/0/glif1CellInstance/v"/>
+    </OutputFile>
+    <EventOutputFile id="spikesFile" fileName="delayed_coupling_network_spikes.dat" format="TIME_ID">
+      <EventSelection id="sel_source" select="SourcePop/0/glif1CellInstance" eventPort="spike"/>
+      <EventSelection id="sel_target" select="TargetPop/0/glif1CellInstance" eventPort="spike"/>
+    </EventOutputFile>
+  </Simulation>
+</neuroml>

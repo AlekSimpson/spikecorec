@@ -1,0 +1,20 @@
+<Lems>
+    <!--
+      LEMS wrapper used only to drive delayed_coupling_network.nml through
+      jNeuroML/jLEMS (ticket #67 [H2]) - NOT parsed by spikecorec's own
+      front-end (which reads delayed_coupling_network.nml directly).
+      Regenerate the checked-in reference data under
+      tests/fixtures/reference_data/delayed_coupling_network/ with, from
+      this directory:
+
+        python3 -m pyneuroml.pynml LEMS_delayed_coupling_network.xml -nogui
+
+      (pyneuroml bundles its own jNeuroML jar, so this runs entirely offline
+      once pyneuroml itself is installed: `pip3 install pyneuroml`.)
+    -->
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="delayed_coupling_network.nml"/>
+    <Target component="sim1"/>
+</Lems>
