@@ -60,6 +60,19 @@ static void check_nvrtc_compile_result(nvrtcResult result, nvrtcProgram program)
     throw runtime_error("NVRTC: compile failed: " + compile_log);
 }
 
+// NVRTC's virtual filesystem has no default include search path of its own (unlike nvcc,
+// which implicitly wires up the CUDA toolkit's own include/ directory for every .cu it
+// compiles) — any generated source that #includes a CUDA header (e.g. gpu_source.cpp's
+// `#include <vector_types.h>`, emitted for any codegen path that needs the float4 type to
+// walk the shared-basis U/V edge storage) fails to compile with "could not open source
+// file" unless the CUDA include directory is passed to nvrtcCompileProgram explicitly.
+// Baked in at compile time from the same CUDA_PATH the Makefile already uses for the host
+// compiler's own -I/-L flags; falls back to the Makefile's own CUDA_PATH default so this
+// still works if built any other way.
+#ifndef SPIKECOREC_CUDA_INCLUDE_DIR
+#define SPIKECOREC_CUDA_INCLUDE_DIR "/usr/local/cuda/include"
+#endif
+
 #elif defined(SPIKECOREC_METAL)
 static MTL::Device       *global_device          = nullptr;
 static MTL::CommandQueue *global_queue           = nullptr;
@@ -216,7 +229,9 @@ KernelHandle compile_kernel(const char *source, const char *function_name) {
 #ifdef SPIKECOREC_CUDA
     nvrtcProgram program;
     check_nvrtc_result(nvrtcCreateProgram(&program, source, nullptr, 0, nullptr, nullptr), "nvrtcCreateProgram");
-    check_nvrtc_compile_result(nvrtcCompileProgram(program, 0, nullptr), program);
+
+    const char *compile_options[] = { "-I" SPIKECOREC_CUDA_INCLUDE_DIR };
+    check_nvrtc_compile_result(nvrtcCompileProgram(program, 1, compile_options), program);
 
     size_t parallel_thread_execution_size;
     check_nvrtc_result(nvrtcGetPTXSize(program, &parallel_thread_execution_size), "nvrtcGetPTXSize");
