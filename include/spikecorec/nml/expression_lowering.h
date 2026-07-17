@@ -42,20 +42,28 @@ Vector<const NML_Node *> find_children(const NML_Node &node, const String &tag_n
 
 // ── Minimal LEMS math-expression parser ──────────────────────────────────
 //
-// Arithmetic `+ - * /`, parentheses, unary minus, and the six LEMS
-// dot-operator comparisons (`.gt. .lt. .geq. .leq. .eq. .neq.`). No `^`/pow
-// and no function-call syntax (`exp(...)` etc.) -- see cell_lowering.cpp's
-// GLIF1-5 fixtures and this ticket's D3 synapse fixtures, neither of which
-// need them.
+// Arithmetic `+ - * /`, parentheses, unary minus, the six LEMS dot-operator
+// comparisons (`.gt. .lt. .geq. .leq. .eq. .neq.`) -- ticket #50/#51's own
+// original scope -- plus, as of ticket #63 [F2] (needed by the real nonlinear
+// point cells it lowers, none of which are expressible without these): `^`
+// (right-associative `pow`, e.g. `fitzHughNagumoCell`'s `V^3`,
+// `hindmarshRose1984Cell`'s `x^2`/`x^3`) and single-argument function-call
+// syntax for the already-existing `UnaryOpcode` math names (`exp(...)` etc.,
+// e.g. `adExIaFCell`'s `exp((v-VT)/delT)`) -- see expression_lowering.cpp's
+// `unary_opcode_for_function_name` for the exact recognized name list. Both
+// map onto ir.h ops that already existed (`BinaryOpcode::Pow`,
+// `UnaryOpcode::Exp`/... -- ticket #63's own "no new ops" scope), this is
+// purely front-end (text -> AST) surface the old parser never exposed a way
+// to reach.
 
-enum class ExpressionNodeKind { Number, Identifier, Negate, Binary };
+enum class ExpressionNodeKind { Number, Identifier, Negate, Binary, FunctionCall };
 
 struct ExpressionNode {
     ExpressionNodeKind kind;
-    String text;                       // Number literal text, or Identifier name
-    char binary_operator_character = '\0'; // '+' '-' '*' '/' for Binary
-    std::unique_ptr<ExpressionNode> left;
-    std::unique_ptr<ExpressionNode> right; // unused for Negate (operand is `left`)
+    String text;                       // Number literal text, Identifier name, or FunctionCall's function name
+    char binary_operator_character = '\0'; // '+' '-' '*' '/' '^' for Binary
+    std::unique_ptr<ExpressionNode> left;   // FunctionCall's single argument, for FunctionCall
+    std::unique_ptr<ExpressionNode> right; // unused for Negate/FunctionCall (operand is `left`)
 };
 
 using ExpressionNodePointer = std::unique_ptr<ExpressionNode>;
@@ -67,18 +75,31 @@ using ExpressionNodePointer = std::unique_ptr<ExpressionNode>;
 // names where it came from.
 ExpressionNodePointer parse_arithmetic_text(const String &expression_text, const String &context_for_errors);
 
-// One parsed LEMS `test=` condition: exactly one top-level dot-comparison
-// operator (LEMS forbids nested comparisons), split into its two arithmetic
-// operand subtrees plus the comparison opcode.
+// One parsed LEMS `test=` condition: either one bare comparison (exactly one top-level dot-comparison
+// operator over two arithmetic operand subtrees -- ticket #50/#51's original, still-supported shape),
+// or, as of ticket #63 [F2] (needed by `hindmarshRose1984Cell`'s own real
+// `test="v .gt. 0 .and. spiking .lt. 0.5"`, a widely-used real-vendored-ComponentType idiom -- see
+// Cells.xml's other iaf*RefCell fixtures and Inputs.xml's generators, which use the identical
+// pattern), a boolean combination of two further ParsedConditions via `.and.`/`.or.`.
+// `combinator_opcode` is `BinaryOpcode::And`/`Or` and `left_condition`/`right_condition` are populated
+// for a combination; absent (nullopt/null) for a bare comparison, in which case `left`/`opcode`/
+// `right` are the comparison itself (unchanged shape/meaning from before this ticket). This is a flat
+// left-to-right fold, not a full recursive boolean grammar -- no ComponentType this codebase lowers
+// mixes `.and.`/`.or.` in one test string or wraps a sub-condition in parentheses (LEMS allows both;
+// see expression_lowering.cpp's own comment on `parse_condition_text`), so neither is supported.
 struct ParsedCondition {
+    std::optional<BinaryOpcode> combinator_opcode;
+    std::unique_ptr<ParsedCondition> left_condition;
+    std::unique_ptr<ParsedCondition> right_condition;
+
     ExpressionNodePointer left;
-    BinaryOpcode opcode;
+    BinaryOpcode opcode = BinaryOpcode::Gt;
     ExpressionNodePointer right;
 };
 
-// Parses a `test="a .gt. b"`-shaped condition string. Throws
-// std::runtime_error if it has zero or more than one top-level comparison
-// operator.
+// Parses a `test="a .gt. b"`-shaped condition string, or a flat `.and./.or.`-joined chain of such
+// comparisons (ticket #63 [F2]). Throws std::runtime_error if any individual comparison segment has
+// zero or more than one top-level comparison operator.
 ParsedCondition parse_condition_text(const String &condition_text);
 
 // Whether `identifier_name` is read anywhere inside `node`'s subtree. Used

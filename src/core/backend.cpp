@@ -11,6 +11,7 @@
 #elif defined(SPIKECOREC_METAL)
 #include <Metal/Metal.hpp>
 #include <dlfcn.h>
+#include <optional>
 #include <stdexcept>
 #endif
 

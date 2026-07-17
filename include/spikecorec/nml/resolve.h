@@ -26,9 +26,20 @@ namespace spikecorec::nml {
 // `Fixed` (§3.1): pins an inherited Parameter to a literal, resolved to its
 // SI value. Kept separate from ParameterDecl (which never carries a value,
 // by ticket #2's design) since pinning is strictly a resolve-time concern.
+//
+// `is_from_constant_declaration` (ticket #63 [F2]): true when this FixedDecl was synthesized from a
+// `<Constant>` element (nml.cpp's extract_parameters/resolve.cpp's extract_fixed_decls) rather than a
+// real, user-authored `<Fixed>`. `resolve_and_lower` unconditionally flattens EVERY cataloged
+// ComponentType in the whole vendored std-lib bundle on every parse (NML_Parser::parse always loads
+// it), not just ones a given model actually instantiates -- so a `<Constant>` this build's
+// unit-conversion table doesn't recognize (e.g. Cells.xml's own out-of-Phase-1-scope
+// `R = "8.3144621 J_per_K_per_mol"` gas constant, used by ion-channel/HH ComponentTypes) must not
+// fail resolution for every model, only real ones. See apply_fixed_pins's own doc comment for the
+// resulting warn-and-skip (rather than throw) handling this flag selects.
 struct FixedDecl {
     String parameter;
     String value;
+    bool is_from_constant_declaration = false;
 };
 
 // Which of arch §1.1's lifecycle buckets a resolved ComponentType falls

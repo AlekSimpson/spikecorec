@@ -214,52 +214,106 @@ void append_regime_dispatch_for_variable(const String &state_variable_name, cons
 // function directly would misclassify every real GLIF fixture as nonlinear -- the more general
 // affine check below is what correctly keeps "all of GLIF" tagged linear.
 //
-// Referenced identifiers OTHER than the cell's own state variables (parameters, network_inputs, a
-// DerivedVariable's name) are treated as opaque affine leaves, matching detect_linear_decay_shape's
-// own precedent of not looking inside another identifier's definition -- a DerivedVariable with a
-// NONLINEAR `value=` expression that is then read by a TimeDerivative would be misclassified as
-// linear, but no Phase-1 GLIF fixture does this (the only DerivedVariables real GLIF cells declare
-// are select/reduce="add" network_inputs aliases, arch §3.2) and this ticket's own synthetic
-// nonlinear test fixture embeds its nonlinear term directly in a TimeDerivative rather than through
-// an intermediate DerivedVariable, so closing that gap is out of this ticket's scope.
+// Referenced identifiers OTHER than the cell's own state variables (parameters, network_inputs) are
+// treated as opaque affine leaves -- EXCEPT a plain `value=` DerivedVariable's own name (ticket #63
+// [F2]'s own extension over ticket #62's original, narrower version of this check, which treated
+// every non-state-variable identifier, DerivedVariable names included, as an opaque leaf): every one
+// of ticket #63's real nonlinear cells hides its actual nonlinear term behind exactly this indirection
+// -- `izhikevich2007Cell`'s own `v` TimeDerivative is just `iMemb / C`, with the real
+// `k*(v-vr)*(v-vt)` product living inside `iMemb`'s own DerivedVariable definition;
+// `hindmarshRose1984Cell` nests three levels deep (`iMemb` reads `phi`/`z`, `phi` reads `x`, `x` reads
+// `v`) -- so AffineCheckContext below transitively inlines a plain-value DerivedVariable's own
+// definition wherever its name is read, closing the exact gap ticket #62's own header comment (see
+// its git history) flagged as out of scope at the time ("no Phase-1 GLIF fixture does this... closing
+// that gap is out of this ticket's scope"). A `select`/`reduce="add"` alias (e.g. `iSyn`) has no
+// entry in `derived_variable_value_by_name` (its own `.value` is empty), so it is still an ordinary
+// opaque leaf, exactly as before -- this is a strict extension, not a behavior change for GLIF1-5.
 
-bool expression_depends_on_any_state_variable(const ExpressionNode &node, const std::unordered_set<String> &state_variable_names) {
+struct AffineCheckContext {
+    const std::unordered_set<String> &state_variable_names;
+    // Plain `value=` DerivedVariables only (name -> raw value text) -- a select/reduce alias has no
+    // entry here, see this section's own header comment.
+    const UnorderedMap<String, String> &derived_variable_value_by_name;
+    // DFS "currently being resolved" guard (pushed before recursing into a name's own definition,
+    // popped after) -- NOT an "ever visited" set, so the SAME DerivedVariable name legitimately read
+    // from two independent places (hindmarshRose1984Cell's own `x`, read once each by `phi`/`chi`/
+    // `rho`) is still resolved correctly both times; only a genuine cyclic definition (never expected
+    // in a real LEMS ComponentType) is conservatively short-circuited.
+    std::unordered_set<String> &names_currently_being_resolved;
+};
+
+bool expression_depends_on_any_state_variable(const ExpressionNode &node, AffineCheckContext &context);
+bool expression_is_affine_in_state_variables(const ExpressionNode &node, AffineCheckContext &context);
+
+bool identifier_transitively_depends_on_state(const String &identifier_name, AffineCheckContext &context) {
+    auto definition = context.derived_variable_value_by_name.find(identifier_name);
+    if (definition == context.derived_variable_value_by_name.end()) return false; // an ordinary parameter/opaque leaf
+    if (!context.names_currently_being_resolved.insert(identifier_name).second) return false; // cyclic reference guard
+    ExpressionNodePointer parsed_definition = parse_arithmetic_text(
+        definition->second, "DerivedVariable '" + identifier_name + "' dependency classification (ticket #63)");
+    bool depends = expression_depends_on_any_state_variable(*parsed_definition, context);
+    context.names_currently_being_resolved.erase(identifier_name);
+    return depends;
+}
+
+bool identifier_transitively_affine(const String &identifier_name, AffineCheckContext &context) {
+    auto definition = context.derived_variable_value_by_name.find(identifier_name);
+    if (definition == context.derived_variable_value_by_name.end()) return true; // an ordinary parameter/opaque leaf
+    if (!context.names_currently_being_resolved.insert(identifier_name).second) return true; // cyclic reference guard
+    ExpressionNodePointer parsed_definition = parse_arithmetic_text(
+        definition->second, "DerivedVariable '" + identifier_name + "' linearity classification (ticket #63)");
+    bool affine = expression_is_affine_in_state_variables(*parsed_definition, context);
+    context.names_currently_being_resolved.erase(identifier_name);
+    return affine;
+}
+
+bool expression_depends_on_any_state_variable(const ExpressionNode &node, AffineCheckContext &context) {
     switch (node.kind) {
-        case ExpressionNodeKind::Identifier: return state_variable_names.count(node.text) != 0;
+        case ExpressionNodeKind::Identifier:
+            if (context.state_variable_names.count(node.text)) return true;
+            return identifier_transitively_depends_on_state(node.text, context);
         case ExpressionNodeKind::Number: return false;
-        case ExpressionNodeKind::Negate: return expression_depends_on_any_state_variable(*node.left, state_variable_names);
+        case ExpressionNodeKind::Negate: return expression_depends_on_any_state_variable(*node.left, context);
+        case ExpressionNodeKind::FunctionCall: return expression_depends_on_any_state_variable(*node.left, context);
         case ExpressionNodeKind::Binary:
-            return expression_depends_on_any_state_variable(*node.left, state_variable_names) ||
-                   expression_depends_on_any_state_variable(*node.right, state_variable_names);
+            return expression_depends_on_any_state_variable(*node.left, context) ||
+                   expression_depends_on_any_state_variable(*node.right, context);
     }
     return false;
 }
 
-bool expression_is_affine_in_state_variables(const ExpressionNode &node, const std::unordered_set<String> &state_variable_names) {
+bool expression_is_affine_in_state_variables(const ExpressionNode &node, AffineCheckContext &context) {
     switch (node.kind) {
         case ExpressionNodeKind::Number:
-        case ExpressionNodeKind::Identifier:
             return true;
+        case ExpressionNodeKind::Identifier:
+            if (context.state_variable_names.count(node.text)) return true;
+            return identifier_transitively_affine(node.text, context);
         case ExpressionNodeKind::Negate:
-            return expression_is_affine_in_state_variables(*node.left, state_variable_names);
+            return expression_is_affine_in_state_variables(*node.left, context);
+        case ExpressionNodeKind::FunctionCall:
+            // exp/log/sin/... of anything that depends on a state variable is never affine; of a
+            // pure-parameter/constant argument it is just another opaque (affine) leaf (ticket #63:
+            // `adExIaFCell`'s own `exp((v-VT)/delT)`).
+            return !expression_depends_on_any_state_variable(*node.left, context);
         case ExpressionNodeKind::Binary:
             if (node.binary_operator_character == '+' || node.binary_operator_character == '-') {
-                return expression_is_affine_in_state_variables(*node.left, state_variable_names) &&
-                       expression_is_affine_in_state_variables(*node.right, state_variable_names);
+                return expression_is_affine_in_state_variables(*node.left, context) &&
+                       expression_is_affine_in_state_variables(*node.right, context);
             }
             if (node.binary_operator_character == '*') {
-                bool left_depends = expression_depends_on_any_state_variable(*node.left, state_variable_names);
-                bool right_depends = expression_depends_on_any_state_variable(*node.right, state_variable_names);
+                bool left_depends = expression_depends_on_any_state_variable(*node.left, context);
+                bool right_depends = expression_depends_on_any_state_variable(*node.right, context);
                 if (left_depends && right_depends) return false; // a state variable times another -- nonlinear
-                return expression_is_affine_in_state_variables(*node.left, state_variable_names) &&
-                       expression_is_affine_in_state_variables(*node.right, state_variable_names);
+                return expression_is_affine_in_state_variables(*node.left, context) &&
+                       expression_is_affine_in_state_variables(*node.right, context);
             }
             if (node.binary_operator_character == '/') {
                 // A state variable in the denominator (e.g. `1/v`) is never affine.
-                if (expression_depends_on_any_state_variable(*node.right, state_variable_names)) return false;
-                return expression_is_affine_in_state_variables(*node.left, state_variable_names);
+                if (expression_depends_on_any_state_variable(*node.right, context)) return false;
+                return expression_is_affine_in_state_variables(*node.left, context);
             }
-            return false;
+            return false; // '^' (Pow, ticket #63) and anything else -- never affine
     }
     return false;
 }
@@ -271,10 +325,20 @@ bool cell_dynamics_are_closed_form_advanceable(const CellType &cell, const Vecto
     std::unordered_set<String> state_variable_names;
     for (const auto &state_variable : cell.state_variables) state_variable_names.insert(state_variable.name);
 
+    UnorderedMap<String, String> derived_variable_value_by_name;
+    for (const auto &derived_variable : cell.derived_variables) {
+        if (derived_variable.select.empty() && !derived_variable.value.empty()) {
+            derived_variable_value_by_name[derived_variable.name] = derived_variable.value;
+        }
+    }
+
+    std::unordered_set<String> names_currently_being_resolved;
+    AffineCheckContext context{state_variable_names, derived_variable_value_by_name, names_currently_being_resolved};
+
     auto right_hand_side_is_affine = [&](const String &value_text) {
         ExpressionNodePointer right_hand_side =
             parse_arithmetic_text(value_text, "TimeDerivative linearity classification (ticket #62)");
-        return expression_is_affine_in_state_variables(*right_hand_side, state_variable_names);
+        return expression_is_affine_in_state_variables(*right_hand_side, context);
     };
 
     for (const auto &time_derivative : cell.time_derivatives) {
@@ -304,6 +368,29 @@ UnorderedMap<String, String> gather_initial_values(const CellType &cell) {
         }
     }
     return initial_value_of_variable;
+}
+
+// Recursively emits `condition`'s boolean value into `output`, returning the operand name holding it
+// (ticket #63 [F2]: ParsedCondition can now be a `.and.`/`.or.`-combination of sub-conditions, not
+// just one bare comparison -- see expression_lowering.h's own doc comment). A bare-comparison LEAF
+// (no `combinator_opcode`) is emitted into `destination_name` directly -- EXACTLY the single
+// `BinaryInstruction` this file always emitted before this ticket, so both call sites below are
+// byte-for-byte unchanged for every pre-#63 (single-comparison) OnCondition. A combinator node
+// recursively emits its own two sub-conditions (each into its OWN fresh temporary, since only the
+// outermost condition's name matters to either call site) and ANDs/ORs them together into
+// `destination_name`.
+String emit_condition_test(const ParsedCondition &condition, LoweringContext &context,
+                           Vector<TickInstruction> &output, const String &destination_name) {
+    if (!condition.combinator_opcode.has_value()) {
+        String left_operand = context.emit_expression(*condition.left, output, std::nullopt);
+        String right_operand = context.emit_expression(*condition.right, output, std::nullopt);
+        output.push_back(BinaryInstruction{condition.opcode, destination_name, left_operand, right_operand});
+        return destination_name;
+    }
+    String left_name = emit_condition_test(*condition.left_condition, context, output, context.fresh_temporary());
+    String right_name = emit_condition_test(*condition.right_condition, context, output, context.fresh_temporary());
+    output.push_back(BinaryInstruction{*condition.combinator_opcode, destination_name, left_name, right_name});
+    return destination_name;
 }
 
 } // namespace
@@ -420,10 +507,8 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
         const OnConditionDecl &on_condition = cell.on_conditions[condition_index];
         context.reset_temporary_counter();
         ParsedCondition parsed_condition = parse_condition_text(on_condition.test);
-        String left_operand = context.emit_expression(*parsed_condition.left, tick.detect, std::nullopt);
-        String right_operand = context.emit_expression(*parsed_condition.right, tick.detect, std::nullopt);
         String condition_name = cell.on_conditions.size() == 1 ? String("spiked") : ("spiked" + std::to_string(condition_index));
-        tick.detect.push_back(BinaryInstruction{parsed_condition.opcode, condition_name, left_operand, right_operand});
+        emit_condition_test(parsed_condition, context, tick.detect, condition_name);
 
         OnConditionActions actions = lower_on_condition_actions(
             on_condition.body, context, regime_index_of, on_entry_assignments_of_regime,
@@ -445,11 +530,9 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
             tick.detect.push_back(BinaryInstruction{BinaryOpcode::Eq, is_regime_name, REGIME_VARIABLE_NAME, std::to_string(regime.index)});
 
             ParsedCondition parsed_condition = parse_condition_text(on_condition.test_text);
-            String left_operand = context.emit_expression(*parsed_condition.left, tick.detect, std::nullopt);
-            String right_operand = context.emit_expression(*parsed_condition.right, tick.detect, std::nullopt);
             String name_suffix = regime.on_conditions.size() == 1 ? regime.name : (regime.name + std::to_string(condition_index));
             String raw_test_name = "test_" + name_suffix;
-            tick.detect.push_back(BinaryInstruction{parsed_condition.opcode, raw_test_name, left_operand, right_operand});
+            emit_condition_test(parsed_condition, context, tick.detect, raw_test_name);
 
             String fire_name = "fire_" + name_suffix;
             tick.detect.push_back(BinaryInstruction{BinaryOpcode::And, fire_name, is_regime_name, raw_test_name});
