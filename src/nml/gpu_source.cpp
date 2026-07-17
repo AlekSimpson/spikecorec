@@ -1189,7 +1189,12 @@ void render_signature_and_prologue(Backend backend, const String &function_name,
                                     const Vector<ParamDescriptor> &parameters, FunctionKind kind,
                                     const Vector<AllocDirective> &alloc, const ScanResult &scan, ostringstream &output) {
     bool msl = backend == Backend::Msl;
-    output << (msl ? "kernel void " : "__global__ void ") << function_name << "(\n";
+    // CUDA kernels are looked up by their plain, unmangled name via cuModuleGetFunction
+    // (src/core/backend.cpp's compile_kernel) -- nvcc/NVRTC C++-mangle __global__ symbols by
+    // default, so the CUDA path must declare extern "C" linkage to keep the name lookup-able.
+    // Metal has no equivalent name-mangling concern (newLibrary's function lookup is by string
+    // name regardless), so the MSL template is untouched.
+    output << (msl ? "kernel void " : "extern \"C\" __global__ void ") << function_name << "(\n";
     for (usize index = 0; index < parameters.size(); ++index) {
         if (msl) {
             output << render_msl_param(parameters[index], static_cast<int>(index)) << ",\n";
