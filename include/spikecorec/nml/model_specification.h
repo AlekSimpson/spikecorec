@@ -103,8 +103,10 @@ struct PopulationEntry {
 
 // One `connection`/`connectionWD` inside a projection: the per-edge routing
 // + initial weight/delay data (arch §1.4, §3.1 `Property`, §4.4). `delay`
-// is 0 for a plain `connection` (Phase 1 keeps the engine's existing
-// implicit one-tick latency, arch §4.4 -- the delay ring is Phase 2).
+// is 0.0 for a plain `connection` (no `delay` attribute given) -- consumed
+// by the delay-ring subsystem (ticket #64 [F3], nml/delay_ring.h), which
+// floors a zero/absent delay to the engine's existing implicit one-tick
+// latency (arch §4.4).
 struct ConnectionEntry {
     s32 source_neuron_index = -1;
     s32 target_neuron_index = -1;

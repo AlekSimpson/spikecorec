@@ -17,6 +17,7 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
+#include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/master_kernel.h"
 
 using namespace std;
@@ -795,4 +796,399 @@ TEST(MasterKernelActiveSetNonlinearRule, nonlinear_population_never_receives_a_c
     // @integrate).
     EXPECT_NE(reference_v, EL);
     EXPECT_EQ(last_spiked.get_contents()[0], 0);
+}
+
+// ── ticket #64 [F3]: spike-delay subsystem (delay ring) ──────────────────────────────────────────
+//
+// Exercises the ring-based deliver-drain/propagate path (AssembledModel constructed with
+// enable_delay_ring=true, ModelRuntimeBuffers::delay_ring set) end to end through the real,
+// compiled Metal kernels -- both this ticket's own acceptance criteria: (1) a delayed edge delivers
+// exactly `delay` ticks later (checked directly against DelayRingAllocation::input_ring, the ring
+// generalization of network_inputs the per-population `_tick` kernel actually reads -- IR spec
+// §3.5), and (2) the active-set x delay interaction: the target neuron's own pending-active entry
+// (DelayRingAllocation::pending_active_neuron_indices/count) appears at exactly the tick its
+// delivery lands on, never before. compute_max_delay_ticks()/allocate_delay_ring()'s own host-side
+// sizing/defaulting logic is unit-tested in isolation in delay_ring_tests.cpp; this file's own job
+// is proving the whole thing wired together through a real AssembledModel::step_tick call.
+
+namespace {
+
+// True iff `neuron_index` appears among the first `count` entries of `indices_base` -- the
+// compacted-list membership check every pending-active assertion below needs (order within a slot
+// is not itself meaningful, only membership + count).
+bool compacted_list_contains(const s32 *indices_base, s32 count, s32 neuron_index) {
+    for (s32 position = 0; position < count; ++position) {
+        if (indices_base[position] == neuron_index) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+// Genuinely compiles the two new ring kernels' exact MSL text via the real Metal compiler (mirrors
+// this file's own `compiles_as_msl` helper / the flat drain+propagate kernels' own compile check in
+// assembles_a_two_population_two_cell_type_model_and_compiles_every_kernel_as_msl above) -- on top
+// of (not instead of) the real `newLibrary` compile AssembledModel's constructor performs for real
+// further down in this section.
+TEST(MasterKernelDelayRing, ring_kernel_sources_compile_as_msl) {
+    GpuSource drain_ring_source = build_drain_ring_kernel_gpu_source();
+    GpuSource propagate_ring_source = build_propagate_ring_kernel_gpu_source();
+
+    EXPECT_NE(drain_ring_source.msl_source.find("kernel void spikecorec_master_drain_network_inputs_ring("),
+              String::npos);
+    EXPECT_NE(propagate_ring_source.msl_source.find("kernel void spikecorec_master_propagate_ring("), String::npos);
+
+    EXPECT_TRUE(compiles_as_msl(drain_ring_source.msl_source, "drain_ring"));
+    EXPECT_TRUE(compiles_as_msl(propagate_ring_source.msl_source, "propagate_ring"));
+
+    // CUDA: structural check only -- no CUDA toolchain on this machine (documented constraint).
+    EXPECT_NE(drain_ring_source.cuda_source.find("__global__ void spikecorec_master_drain_network_inputs_ring("),
+              String::npos);
+    EXPECT_NE(propagate_ring_source.cuda_source.find("__global__ void spikecorec_master_propagate_ring("),
+              String::npos);
+}
+
+TEST(MasterKernelDelayRing, delivers_exactly_delay_ticks_later_and_wakes_the_active_set_at_the_right_tick) {
+    const f32 resting_mp = 0.0f;
+    const f32 decay_rate = 0.1f; // gL
+    const f32 spike_threshold = 1.0f;
+    const f32 dt = 1.0f; // also this test's own dt_seconds -- see allocate_delay_ring call below
+    const f32 edge_weight = 0.6f;
+    const s64 total_neuron_count = 2; // neuron 0 = source, neuron 1 = target
+    const s64 delay_ticks = 5;        // "at least 5 ticks" per this ticket's own acceptance criterion
+    const s64 tick_count = 10;
+
+    vector<vector<s32>> adjacency = {{1}, {}}; // neuron 0 -> neuron 1 only
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(build_lif_equivalent_type_entry("LifEquivalentCell", "lifEquivalentInstance", 1.0f,
+                                                                   decay_rate, resting_mp, spike_threshold));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    ProjectionEntry projection;
+    projection.id = "Proj";
+    projection.presynaptic_population_index = 0;
+    projection.postsynaptic_population_index = 0;
+    ConnectionEntry connection;
+    connection.source_neuron_index = 0;
+    connection.target_neuron_index = 1;
+    connection.weight = (f64)edge_weight;
+    connection.delay = (f64)delay_ticks * (f64)dt; // dt doubles as this test's own dt_seconds
+    projection.connections.push_back(connection);
+    model.projections.push_back(projection);
+
+    spikecorec::Vector<IrProgram> programs = {
+        build_lif_equivalent_program("LifEquivalentCell", decay_rate, resting_mp, spike_threshold)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count,
+              resting_mp);
+
+    WeightMatrix weights(adjacency, /*rank=*/1);
+    weights.set_constant_weight(edge_weight);
+    weights.using_constant_weight = true;
+
+    DelayRingAllocation ring = allocate_delay_ring(model, weights, /*dt_seconds=*/dt);
+    ASSERT_EQ(ring.ring_slot_count, delay_ticks + 1); // arch §4.4: max_delay_ticks + 1
+
+    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
+
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+    buffers.delay_ring = &ring;
+
+    // A single, deliberately isolated pulse on tick 1: v settles to 0.9*1.2=1.08 > vth=1.0 (one
+    // spike, tick 1 only) then decays monotonically toward EL=0 forever after (0.972, 0.8748, ...),
+    // never re-crossing vth -- worked out from this fixture's own `@integrate`
+    // (dv = dt*(gL*(EL - v) + network_inputs)/C, C=1, applied to v AFTER the external pulse is added
+    // directly into cell_state, matching every other test in this file's own external-stimulus
+    // convention). This isolates the acceptance criterion to exactly ONE spike -> ONE delivery,
+    // rather than the multi-spike burst a larger pulse (e.g. this file's own 1.5 constant) would
+    // cause here (there is no @reset in this shared fixture -- see this file's own header comment).
+    const f32 external_pulse = 1.2f;
+
+    // Per-tick snapshots of exactly what the target neuron's own `_tick` kernel will read as
+    // `network_inputs` THIS tick (ring.input_ring's slot for `tick`, read immediately before
+    // step_tick(tick) so nothing has touched it since the last tick's own drain) -- and the matching
+    // pending-active bookkeeping for the SAME slot.
+    vector<f32> network_input_at_target_by_tick((usize)tick_count, 0.0f);
+    vector<s32> pending_count_by_tick((usize)tick_count, 0);
+    vector<bool> pending_contains_source_by_tick((usize)tick_count, false);
+    vector<bool> pending_contains_target_by_tick((usize)tick_count, false);
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        s64 slot = tick % ring.ring_slot_count;
+        network_input_at_target_by_tick[(usize)tick] =
+            ring.input_ring.get_contents()[slot * total_neuron_count + 1];
+        s32 count = ring.pending_active_neuron_count.get_contents()[slot];
+        pending_count_by_tick[(usize)tick] = count;
+        const s32 *indices_base = ring.pending_active_neuron_indices.get_contents() + slot * total_neuron_count;
+        pending_contains_source_by_tick[(usize)tick] = compacted_list_contains(indices_base, count, 0);
+        pending_contains_target_by_tick[(usize)tick] = compacted_list_contains(indices_base, count, 1);
+
+        f32 this_tick_external_input = (tick == 1) ? external_pulse : 0.0f;
+        allocation.cell_state.get_contents()[0] += this_tick_external_input;
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+    }
+
+    // ── acceptance criterion 1: exact-tick delivery, not before, not after ──────────────────────
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        f32 expected = (tick == 1 + delay_ticks) ? edge_weight : 0.0f;
+        EXPECT_NEAR(network_input_at_target_by_tick[(usize)tick], expected, 1e-6f)
+            << "tick=" << tick << " (spike at tick 1, delay=" << delay_ticks << " ticks)";
+    }
+
+    // ── acceptance criterion 2: the active-set x delay interaction -- the target neuron's own
+    // pending-active entry appears at exactly the arrival tick (1 + delay_ticks), and the SOURCE
+    // neuron's own unconditional one-tick self-reactivation (unaffected by any edge's delay, see
+    // master_kernel.cpp's propagate-ring kernel) appears at exactly tick 1 + 1 = 2 -- neither
+    // before nor after either tick, and no OTHER tick has any pending entry at all (no other spike
+    // ever occurs in this fixture). ──
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        if (tick == 1 + delay_ticks) {
+            EXPECT_EQ(pending_count_by_tick[(usize)tick], 1) << "tick=" << tick;
+            EXPECT_TRUE(pending_contains_target_by_tick[(usize)tick]) << "tick=" << tick;
+        } else if (tick == 2) {
+            EXPECT_EQ(pending_count_by_tick[(usize)tick], 1) << "tick=" << tick;
+            EXPECT_TRUE(pending_contains_source_by_tick[(usize)tick]) << "tick=" << tick;
+        } else {
+            EXPECT_EQ(pending_count_by_tick[(usize)tick], 0) << "tick=" << tick;
+        }
+    }
+
+    // Sanity: the source neuron fired exactly once, at tick 1; the target never fired at all (its
+    // own single 0.6 pulse at tick 6 settles to v=0.6 < vth=1.0 -- see this test's own header
+    // comment's worked arithmetic).
+    EXPECT_EQ(last_spiked.get_contents()[0], 1);
+    EXPECT_EQ(last_spiked.get_contents()[1], 0);
+}
+
+// A model whose longest delay is bigger gets a correspondingly bigger ring -- exercised here through
+// the SAME allocate_delay_ring() a real AssembledModel-driven simulation would call, not just
+// delay_ring_tests.cpp's own narrower host-side unit tests, tying "sizing scales with the longest
+// delay" directly to this ticket's own AssembledModel/ModelRuntimeBuffers integration.
+TEST(MasterKernelDelayRing, ring_size_scales_with_the_longest_delay_actually_present_in_the_model) {
+    const f32 dt_seconds = 1.0f;
+    vector<vector<s32>> adjacency = {{1}, {}};
+
+    auto build_model_with_delay = [&](f64 delay_seconds) {
+        ModelSpecification model;
+        model.total_neuron_count = 2;
+        ProjectionEntry projection;
+        ConnectionEntry connection;
+        connection.source_neuron_index = 0;
+        connection.target_neuron_index = 1;
+        connection.weight = 1.0;
+        connection.delay = delay_seconds;
+        projection.connections.push_back(connection);
+        model.projections.push_back(projection);
+        return model;
+    };
+
+    ModelSpecification short_delay_model = build_model_with_delay(3.0);  // 3 ticks
+    ModelSpecification long_delay_model = build_model_with_delay(20.0);  // 20 ticks
+
+    WeightMatrix short_delay_weights(adjacency, /*rank=*/1);
+    WeightMatrix long_delay_weights(adjacency, /*rank=*/1);
+
+    DelayRingAllocation short_ring = allocate_delay_ring(short_delay_model, short_delay_weights, dt_seconds);
+    DelayRingAllocation long_ring = allocate_delay_ring(long_delay_model, long_delay_weights, dt_seconds);
+
+    EXPECT_EQ(short_ring.ring_slot_count, 4);  // 3 + 1
+    EXPECT_EQ(long_ring.ring_slot_count, 21);  // 20 + 1
+    EXPECT_GT(long_ring.ring_slot_count, short_ring.ring_slot_count);
+}
+
+// Ring mode's own zero/default-delay case (every connection floors to 1 tick, ring_slot_count == 2)
+// must reproduce this file's own pre-#64 flat-network_inputs behavior byte for byte -- proving this
+// ticket's own claim that it GENERALIZES the existing one-tick latency rather than replacing it.
+// Same network/fixture as reproduces_hardcoded_lif_membrane_trajectory_and_spike_timing above,
+// driven through the ring path instead of the flat path.
+TEST(MasterKernelDelayRing, ring_mode_with_default_delay_reproduces_the_flat_one_tick_latency_behavior) {
+    const f32 resting_mp = 0.0f;
+    const f32 decay_rate = 0.1f;
+    const f32 spike_threshold = 1.0f;
+    const f32 dt = 1.0f;
+    const f32 edge_weight = 0.6f;
+    const s64 total_neuron_count = 3;
+    const s64 tick_count = 6;
+
+    // ── reference path: the existing hardcoded engine (identical to the non-ring equivalence test
+    // above) ──
+    vector<vector<s32>> adjacency = {{1}, {}, {}};
+    SpikeEngine engine(&adjacency, {total_neuron_count, 1}, /*rank=*/1, resting_mp, decay_rate,
+                        /*learning_rate=*/0.0f, /*plasticity_enabled=*/false,
+                        /*active_set_optimization_enabled=*/false);
+    engine.spike_period = 0;
+    engine.spike_threshold = spike_threshold;
+    engine.weights.set_constant_weight(edge_weight);
+    engine.use_constant_weight = true;
+    engine.set_input_neurons({0});
+
+    // ── assembled-model path, ring mode, no delay attribute anywhere (every connection floors to
+    // the implicit 1-tick latency, ring_slot_count = 1 + 1 = 2) ──
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(
+        build_lif_equivalent_type_entry("LifEquivalentCell", "lifEquivalentInstance", 1.0f, decay_rate, resting_mp,
+                                         spike_threshold));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    ProjectionEntry projection;
+    ConnectionEntry connection;
+    connection.source_neuron_index = 0;
+    connection.target_neuron_index = 1;
+    connection.weight = (f64)edge_weight;
+    connection.delay = 0.0; // no delay attribute -> floors to 1 tick (compute_max_delay_ticks)
+    projection.connections.push_back(connection);
+    model.projections.push_back(projection);
+
+    spikecorec::Vector<IrProgram> programs = {
+        build_lif_equivalent_program("LifEquivalentCell", decay_rate, resting_mp, spike_threshold)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count,
+              resting_mp);
+
+    WeightMatrix my_weights(adjacency, /*rank=*/1);
+    my_weights.set_constant_weight(edge_weight);
+
+    DelayRingAllocation ring = allocate_delay_ring(model, my_weights, /*dt_seconds=*/dt);
+    ASSERT_EQ(ring.ring_slot_count, 2); // the pre-#64 flat scheme's own special case
+
+    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
+
+    GpuPointer<s64> my_last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(my_last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<bool> my_emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(my_emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &my_weights;
+    buffers.last_spiked = my_last_spiked.get_contents();
+    buffers.emit_port_flags["spike"] = my_emit_spike.get_contents();
+    buffers.delay_ring = &ring;
+
+    const f32 external_pulse = 1.5f;
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        f32 this_tick_external_input = (tick == 1) ? external_pulse : 0.0f;
+
+        engine.step_simulation({this_tick_external_input}, tick);
+
+        allocation.cell_state.get_contents()[0] += this_tick_external_input;
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+
+        const f32 *engine_membrane_potentials = engine.membrane_potentials.get_contents();
+        const f32 *my_v = allocation.cell_state.get_contents();
+        for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
+            EXPECT_NEAR(engine_membrane_potentials[neuron_index], my_v[neuron_index], 1e-4f)
+                << "tick=" << tick << " neuron_index=" << neuron_index;
+        }
+
+        const s64 *engine_last_spiked = engine.last_spiked.get_contents();
+        const s64 *my_last_spiked_contents = my_last_spiked.get_contents();
+        for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
+            EXPECT_EQ(engine_last_spiked[neuron_index], my_last_spiked_contents[neuron_index])
+                << "tick=" << tick << " neuron_index=" << neuron_index;
+        }
+
+        // engine.network_inputs, checked immediately after this tick's own call, holds whatever THIS
+        // tick's own spikes just scattered (to be consumed at tick+1) -- the ring's own equivalent
+        // slot for that same "not yet consumed, due next tick" contribution is (tick+1) %
+        // ring_slot_count, not tick % ring_slot_count (which is the slot THIS tick's own population
+        // dispatch just consumed and drain just zeroed).
+        const f32 *engine_network_inputs = engine.network_inputs.get_contents();
+        s64 next_slot = (tick + 1) % ring.ring_slot_count;
+        const f32 *my_ring_slot_contents = ring.input_ring.get_contents() + next_slot * total_neuron_count;
+        for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
+            EXPECT_NEAR(engine_network_inputs[neuron_index], my_ring_slot_contents[neuron_index], 1e-4f)
+                << "tick=" << tick << " neuron_index=" << neuron_index;
+        }
+    }
+
+    bool any_spike_recorded = false;
+    for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
+        if (engine.last_spiked.get_contents()[neuron_index] != 0) any_spike_recorded = true;
+    }
+    EXPECT_TRUE(any_spike_recorded);
+}
+
+// A caller must not mix delay-ring mode between construction and step_tick -- both mismatches throw
+// rather than silently reading/writing whichever buffer happens to be set.
+TEST(MasterKernelDelayRing, step_tick_throws_on_a_delay_ring_enablement_mismatch) {
+    ModelSpecification model;
+    model.total_neuron_count = 1;
+    model.type_library.push_back(build_lif_equivalent_type_entry("Cell", "instance", 1.0f, 0.1f, 0.0f, 1.0f));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = 1;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = 1;
+    model.populations.push_back(population);
+
+    spikecorec::Vector<IrProgram> programs = {build_lif_equivalent_program("Cell", 0.1f, 0.0f, 1.0f)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    vector<vector<s32>> adjacency = {{}};
+    WeightMatrix weights(adjacency, /*rank=*/1);
+
+    GpuPointer<f32> network_inputs = allocate<f32>(sizeof(f32));
+    memset(network_inputs.get_contents(), 0, sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>(sizeof(s64));
+    memset(last_spiked.get_contents(), 0, sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>(sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>(sizeof(s32));
+    active_generation.get_contents()[0] = -1;
+    GpuPointer<bool> emit_spike = allocate<bool>(sizeof(bool));
+    memset(emit_spike.get_contents(), 0, sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    // Constructed WITHOUT enable_delay_ring, but buffers.delay_ring is left non-null below.
+    AssembledModel assembled_model_flat(model, programs, /*enable_delay_ring=*/false);
+    DelayRingAllocation ring = allocate_delay_ring(model, weights, /*dt_seconds=*/1.0f);
+    buffers.delay_ring = &ring;
+    EXPECT_THROW(assembled_model_flat.step_tick(buffers, 1.0f, 0, 1), std::runtime_error);
+
+    // Constructed WITH enable_delay_ring, but buffers.delay_ring is null below.
+    AssembledModel assembled_model_ring(model, programs, /*enable_delay_ring=*/true);
+    buffers.delay_ring = nullptr;
+    EXPECT_THROW(assembled_model_ring.step_tick(buffers, 1.0f, 0, 1), std::runtime_error);
 }

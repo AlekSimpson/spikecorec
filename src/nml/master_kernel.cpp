@@ -473,6 +473,249 @@ GpuSource build_propagate_kernel_gpu_source() {
 
 } // namespace
 
+// ── ticket #64 [F3]: ring-based deliver-drain/propagate (the "delay ring") ──────────────────────
+//
+// Only assembled/compiled when AssembledModel is constructed with enable_delay_ring=true (see
+// master_kernel.h). Same fixed-stage role as the two kernels above (deliver-drain / k^2-tree
+// propagate+scatter+active-set-enqueue), generalized so a scattered spike lands in the ring slot
+// due at `tick + delay_ticks` instead of always the very next tick -- see delay_ring.h for the ring
+// design (slot math, why ring_slot_count = max_delay_ticks + 1, and the per-slot pending-active
+// dedup). Reuses the SAME k2t_find_nth_neighbor walk / U-V-or-constant weight reconstruction the
+// non-ring propagate kernel above already does -- this ticket's own scope is real per-edge DELAY,
+// not real per-edge weight (still #52-54/#57's job, unchanged here).
+//
+// Exported (not file-local like the two kernel builders above) so master_kernel_tests.cpp can
+// genuinely compile their exact MSL text via the real `xcrun -sdk macosx metal -c` toolchain
+// directly, mirroring gpu_source_tests.cpp's/this file's own `compiles_as_msl` helper -- the same
+// scrutiny AssembledMasterKernelSource's public drain_network_inputs_source/propagate_source
+// fields already get, without adding these two ticket-#64-only kernels to that struct's own
+// established (and already-tested) contract.
+
+namespace {
+const char *const MASTER_KERNEL_DRAIN_RING_NAME = "spikecorec_master_drain_network_inputs_ring";
+const char *const MASTER_KERNEL_PROPAGATE_RING_NAME = "spikecorec_master_propagate_ring";
+} // namespace
+
+GpuSource build_drain_ring_kernel_gpu_source() {
+    GpuSource source;
+    source.msl_source =
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "\n"
+        "kernel void spikecorec_master_drain_network_inputs_ring(\n"
+        "    device float *network_inputs_ring [[ buffer(0) ]],\n"
+        "    constant long &neuron_count       [[ buffer(1) ]],\n"
+        "    constant long &current_slot       [[ buffer(2) ]],\n"
+        "    uint thread_id [[ thread_position_in_grid ]]\n"
+        ") {\n"
+        "    long neuron_index = (long)thread_id;\n"
+        "    if (neuron_index >= neuron_count) return;\n"
+        "    network_inputs_ring[current_slot * neuron_count + neuron_index] = 0.0f;\n"
+        "}\n";
+    source.cuda_source =
+        "__global__ void spikecorec_master_drain_network_inputs_ring(\n"
+        "    float *network_inputs_ring,\n"
+        "    long long neuron_count,\n"
+        "    long long current_slot\n"
+        ") {\n"
+        "    long long neuron_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    if (neuron_index >= neuron_count) return;\n"
+        "    network_inputs_ring[current_slot * neuron_count + neuron_index] = 0.0f;\n"
+        "}\n";
+    source.functions = {
+        GpuFunctionSignature{MASTER_KERNEL_DRAIN_RING_NAME, {"network_inputs_ring", "neuron_count", "current_slot"}}};
+    return source;
+}
+
+GpuSource build_propagate_ring_kernel_gpu_source() {
+    GpuSource source;
+
+    String msl_body =
+        "kernel void spikecorec_master_propagate_ring(\n"
+        "    constant long        &tick                       [[ buffer(0) ]],\n"
+        "    constant long        &ring_slot_count             [[ buffer(1) ]],\n"
+        "    const device float4  *U                          [[ buffer(2) ]],\n"
+        "    const device float4  *V                          [[ buffer(3) ]],\n"
+        "    constant long        &rank_float4_stride         [[ buffer(4) ]],\n"
+        "    constant float       &constant_weight            [[ buffer(5) ]],\n"
+        "    constant int         &using_constant_weight      [[ buffer(6) ]],\n"
+        "    const device uint    *internal_node_words        [[ buffer(7) ]],\n"
+        "    const device uint    *leaf_node_words             [[ buffer(8) ]],\n"
+        "    const device uint    *rank_superblock_table      [[ buffer(9) ]],\n"
+        "    const device ushort  *rank_subblock_table        [[ buffer(10) ]],\n"
+        "    constant int         &branching_factor           [[ buffer(11) ]],\n"
+        "    constant int         &superblock_size_words      [[ buffer(12) ]],\n"
+        "    constant int         &padded_node_count          [[ buffer(13) ]],\n"
+        "    constant int         &tree_height                [[ buffer(14) ]],\n"
+        "    constant int         &internal_bit_count         [[ buffer(15) ]],\n"
+        "    constant long        &neuron_count               [[ buffer(16) ]],\n"
+        "    constant long        &max_neighbor_count         [[ buffer(17) ]],\n"
+        "    const device int     *edge_delay_ticks           [[ buffer(18) ]],\n"
+        "    device float         *network_inputs_ring        [[ buffer(19) ]],\n"
+        "    device long          *last_spiked                [[ buffer(20) ]],\n"
+        "    device int           *pending_active_neuron_indices [[ buffer(21) ]],\n"
+        "    device int           *pending_active_neuron_count   [[ buffer(22) ]],\n"
+        "    device int           *pending_active_generation     [[ buffer(23) ]],\n"
+        "    device bool          *emit_spike                 [[ buffer(24) ]],\n"
+        "    uint thread_id [[ thread_position_in_grid ]]\n"
+        ") {\n"
+        "    long neuron_index = (long)thread_id;\n"
+        "    if (neuron_index >= neuron_count) return;\n"
+        "    if (!emit_spike[neuron_index]) return;\n"
+        "    emit_spike[neuron_index] = false;\n"
+        "\n"
+        "    last_spiked[neuron_index] = tick;\n"
+        "\n"
+        "    const device float4 *u_row = U + (long)neuron_index * rank_float4_stride;\n"
+        "\n"
+        "    for (long slot = 0; slot < max_neighbor_count; ++slot) {\n"
+        "        int child = k2t_find_nth_neighbor(\n"
+        "            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,\n"
+        "            branching_factor, superblock_size_words, (int)neuron_count, padded_node_count,\n"
+        "            tree_height, internal_bit_count, (int)neuron_index, (int)slot\n"
+        "        );\n"
+        "        if (child < 0) continue;\n"
+        "\n"
+        "        float weight = constant_weight;\n"
+        "        if (using_constant_weight == 0) {\n"
+        "            const device float4 *v_row = V + (long)child * rank_float4_stride;\n"
+        "            float dot_product = 0.0f;\n"
+        "            for (long lane = 0; lane < rank_float4_stride; ++lane) {\n"
+        "                dot_product += dot(u_row[lane], v_row[lane]);\n"
+        "            }\n"
+        "            weight = dot_product;\n"
+        "        }\n"
+        "\n"
+        "        int delay_ticks = edge_delay_ticks[neuron_index * max_neighbor_count + slot];\n"
+        "        long arrival_tick = tick + (long)delay_ticks;\n"
+        "        long target_slot = arrival_tick % ring_slot_count;\n"
+        "        int arrival_tick_i = (int)arrival_tick;\n"
+        "\n"
+        "        device atomic_float *input_slot =\n"
+        "            (device atomic_float *)(network_inputs_ring + target_slot * neuron_count + child);\n"
+        "        atomic_fetch_add_explicit(input_slot, weight, memory_order_relaxed);\n"
+        "\n"
+        "        device atomic_int *child_generation_slot =\n"
+        "            (device atomic_int *)(pending_active_generation + target_slot * neuron_count + child);\n"
+        "        int previous_child_generation =\n"
+        "            atomic_exchange_explicit(child_generation_slot, arrival_tick_i, memory_order_relaxed);\n"
+        "        if (previous_child_generation != arrival_tick_i) {\n"
+        "            device atomic_int *count_slot = (device atomic_int *)(pending_active_neuron_count + target_slot);\n"
+        "            int position = atomic_fetch_add_explicit(count_slot, 1, memory_order_relaxed);\n"
+        "            pending_active_neuron_indices[target_slot * neuron_count + position] = child;\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    long self_slot = (tick + 1) % ring_slot_count;\n"
+        "    int self_arrival_i = (int)(tick + 1);\n"
+        "    device atomic_int *self_generation_slot =\n"
+        "        (device atomic_int *)(pending_active_generation + self_slot * neuron_count + neuron_index);\n"
+        "    int previous_self_generation =\n"
+        "        atomic_exchange_explicit(self_generation_slot, self_arrival_i, memory_order_relaxed);\n"
+        "    if (previous_self_generation != self_arrival_i) {\n"
+        "        device atomic_int *count_slot = (device atomic_int *)(pending_active_neuron_count + self_slot);\n"
+        "        int position = atomic_fetch_add_explicit(count_slot, 1, memory_order_relaxed);\n"
+        "        pending_active_neuron_indices[self_slot * neuron_count + position] = (int)neuron_index;\n"
+        "    }\n"
+        "}\n";
+
+    source.msl_source = "#include <metal_stdlib>\nusing namespace metal;\n" + k2tree_walk_preamble_msl() + "\n" + msl_body;
+
+    String cuda_body =
+        "__global__ void spikecorec_master_propagate_ring(\n"
+        "    long long             tick,\n"
+        "    long long             ring_slot_count,\n"
+        "    const float4          *U,\n"
+        "    const float4          *V,\n"
+        "    long long             rank_float4_stride,\n"
+        "    float                 constant_weight,\n"
+        "    int                   using_constant_weight,\n"
+        "    const unsigned int    *internal_node_words,\n"
+        "    const unsigned int    *leaf_node_words,\n"
+        "    const unsigned int    *rank_superblock_table,\n"
+        "    const unsigned short  *rank_subblock_table,\n"
+        "    int                   branching_factor,\n"
+        "    int                   superblock_size_words,\n"
+        "    int                   padded_node_count,\n"
+        "    int                   tree_height,\n"
+        "    int                   internal_bit_count,\n"
+        "    long long             neuron_count,\n"
+        "    long long             max_neighbor_count,\n"
+        "    const int             *edge_delay_ticks,\n"
+        "    float                 *network_inputs_ring,\n"
+        "    long long             *last_spiked,\n"
+        "    int                   *pending_active_neuron_indices,\n"
+        "    int                   *pending_active_neuron_count,\n"
+        "    int                   *pending_active_generation,\n"
+        "    bool                  *emit_spike\n"
+        ") {\n"
+        "    long long neuron_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    if (neuron_index >= neuron_count) return;\n"
+        "    if (!emit_spike[neuron_index]) return;\n"
+        "    emit_spike[neuron_index] = false;\n"
+        "\n"
+        "    last_spiked[neuron_index] = tick;\n"
+        "\n"
+        "    const float4 *u_row = U + (long long)neuron_index * rank_float4_stride;\n"
+        "\n"
+        "    for (long long slot = 0; slot < max_neighbor_count; ++slot) {\n"
+        "        int child = k2t_find_nth_neighbor(\n"
+        "            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,\n"
+        "            branching_factor, superblock_size_words, (int)neuron_count, padded_node_count,\n"
+        "            tree_height, internal_bit_count, (int)neuron_index, (int)slot\n"
+        "        );\n"
+        "        if (child < 0) continue;\n"
+        "\n"
+        "        float weight = constant_weight;\n"
+        "        if (using_constant_weight == 0) {\n"
+        "            const float4 *v_row = V + (long long)child * rank_float4_stride;\n"
+        "            float dot_product = 0.0f;\n"
+        "            for (long long lane = 0; lane < rank_float4_stride; ++lane) {\n"
+        "                float4 u4 = u_row[lane];\n"
+        "                float4 v4 = v_row[lane];\n"
+        "                dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;\n"
+        "            }\n"
+        "            weight = dot_product;\n"
+        "        }\n"
+        "\n"
+        "        int delay_ticks = edge_delay_ticks[neuron_index * max_neighbor_count + slot];\n"
+        "        long long arrival_tick = tick + (long long)delay_ticks;\n"
+        "        long long target_slot = arrival_tick % ring_slot_count;\n"
+        "        int arrival_tick_i = (int)arrival_tick;\n"
+        "\n"
+        "        atomicAdd(&network_inputs_ring[target_slot * neuron_count + child], weight);\n"
+        "\n"
+        "        int previous_child_generation =\n"
+        "            atomicExch(&pending_active_generation[target_slot * neuron_count + child], arrival_tick_i);\n"
+        "        if (previous_child_generation != arrival_tick_i) {\n"
+        "            int position = atomicAdd(&pending_active_neuron_count[target_slot], 1);\n"
+        "            pending_active_neuron_indices[target_slot * neuron_count + position] = child;\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    long long self_slot = (tick + 1) % ring_slot_count;\n"
+        "    int self_arrival_i = (int)(tick + 1);\n"
+        "    int previous_self_generation =\n"
+        "        atomicExch(&pending_active_generation[self_slot * neuron_count + neuron_index], self_arrival_i);\n"
+        "    if (previous_self_generation != self_arrival_i) {\n"
+        "        int position = atomicAdd(&pending_active_neuron_count[self_slot], 1);\n"
+        "        pending_active_neuron_indices[self_slot * neuron_count + position] = (int)neuron_index;\n"
+        "    }\n"
+        "}\n";
+
+    source.cuda_source = "#include <vector_types.h>\n" + k2tree_walk_preamble_cuda() + "\n" + cuda_body;
+
+    source.functions = {GpuFunctionSignature{
+        MASTER_KERNEL_PROPAGATE_RING_NAME,
+        {"tick", "ring_slot_count", "U", "V", "rank_float4_stride", "constant_weight", "using_constant_weight",
+         "internal_node_words", "leaf_node_words", "rank_superblock_table", "rank_subblock_table",
+         "branching_factor", "superblock_size_words", "padded_node_count", "tree_height", "internal_bit_count",
+         "neuron_count", "max_neighbor_count", "edge_delay_ticks", "network_inputs_ring", "last_spiked",
+         "pending_active_neuron_indices", "pending_active_neuron_count", "pending_active_generation",
+         "emit_spike"}}};
+    return source;
+}
+
 Vector<String> collect_emit_port_names(const ModelSpecification &model,
                                         const Vector<IrProgram> &type_library_ir_programs) {
     Vector<String> ports_in_order;
@@ -534,7 +777,8 @@ KernelHandle compile_kernel_or_throw_with_source(const String &source_text, cons
     }
 }
 
-AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs) {
+AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs,
+                                bool enable_delay_ring) {
     AssembledMasterKernelSource assembled = assemble_master_kernel_source(model, type_library_ir_programs);
 
     type_library_ir_programs_ = type_library_ir_programs;
@@ -573,6 +817,22 @@ AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrP
         source_text_for_this_backend(assembled.propagate_source),
         assembled.propagate_source.functions.at(0).function_name,
         "the engine-fixed propagate kernel", "");
+
+    // ── ticket #64 [F3]: ring-based deliver-drain/propagate, only when opted into ─────────────────
+    delay_ring_enabled_ = enable_delay_ring;
+    if (delay_ring_enabled_) {
+        GpuSource drain_ring_source = build_drain_ring_kernel_gpu_source();
+        drain_ring_parameter_names_ = drain_ring_source.functions.at(0).parameter_names_in_order;
+        drain_ring_kernel_handle_ = compile_kernel_or_throw_with_source(
+            source_text_for_this_backend(drain_ring_source), drain_ring_source.functions.at(0).function_name,
+            "the engine-fixed ring deliver-drain kernel (ticket #64)", "");
+
+        GpuSource propagate_ring_source = build_propagate_ring_kernel_gpu_source();
+        propagate_ring_parameter_names_ = propagate_ring_source.functions.at(0).parameter_names_in_order;
+        propagate_ring_kernel_handle_ = compile_kernel_or_throw_with_source(
+            source_text_for_this_backend(propagate_ring_source), propagate_ring_source.functions.at(0).function_name,
+            "the engine-fixed ring propagate kernel (ticket #64)", "");
+    }
 }
 
 AssembledModel::~AssembledModel() {
@@ -581,6 +841,10 @@ AssembledModel::~AssembledModel() {
     }
     release_kernel(drain_kernel_handle_);
     release_kernel(propagate_kernel_handle_);
+    if (delay_ring_enabled_) {
+        release_kernel(drain_ring_kernel_handle_);
+        release_kernel(propagate_ring_kernel_handle_);
+    }
 }
 
 bool AssembledModel::population_is_closed_form_advanceable(usize population_index) const {
@@ -593,8 +857,25 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
     if (buffers.allocation == nullptr || buffers.weights == nullptr) {
         fail("step_tick: ModelRuntimeBuffers::allocation/weights must be non-null");
     }
+    if (delay_ring_enabled_ != (buffers.delay_ring != nullptr)) {
+        fail("step_tick: ModelRuntimeBuffers::delay_ring must be non-null if and only if this "
+             "AssembledModel was constructed with enable_delay_ring=true (ticket #64)");
+    }
 
     const s64 *chunk_base_offsets = buffers.allocation->cell_type_boundaries.get_contents();
+
+    // ── ticket #64 [F3]: which network_inputs buffer this tick's population dispatch reads from --
+    // either the flat, pre-#64 buffer (delay_ring == nullptr, byte-for-byte the same as before this
+    // ticket) or this tick's own ring slot (delay_ring != nullptr, see delay_ring.h). Either way, the
+    // per-population `_tick` kernels below still take a parameter literally named `network_inputs`
+    // (append_cell_tick_argument, unchanged by this ticket) -- only WHERE it points changes.
+    f32 *network_inputs_for_this_tick = buffers.network_inputs;
+    s64 current_ring_slot = 0;
+    if (buffers.delay_ring != nullptr) {
+        current_ring_slot = tick % buffers.delay_ring->ring_slot_count;
+        network_inputs_for_this_tick =
+            buffers.delay_ring->input_ring.get_contents() + current_ring_slot * total_neuron_count_;
+    }
 
     // stages 2-5: one dispatch per population, over its own full neuron range (arch §4.1's
     // cell-type-boundary dispatch -- one dispatch per boundary, not a single mega-dispatch with a
@@ -617,37 +898,99 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         for (const String &parameter_name : info.parameter_names_in_order) {
             append_cell_tick_argument(builder, parameter_name, program, info.type_library_index,
                                        info.neuron_index_begin, info.population_size, chunk_base_offset,
-                                       *buffers.allocation, dt, tick, buffers.network_inputs,
+                                       *buffers.allocation, dt, tick, network_inputs_for_this_tick,
                                        buffers.emit_port_flags);
         }
         builder.dispatch(info.handle, launch_config_for(info.population_size));
     }
 
-    // fixed deliver-drain: network_inputs has now been read by every population's own `_tick`
-    // kernel this tick -- zero it so the propagate stage below writes THIS tick's fresh
-    // contributions, not an accumulation on top of what was already consumed (ir_spec.md §3.5's
-    // >=1-tick latency: a write below is only ever read at the NEXT tick's per-population pass
-    // above, never this one, since that pass already ran before this drain).
-    {
-        DispatchArgumentBuilder builder;
-        builder.add_pointer(buffers.network_inputs);
-        builder.add_s64(total_neuron_count_);
-        builder.dispatch(drain_kernel_handle_, launch_config_for(total_neuron_count_));
+    if (buffers.delay_ring == nullptr) {
+        // fixed deliver-drain: network_inputs has now been read by every population's own `_tick`
+        // kernel this tick -- zero it so the propagate stage below writes THIS tick's fresh
+        // contributions, not an accumulation on top of what was already consumed (ir_spec.md §3.5's
+        // >=1-tick latency: a write below is only ever read at the NEXT tick's per-population pass
+        // above, never this one, since that pass already ran before this drain).
+        {
+            DispatchArgumentBuilder builder;
+            builder.add_pointer(buffers.network_inputs);
+            builder.add_s64(total_neuron_count_);
+            builder.dispatch(drain_kernel_handle_, launch_config_for(total_neuron_count_));
+        }
+
+        // Reset the active-set enqueue counter to 0 before this tick's propagate dispatches run --
+        // matches the real engine's own per-tick reset (src/core/engine.cpp resets
+        // next_active_neuron_count to 0 once per tick, before the dispatch that performs the enqueue).
+        // The propagate kernel's `active_generation` dedup only prevents re-enqueuing the SAME neuron
+        // WITHIN this tick (it compares against next_tick, which is constant for the whole tick); it
+        // does nothing to bound the counter ACROSS ticks. Without this reset, `position` grows without
+        // bound tick over tick and eventually writes past next_active_neuron_indices's own
+        // [total_neuron_count] allocation.
+        *buffers.next_active_neuron_count = 0;
+
+        // fixed k^2-tree propagate/scatter + active-set-enqueue (stage 6/9): one dispatch per distinct
+        // emit-port name, each over the WHOLE model's neuron range (a spiking neuron's downstream
+        // targets come from the model-wide k^2-tree/WeightMatrix, not a population-scoped one).
+        for (const String &port_name : emit_port_names_) {
+            auto found = buffers.emit_port_flags.find(port_name);
+            if (found == buffers.emit_port_flags.end()) {
+                fail("step_tick: no emit-port flag buffer supplied in ModelRuntimeBuffers::emit_port_flags for "
+                     "port '" +
+                     port_name + "'");
+            }
+
+            DispatchArgumentBuilder builder;
+            builder.add_s64(tick);
+            builder.add_s64(next_tick);
+            builder.add_pointer(buffers.weights->U_matrix.get_contents());
+            builder.add_pointer(buffers.weights->V_matrix.get_contents());
+            builder.add_s64(buffers.weights->rank_float4_stride);
+            builder.add_f32(buffers.weights->constant_weight);
+            builder.add_s32(buffers.weights->using_constant_weight ? 1 : 0);
+            builder.add_pointer(buffers.weights->k2tree.internal_node_words.get_contents());
+            builder.add_pointer(buffers.weights->k2tree.leaf_node_words.get_contents());
+            builder.add_pointer(buffers.weights->k2tree.rank_superblock_table.get_contents());
+            builder.add_pointer(buffers.weights->k2tree.rank_subblock_table.get_contents());
+            builder.add_s32(buffers.weights->k2tree.branching_factor);
+            builder.add_s32(buffers.weights->k2tree.superblock_size_words);
+            builder.add_s32(buffers.weights->k2tree.padded_node_count);
+            builder.add_s32(buffers.weights->k2tree.tree_height);
+            builder.add_s32(buffers.weights->k2tree.internal_bit_count);
+            builder.add_s64(total_neuron_count_);
+            builder.add_s64(buffers.weights->max_neighbor_count);
+            builder.add_pointer(buffers.network_inputs);
+            builder.add_pointer(buffers.last_spiked);
+            builder.add_pointer(buffers.next_active_neuron_indices);
+            builder.add_pointer(buffers.next_active_neuron_count);
+            builder.add_pointer(buffers.active_generation);
+            builder.add_pointer(found->second);
+            builder.dispatch(propagate_kernel_handle_, launch_config_for(total_neuron_count_));
+        }
+        return;
     }
 
-    // Reset the active-set enqueue counter to 0 before this tick's propagate dispatches run --
-    // matches the real engine's own per-tick reset (src/core/engine.cpp resets
-    // next_active_neuron_count to 0 once per tick, before the dispatch that performs the enqueue).
-    // The propagate kernel's `active_generation` dedup only prevents re-enqueuing the SAME neuron
-    // WITHIN this tick (it compares against next_tick, which is constant for the whole tick); it
-    // does nothing to bound the counter ACROSS ticks. Without this reset, `position` grows without
-    // bound tick over tick and eventually writes past next_active_neuron_indices's own
-    // [total_neuron_count] allocation.
-    *buffers.next_active_neuron_count = 0;
+    // ── ticket #64 [F3]: ring-based deliver-drain/propagate ─────────────────────────────────────
+    //
+    // fixed deliver-drain: this tick's own ring slot has now been read by every population's
+    // `_tick` kernel above (via network_inputs_for_this_tick) -- zero just that slot, ready to be
+    // reused ring_slot_count ticks from now (see delay_ring.h for why this never collides with
+    // anything the propagate-ring dispatch below writes THIS tick -- delay is always >= 1, so it
+    // never targets the slot that just got drained).
+    {
+        DispatchArgumentBuilder builder;
+        builder.add_pointer(buffers.delay_ring->input_ring.get_contents());
+        builder.add_s64(total_neuron_count_);
+        builder.add_s64(current_ring_slot);
+        builder.dispatch(drain_ring_kernel_handle_, launch_config_for(total_neuron_count_));
+    }
 
-    // fixed k^2-tree propagate/scatter + active-set-enqueue (stage 6/9): one dispatch per distinct
-    // emit-port name, each over the WHOLE model's neuron range (a spiking neuron's downstream
-    // targets come from the model-wide k^2-tree/WeightMatrix, not a population-scoped one).
+    // Reset this tick's own pending-active slot's count to 0 -- mirrors the flat path's
+    // next_active_neuron_count reset above, ring-generalized: slot current_ring_slot's list was
+    // populated over the PAST several ticks by whichever earlier ticks' propagate-ring dispatch
+    // scattered a delayed arrival landing exactly on `tick` (delay_ring.h explains why resetting it
+    // here, before this tick's OWN propagate-ring dispatch runs, is always safe -- this tick can
+    // only ever populate SOME OTHER slot, never this one).
+    buffers.delay_ring->pending_active_neuron_count.get_contents()[current_ring_slot] = 0;
+
     for (const String &port_name : emit_port_names_) {
         auto found = buffers.emit_port_flags.find(port_name);
         if (found == buffers.emit_port_flags.end()) {
@@ -658,7 +1001,7 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
 
         DispatchArgumentBuilder builder;
         builder.add_s64(tick);
-        builder.add_s64(next_tick);
+        builder.add_s64(buffers.delay_ring->ring_slot_count);
         builder.add_pointer(buffers.weights->U_matrix.get_contents());
         builder.add_pointer(buffers.weights->V_matrix.get_contents());
         builder.add_s64(buffers.weights->rank_float4_stride);
@@ -675,13 +1018,14 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         builder.add_s32(buffers.weights->k2tree.internal_bit_count);
         builder.add_s64(total_neuron_count_);
         builder.add_s64(buffers.weights->max_neighbor_count);
-        builder.add_pointer(buffers.network_inputs);
+        builder.add_pointer(buffers.delay_ring->edge_delay_ticks.get_contents());
+        builder.add_pointer(buffers.delay_ring->input_ring.get_contents());
         builder.add_pointer(buffers.last_spiked);
-        builder.add_pointer(buffers.next_active_neuron_indices);
-        builder.add_pointer(buffers.next_active_neuron_count);
-        builder.add_pointer(buffers.active_generation);
+        builder.add_pointer(buffers.delay_ring->pending_active_neuron_indices.get_contents());
+        builder.add_pointer(buffers.delay_ring->pending_active_neuron_count.get_contents());
+        builder.add_pointer(buffers.delay_ring->pending_active_generation.get_contents());
         builder.add_pointer(found->second);
-        builder.dispatch(propagate_kernel_handle_, launch_config_for(total_neuron_count_));
+        builder.dispatch(propagate_ring_kernel_handle_, launch_config_for(total_neuron_count_));
     }
 }
 

@@ -66,38 +66,6 @@ static MTL::CommandQueue *global_queue           = nullptr;
 static MTL::Library      *global_default_library = nullptr;
 static unordered_map<void *, MTL::Buffer *> global_buffer_map;
 
-// Resolves an arbitrary data pointer to its containing MTLBuffer plus the byte offset within it.
-// `global_buffer_map` only ever indexes a buffer by the BASE address allocate_bytes() returned
-// (`buffer->contents()`) -- but dispatch call sites throughout this codebase (master_kernel.cpp's
-// per-population/per-state-variable addressing chief among them: `cell_state.get_contents() +
-// chunk_base_offset + variable_offset*population_size`, `network_inputs + neuron_index_begin`, etc.)
-// routinely pass POINTER ARITHMETIC into the MIDDLE of an allocation, not just its base. An exact-match
-// lookup on such a pointer misses (found == end()), silently falling through to `setBytes` -- binding
-// the raw pointer VALUE as inline constant data instead of an actual buffer reference, so a `device`
-// pointer parameter the shader expects to read AND WRITE through ends up bound as a bare scalar; reads
-// through it happen to still succeed (the bytes are a real, dereferenceable address under Metal's
-// unified memory model) but writes silently do nothing (or are undefined) -- exactly the kind of thing
-// that fools "the first tick works, later ticks look frozen" until this file's own owning ticket (#61
-// [H1]) exercised a cell type with more than one state variable / a population with a nonzero base
-// offset for the first time. Scanning every live allocation's own [base, base+length) range to find
-// the one containing `candidate` fixes this for every such offset pointer.
-struct ResolvedMetalBuffer {
-    MTL::Buffer *buffer = nullptr;
-    usize offset = 0;
-};
-
-ResolvedMetalBuffer resolve_metal_buffer(void *candidate) {
-    for (auto &entry : global_buffer_map) {
-        auto *base = static_cast<u8 *>(entry.first);
-        auto *candidate_bytes = static_cast<u8 *>(candidate);
-        usize length = entry.second->length();
-        if (candidate_bytes >= base && candidate_bytes < base + length) {
-            return ResolvedMetalBuffer{entry.second, (usize)(candidate_bytes - base)};
-        }
-    }
-    return ResolvedMetalBuffer{};
-}
-
 // The shaders in src/metal/kernels.metal are compiled ahead-of-time by the
 // Makefile into default.metallib, placed alongside the build artifacts. Command
 // line tools have no app bundle for newDefaultLibrary() to search, so locate the
@@ -350,6 +318,47 @@ void commit_command_batch(MetalCommandBatch *batch) {
 
 // ── metal_dispatch ──────────────────────────────────────────────────────────────────
 
+#ifdef SPIKECOREC_METAL
+// Resolves an arbitrary live pointer back to its owning MTL::Buffer plus the byte offset within it —
+// not just an exact match against a buffer's own base `contents()` address (global_buffer_map's own
+// key). Needed because a caller may legitimately pass an INTERIOR pointer, not just a buffer's base
+// address — e.g. the delay-ring subsystem (ticket #64, master_kernel.cpp) passes
+// `input_ring.get_contents() + current_slot * neuron_count` as its per-tick "network_inputs"
+// argument, one ring slot's own row within one larger allocation. Metal's own
+// `setBuffer(buffer, offset, index)` supports exactly this, but only once the caller has resolved
+// the right (buffer, offset) pair — plain address equality (this function's own fast path, and the
+// ONLY thing this file did before ticket #64) silently fails for any such offset pointer, which
+// `metal_dispatch` used to fall back to binding as inline scalar bytes (`setBytes`) instead of a
+// real device-buffer reference — wrong for a `device T*`-typed kernel parameter, and a silent
+// wrong-data bug (reads back as all-zero on this driver), not a crash, so it went unnoticed until a
+// caller actually exercised a non-zero offset in a real dispatch. Falls back to a linear scan over
+// every live allocation's own [base, base+length) range only when the fast exact-match path misses
+// (the overwhelming common case for every OTHER existing pointer argument in this codebase, which
+// already always passes a buffer's own base address, stays exactly as fast as before).
+static bool resolve_metal_buffer_and_offset(void *candidate, MTL::Buffer *&out_buffer, usize &out_offset) {
+    if (!candidate) return false;
+
+    auto exact_match = global_buffer_map.find(candidate);
+    if (exact_match != global_buffer_map.end()) {
+        out_buffer = exact_match->second;
+        out_offset = 0;
+        return true;
+    }
+
+    auto candidate_address = reinterpret_cast<uintptr_t>(candidate);
+    for (auto &[base_pointer, buffer] : global_buffer_map) {
+        auto base_address = reinterpret_cast<uintptr_t>(base_pointer);
+        usize length = buffer->length();
+        if (candidate_address > base_address && candidate_address < base_address + length) {
+            out_buffer = buffer;
+            out_offset = (usize)(candidate_address - base_address);
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 void metal_dispatch(
     KernelHandle handle,
     LaunchConfig config,
@@ -377,11 +386,12 @@ void metal_dispatch(
         if (arg_sizes[i] == sizeof(void *)) {
             candidate = *reinterpret_cast<void * const *>(args[i]);
         }
-        ResolvedMetalBuffer resolved = candidate ? resolve_metal_buffer(candidate) : ResolvedMetalBuffer{};
-        if (resolved.buffer) {
-            // resolved to a unified memory allocation (possibly an offset into it) — bind its
-            // MTLBuffer at that offset
-            encoder->setBuffer(resolved.buffer, resolved.offset, i);
+        MTL::Buffer *resolved_buffer = nullptr;
+        usize resolved_offset = 0;
+        if (resolve_metal_buffer_and_offset(candidate, resolved_buffer, resolved_offset)) {
+            // resolved to a unified memory allocation (possibly at an interior offset) — bind its
+            // MTLBuffer at the correct byte offset
+            encoder->setBuffer(resolved_buffer, resolved_offset, i);
         } else {
             // scalar argument — pass by value
             encoder->setBytes(args[i], arg_sizes[i], i);

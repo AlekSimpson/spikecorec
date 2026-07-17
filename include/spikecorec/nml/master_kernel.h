@@ -3,6 +3,7 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/allocator.h"
+#include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/gpu_source.h"
 #include "spikecorec/nml/ir.h"
 #include "spikecorec/nml/model_specification.h"
@@ -101,6 +102,18 @@ struct AssembledMasterKernelSource {
 AssembledMasterKernelSource assemble_master_kernel_source(
     const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs);
 
+// ── ticket #64 [F3]: ring-based deliver-drain/propagate kernel sources ──────────────────────────
+//
+// The delay-ring generalization of the two engine-fixed scaffold kernels above (see delay_ring.h
+// for the ring design). Deliberately NOT added to AssembledMasterKernelSource/
+// assemble_master_kernel_source above (that struct/function's own established contract is
+// unchanged by this ticket -- only assembled/compiled by AssembledModel's constructor when built
+// with enable_delay_ring=true, see below). Exported as free functions purely so tests can genuinely
+// compile their exact MSL text through the real Metal toolchain directly, mirroring how
+// AssembledMasterKernelSource's own public fields are used for the same purpose.
+GpuSource build_drain_ring_kernel_gpu_source();
+GpuSource build_propagate_ring_kernel_gpu_source();
+
 // ── compile + cache + dispatch ──────────────────────────────────────────────────────────────────
 
 // Wraps backend::compile_kernel so a compile failure's thrown message carries the generated GPU
@@ -142,6 +155,16 @@ struct ModelRuntimeBuffers {
     // own port's flag true on firing (ticket #55's `emit <port>` convention); the fixed propagate
     // stage reads+clears it.
     UnorderedMap<String, bool *> emit_port_flags;
+
+    // ── ticket #64 [F3]: spike-delay subsystem ──────────────────────────────────────────────────
+    // Non-null activates the ring-based, delay-aware deliver-drain/propagate stages below (only
+    // usable if AssembledModel was constructed with enable_delay_ring=true -- step_tick throws on a
+    // mismatch either way). When non-null, `network_inputs`/`next_active_neuron_indices`/
+    // `next_active_neuron_count`/`active_generation` above are ignored entirely (superseded by
+    // `delay_ring`'s own ring-shaped equivalents, see delay_ring.h) -- a caller using the delay ring
+    // need not allocate those at all. When null (the default), step_tick's fixed drain/propagate
+    // stages behave exactly as they did before this ticket, byte for byte.
+    DelayRingAllocation *delay_ring = nullptr;
 };
 
 // Every distinct EventPort name any Cell-category type-in-use's IR fires `emit` on, in first-seen
@@ -158,7 +181,13 @@ Vector<String> collect_emit_port_names(const ModelSpecification &model, const Ve
 // changed").
 class AssembledModel {
 public:
-    AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs);
+    // `enable_delay_ring` (ticket #64 [F3]): when true, also assembles+compiles the ring-based
+    // deliver-drain/propagate kernels (delay_ring.h) and step_tick uses THOSE instead of the flat,
+    // one-tick-ahead ones -- every step_tick call then requires ModelRuntimeBuffers::delay_ring to
+    // be non-null. When false (the default), behavior is exactly what it was before this ticket;
+    // ModelRuntimeBuffers::delay_ring must be null (step_tick throws on either mismatch).
+    AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs,
+                   bool enable_delay_ring = false);
     AssembledModel(const AssembledModel &) = delete;
     AssembledModel &operator=(const AssembledModel &) = delete;
     ~AssembledModel();
@@ -216,6 +245,16 @@ private:
 
     KernelHandle propagate_kernel_handle_{};
     Vector<String> propagate_parameter_names_;
+
+    // ── ticket #64 [F3]: ring-based deliver-drain/propagate kernels -- only assembled/compiled
+    // when constructed with enable_delay_ring=true (see the constructor's own doc comment above). ──
+    bool delay_ring_enabled_ = false;
+
+    KernelHandle drain_ring_kernel_handle_{};
+    Vector<String> drain_ring_parameter_names_;
+
+    KernelHandle propagate_ring_kernel_handle_{};
+    Vector<String> propagate_ring_parameter_names_;
 };
 
 } // namespace spikecorec::nml
