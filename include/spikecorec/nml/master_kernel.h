@@ -51,11 +51,14 @@ namespace spikecorec::nml {
 //   arguments) supports the parameter KINDS Phase-1's own GLIF-family cell lowering (cell_lowering.cpp)
 //   emits: `dt`/`network_inputs` (reserved), `state`/`accum`/`regime`/`param:dyn`/`expose`-scratch
 //   (per-neuron arrays), baked `param` constants (no argument -- already inlined as a literal),
-//   `emit_<port>` flags, and the trailing `neuron_count`. A per-neuron cell kernel that references
-//   `require`, `rng_state` (`rand`/`randn`), or the k^2-tree-walk/shared-basis block (`forall`/
-//   `loadedge`/`accedge`) throws a clear std::runtime_error at dispatch-argument-resolution time --
-//   none of Phase-1's GLIF cells reference any of these (they are synapse-side or Phase-2/3
-//   constructs), so this is a documented scope boundary, not a silent gap.
+//   `emit_<port>` flags, and the trailing `neuron_count` -- plus, as of ticket #65 [F4],
+//   `rng_state` (`rand`/`randn`; ModelRuntimeBuffers::rng_state, caller-allocated and seeded). A
+//   per-neuron cell kernel that references `require` or the k^2-tree-walk/shared-basis block
+//   (`forall`/`loadedge`/`accedge`) still throws a clear std::runtime_error at
+//   dispatch-argument-resolution time -- none of Phase-1's GLIF cells or ticket #65's on-device
+//   generators reference either (they are synapse-side or Phase-3 constructs, save for
+//   `voltageClamp`'s own `require v`, itself a documented, deliberate exclusion -- see
+//   inputs_lowering.h), so this is a documented scope boundary, not a silent gap.
 // - Active-set-driven SKIP dispatch (the closed-form multi-tick lazy decay the current hardcoded
 //   `step` kernel performs for a neuron with no new input) is NOT implemented: every population's
 //   kernel runs over its FULL neuron range every tick, matching the existing engine's own
@@ -165,6 +168,17 @@ struct ModelRuntimeBuffers {
     // need not allocate those at all. When null (the default), step_tick's fixed drain/propagate
     // stages behave exactly as they did before this ticket, byte for byte.
     DelayRingAllocation *delay_ring = nullptr;
+
+    // Per-neuron persistent RNG state (ticket #65 [F4]) -- gpu_source.h's own `rng_state` reserved
+    // buffer (xorshift32; ticket #55), one `u32` per neuron, model-wide (whole `[total_neuron_count]`,
+    // same "+neuron_index_begin" slicing convention as network_inputs/emit_port_flags above). Left
+    // null iff no population's kernel in this model actually uses `rand`/`randn` -- ticket #6's
+    // AssembledModel only throws asking for this when a dispatched kernel's own parameter list
+    // actually needs it, so a model with no on-device generator can leave this unset. The caller
+    // seeds every entry to a NONZERO value before the first tick (xorshift32 is stuck at 0 forever
+    // once it reaches 0 -- e.g. seed neuron n with `(n+1)*2654435761u | 1u`, or any other
+    // per-neuron-distinct nonzero scheme); step_tick only ever reads/advances it, never re-seeds it.
+    u32 *rng_state = nullptr; // [total_neuron_count]
 };
 
 // Every distinct EventPort name any Cell-category type-in-use's IR fires `emit` on, in first-seen

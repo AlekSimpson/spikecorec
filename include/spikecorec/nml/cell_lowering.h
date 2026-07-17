@@ -23,9 +23,12 @@ namespace spikecorec::nml {
 // values (`TypeLibraryEntry::baked_constants`) for Phase 1 (one population
 // binds one component -> every neuron sharing that entry has the same
 // resolved value) -- this lowering just reads that map and emits a literal
-// `ParamConstantDirective` per `Parameter`. No per-neuron `param : dyn` array
-// is ever emitted in Phase 1; see cell_lowering.cpp's header comment for why
-// that's sufficient rather than a rule this ticket re-implements.
+// `ParamConstantDirective` per `Parameter`. The one exception (ticket #65
+// [F4], Phase 2): a `Parameter` name also present in
+// `TypeLibraryEntry::heterogeneous_parameter_values` emits a per-neuron
+// `param : dyn` array (`ParamDynamicDirective`) instead -- see that field's
+// own doc comment (model_specification.h) for how genuine heterogeneity gets
+// into that map.
 
 // Lowers one Cell-category `TypeLibraryEntry` to its `IrProgram`. Throws
 // std::runtime_error if `cell_entry.category != TypeLibraryCategory::Cell`,

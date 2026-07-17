@@ -461,6 +461,14 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
     }
     if (!regimes.empty()) alloc_directives.push_back(RegimeDirective{REGIME_VARIABLE_NAME});
     for (const auto &parameter : cell.parameters) {
+        // Bake-vs-parameterize (arch §3.1; ticket #65 [F4]'s heterogeneous branch): a name present
+        // in `heterogeneous_parameter_values` genuinely varies per neuron in this population, so it
+        // is emitted as a `param : dyn` array instead of a baked literal, even if `baked_constants`
+        // also happens to carry a (population-uniform-case) value for the same name.
+        if (cell_entry.heterogeneous_parameter_values.count(parameter.name)) {
+            alloc_directives.push_back(ParamDynamicDirective{parameter.name, "f32"});
+            continue;
+        }
         auto baked_value = cell_entry.baked_constants.find(parameter.name);
         std::optional<String> literal_value;
         if (baked_value != cell_entry.baked_constants.end()) literal_value = format_literal(baked_value->second);
