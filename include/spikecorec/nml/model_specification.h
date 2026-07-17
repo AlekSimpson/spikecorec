@@ -69,13 +69,30 @@ struct TypeLibraryEntry {
     // (`dynamics.fixed_parameter_values`) with the bound instance's own
     // numeric attribute values; the instance's value wins on a name
     // collision, since a bound instance's own value is strictly more
-    // specific than an inherited `Fixed` pin. Genuine per-neuron
-    // heterogeneity (arch §3.1: distinct components, per-cell distribution
-    // draws, or Phase-3 `inhomogeneousParameter`) is out of Phase-1 scope --
-    // it would hook in here as a per-entry flag plus a per-neuron array,
-    // replacing a baked entry when a future Structure-level construct makes
-    // the values non-uniform.
+    // specific than an inherited `Fixed` pin. A name present in
+    // `heterogeneous_parameter_values` (below) is NOT baked from here even if
+    // also present in this map -- see that field's own doc comment.
     UnorderedMap<String, f64> baked_constants;
+
+    // Genuine within-population parameter heterogeneity (arch §3.1's
+    // heterogeneous branch; ticket #65 [F4]): one entry per Parameter/Property
+    // name that varies per neuron rather than being shared by the whole
+    // population, each a `Vector<f64>` of exactly the OWNING population's
+    // `size`, in local (population-relative) neuron-index order. When a name
+    // here also appears in `baked_constants`, cell_lowering.cpp's
+    // bake-vs-parameterize step prefers this map -- it emits a
+    // `ParamDynamicDirective` (a per-neuron `param : dyn` array) instead of a
+    // baked `ParamConstantDirective`, and allocate_model (allocator.cpp) fills
+    // the resulting per-neuron array from these values instead of leaving it
+    // zeroed. Empty by default (Phase-1's uniform-population default, still
+    // the common case). Populating this from real NML syntax (per-instance
+    // distinct bound components, `inhomogeneousParameter`/`inhomogeneousValue`)
+    // is NOT implemented -- model_specification.cpp never fills this map
+    // itself; a caller that wants genuine heterogeneity sets it directly
+    // (matching the same hand-built-fixture pattern allocator_tests.cpp/
+    // master_kernel_tests.cpp already use to exercise engine-level data this
+    // ticket's front end has no NML syntax for yet).
+    UnorderedMap<String, Vector<f64>> heterogeneous_parameter_values;
 
     // Meaningful only when category == Synapse (arch §3.1 `ComponentType`,
     // §3.3 D3): does the `extends` chain pass through

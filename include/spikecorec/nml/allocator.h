@@ -31,12 +31,14 @@ namespace spikecorec::nml {
 //
 // `type_library_ir_programs` is a parallel array to `model.type_library`,
 // one `IrProgram` per entry, in the same index order -- e.g. built by
-// calling `lower_cell_to_ir`/`lower_synapse_to_ir` per entry depending on
-// its `TypeLibraryCategory` (see this ticket's tests for exactly that). A
-// `TypeLibraryCategory::Inputs` entry has no IR-lowering ticket yet (Phase-1
-// stimulus generators are host-precomputed, arch §3.3 D4/§5) -- callers
-// should pass an empty placeholder `IrProgram` for those slots; an empty
-// `.alloc` correctly contributes nothing here.
+// calling `lower_cell_to_ir`/`lower_synapse_to_ir`/`lower_inputs_to_ir` per
+// entry depending on its `TypeLibraryCategory` (see this ticket's tests for
+// exactly that). A `TypeLibraryCategory::Inputs` entry whose ComponentType
+// isn't one of the on-device generators `inputs_lowering.cpp` (ticket #65
+// [F4]) lowers has no IR-lowering path at all (Phase-1's `pulseGenerator` is
+// host-precomputed instead, arch §3.3 D4/§5) -- callers should pass an empty
+// placeholder `IrProgram` for those slots; an empty `.alloc` correctly
+// contributes nothing here.
 
 // One `require <name> from <scope>` binding, recorded as metadata only (IR
 // spec §2: "a binding; storage lives with the owner of the quantity" -- no
@@ -90,10 +92,13 @@ public:
     bool has_regime_index = false;
 
     // ── `param <name> : dyn <dtype>` per-neuron dynamic parameter arrays --
-    // never actually emitted by the current Phase-1 cell/synapse lowering
-    // (which always bakes), but part of the locked IR spec's `.alloc`
-    // surface (§2), so handled here for whatever future lowering emits it.
-    // Keyed by `type_scoped_key()`, sized to `total_neuron_count`. ──
+    // Phase-1's cell/synapse lowering always bakes, so never emits one; ticket
+    // #65 [F4]'s bake-vs-parameterize alternative path emits one for a
+    // genuinely heterogeneous Parameter (cell_lowering.cpp), filled here from
+    // that type's `TypeLibraryEntry::heterogeneous_parameter_values` (left
+    // zero-filled, with a warning, if a directive has no matching values --
+    // e.g. a hand-built test IrProgram fixture). Keyed by `type_scoped_key()`,
+    // sized to `total_neuron_count`. ──
     UnorderedMap<String, GpuPointer<f32>> dynamic_parameter_arrays;
 
     // ── recorded-derived-exposure scratch (arch §4.1/§4.5: "a recorded

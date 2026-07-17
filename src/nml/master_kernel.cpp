@@ -156,12 +156,13 @@ const String &source_text_for_this_backend(const GpuSource &source) {
 
 // Resolves one population `_tick` kernel parameter name to a dispatch argument, appended onto
 // `builder` -- see master_kernel.h's own header comment for exactly which parameter kinds this
-// supports (the ones Phase-1's GLIF-family cell lowering, cell_lowering.cpp, actually emits) and
-// which it deliberately throws on (require/rng_state/tree-walk/shared-basis/un-baked-bare-param).
+// supports (the ones Phase-1's GLIF-family cell lowering, cell_lowering.cpp, actually emits, plus
+// ticket #65 [F4]'s `rng_state`) and which it deliberately still throws on
+// (require/tree-walk/shared-basis/un-baked-bare-param).
 void append_cell_tick_argument(DispatchArgumentBuilder &builder, const String &parameter_name,
                                 const IrProgram &program, s32 type_library_index, s32 neuron_index_begin,
                                 s32 population_size, s64 cell_state_chunk_base_offset, ModelAllocation &allocation,
-                                f32 dt, s64 tick, f32 *network_inputs,
+                                f32 dt, s64 tick, f32 *network_inputs, u32 *rng_state,
                                 const UnorderedMap<String, bool *> &emit_port_flags) {
     if (parameter_name == "dt") {
         builder.add_f32(dt);
@@ -173,6 +174,15 @@ void append_cell_tick_argument(DispatchArgumentBuilder &builder, const String &p
     }
     if (parameter_name == "network_inputs") {
         builder.add_pointer(network_inputs + neuron_index_begin);
+        return;
+    }
+    if (parameter_name == "rng_state") {
+        if (rng_state == nullptr) {
+            fail("cell-type kernel parameter 'rng_state' (rand/randn) needs ModelRuntimeBuffers::rng_state "
+                 "to be set (non-null) -- allocate + seed one u32 per neuron before calling step_tick "
+                 "(see master_kernel.h)");
+        }
+        builder.add_pointer(rng_state + neuron_index_begin);
         return;
     }
     if (parameter_name == "neuron_count") {
@@ -248,10 +258,6 @@ void append_cell_tick_argument(DispatchArgumentBuilder &builder, const String &p
         }
     }
 
-    if (parameter_name == "rng_state") {
-        fail("cell-type kernel parameter 'rng_state' (rand/randn) is not wired by this ticket's dispatch "
-             "(Phase-2 scope)");
-    }
     fail("cell-type kernel parameter '" + parameter_name + "' is not a recognized reserved name, .alloc name, "
          "or emit port for this ticket's dispatch -- likely the k^2-tree-walk/shared-basis block "
          "(forall/loadedge/accedge), out of scope for a Phase-1 GLIF-family cell (see master_kernel.h)");
@@ -898,7 +904,7 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         for (const String &parameter_name : info.parameter_names_in_order) {
             append_cell_tick_argument(builder, parameter_name, program, info.type_library_index,
                                        info.neuron_index_begin, info.population_size, chunk_base_offset,
-                                       *buffers.allocation, dt, tick, network_inputs_for_this_tick,
+                                       *buffers.allocation, dt, tick, network_inputs_for_this_tick, buffers.rng_state,
                                        buffers.emit_port_flags);
         }
         builder.dispatch(info.handle, launch_config_for(info.population_size));

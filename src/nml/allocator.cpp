@@ -58,6 +58,15 @@ ModelAllocation allocate_model(ModelSpecification &model, const Vector<IrProgram
 
     ModelAllocation allocation;
 
+    // ── population(s) owning each type-library entry (ticket #65 [F4]) -- needed below to place a
+    // heterogeneous `param : dyn` array's real per-neuron values at the right offset within the
+    // model-wide `dynamic_parameter_arrays` buffer (that buffer stays whole-model-sized per this
+    // header's own existing convention; only the owning population's own neuron range is filled). ──
+    UnorderedMap<s32, Vector<const PopulationEntry *>> populations_by_type_library_index;
+    for (const auto &population : model.populations) {
+        populations_by_type_library_index[population.type_library_index].push_back(&population);
+    }
+
     // ── widened cell-state vector + O(P) boundary array (arch §4.1) ────────
     // Walk populations in order, summing each population's `size * V_t`
     // (`V_t` read from its cell type's own `.alloc` `state` directive count,
@@ -148,9 +157,44 @@ ModelAllocation allocate_model(ModelSpecification &model, const Vector<IrProgram
                 const auto &param_directive = std::get<ParamDynamicDirective>(directive);
                 require_f32_dtype(param_directive.dtype,
                     "type '" + program.component_type_name + "' param:dyn '" + param_directive.name + "'");
+                GpuPointer<f32> buffer = allocate_zeroed_f32(model.total_neuron_count);
+
+                // Fill from TypeLibraryEntry::heterogeneous_parameter_values when the lowering that
+                // produced this `param : dyn` directive was driven by genuine per-neuron
+                // heterogeneity (ticket #65 [F4]) -- left zeroed (with a warning) otherwise, since a
+                // `param : dyn` directive with no known per-neuron source has no value to fill it
+                // with (e.g. a hand-built IrProgram fixture in a test).
+                auto heterogeneous_values = type_entry.heterogeneous_parameter_values.find(param_directive.name);
+                if (heterogeneous_values != type_entry.heterogeneous_parameter_values.end()) {
+                    const Vector<f64> &values = heterogeneous_values->second;
+                    auto owning_populations = populations_by_type_library_index.find(type_library_index);
+                    if (owning_populations == populations_by_type_library_index.end()) {
+                        log::throw_runtime_error(log::logger(),
+                            "allocator: type '" + program.component_type_name + "' has heterogeneous values for "
+                            "param:dyn '" + param_directive.name + "' but no population binds it");
+                    }
+                    for (const PopulationEntry *population : owning_populations->second) {
+                        if ((s32)values.size() != population->size) {
+                            log::throw_runtime_error(log::logger(),
+                                "allocator: type '" + program.component_type_name + "' param:dyn '" +
+                                param_directive.name + "' has " + std::to_string(values.size()) +
+                                " heterogeneous value(s), but population '" + population->id + "' binding it has "
+                                "size " + std::to_string(population->size));
+                        }
+                        f32 *destination = buffer.get_contents() + population->neuron_index_begin;
+                        for (s32 local_index = 0; local_index < population->size; ++local_index) {
+                            destination[local_index] = (f32)values[(usize)local_index];
+                        }
+                    }
+                } else {
+                    log::logger().warn(
+                        "allocator: type '{}' param:dyn '{}' has no matching "
+                        "TypeLibraryEntry::heterogeneous_parameter_values -- left zero-filled",
+                        program.component_type_name, param_directive.name);
+                }
+
                 allocation.dynamic_parameter_arrays.emplace(
-                    type_scoped_key(type_library_index, param_directive.name),
-                    allocate_zeroed_f32(model.total_neuron_count));
+                    type_scoped_key(type_library_index, param_directive.name), std::move(buffer));
 
             } else if (std::holds_alternative<RequireDirective>(directive)) {
                 const auto &require_directive = std::get<RequireDirective>(directive);
