@@ -1,0 +1,20 @@
+<Lems>
+    <!--
+      LEMS wrapper used only to drive glif_ei_network.nml through jNeuroML/
+      jLEMS (ticket #61 [H1]) - NOT parsed by spikecorec's own front-end
+      (which reads glif_ei_network.nml directly). Regenerate the checked-in
+      reference data under
+      tests/fixtures/reference_data/glif_ei_network/ with, from this
+      directory:
+
+        python3 -m pyneuroml.pynml LEMS_glif_ei_network.xml -nogui
+
+      (pyneuroml bundles its own jNeuroML jar, so this runs entirely offline
+      once pyneuroml itself is installed: `pip3 install pyneuroml`.)
+    -->
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="glif_ei_network.nml"/>
+    <Target component="sim1"/>
+</Lems>

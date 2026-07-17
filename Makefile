@@ -84,6 +84,14 @@ CXXFLAGS        += -DSPIKECOREC_NML_STD_LIB_DIR=\"$(NML_STD_LIB_DIR)\"
 NML_SCHEMA_PATH := $(abspath third_party/neuroml2/schema/NeuroML_v2.3.xsd)
 CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 
+# ── Test fixture data directory (ticket #61 [H1]) ────────────────────────────
+# Baked in as an absolute path at compile time, same convention as
+# NML_STD_LIB_DIR above, so tests/exit_model_validation_tests.cpp can locate
+# its checked-in .nml fixtures / captured pyneuroml reference data no matter
+# what directory the test binary is run from.
+TEST_FIXTURES_DIR := $(abspath tests/fixtures)
+CXXFLAGS          += -DSPIKECOREC_TEST_FIXTURES_DIR=\"$(TEST_FIXTURES_DIR)\"
+
 # ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────
 # Header-only mode is spdlog's default (it self-defines SPDLOG_HEADER_ONLY
 # whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.

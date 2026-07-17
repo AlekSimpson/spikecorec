@@ -1,0 +1,100 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/master/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="Glif3SingleCellExitModel">
+
+  <!--
+    Phase-1 exit model (ticket #61 [H1], arch §5): a GLIF3 single cell
+    reproducing after-spike-current dynamics and spike-frequency adaptation
+    under a current step. The ComponentType below is the SAME GLIF3Cell
+    declaration tests/cell_lowering_tests.cpp's own GLIF3_COMPONENT_TYPE
+    fixture uses (two after-spike currents asc1/asc2, each a linear decay
+    plus an additive spike-time bump, wrapped in a refractory Regime pair) -
+    reused verbatim here, per ticket #61's instruction to reuse the
+    established GLIF3/GLIF5 fixture pattern, so the SAME .nml file drives
+    BOTH pyneuroml/jNeuroML (real reference trace/spike capture) and
+    spikecorec's own parse->resolve->lower->IR->AssembledModel pipeline (see
+    tests/exit_model_validation_tests.cpp), with byte-identical model
+    definitions on both sides.
+
+    ascAdd1/ascAdd2 are NEGATIVE here (unlike cell_lowering_tests.cpp's own
+    lowering-only fixture, which uses positive placeholder values purely to
+    exercise the IR lowering machinery) - a real GLIF3 after-spike current is
+    hyperpolarizing/suppressive, so a negative bump is what actually produces
+    genuine spike-frequency adaptation (growing inter-spike intervals) under a
+    sustained current step, which is this exit model's whole point.
+  -->
+  <ComponentType name="GLIF3Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Parameter name="tauAsc1" dimension="time"/>
+    <Parameter name="tauAsc2" dimension="time"/>
+    <Parameter name="ascAdd1" dimension="current"/>
+    <Parameter name="ascAdd2" dimension="current"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Exposure name="asc1" dimension="current"/>
+    <Exposure name="asc2" dimension="current"/>
+    <Exposure name="iSyn" dimension="current"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="asc1" dimension="current" exposure="asc1"/>
+      <StateVariable name="asc2" dimension="current" exposure="asc2"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
+      <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
+      <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+        <StateAssignment variable="asc1" value="0"/>
+        <StateAssignment variable="asc2" value="0"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn + ascSum) / C"/>
+        <OnCondition test="v .gt. vth">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset"/>
+          <StateAssignment variable="asc1" value="asc1 + ascAdd1"/>
+          <StateAssignment variable="asc2" value="asc2 + ascAdd2"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF3Cell id="glif3CellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             t_ref="5ms" tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-100pA" ascAdd2="-200pA"/>
+
+  <pulseGenerator id="pulseGen1" delay="20ms" duration="300ms" amplitude="0.6nA"/>
+
+  <network id="Glif3Net">
+    <population id="Glif3Pop" component="glif3CellInstance" size="1"/>
+    <explicitInput target="Glif3Pop[0]" input="pulseGen1"/>
+  </network>
+
+  <Simulation id="sim1" length="350ms" step="0.1ms" target="Glif3Net">
+    <OutputFile id="membraneTrace" fileName="glif3_membrane_trace.dat">
+      <OutputColumn id="v" quantity="Glif3Pop[0]/v"/>
+      <OutputColumn id="asc1" quantity="Glif3Pop[0]/asc1"/>
+      <OutputColumn id="asc2" quantity="Glif3Pop[0]/asc2"/>
+    </OutputFile>
+    <EventOutputFile id="spikesFile" fileName="glif3_spikes.dat" format="TIME_ID">
+      <EventSelection id="sel0" select="Glif3Pop[0]" eventPort="spike"/>
+    </EventOutputFile>
+  </Simulation>
+</neuroml>

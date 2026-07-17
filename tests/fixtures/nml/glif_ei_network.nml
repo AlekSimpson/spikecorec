@@ -1,0 +1,177 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/master/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="GlifEiNetworkExitModel">
+
+  <!--
+    Phase-1 exit model (ticket #61 [H1], arch §5): a current- and
+    conductance-based GLIF E/I network including an NMDA synapse, producing a
+    spike raster. Reuses tests/allocator_tests.cpp's own 2-population GLIF E/I
+    fixture's cell/synapse ComponentTypes and wiring topology (GLIF1Cell
+    excitatory/inhibitory neurons; expOneSynapse, a real vendored
+    conductance-based synapse; alphaCurrentSynapse, a real vendored
+    current-based synapse; TestNmdaSynapse, synapse_lowering_tests.cpp's own
+    conductance-based per-edge NMDA fixture, extends
+    baseConductanceBasedSynapse so it inherits that real type's own
+    Exposure/EventPort/Requirement declarations), plus a pulseGenerator
+    current step driving ExcPop[0] so the network actually spikes and
+    propagates through all three synapse types. Same .nml file drives BOTH
+    pyneuroml/jNeuroML (real reference trace/spike capture) and spikecorec's
+    own parse->resolve->lower->IR->AssembledModel pipeline (see
+    tests/exit_model_validation_tests.cpp).
+
+    GLIF1Cell extends "baseCell" directly (not baseCellMembPot/
+    baseSpikingCell), so - unlike expOneSynapse/alphaCurrentSynapse/
+    TestNmdaSynapse, which all inherit their Exposure/EventPort declarations
+    from real vendored parent ComponentTypes - it needs its own explicit
+    <EventPort>/<Exposure> declarations below for jLEMS's stricter semantic
+    validation (spikecorec's own front-end does not require these; see
+    glif3_single_cell.nml's own header comment for the same point).
+
+    Populations are declared `type="populationList"` with explicit
+    `<instance>` children, not the plain `size="N"` shorthand
+    allocator_tests.cpp's own (spikecorec-only) fixture uses: this exact
+    jLEMS build (bundled with pyneuroml 1.3.22) cannot resolve indexed
+    per-member access (`explicitInput`/`inputList` targets, `connection`
+    preCellId/postCellId) against a plain multi-instance `population`
+    (reproduced independently of spikecorec, and independent of
+    ComponentType, with the real vendored `iafCell`/`expOneSynapse` too -
+    see this ticket's own final report) - `populationList` is jLEMS's own
+    documented mechanism for indexed access and is what NeuroML2's own
+    bundled example (`NML2_InstanceBasedNetwork.nml`) uses for exactly this
+    shape. `<connection>`/`<input>` address a populationList member as
+    `population/index/componentId` (spikecorec's own `parse_population_path`
+    ignores everything after the index for connections, so this is harmless
+    there); recording quantities need a further `/exposureName` hop
+    (`population/index/componentId/exposureName`) that spikecorec's own
+    parser does NOT split the same way jLEMS needs - see
+    tests/exit_model_validation_tests.cpp's own header comment for how the
+    spikecorec-side harness reads state back out directly instead of through
+    ticket #59's output_recording.h for this specific model.
+  -->
+  <ComponentType name="GLIF1Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Exposure name="iSyn" dimension="current"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+        <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
+        <OnCondition test="v .gt. vth">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF1Cell id="glif1ExcCellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV" t_ref="2ms"/>
+  <GLIF1Cell id="glif1InhCellInstance" C="100pF" gL="12nS" EL="-65mV" vth="-50mV" vreset="-65mV" t_ref="2ms"/>
+
+  <expOneSynapse id="glifExcSynapse" gbase="20nS" erev="0mV" tauDecay="3ms" weight="2"/>
+  <alphaCurrentSynapse id="glifCurrSynapse" tau="2ms" ibase="2nA" weight="2"/>
+
+  <ComponentType name="TestNmdaSynapse" extends="baseConductanceBasedSynapse">
+    <Property name="weight" dimension="none" defaultValue="1"/>
+    <Parameter name="tau" dimension="time"/>
+    <Children name="blockMechanisms" type="baseBlockMechanism"/>
+    <Dynamics>
+      <StateVariable name="g" dimension="conductance" exposure="g"/>
+      <DerivedVariable name="i" exposure="i" dimension="current" value="g * (erev - v)"/>
+      <TimeDerivative variable="g" value="-g / tau"/>
+      <OnStart>
+        <StateAssignment variable="g" value="0"/>
+      </OnStart>
+      <OnEvent port="in">
+        <StateAssignment variable="g" value="g + (weight * gbase)"/>
+      </OnEvent>
+    </Dynamics>
+  </ComponentType>
+  <TestNmdaSynapse id="glifNmdaSynapse" gbase="20nS" erev="0mV" tau="50ms" weight="1"/>
+
+  <pulseGenerator id="pulseGen1" delay="10ms" duration="200ms" amplitude="0.5nA"/>
+
+  <!--
+    Each neuron is its own size="1" population (ExcPopA/B/C, InhPopA/B) rather
+    than allocator_tests.cpp's own 2 multi-neuron populations (ExcPop size=3,
+    InhPop size=2) - jLEMS (this exact version, bundled with pyneuroml
+    1.3.22) fails to resolve `explicitInput`'s own indexed-member target
+    against a plain multi-instance `population size="N"` (a real,
+    reproducible jLEMS limitation independent of spikecorec, see this
+    ticket's own final report), and `populationList`+`instance` (LEMS's
+    documented alternative for indexed addressing) breaks `connection`
+    preCellId/postCellId resolution the SAME jLEMS version instead. One
+    neuron per population sidesteps both: every population/connection/
+    explicitInput/recording path below addresses index 0 of a single-neuron
+    population, the one shape already proven to work against this jLEMS
+    version. The wiring topology (which neuron connects to which, via which
+    synapse) is otherwise identical to allocator_tests.cpp's own fixture:
+    ExcPopA -> InhPopA (expOneSynapse, conductance-based), ExcPopA -> ExcPopC
+    (alphaCurrentSynapse, current-based, recurrent), ExcPopC -> InhPopA
+    (glifNmdaSynapse); ExcPopB/InhPopB are unconnected, matching
+    allocator_tests.cpp's own ExcPop[1]/InhPop[1].
+  -->
+  <network id="GlifEiNet">
+    <population id="ExcPop" component="glif1ExcCellInstance" type="populationList" size="3">
+      <instance id="0"><location x="0" y="0" z="0"/></instance>
+      <instance id="1"><location x="1" y="0" z="0"/></instance>
+      <instance id="2"><location x="2" y="0" z="0"/></instance>
+    </population>
+    <population id="InhPop" component="glif1InhCellInstance" type="populationList" size="2">
+      <instance id="0"><location x="0" y="1" z="0"/></instance>
+      <instance id="1"><location x="1" y="1" z="0"/></instance>
+    </population>
+    <inputList id="stimList" component="pulseGen1" population="ExcPop">
+      <input id="0" target="../ExcPop/0/glif1ExcCellInstance" destination="synapses"/>
+    </inputList>
+    <projection id="ExcToInh" presynapticPopulation="ExcPop" postsynapticPopulation="InhPop" synapse="glifExcSynapse">
+      <connection id="0" preCellId="../ExcPop/0/glif1ExcCellInstance" postCellId="../InhPop/0/glif1InhCellInstance"/>
+    </projection>
+    <projection id="ExcRecurrent" presynapticPopulation="ExcPop" postsynapticPopulation="ExcPop" synapse="glifCurrSynapse">
+      <connection id="0" preCellId="../ExcPop/0/glif1ExcCellInstance" postCellId="../ExcPop/2/glif1ExcCellInstance"/>
+    </projection>
+    <projection id="ExcToInhNmda" presynapticPopulation="ExcPop" postsynapticPopulation="InhPop" synapse="glifNmdaSynapse">
+      <connection id="0" preCellId="../ExcPop/2/glif1ExcCellInstance" postCellId="../InhPop/0/glif1InhCellInstance"/>
+    </projection>
+  </network>
+
+  <Simulation id="sim1" length="250ms" step="0.1ms" target="GlifEiNet">
+    <OutputFile id="membraneTrace" fileName="glif_ei_network_membrane_trace.dat">
+      <OutputColumn id="v_exc0" quantity="ExcPop/0/glif1ExcCellInstance/v"/>
+      <OutputColumn id="v_exc1" quantity="ExcPop/1/glif1ExcCellInstance/v"/>
+      <OutputColumn id="v_exc2" quantity="ExcPop/2/glif1ExcCellInstance/v"/>
+      <OutputColumn id="v_inh0" quantity="InhPop/0/glif1InhCellInstance/v"/>
+      <OutputColumn id="v_inh1" quantity="InhPop/1/glif1InhCellInstance/v"/>
+    </OutputFile>
+    <EventOutputFile id="spikesFile" fileName="glif_ei_network_spikes.dat" format="TIME_ID">
+      <EventSelection id="sel_exc0" select="ExcPop/0/glif1ExcCellInstance" eventPort="spike"/>
+      <EventSelection id="sel_exc1" select="ExcPop/1/glif1ExcCellInstance" eventPort="spike"/>
+      <EventSelection id="sel_exc2" select="ExcPop/2/glif1ExcCellInstance" eventPort="spike"/>
+      <EventSelection id="sel_inh0" select="InhPop/0/glif1InhCellInstance" eventPort="spike"/>
+      <EventSelection id="sel_inh1" select="InhPop/1/glif1InhCellInstance" eventPort="spike"/>
+    </EventOutputFile>
+  </Simulation>
+</neuroml>

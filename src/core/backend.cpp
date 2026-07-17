@@ -66,6 +66,38 @@ static MTL::CommandQueue *global_queue           = nullptr;
 static MTL::Library      *global_default_library = nullptr;
 static unordered_map<void *, MTL::Buffer *> global_buffer_map;
 
+// Resolves an arbitrary data pointer to its containing MTLBuffer plus the byte offset within it.
+// `global_buffer_map` only ever indexes a buffer by the BASE address allocate_bytes() returned
+// (`buffer->contents()`) -- but dispatch call sites throughout this codebase (master_kernel.cpp's
+// per-population/per-state-variable addressing chief among them: `cell_state.get_contents() +
+// chunk_base_offset + variable_offset*population_size`, `network_inputs + neuron_index_begin`, etc.)
+// routinely pass POINTER ARITHMETIC into the MIDDLE of an allocation, not just its base. An exact-match
+// lookup on such a pointer misses (found == end()), silently falling through to `setBytes` -- binding
+// the raw pointer VALUE as inline constant data instead of an actual buffer reference, so a `device`
+// pointer parameter the shader expects to read AND WRITE through ends up bound as a bare scalar; reads
+// through it happen to still succeed (the bytes are a real, dereferenceable address under Metal's
+// unified memory model) but writes silently do nothing (or are undefined) -- exactly the kind of thing
+// that fools "the first tick works, later ticks look frozen" until this file's own owning ticket (#61
+// [H1]) exercised a cell type with more than one state variable / a population with a nonzero base
+// offset for the first time. Scanning every live allocation's own [base, base+length) range to find
+// the one containing `candidate` fixes this for every such offset pointer.
+struct ResolvedMetalBuffer {
+    MTL::Buffer *buffer = nullptr;
+    usize offset = 0;
+};
+
+ResolvedMetalBuffer resolve_metal_buffer(void *candidate) {
+    for (auto &entry : global_buffer_map) {
+        auto *base = static_cast<u8 *>(entry.first);
+        auto *candidate_bytes = static_cast<u8 *>(candidate);
+        usize length = entry.second->length();
+        if (candidate_bytes >= base && candidate_bytes < base + length) {
+            return ResolvedMetalBuffer{entry.second, (usize)(candidate_bytes - base)};
+        }
+    }
+    return ResolvedMetalBuffer{};
+}
+
 // The shaders in src/metal/kernels.metal are compiled ahead-of-time by the
 // Makefile into default.metallib, placed alongside the build artifacts. Command
 // line tools have no app bundle for newDefaultLibrary() to search, so locate the
@@ -345,10 +377,11 @@ void metal_dispatch(
         if (arg_sizes[i] == sizeof(void *)) {
             candidate = *reinterpret_cast<void * const *>(args[i]);
         }
-        auto it = candidate ? global_buffer_map.find(candidate) : global_buffer_map.end();
-        if (it != global_buffer_map.end()) {
-            // resolved to a unified memory allocation — bind its MTLBuffer
-            encoder->setBuffer(it->second, 0, i);
+        ResolvedMetalBuffer resolved = candidate ? resolve_metal_buffer(candidate) : ResolvedMetalBuffer{};
+        if (resolved.buffer) {
+            // resolved to a unified memory allocation (possibly an offset into it) — bind its
+            // MTLBuffer at that offset
+            encoder->setBuffer(resolved.buffer, resolved.offset, i);
         } else {
             // scalar argument — pass by value
             encoder->setBytes(args[i], arg_sizes[i], i);
