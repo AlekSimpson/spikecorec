@@ -113,6 +113,9 @@ TEST(InputsLowering, sine_generator_lowers_to_windowed_on_device_current_and_com
     ASSERT_EQ(source.functions.size(), 1u);
     EXPECT_EQ(source.functions[0].function_name, "sineGenerator_tick");
     EXPECT_NE(source.msl_source.find("sin("), String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "sine_generator"));
 }
 
@@ -126,6 +129,9 @@ TEST(InputsLowering, ramp_generator_lowers_to_windowed_linear_ramp_and_compiles_
 
     GpuSource source = lower_ir_program_to_gpu_source(program);
     ASSERT_EQ(source.functions.size(), 1u);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "ramp_generator"));
 }
 
@@ -148,6 +154,9 @@ TEST(InputsLowering, voltage_clamp_lowers_with_a_require_v_binding_and_compiles_
 
     GpuSource source = lower_ir_program_to_gpu_source(program);
     ASSERT_EQ(source.functions.size(), 1u);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "voltage_clamp"));
 }
 
@@ -213,6 +222,9 @@ TEST(InputsLowering, spike_source_poisson_lowers_to_a_rand_driven_spike_source_a
     EXPECT_EQ(source.functions[0].function_name, "SpikeSourcePoisson_tick");
     EXPECT_NE(source.msl_source.find("rng_state"), String::npos);
     EXPECT_NE(source.msl_source.find("spikecorec_rand_uniform"), String::npos);
+#ifndef SPIKECOREC_METAL
+    GTEST_SKIP() << "MSL compile verification requires macOS/xcrun, skipping on non-Metal build";
+#endif
     EXPECT_TRUE(compiles_as_msl(source.msl_source, "spike_source_poisson"));
 
     // rng_state is a required parameter of the generated per-neuron function.
