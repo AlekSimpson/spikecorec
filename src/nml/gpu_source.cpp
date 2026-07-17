@@ -469,38 +469,43 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
         parameters.push_back({"float", "float", "network_inputs", ParamKind::MutableArray});
     }
 
-    // A name can legitimately appear on more than one `.alloc` directive -- most commonly a
-    // `StateVariable` whose own name is ALSO its `expose` name (arch §4.1: "if a STORED
-    // StateVariable is exposed, recording reads it directly", i.e. no separate scratch slot is
-    // needed -- cell_lowering.cpp emits exactly this shape for every real GLIF cell's own `v`, e.g.
-    // both `state v` and `expose v`). Without this guard the loop below would emit two DIFFERENT
-    // kernel parameters both named `v` (a duplicate-parameter compile failure) since each directive
-    // is visited independently; this dedupes by name across every category, first directive wins --
-    // the state/accum/etc. slot IS the exposure's own storage, so subsequent directives for the
-    // same name need no parameter of their own.
-    unordered_set<String> alloc_parameter_names_added;
+    // A directly-stored StateVariable whose own `exposure=` name equals its own name (arch §3.2's
+    // most common shape -- every one of ticket #63's own real nonlinear cells has this, e.g.
+    // `<StateVariable name="v" ... exposure="v"/>`) produces BOTH a `state v` AND an `expose v`
+    // `.alloc` directive for the exact same underlying quantity (allocator.h's own
+    // derived_exposure_scratch_buffers doc comment already documents this precedent: "a directly
+    // stored StateVariable's own exposure already has a slot and needs no scratch"). Both directives
+    // resolve to the identical operand text (`name + "[neuron_index]"`, resolve_operand) either way,
+    // so this set exists purely to stop `alloc_in_order`'s per-directive loop below from declaring
+    // TWO kernel parameters of the same name (a real MSL/CUDA compile error -- "redefinition of
+    // parameter") for what is really one buffer -- the first directive to reference a given name (in
+    // `.alloc` declaration order) wins, matching resolve_operand's own AllocIndex lookup (a plain
+    // `unordered_map`, so whichever directive is inserted LAST there actually determines the category
+    // resolve_operand sees -- irrelevant here, both categories resolve identically).
+    unordered_set<String> parameter_names_already_added;
+    auto add_parameter_once = [&](ParamDescriptor descriptor) {
+        if (!parameter_names_already_added.insert(descriptor.name).second) return;
+        parameters.push_back(std::move(descriptor));
+    };
 
     for (const auto &directive : alloc_in_order) {
         std::visit(Overloaded{
             [&](const ParamConstantDirective &param) {
                 if (scan.alloc_names_referenced.count(param.name) == 0) return;
                 if (param.literal_value.has_value()) return; // baked as a local const, not a parameter
-                if (!alloc_parameter_names_added.insert(param.name).second) return;
-                parameters.push_back({"float", "float", param.name, ParamKind::Scalar});
+                add_parameter_once({"float", "float", param.name, ParamKind::Scalar});
             },
             [&](const ParamDynamicDirective &param) {
                 if (scan.alloc_names_referenced.count(param.name) == 0) return;
-                if (!alloc_parameter_names_added.insert(param.name).second) return;
-                parameters.push_back({dtype_to_backend_type(param.dtype, Backend::Msl),
-                                       dtype_to_backend_type(param.dtype, Backend::Cuda), param.name,
-                                       ParamKind::MutableArray});
+                add_parameter_once({dtype_to_backend_type(param.dtype, Backend::Msl),
+                                     dtype_to_backend_type(param.dtype, Backend::Cuda), param.name,
+                                     ParamKind::MutableArray});
             },
             [&](const StateDirective &state) {
                 if (scan.alloc_names_referenced.count(state.name) == 0) return;
-                if (!alloc_parameter_names_added.insert(state.name).second) return;
-                parameters.push_back({dtype_to_backend_type(state.dtype, Backend::Msl),
-                                       dtype_to_backend_type(state.dtype, Backend::Cuda), state.name,
-                                       ParamKind::MutableArray});
+                add_parameter_once({dtype_to_backend_type(state.dtype, Backend::Msl),
+                                     dtype_to_backend_type(state.dtype, Backend::Cuda), state.name,
+                                     ParamKind::MutableArray});
             },
             [&](const AccumDirective &accum) {
                 // accum can be touched two ways: as a plain per-neuron operand (expOne's own
@@ -510,26 +515,22 @@ Vector<ParamDescriptor> build_common_parameters(const ScanResult &scan,
                 bool referenced = scan.alloc_names_referenced.count(accum.name) > 0 ||
                                    edge_variable_names_referenced.count(accum.name) > 0;
                 if (!referenced) return;
-                if (!alloc_parameter_names_added.insert(accum.name).second) return;
-                parameters.push_back({dtype_to_backend_type(accum.dtype, Backend::Msl),
-                                       dtype_to_backend_type(accum.dtype, Backend::Cuda), accum.name,
-                                       ParamKind::MutableArray});
+                add_parameter_once({dtype_to_backend_type(accum.dtype, Backend::Msl),
+                                     dtype_to_backend_type(accum.dtype, Backend::Cuda), accum.name,
+                                     ParamKind::MutableArray});
             },
             [&](const PeredgeDirective &) { /* handled below, alongside the edge-walk block */ },
             [&](const RegimeDirective &regime) {
                 if (scan.alloc_names_referenced.count(regime.name) == 0) return;
-                if (!alloc_parameter_names_added.insert(regime.name).second) return;
-                parameters.push_back({"int", "int", regime.name, ParamKind::MutableArray});
+                add_parameter_once({"int", "int", regime.name, ParamKind::MutableArray});
             },
             [&](const ExposeDirective &expose) {
                 if (scan.alloc_names_referenced.count(expose.name) == 0) return;
-                if (!alloc_parameter_names_added.insert(expose.name).second) return;
-                parameters.push_back({"float", "float", expose.name, ParamKind::MutableArray});
+                add_parameter_once({"float", "float", expose.name, ParamKind::MutableArray});
             },
             [&](const RequireDirective &require) {
                 if (scan.alloc_names_referenced.count(require.name) == 0) return;
-                if (!alloc_parameter_names_added.insert(require.name).second) return;
-                parameters.push_back({"float", "float", require.name, ParamKind::MutableArray});
+                add_parameter_once({"float", "float", require.name, ParamKind::MutableArray});
             },
         }, directive);
     }

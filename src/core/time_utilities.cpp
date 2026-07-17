@@ -21,9 +21,11 @@ namespace {
 // this table needs, update this table to match by hand.
 const UnorderedMap<String, f64> UNIT_SYMBOL_TO_SCALE = {
     {"s", 1.0}, {"ms", 1e-3}, {"min", 60.0}, {"hour", 3600.0},
+    {"per_s", 1.0}, {"per_ms", 1e3}, // ticket #63 [F2]: izhikevich2007Cell's own `a` (per_ms)
     {"V", 1.0}, {"mV", 1e-3},
     {"ohm", 1.0}, {"kohm", 1e3}, {"Mohm", 1e6},
     {"S", 1.0}, {"mS", 1e-3}, {"uS", 1e-6}, {"nS", 1e-9}, {"pS", 1e-12},
+    {"S_per_V", 1.0}, {"nS_per_mV", 1e-6}, // ticket #63 [F2]: izhikevich2007Cell's own `k`
     {"F", 1.0}, {"uF", 1e-6}, {"nF", 1e-9}, {"pF", 1e-12},
     {"A", 1.0}, {"uA", 1e-6}, {"nA", 1e-9}, {"pA", 1e-12},
 };

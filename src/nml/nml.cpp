@@ -60,9 +60,20 @@ void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
     *destination += "line " + std::to_string(error->line) + ": " + message;
 }
 
+// A `<Constant>` (e.g. `hindmarshRose1984Cell`'s `MSEC`, `fitzHughNagumoCell`'s `SEC`) declares a
+// name + dimension exactly like a `<Parameter>` does, structurally -- the only difference is that
+// its value is a fixed literal in the ComponentType itself (its own `value=` attribute) rather than
+// supplied per bound instance. Cataloging it here as an ordinary ParameterDecl (ticket #63 [F2],
+// needed to lower these real ComponentTypes at all) makes it a legal identifier everywhere a
+// Parameter already is (known_names, `.alloc` ParamConstantDirective emission); resolve.cpp's own
+// extract_fixed_decls separately synthesizes the `Fixed` pin that supplies its actual value, so nml.h
+// gains no new decl struct for it.
 Vector<ParameterDecl> extract_parameters(const NML_Node &node) {
     Vector<ParameterDecl> result;
     for (const auto *child : find_children(node, "Parameter")) {
+        result.push_back(ParameterDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
+    }
+    for (const auto *child : find_children(node, "Constant")) {
         result.push_back(ParameterDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
     }
     return result;

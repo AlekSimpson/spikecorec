@@ -59,9 +59,22 @@ ExpressionNodePointer make_binary_node(char operator_character, ExpressionNodePo
     return node;
 }
 
+// ticket #63 [F2]: `name(argument)` -- a single-argument function call (`exp(...)` etc.), resolved to
+// a `UnaryOpcode` by `unary_opcode_for_function_name` at emission time (not here -- see
+// `binary_opcode_for`'s own precedent of resolving operator text to an IR opcode at emission, not
+// parse, time).
+ExpressionNodePointer make_function_call_node(String function_name, ExpressionNodePointer argument) {
+    auto node = std::make_unique<ExpressionNode>();
+    node->kind = ExpressionNodeKind::FunctionCall;
+    node->text = std::move(function_name);
+    node->left = std::move(argument);
+    return node;
+}
+
 enum class TokenKind {
-    Number, Identifier, Plus, Minus, Star, Slash, LeftParen, RightParen,
-    CompareGt, CompareLt, CompareGe, CompareLe, CompareEq, CompareNe, End
+    Number, Identifier, Plus, Minus, Star, Slash, Caret, LeftParen, RightParen,
+    CompareGt, CompareLt, CompareGe, CompareLe, CompareEq, CompareNe,
+    BooleanAnd, BooleanOr, End
 };
 
 struct Token {
@@ -82,6 +95,14 @@ const Vector<std::pair<String, TokenKind>> DOT_COMPARISON_OPERATORS = {
     {".gt.", TokenKind::CompareGt}, {".lt.", TokenKind::CompareLt}, {".eq.", TokenKind::CompareEq},
 };
 
+// ticket #63 [F2]: LEMS's boolean condition-combination operators (`hindmarshRose1984Cell`'s own
+// `test="v .gt. 0 .and. spiking .lt. 0.5"`, plus the same idiom elsewhere in the vendored std-lib --
+// see expression_lowering.h's own doc comment on ParsedCondition). Neither is a prefix of the other
+// or of any DOT_COMPARISON_OPERATORS entry, so match order between the two tables doesn't matter.
+const Vector<std::pair<String, TokenKind>> DOT_LOGICAL_OPERATORS = {
+    {".and.", TokenKind::BooleanAnd}, {".or.", TokenKind::BooleanOr},
+};
+
 Vector<Token> tokenize_expression(const String &expression_text, const String &context_for_errors) {
     Vector<Token> tokens;
     usize position = 0;
@@ -98,6 +119,16 @@ Vector<Token> tokenize_expression(const String &expression_text, const String &c
                     position += operator_text.size();
                     matched_operator = true;
                     break;
+                }
+            }
+            if (!matched_operator) {
+                for (const auto &[operator_text, operator_kind] : DOT_LOGICAL_OPERATORS) {
+                    if (expression_text.compare(position, operator_text.size(), operator_text) == 0) {
+                        tokens.push_back(Token{operator_kind, operator_text});
+                        position += operator_text.size();
+                        matched_operator = true;
+                        break;
+                    }
                 }
             }
             if (matched_operator) continue;
@@ -141,6 +172,7 @@ Vector<Token> tokenize_expression(const String &expression_text, const String &c
             case '-': tokens.push_back(Token{TokenKind::Minus, "-"}); break;
             case '*': tokens.push_back(Token{TokenKind::Star, "*"}); break;
             case '/': tokens.push_back(Token{TokenKind::Slash, "/"}); break;
+            case '^': tokens.push_back(Token{TokenKind::Caret, "^"}); break;
             case '(': tokens.push_back(Token{TokenKind::LeftParen, "("}); break;
             case ')': tokens.push_back(Token{TokenKind::RightParen, ")"}); break;
             default:
@@ -157,9 +189,11 @@ Vector<Token> tokenize_expression(const String &expression_text, const String &c
 
 // Recursive-descent over an already-tokenized (sub)expression -- precedence,
 // lowest to highest: additive (`+ -`), multiplicative (`* /`), unary minus,
-// primary (number / identifier / parenthesized expression). Comparisons are
+// power (`^`, right-associative -- ticket #63 [F2]), primary (number /
+// identifier / function-call / parenthesized expression). Comparisons are
 // handled one level up, in parse_condition_text, since LEMS forbids nested
-// comparisons (a `test=` string has exactly one top-level compare operator).
+// comparisons (a `test=` string has exactly one top-level compare operator
+// per `.and.`/`.or.`-joined segment, ticket #63).
 class ExpressionParser {
 public:
     ExpressionParser(const Vector<Token> &tokens, const String &context_for_errors)
@@ -180,6 +214,9 @@ private:
     const String &context_for_errors_;
 
     const Token &current_token() const { return tokens_[position_]; }
+    // `tokens_` always ends with a TokenKind::End sentinel (tokenize_expression's own contract), so
+    // `position_ + 1` is always in bounds whenever current_token() isn't already that trailing End.
+    const Token &peek_next_token() const { return tokens_[position_ + 1]; }
     Token advance_token() { return tokens_[position_++]; }
 
     ExpressionNodePointer parse_additive() {
@@ -207,12 +244,45 @@ private:
             advance_token();
             return make_negate_node(parse_unary());
         }
-        return parse_primary();
+        return parse_power();
+    }
+
+    // `^` (ticket #63 [F2]): right-associative (`a^b^c` == `a^(b^c)`), binding tighter than unary
+    // minus's own operand (so `-x^2` parses as `-(x^2)`, matching this parser's own precedent of
+    // wrapping the innermost still-yet-to-be-determined operand rather than re-deriving a full
+    // precedence-climbing table for one operator neither GLIF's nor any D3 synapse fixture ever
+    // needed before this ticket).
+    ExpressionNodePointer parse_power() {
+        ExpressionNodePointer base = parse_primary();
+        if (current_token().kind == TokenKind::Caret) {
+            advance_token();
+            ExpressionNodePointer exponent = parse_power();
+            return make_binary_node('^', std::move(base), std::move(exponent));
+        }
+        return base;
     }
 
     ExpressionNodePointer parse_primary() {
         if (current_token().kind == TokenKind::Number) return make_number_node(advance_token().text);
-        if (current_token().kind == TokenKind::Identifier) return make_identifier_node(advance_token().text);
+        if (current_token().kind == TokenKind::Identifier) {
+            // ticket #63 [F2]: `name(argument)` -- single-argument function-call syntax
+            // (`adExIaFCell`'s `exp((v-VT)/delT)`). Any identifier immediately followed by `(` is
+            // treated as a call (not gated on a fixed allowlist here -- an unrecognized function name
+            // is instead a clear error at emission time, unary_opcode_for_function_name, matching
+            // binary_opcode_for's own "resolve operator text to an opcode at emission" precedent).
+            if (peek_next_token().kind == TokenKind::LeftParen) {
+                String function_name = advance_token().text; // the identifier
+                advance_token(); // '('
+                ExpressionNodePointer argument = parse_additive();
+                if (current_token().kind != TokenKind::RightParen) {
+                    log::throw_runtime_error(log::logger(),
+                        "expression_lowering: expected ')' after function-call argument (" + context_for_errors_ + ")");
+                }
+                advance_token();
+                return make_function_call_node(std::move(function_name), std::move(argument));
+            }
+            return make_identifier_node(advance_token().text);
+        }
         if (current_token().kind == TokenKind::LeftParen) {
             advance_token();
             ExpressionNodePointer inner = parse_additive();
@@ -248,9 +318,32 @@ BinaryOpcode binary_opcode_for(char operator_character) {
         case '-': return BinaryOpcode::Sub;
         case '*': return BinaryOpcode::Mul;
         case '/': return BinaryOpcode::Div;
+        case '^': return BinaryOpcode::Pow;
         default:
             log::throw_runtime_error(log::logger(), "expression_lowering: internal error -- unhandled binary operator");
     }
+}
+
+// ticket #63 [F2]: resolves a parsed function-call's name to the existing UnaryOpcode it means (IR
+// spec §3.3's own math-function surface, ir.h's UnaryOpcode enum) -- every name this recognizes maps
+// onto an op that already existed; this just lets the front-end parser actually reach it via
+// `name(argument)` syntax. `adExIaFCell` only needs `exp`; the rest are included since they are
+// exactly as cheap to recognize and are the same already-existing op set (no speculative additions
+// beyond ir.h's own UnaryOpcode list).
+std::optional<UnaryOpcode> unary_opcode_for_function_name(const String &name) {
+    if (name == "exp") return UnaryOpcode::Exp;
+    if (name == "log") return UnaryOpcode::Log;
+    if (name == "sqrt") return UnaryOpcode::Sqrt;
+    if (name == "abs") return UnaryOpcode::Abs;
+    if (name == "floor") return UnaryOpcode::Floor;
+    if (name == "ceil") return UnaryOpcode::Ceil;
+    if (name == "sin") return UnaryOpcode::Sin;
+    if (name == "cos") return UnaryOpcode::Cos;
+    if (name == "tan") return UnaryOpcode::Tan;
+    if (name == "sinh") return UnaryOpcode::Sinh;
+    if (name == "cosh") return UnaryOpcode::Cosh;
+    if (name == "tanh") return UnaryOpcode::Tanh;
+    return std::nullopt;
 }
 
 } // namespace
@@ -260,27 +353,33 @@ ExpressionNodePointer parse_arithmetic_text(const String &expression_text, const
     return ExpressionParser(tokens, context_for_errors).parse_full_expression();
 }
 
-ParsedCondition parse_condition_text(const String &condition_text) {
-    String context_for_errors = "condition '" + condition_text + "'";
-    Vector<Token> tokens = tokenize_expression(condition_text, context_for_errors);
+namespace {
 
+// Parses tokens[begin,end) as ONE bare comparison (exactly the pre-ticket-#63 logic, just scoped to a
+// token subrange instead of always the whole stream, so parse_condition_text below can reuse it once
+// per `.and.`/`.or.`-joined segment).
+ParsedCondition parse_comparison_segment(const Vector<Token> &tokens, usize begin, usize end,
+                                          const String &condition_text, const String &context_for_errors) {
     s32 comparison_token_index = -1;
-    for (usize token_index = 0; token_index < tokens.size(); ++token_index) {
+    for (usize token_index = begin; token_index < end; ++token_index) {
         if (!is_comparison_token(tokens[token_index].kind)) continue;
         if (comparison_token_index >= 0) {
             log::throw_runtime_error(log::logger(),
-                "expression_lowering: condition '" + condition_text + "' has more than one comparison operator");
+                "expression_lowering: condition '" + condition_text + "' has more than one comparison operator "
+                "in one .and./.or. segment");
         }
         comparison_token_index = static_cast<s32>(token_index);
     }
     if (comparison_token_index < 0) {
         log::throw_runtime_error(log::logger(),
-            "expression_lowering: condition '" + condition_text + "' has no comparison operator");
+            "expression_lowering: condition '" + condition_text + "' has no comparison operator "
+            "in one .and./.or. segment");
     }
 
-    Vector<Token> left_tokens(tokens.begin(), tokens.begin() + comparison_token_index);
+    Vector<Token> left_tokens(tokens.begin() + begin, tokens.begin() + comparison_token_index);
     left_tokens.push_back(Token{TokenKind::End, ""});
-    Vector<Token> right_tokens(tokens.begin() + comparison_token_index + 1, tokens.end());
+    Vector<Token> right_tokens(tokens.begin() + comparison_token_index + 1, tokens.begin() + end);
+    right_tokens.push_back(Token{TokenKind::End, ""});
 
     ParsedCondition parsed;
     parsed.opcode = opcode_for_comparison_token(tokens[static_cast<usize>(comparison_token_index)].kind);
@@ -289,11 +388,57 @@ ParsedCondition parse_condition_text(const String &condition_text) {
     return parsed;
 }
 
+} // namespace
+
+ParsedCondition parse_condition_text(const String &condition_text) {
+    String context_for_errors = "condition '" + condition_text + "'";
+    Vector<Token> tokens = tokenize_expression(condition_text, context_for_errors);
+    // tokenize_expression's own contract: always ends with exactly one trailing End token.
+    usize end_token_index = tokens.size() - 1;
+
+    // ticket #63 [F2]: split on every top-level `.and.`/`.or.` token first (a flat, left-to-right
+    // fold -- see expression_lowering.h's own doc comment on ParsedCondition for why this is not a
+    // full recursive boolean grammar), THEN parse each segment between splits as one bare comparison
+    // via parse_comparison_segment (the pre-existing, single-comparison-only logic, unchanged).
+    Vector<usize> combinator_token_indices;
+    Vector<BinaryOpcode> combinator_opcodes;
+    for (usize token_index = 0; token_index < end_token_index; ++token_index) {
+        if (tokens[token_index].kind == TokenKind::BooleanAnd) {
+            combinator_token_indices.push_back(token_index);
+            combinator_opcodes.push_back(BinaryOpcode::And);
+        } else if (tokens[token_index].kind == TokenKind::BooleanOr) {
+            combinator_token_indices.push_back(token_index);
+            combinator_opcodes.push_back(BinaryOpcode::Or);
+        }
+    }
+
+    if (combinator_token_indices.empty()) {
+        return parse_comparison_segment(tokens, 0, end_token_index, condition_text, context_for_errors);
+    }
+
+    ParsedCondition combined =
+        parse_comparison_segment(tokens, 0, combinator_token_indices[0], condition_text, context_for_errors);
+    for (usize combinator_index = 0; combinator_index < combinator_token_indices.size(); ++combinator_index) {
+        usize segment_begin = combinator_token_indices[combinator_index] + 1;
+        usize segment_end = (combinator_index + 1 < combinator_token_indices.size())
+            ? combinator_token_indices[combinator_index + 1] : end_token_index;
+        ParsedCondition right_segment = parse_comparison_segment(tokens, segment_begin, segment_end, condition_text, context_for_errors);
+
+        ParsedCondition combiner;
+        combiner.combinator_opcode = combinator_opcodes[combinator_index];
+        combiner.left_condition = std::make_unique<ParsedCondition>(std::move(combined));
+        combiner.right_condition = std::make_unique<ParsedCondition>(std::move(right_segment));
+        combined = std::move(combiner);
+    }
+    return combined;
+}
+
 bool references_identifier(const ExpressionNode &node, const String &identifier_name) {
     switch (node.kind) {
         case ExpressionNodeKind::Identifier: return node.text == identifier_name;
         case ExpressionNodeKind::Number: return false;
         case ExpressionNodeKind::Negate: return references_identifier(*node.left, identifier_name);
+        case ExpressionNodeKind::FunctionCall: return references_identifier(*node.left, identifier_name);
         case ExpressionNodeKind::Binary:
             return references_identifier(*node.left, identifier_name) || references_identifier(*node.right, identifier_name);
     }
@@ -370,6 +515,21 @@ String LoweringContext::emit_expression(const ExpressionNode &node, Vector<TickI
             return *preferred_destination;
         }
         case ExpressionNodeKind::Identifier: {
+            // ticket #63 [F2]: LEMS's own built-in "current simulation time" `t` -- needed by
+            // `adExIaFCell`'s real (unmodified) refractory regime (`lastSpikeTime <- t`,
+            // `t .gt. lastSpikeTime + refract`), and by several other real vendored ComponentTypes'
+            // own OnConditions (Inputs.xml's generators). Unlike every other reserved name
+            // (`dt`/`tick`/`network_inputs`, resolved by resolve_identifier below), `t` has no
+            // stored buffer of its own anywhere downstream (ir.h/gpu_source.cpp are unchanged by this
+            // ticket) -- it is instead expanded HERE into one `mul` of the two reserved operands that
+            // already exist (`tick * dt`, this engine's own continuous-time convention, arch's
+            // "Clock-driven tick loop"), so it never appears as a bare unresolved operand name in any
+            // emitted instruction.
+            if (node.text == "t") {
+                String destination_name = preferred_destination.value_or(fresh_temporary());
+                output.push_back(BinaryInstruction{BinaryOpcode::Mul, destination_name, "tick", "dt"});
+                return destination_name;
+            }
             String resolved_name = resolve_identifier(node.text);
             if (!preferred_destination || *preferred_destination == resolved_name) return resolved_name;
             output.push_back(MoveInstruction{*preferred_destination, resolved_name});
@@ -379,6 +539,21 @@ String LoweringContext::emit_expression(const ExpressionNode &node, Vector<TickI
             String operand_name = emit_expression(*node.left, output, std::nullopt);
             String destination_name = preferred_destination.value_or(fresh_temporary());
             output.push_back(UnaryInstruction{UnaryOpcode::Neg, destination_name, operand_name});
+            return destination_name;
+        }
+        case ExpressionNodeKind::FunctionCall: {
+            // ticket #63 [F2]: `name(argument)` -> a UnaryInstruction, same shape as Negate above
+            // (the argument is always evaluated into its OWN operand/temporary via a `nullopt`
+            // destination first, so this is unconditionally safe regardless of destination aliasing,
+            // for the same reason Negate already is -- see this function's own header comment).
+            std::optional<UnaryOpcode> opcode = unary_opcode_for_function_name(node.text);
+            if (!opcode.has_value()) {
+                log::throw_runtime_error(log::logger(),
+                    "expression_lowering: unrecognized function '" + node.text + "' in expression");
+            }
+            String operand_name = emit_expression(*node.left, output, std::nullopt);
+            String destination_name = preferred_destination.value_or(fresh_temporary());
+            output.push_back(UnaryInstruction{*opcode, destination_name, operand_name});
             return destination_name;
         }
         case ExpressionNodeKind::Binary: {

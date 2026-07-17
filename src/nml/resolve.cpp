@@ -65,11 +65,21 @@ bool looks_like_dimensioned_literal(const String &value_text) {
 
 // `Fixed` (§3.1) lives as a direct child of a ComponentType node, alongside
 // `Parameter`/`Constant` -- not nested inside `<Dynamics>`.
+//
+// A `<Constant name="X" value="V"/>` (ticket #63 [F2]: `fitzHughNagumoCell`'s `SEC`,
+// `hindmarshRose1984Cell`'s `MSEC`) is synthesized into a `FixedDecl{X, V}` here too -- its own
+// `value=` attribute IS its Fixed pin, it just spells the pin inline on the same element rather than
+// as a separate `<Fixed parameter="X" value="V"/>` sibling. nml.cpp's own extract_parameters already
+// catalogs `X` as a ParameterDecl (so it's a legal identifier at all); this is what actually supplies
+// its baked value, reusing apply_fixed_pins/the whole existing Fixed-pin pipeline unchanged.
 Vector<FixedDecl> extract_fixed_decls(const NML_Node &node) {
     Vector<FixedDecl> result;
     for (const auto &child : node.body) {
-        if (child.tag_name != "Fixed") continue;
-        result.push_back(FixedDecl{get_attr(child, "parameter"), get_attr(child, "value")});
+        if (child.tag_name == "Fixed") {
+            result.push_back(FixedDecl{get_attr(child, "parameter"), get_attr(child, "value"), false});
+        } else if (child.tag_name == "Constant") {
+            result.push_back(FixedDecl{get_attr(child, "name"), get_attr(child, "value"), true});
+        }
     }
     return result;
 }
@@ -110,8 +120,18 @@ void merge_with_override(Vector<T> &accumulated, const Vector<T> &ancestor_decla
 // here rather than overwritten: the most-derived `Fixed` for a given
 // parameter always wins over an ancestor's (arch §3.1 `extends`:
 // inheritance-override semantics), without even evaluating an
-// already-shadowed ancestor value. An unconvertible value is a resolve
-// error, same as any other dimensioned literal.
+// already-shadowed ancestor value. An unconvertible value on a real, user-authored `Fixed` is a
+// resolve error, same as any other dimensioned literal (see the ticket #63 [F2] note right below for
+// the one exception: a `<Constant>`-synthesized pin).
+// ticket #63 [F2]: a `<Constant>`-synthesized FixedDecl (`fixed.is_from_constant_declaration`) whose
+// value this build's unit-conversion table doesn't recognize is warned about and left unbaked (same
+// fate as an absent Fixed pin -- the allocator/cell-lowering path already handles a parameter with no
+// baked_constants entry) rather than throwing -- see resolve.h's own doc comment on
+// `is_from_constant_declaration` for why: resolve_and_lower flattens EVERY cataloged std-lib
+// ComponentType unconditionally, so an out-of-scope Constant (Phase 3 ion-channel/HH machinery, e.g.
+// Cells.xml's own gas-constant `R`) must not break resolution for every model. A real, user-authored
+// `<Fixed>` keeps its original hard-throw behavior unchanged (a genuinely malformed Fixed pin on a
+// parameter THIS model's own cell/synapse actually declares is still a real authoring error).
 void apply_fixed_pins(const Vector<FixedDecl> &pending_fixed, UnorderedMap<String, f64> &fixed_parameter_values) {
     for (const auto &fixed : pending_fixed) {
         if (fixed_parameter_values.count(fixed.parameter)) continue;
@@ -119,6 +139,13 @@ void apply_fixed_pins(const Vector<FixedDecl> &pending_fixed, UnorderedMap<Strin
         try {
             fixed_parameter_values[fixed.parameter] = time::unit_value_to_si(fixed.value);
         } catch (const std::invalid_argument &conversion_error) {
+            if (fixed.is_from_constant_declaration) {
+                log::logger().warn(
+                    "resolve: Constant '{}' has a value '{}' this build's unit-conversion table "
+                    "doesn't recognize ({}) -- leaving it unbaked",
+                    fixed.parameter, fixed.value, conversion_error.what());
+                continue;
+            }
             // Throws a NEW exception carrying the parameter name (a bare `throw;` here would
             // propagate only `conversion_error`'s own message -- the unresolvable value text, but
             // not which Fixed parameter it belonged to -- leaving that context visible only to
