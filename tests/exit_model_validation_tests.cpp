@@ -15,6 +15,8 @@
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/allocator.h"
 #include "spikecorec/nml/cell_lowering.h"
+#include "spikecorec/nml/delay_ring.h"
+#include "spikecorec/nml/inputs_lowering.h"
 #include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/nml.h"
@@ -697,4 +699,644 @@ TEST(ExitModelValidation, DISABLED_glif_ei_network_matches_pyneuroml_reference) 
                 << "neuron_index=" << neuron_index << " spike_index=" << spike_index;
         }
     }
+}
+
+// ── Phase-2 validation / exit models (ticket #67 [H2]; arch §5 Phase 2) ──────────────────────────
+//
+// The three arch §5 Phase-2 exit models: an izhikevich network exercising real, jLEMS-verified
+// Regular Spiking dynamics through a real (if minimal) synaptic connection
+// (tests/fixtures/nml/izhikevich_network.nml); a delayed-coupling network exercising the delay-ring
+// subsystem (ticket #64 [F3], include/spikecorec/nml/delay_ring.h) with a real, non-trivial
+// `connectionWD` delay (tests/fixtures/nml/delayed_coupling_network.nml); and a Poisson-driven
+// population generated on device (ticket #65 [F4]'s own SpikeSourcePoisson generator,
+// tests/fixtures/nml/poisson_population.nml). All three fixtures follow ticket #61's own established
+// convention exactly: real, checked-in, standalone NeuroML/LEMS files (not inline C++ string
+// literals) driving BOTH pyneuroml/jNeuroML (the real reference simulator) and spikecorec's own
+// pipeline -- see each fixture's own header comment for the exact ComponentTypes/topology and why.
+//
+// Per the ticket's scope clarification (task_master, 2026-07-16, same policy as ticket #61's own):
+// the captured reference data under tests/fixtures/reference_data/{izhikevich_network,
+// delayed_coupling_network,poisson_population}/ is REAL output from running each fixture through
+// pyneuroml/jNeuroML (commands documented in each fixture's own LEMS_*.xml header comment) -- not an
+// analytic stand-in. Everything in this section EXCEPT the DISABLED_-prefixed numeric-comparison
+// tests at the bottom runs and passes normally; those comparison tests are intentionally disabled
+// (do not need to pass in this ticket's PR) per that same scope clarification -- the user will
+// manually enable them later and verify against this same checked-in reference data.
+//
+// ── Known limitations a reviewer should look at closely (Phase-2 section) ────────────────────────
+// 1. Both network fixtures use `<inputList>`/`<input>` for their own pulseGenerator stimulus (NOT
+//    `<explicitInput>`) -- the SAME real, jLEMS-proven-working shape glif_ei_network.nml's own header
+//    comment documents for a multi-population network against this exact jLEMS build (bundled with
+//    pyneuroml 1.3.22). Per this file's own header comment (#2) above, spikecorec's own front-end
+//    does not recognize `inputList` either, so `model.stimuli` is empty for both, and each fixture's
+//    own driver below reconstructs the identical stimulus window by hand from the .nml's own literal
+//    `pulseGenerator` attributes, exactly mirroring `run_glif_ei_network`'s own established pattern.
+// 2. AssembledModel's fixed propagate stage still does not invoke a real per-edge synapse
+//    ComponentType's own dynamics (this file's own header comment #3, carried over unchanged from
+//    ticket #61 -- no ticket in CLAUDE.md's own epic ticket graph has built the "spike-scatter batch
+//    construction" subsystem gpu_source.h's own header comment flags as needed for that yet). Both
+//    network fixtures' own drivers below force the WeightMatrix's scattered value to either exactly
+//    zero (izhikevich network -- a magnitude comparison would be meaningless without real synapse
+//    dynamics, matching glif_ei_network's own precedent) or an arbitrary nonzero placeholder
+//    (delayed-coupling network -- this exit model's own validation target is delivery TIMING, which
+//    the delay ring derives purely from the connection's own `delay` attribute independent of
+//    whatever value gets scattered, so no magnitude comparison is attempted there at all).
+// 3. The delayed-coupling network's own DISABLED_ comparison test compares spikecorec's own delay-ring
+//    delivery tick against a tick DERIVED from the real captured jLEMS reference trace (the first
+//    tick TargetPop's own voltage departs from its resting potential) -- not literally re-deriving
+//    the expected tick from the connection's own `delay` attribute a second time (which would be
+//    circular and would not actually exercise cross-simulator agreement at all).
+// 4. The Poisson population's own comparison is explicitly a STATISTICAL one (aggregate spike count
+//    over the recorded window), not spike-for-spike -- see poisson_population.nml's own header
+//    comment for why an exact comparison is not meaningful even in principle for this exit model
+//    (two structurally different PRNG-driven algorithms, two disjoint PRNG streams).
+
+namespace {
+
+// ── izhikevich network driver (exit model #1) ─────────────────────────────────────────────────────
+//
+// izhikevich2007Cell's own OnStart (v=v0, u=0) -- allocate_model doesn't apply a StateDirective's own
+// initial_value yet (nonlinear_cell_lowering_tests.cpp's own SingleNeuronHarness::seed_state doc
+// comment), so izhikevich_network.nml's own two single-neuron populations (both v0=-60mV) are seeded
+// by hand here, mirroring seed_initial_membrane_potentials's own GLIF-specific convention above but
+// for a 2-state-variable (v, u) cell type instead of GLIF's EL-only v seed. v is state-slot 0 (as for
+// every GLIF cell type above), so v_state_index (this file's own ticket #61 helper) is reused
+// unchanged to read it back out; u (state-slot 1) is written directly here since no test in this
+// file ever needs to read it back.
+void seed_izhikevich_initial_state(ModelAllocation &allocation, const ModelSpecification &model) {
+    const f32 v0_volts = -0.06f; // izhikevich_network.nml's own v0="-60mV", both populations
+    for (s32 population_index = 0; population_index < (s32)model.populations.size(); ++population_index) {
+        const PopulationEntry &population = model.populations[(usize)population_index];
+        s64 chunk_base = allocation.cell_type_boundaries.get_contents()[population_index];
+        for (s32 local_index = 0; local_index < population.size; ++local_index) {
+            allocation.cell_state.get_contents()[chunk_base + local_index] = v0_volts;                // v
+            allocation.cell_state.get_contents()[chunk_base + population.size + local_index] = 0.0f;  // u
+        }
+    }
+}
+
+struct IzhikevichNetworkRunResult {
+    Vector<f32> driven_membrane_trace; // one sample per tick, DrivenPop's own neuron
+    Vector<s64> driven_spike_ticks;
+    Vector<s64> target_spike_ticks;
+};
+
+IzhikevichNetworkRunResult run_izhikevich_network(s64 tick_count, f32 dt_seconds) {
+    ModelSpecification model = load_model_from_nml_fixture("izhikevich_network");
+    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    seed_izhikevich_initial_state(allocation, model);
+    WeightMatrix weights = build_weight_matrix(model);
+    // See this file's own header comment (Phase-2 section, #2): forced to exactly zero, matching
+    // glif_ei_network's own established precedent -- the driven_simulation... test below only
+    // asserts on DrivenPop, never TargetPop, for the same documented reason.
+    weights.set_constant_weight(0.0f);
+
+    AssembledModel assembled_model(model, programs);
+    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+
+    // Manual stimulus reconstruction (see this file's own header comment, Phase-2 section, #1):
+    // izhikevich_network.nml's own <pulseGenerator id="pulseGen1" delay="10ms" duration="200ms"
+    // amplitude="150pA"/>, applied to DrivenPop's neuron 0 (global neuron index 0, declared first).
+    const f64 seconds_per_tick = (f64)dt_seconds;
+    const s64 delay_ticks = (s64)std::round(0.010 / seconds_per_tick);
+    const s64 duration_ticks = (s64)std::round(0.200 / seconds_per_tick);
+    const f32 amplitude_amperes = 150e-12f;
+
+    IzhikevichNetworkRunResult result;
+    result.driven_membrane_trace.reserve((usize)tick_count);
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        if (tick >= delay_ticks && tick < delay_ticks + duration_ticks) {
+            live.buffers.network_inputs[0] += amplitude_amperes;
+        }
+        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+
+        result.driven_membrane_trace.push_back(allocation.cell_state.get_contents()[v_state_index(allocation, 0, 0)]);
+        if (live.buffers.last_spiked[0] == tick) result.driven_spike_ticks.push_back(tick);
+        if (live.buffers.last_spiked[1] == tick) result.target_spike_ticks.push_back(tick);
+    }
+
+    return result;
+}
+
+// ── delayed-coupling network driver (exit model #2) ───────────────────────────────────────────────
+
+struct DelayedCouplingRunResult {
+    Vector<s64> source_spike_ticks;
+    Vector<s64> target_delivery_ticks; // ticks at which the delay ring's own input_ring shows a
+                                        // nonzero contribution reaching TargetPop's own neuron
+};
+
+DelayedCouplingRunResult run_delayed_coupling_network(s64 tick_count, f32 dt_seconds) {
+    ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
+    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    seed_initial_membrane_potentials(allocation, model); // GLIF1Cell -- reuses ticket #61's own EL seed
+    WeightMatrix weights = build_weight_matrix(model);
+    // An arbitrary nonzero placeholder (see this file's own header comment, Phase-2 section, #2) --
+    // this exit model's own validation target is delivery TIMING (arch §4.4), which the delay ring
+    // derives purely from the connection's own `delay` attribute, independent of whatever value gets
+    // scattered -- unlike the izhikevich network's own zero-weight precedent (a magnitude comparison
+    // that WOULD need real per-edge synapse dynamics), no magnitude comparison is made here at all.
+    weights.set_constant_weight(0.6f);
+
+    DelayRingAllocation ring = allocate_delay_ring(model, weights, dt_seconds);
+    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
+
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)model.total_neuron_count * sizeof(s64));
+    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + model.total_neuron_count, (s64)-1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)model.total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)model.total_neuron_count * sizeof(bool));
+
+    // Delay-ring mode: ModelRuntimeBuffers::network_inputs/next_active_neuron_indices/count/
+    // active_generation are unused (superseded by `delay_ring`'s own ring-shaped equivalents,
+    // master_kernel.h's own documented contract) and are left unallocated/null.
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+    buffers.delay_ring = &ring;
+
+    // Manual stimulus reconstruction (see this file's own header comment, Phase-2 section, #1):
+    // delayed_coupling_network.nml's own <pulseGenerator id="pulseGen1" delay="10ms" duration="6ms"
+    // amplitude="0.5nA"/>, applied to SourcePop's neuron 0 (global neuron index 0, declared first).
+    const f64 seconds_per_tick = (f64)dt_seconds;
+    const s64 stimulus_delay_ticks = (s64)std::round(0.010 / seconds_per_tick);
+    const s64 stimulus_duration_ticks = (s64)std::round(0.006 / seconds_per_tick);
+    const f32 amplitude_amperes = 0.5e-9f;
+    const s32 target_neuron_index = 1; // TargetPop, declared second
+    const f32 delivery_epsilon = 1e-9f;
+
+    DelayedCouplingRunResult result;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        s64 current_slot = tick % ring.ring_slot_count;
+        // This tick's own ring slot (master_kernel.cpp's own step_tick, ticket #64) -- read BEFORE
+        // this tick's own stimulus/step_tick call so it reflects only whatever a PRIOR tick's
+        // propagate stage already scattered into it (arch §3.5's >=1-tick latency).
+        f32 target_network_input_this_tick =
+            ring.input_ring.get_contents()[current_slot * model.total_neuron_count + target_neuron_index];
+        if (std::fabs(target_network_input_this_tick) > delivery_epsilon) result.target_delivery_ticks.push_back(tick);
+
+        if (tick >= stimulus_delay_ticks && tick < stimulus_delay_ticks + stimulus_duration_ticks) {
+            // Direct injection into the ring's own CURRENT slot -- the same real, SI-unit-current
+            // stimulus-injection channel run_glif3_single_cell/run_glif_ei_network use above (this
+            // cell's own iSyn DerivedVariable aliases straight to whatever the per-population `_tick`
+            // kernel reads as "network_inputs" THIS tick), just ring-indexed rather than flat
+            // (ModelRuntimeBuffers::delay_ring's own doc comment: the flat `network_inputs` field is
+            // unused/superseded in ring mode, but the per-population `_tick` kernel still reads
+            // whatever THIS tick's own ring slot holds under that same reserved parameter name --
+            // master_kernel.cpp's own `network_inputs_for_this_tick`).
+            ring.input_ring.get_contents()[current_slot * model.total_neuron_count + 0] += amplitude_amperes;
+        }
+
+        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        if (buffers.last_spiked[0] == tick) result.source_spike_ticks.push_back(tick);
+    }
+
+    return result;
+}
+
+// ── Poisson-driven population driver (exit model #3) ──────────────────────────────────────────────
+//
+// Mirrors ticket #65's own inputs_lowering_tests.cpp
+// poisson_population_spike_count_matches_expected_rate_over_several_thousand_ticks acceptance test
+// almost exactly (same trivial-ring-adjacency WeightMatrix workaround, same rng_state seeding
+// scheme), driving THIS ticket's own checked-in poisson_population.nml fixture (so the SAME real
+// NeuroML file drives both jLEMS and spikecorec, this ticket's own established convention) instead of
+// that file's own inline `build_inputs_model` helper, at this exit model's own larger population/
+// window scale.
+
+struct PoissonPopulationRunResult {
+    s64 total_spike_count = 0;
+    s32 neurons_that_fired = 0;
+};
+
+PoissonPopulationRunResult run_poisson_population(s32 population_size, s64 tick_count, f32 dt_seconds) {
+    ModelSpecification model = load_model_from_nml_fixture("poisson_population");
+    Vector<IrProgram> programs{lower_inputs_to_ir(model.type_library[0])};
+    ModelAllocation allocation = allocate_model(model, programs);
+
+    // WeightMatrix rejects an edge-free adjacency (ticket #65's own established workaround) -- a
+    // trivial ring (neuron n -> (n+1)%population_size, since K2Tree rejects self-loops) purely to
+    // satisfy that constructor; this test only cares about spike TIMING (last_spiked), never
+    // network_inputs/propagation, so the edge's own weight is irrelevant.
+    vector<vector<s32>> adjacency((usize)population_size);
+    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
+        adjacency[(usize)neuron_index] = {(neuron_index + 1) % population_size};
+    }
+    WeightMatrix weights(adjacency, /*rank=*/1);
+    weights.set_constant_weight(0.0f);
+
+    AssembledModel assembled_model(model, programs);
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)population_size * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)population_size * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)population_size * sizeof(s64));
+    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + population_size, (s64)-1);
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)population_size * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)population_size * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + population_size, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)population_size * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)population_size * sizeof(bool));
+    GpuPointer<u32> rng_state = allocate<u32>((usize)population_size * sizeof(u32));
+    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
+        rng_state.get_contents()[neuron_index] = (u32)((neuron_index + 1) * 2654435761u) | 1u; // nonzero seed
+    }
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+    buffers.rng_state = rng_state.get_contents();
+
+    PoissonPopulationRunResult result;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        const s64 *last_spiked_contents = last_spiked.get_contents();
+        for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
+            if (last_spiked_contents[neuron_index] == tick) ++result.total_spike_count;
+        }
+    }
+    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
+        if (last_spiked.get_contents()[neuron_index] != -1) ++result.neurons_that_fired;
+    }
+    return result;
+}
+
+} // namespace
+
+// ── izhikevich network: front-end + IR + allocation + compile (enabled) ──────────────────────────
+
+TEST(ExitModelIzhikevichNetwork, parses_resolves_lowers_allocates_and_compiles_without_throwing) {
+    ModelSpecification model = load_model_from_nml_fixture("izhikevich_network");
+    ASSERT_EQ(model.total_neuron_count, 2);
+    ASSERT_EQ(model.populations.size(), 2u);
+    ASSERT_EQ(model.projections.size(), 1u);
+
+    // izhikevich2007Cell (Cell, ONE bound instance shared by both populations) + izhCurrSynapse
+    // (Synapse).
+    ASSERT_EQ(model.type_library.size(), 2u);
+    s32 cell_count = 0, synapse_count = 0;
+    for (const auto &entry : model.type_library) {
+        if (entry.category == TypeLibraryCategory::Cell) ++cell_count;
+        if (entry.category == TypeLibraryCategory::Synapse) ++synapse_count;
+    }
+    EXPECT_EQ(cell_count, 1);
+    EXPECT_EQ(synapse_count, 1);
+
+    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    ASSERT_EQ(programs.size(), 2u);
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    EXPECT_EQ(allocation.cell_state_element_count, 4); // 2 neurons * (v, u)
+
+    EXPECT_NO_THROW({
+        AssembledModel assembled_model(model, programs);
+        (void)assembled_model;
+    });
+}
+
+TEST(ExitModelIzhikevichNetwork, front_end_does_not_recognize_inputList_yet_documented_gap) {
+    // See this file's own header comment (Phase-2 section, #1).
+    ModelSpecification model = load_model_from_nml_fixture("izhikevich_network");
+    EXPECT_TRUE(model.stimuli.empty());
+}
+
+// ── izhikevich network: driven simulation sanity (enabled) ───────────────────────────────────────
+
+TEST(ExitModelIzhikevichNetwork, driven_simulation_produces_regular_spiking_pattern) {
+    const s64 tick_count = 2300; // 230ms / 0.1ms, matching izhikevich_network.nml's own Simulation
+    const f32 dt_seconds = 1e-4f;
+
+    IzhikevichNetworkRunResult result = run_izhikevich_network(tick_count, dt_seconds);
+
+    for (f32 voltage : result.driven_membrane_trace) {
+        ASSERT_TRUE(std::isfinite(voltage));
+        ASSERT_LT(std::abs(voltage), 1.0f) << "membrane potential diverged";
+    }
+
+    // The real pyneuroml reference fires 5 times under these exact parameters (this file's own
+    // checked-in izhikevich_network_spikes.dat); a loose range here (not an exact 5) keeps this
+    // specific test robust to forward-Euler discretization differences, matching
+    // ExitModelGlif3SingleCell's own established convention above -- the DISABLED_ test below does
+    // the exact comparison against the checked-in reference.
+    EXPECT_GE(result.driven_spike_ticks.size(), 3u);
+    EXPECT_LE(result.driven_spike_ticks.size(), 15u);
+
+    // Regular spiking's own settled signature (nonlinear_cell_lowering_tests.cpp's own established
+    // check): the LAST two inter-spike intervals stay roughly constant.
+    usize spike_count = result.driven_spike_ticks.size();
+    ASSERT_GE(spike_count, 3u);
+    s64 last_isi = result.driven_spike_ticks[spike_count - 1] - result.driven_spike_ticks[spike_count - 2];
+    s64 second_last_isi = result.driven_spike_ticks[spike_count - 2] - result.driven_spike_ticks[spike_count - 3];
+    f64 isi_relative_difference =
+        std::fabs((f64)(last_isi - second_last_isi)) / (f64)std::max(last_isi, second_last_isi);
+    EXPECT_LT(isi_relative_difference, 0.25)
+        << "last_isi=" << last_isi << " second_last_isi=" << second_last_isi;
+}
+
+// ── delayed-coupling network: front-end + IR + allocation + compile (enabled) ─────────────────────
+
+TEST(ExitModelDelayedCouplingNetwork, parses_resolves_lowers_allocates_and_compiles_without_throwing) {
+    ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
+    ASSERT_EQ(model.total_neuron_count, 2);
+    ASSERT_EQ(model.populations.size(), 2u);
+    ASSERT_EQ(model.projections.size(), 1u);
+    ASSERT_EQ(model.projections[0].connections.size(), 1u);
+    EXPECT_NEAR(model.projections[0].connections[0].delay, 0.010, 1e-9); // connectionWD delay="10ms"
+
+    // GLIF1Cell (Cell) + delaySynapse (Synapse).
+    ASSERT_EQ(model.type_library.size(), 2u);
+
+    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    ASSERT_EQ(programs.size(), 2u);
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    EXPECT_EQ(allocation.cell_state_element_count, 4); // 2 neurons * (v, refractoryTimeElapsed)
+
+    EXPECT_NO_THROW({
+        AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
+        (void)assembled_model;
+    });
+}
+
+TEST(ExitModelDelayedCouplingNetwork, front_end_does_not_recognize_inputList_yet_documented_gap) {
+    // See this file's own header comment (Phase-2 section, #1).
+    ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
+    EXPECT_TRUE(model.stimuli.empty());
+}
+
+TEST(ExitModelDelayedCouplingNetwork, delay_ring_sizing_matches_the_connections_own_real_delay) {
+    ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
+    WeightMatrix weights = build_weight_matrix(model);
+    const f32 dt_seconds = 1e-4f;
+    EXPECT_EQ(compute_max_delay_ticks(model, dt_seconds), 100); // 10ms / 0.1ms
+
+    DelayRingAllocation ring = allocate_delay_ring(model, weights, dt_seconds);
+    EXPECT_EQ(ring.ring_slot_count, 101); // max_delay_ticks (100) + 1
+}
+
+// ── delayed-coupling network: driven simulation sanity (enabled) ─────────────────────────────────
+
+TEST(ExitModelDelayedCouplingNetwork, driven_simulation_delivers_after_the_source_spike_at_the_expected_offset) {
+    const s64 tick_count = 600; // 60ms / 0.1ms, matching delayed_coupling_network.nml's own Simulation
+    const f32 dt_seconds = 1e-4f;
+    const s64 expected_delay_ticks = 100; // 10ms / 0.1ms
+
+    DelayedCouplingRunResult result = run_delayed_coupling_network(tick_count, dt_seconds);
+
+    // This fixture's own deliberately isolated pulse (delayed_coupling_network.nml's own header
+    // comment) -- exactly one source spike, and exactly one delay-ring delivery, landing EXACTLY
+    // `expected_delay_ticks` after it (spikecorec-only, no jLEMS reference needed for this check --
+    // arithmetic internal to the delay ring itself).
+    ASSERT_EQ(result.source_spike_ticks.size(), 1u);
+    ASSERT_EQ(result.target_delivery_ticks.size(), 1u);
+    EXPECT_EQ(result.target_delivery_ticks[0], result.source_spike_ticks[0] + expected_delay_ticks);
+}
+
+// ── Poisson-driven population: front-end + IR + allocation + compile (enabled) ────────────────────
+
+TEST(ExitModelPoissonPopulation, parses_resolves_lowers_allocates_and_compiles_without_throwing) {
+    ModelSpecification model = load_model_from_nml_fixture("poisson_population");
+    ASSERT_EQ(model.total_neuron_count, 100);
+    ASSERT_EQ(model.populations.size(), 1u);
+    ASSERT_EQ(model.type_library.size(), 1u);
+    EXPECT_EQ(model.type_library[0].category, TypeLibraryCategory::Inputs);
+    EXPECT_EQ(model.type_library[0].component_type_name, "SpikeSourcePoisson");
+
+    IrProgram program = lower_inputs_to_ir(model.type_library[0]);
+    Vector<IrProgram> programs{program};
+    ModelAllocation allocation = allocate_model(model, programs);
+    (void)allocation;
+
+    EXPECT_NO_THROW({
+        AssembledModel assembled_model(model, programs);
+        (void)assembled_model;
+    });
+}
+
+// ── Poisson-driven population: driven simulation sanity (enabled) ────────────────────────────────
+
+TEST(ExitModelPoissonPopulation, driven_simulation_matches_expected_poisson_rate_self_consistently) {
+    // Mirrors ticket #65's own inputs_lowering_tests.cpp statistical-tolerance acceptance test
+    // (population_size=50/rate=20Hz/5s there), at THIS exit model's own larger population/window
+    // scale (100 neurons/10Hz/8s, matching poisson_population.nml exactly, so the SAME model drives
+    // both this spikecorec-only sanity check and the DISABLED_ jLEMS comparison below).
+    const s32 population_size = 100;
+    const f64 rate_hz = 10.0;
+    const s64 tick_count = 8000;
+    const f32 dt_seconds = 0.001f;
+
+    PoissonPopulationRunResult result = run_poisson_population(population_size, tick_count, dt_seconds);
+
+    f64 expected_spike_count = (f64)population_size * rate_hz * ((f64)tick_count * (f64)dt_seconds);
+    f64 tolerance = expected_spike_count * 0.25;
+    EXPECT_NEAR((f64)result.total_spike_count, expected_spike_count, tolerance)
+        << "observed=" << result.total_spike_count << " expected=" << expected_spike_count;
+    EXPECT_GT(result.neurons_that_fired, population_size / 2);
+}
+
+// ── Reference-data loader (enabled -- loads the checked-in fixture data, does NOT call pyneuroml at
+// test time) ───────────────────────────────────────────────────────────────────────────────────────
+
+TEST(ExitModelReferenceDataLoader, loads_izhikevich_network_membrane_trace_and_spike_raster) {
+    ReferenceTrace trace = load_reference_trace(
+        fixture_path("reference_data/izhikevich_network/izhikevich_network_membrane_trace.dat"));
+    // 230ms at 0.1ms steps -> 2301 rows; 3 recorded columns (v_driven, u_driven, v_target).
+    ASSERT_EQ(trace.time_seconds.size(), 2301u);
+    EXPECT_EQ(trace.column_values[0].size(), 3u);
+    EXPECT_NEAR(trace.column_values[0][0], -0.06, 1e-6); // v_driven starts at v0 = -60mV
+
+    Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
+        fixture_path("reference_data/izhikevich_network/izhikevich_network_spikes.dat"));
+    // Real captured jLEMS raster: 5 DrivenPop spikes, 5 TargetPop spikes (real network propagation
+    // through izhCurrSynapse -- see izhikevich_network.nml's own header comment).
+    ASSERT_EQ(spikes.size(), 10u);
+    s32 driven_count = 0, target_count = 0;
+    for (const auto &spike : spikes) {
+        if (spike.selection_id == "sel_driven") ++driven_count;
+        else if (spike.selection_id == "sel_target") ++target_count;
+    }
+    EXPECT_EQ(driven_count, 5);
+    EXPECT_EQ(target_count, 5);
+}
+
+TEST(ExitModelReferenceDataLoader, loads_delayed_coupling_network_membrane_trace_and_spike_raster) {
+    ReferenceTrace trace = load_reference_trace(
+        fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_membrane_trace.dat"));
+    // 60ms at 0.1ms steps -> 601 rows; 2 recorded columns (v_source, v_target).
+    ASSERT_EQ(trace.time_seconds.size(), 601u);
+    EXPECT_EQ(trace.column_values[0].size(), 2u);
+    EXPECT_NEAR(trace.column_values[0][0], -0.07, 1e-6); // both start at EL = -70mV
+
+    Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
+        fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_spikes.dat"));
+    // Real captured jLEMS raster: exactly one SourcePop spike (this fixture's own deliberately short
+    // pulseGenerator window, see delayed_coupling_network.nml's own header comment); TargetPop never
+    // reaches its own threshold (the single delayed delivery is a deliberately weak, subthreshold
+    // perturbation).
+    ASSERT_EQ(spikes.size(), 1u);
+    EXPECT_EQ(spikes[0].selection_id, "sel_source");
+}
+
+TEST(ExitModelReferenceDataLoader, loads_poisson_population_spike_raster) {
+    Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
+        fixture_path("reference_data/poisson_population/poisson_population_spikes.dat"));
+    // Real captured jLEMS raster (seed=17, poisson_population.nml): 100 neurons * 10Hz * 8s ->
+    // expected 8000, observed 7929 (a genuine sample of the same rate-10Hz Poisson process).
+    ASSERT_EQ(spikes.size(), 7929u);
+
+    UnorderedMap<String, s64> spike_count_by_selection;
+    for (const auto &spike : spikes) spike_count_by_selection[spike.selection_id]++;
+    EXPECT_EQ(spike_count_by_selection.size(), 100u); // every one of the 100 neurons fired at least once
+}
+
+// ── DISABLED_: spikecorec vs. real pyneuroml/jLEMS reference (per ticket #67's clarified scope,
+// mirroring ticket #61's own -- these do NOT need to pass in this ticket's PR) ─────────────────────
+
+TEST(ExitModelValidation, DISABLED_izhikevich_network_driven_neuron_matches_pyneuroml_reference) {
+    const s64 tick_count = 2300;
+    const f32 dt_seconds = 1e-4f;
+    const f64 spike_time_tolerance_seconds = 1e-3; // matches ExitModelGlif3SingleCell's own tolerance
+
+    IzhikevichNetworkRunResult own_result = run_izhikevich_network(tick_count, dt_seconds);
+    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+        fixture_path("reference_data/izhikevich_network/izhikevich_network_spikes.dat"));
+
+    Vector<f64> reference_driven_spike_times;
+    for (const auto &spike : reference_spikes) {
+        if (spike.selection_id == "sel_driven") reference_driven_spike_times.push_back(spike.time_seconds);
+    }
+
+    ASSERT_EQ(own_result.driven_spike_ticks.size(), reference_driven_spike_times.size());
+    for (usize index = 0; index < reference_driven_spike_times.size(); ++index) {
+        f64 own_spike_time_seconds = (f64)own_result.driven_spike_ticks[index] * dt_seconds;
+        EXPECT_NEAR(own_spike_time_seconds, reference_driven_spike_times[index], spike_time_tolerance_seconds)
+            << "spike index " << index;
+    }
+}
+
+TEST(ExitModelValidation, DISABLED_izhikevich_network_target_neuron_does_not_yet_match_pyneuroml_reference) {
+    // See izhikevich_network.nml's own header comment / this file's own header comment (Phase-2
+    // section, #2): AssembledModel's fixed propagate stage does not yet invoke izhCurrSynapse's own
+    // real per-edge dynamics -- with the scattered weight forced to exactly zero, TargetPop in
+    // spikecorec's own simulation never receives any input at all and so never spikes, regardless of
+    // tolerance, unlike the real jLEMS reference (which genuinely propagates through izhCurrSynapse
+    // and shows 5 TargetPop spikes). Left DISABLED_ (not merely skipped) so re-enabling it is a
+    // deliberate, visible step once that subsystem exists -- mirrors ticket #61's own
+    // DISABLED_glif_ei_network_matches_pyneuroml_reference precedent exactly.
+    const s64 tick_count = 2300;
+    const f32 dt_seconds = 1e-4f;
+
+    IzhikevichNetworkRunResult own_result = run_izhikevich_network(tick_count, dt_seconds);
+    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+        fixture_path("reference_data/izhikevich_network/izhikevich_network_spikes.dat"));
+
+    Vector<f64> reference_target_spike_times;
+    for (const auto &spike : reference_spikes) {
+        if (spike.selection_id == "sel_target") reference_target_spike_times.push_back(spike.time_seconds);
+    }
+
+    ASSERT_EQ(own_result.target_spike_ticks.size(), reference_target_spike_times.size());
+    for (usize index = 0; index < reference_target_spike_times.size(); ++index) {
+        f64 own_spike_time_seconds = (f64)own_result.target_spike_ticks[index] * dt_seconds;
+        EXPECT_NEAR(own_spike_time_seconds, reference_target_spike_times[index], 1e-3)
+            << "spike index " << index;
+    }
+}
+
+TEST(ExitModelValidation, DISABLED_delayed_coupling_network_source_spike_matches_pyneuroml_reference) {
+    const s64 tick_count = 600;
+    const f32 dt_seconds = 1e-4f;
+    const f64 spike_time_tolerance_seconds = 1e-3;
+
+    DelayedCouplingRunResult own_result = run_delayed_coupling_network(tick_count, dt_seconds);
+    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+        fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_spikes.dat"));
+
+    ASSERT_EQ(own_result.source_spike_ticks.size(), reference_spikes.size());
+    for (usize index = 0; index < reference_spikes.size(); ++index) {
+        f64 own_spike_time_seconds = (f64)own_result.source_spike_ticks[index] * dt_seconds;
+        EXPECT_NEAR(own_spike_time_seconds, reference_spikes[index].time_seconds, spike_time_tolerance_seconds)
+            << "spike index " << index;
+    }
+}
+
+TEST(ExitModelValidation, DISABLED_delayed_coupling_network_delay_ring_matches_pyneuroml_observed_arrival) {
+    // The ticket #64/#67 core proof: spikecorec's own delay ring (allocate_delay_ring,
+    // AssembledModel's enable_delay_ring=true path) delivers at the SAME tick jLEMS's own real,
+    // independently-simulated connection delay does -- NOT re-derived from the connection's own
+    // `delay` attribute in this test (that would be circular), but read directly off the real
+    // captured jLEMS reference trace: the first tick TargetPop's own membrane potential departs from
+    // its resting value EL (delayed_coupling_network.nml's own header comment: TargetPop receives NO
+    // stimulus of its own, so any departure is attributable exclusively to the one delayed
+    // connection).
+    const s64 tick_count = 600;
+    const f32 dt_seconds = 1e-4f;
+    // jLEMS's own discrete-event bookkeeping does not line up tick-for-tick with a naive
+    // forward-Euler comparison (a real, small few-tick offset was observed while capturing this
+    // fixture's own reference data -- see this ticket's own final report) -- this is a tolerance
+    // band, not exact-tick matching, matching this file's own established 1ms spike-time-tolerance
+    // convention above.
+    const f64 delivery_time_tolerance_seconds = 1e-3;
+
+    DelayedCouplingRunResult own_result = run_delayed_coupling_network(tick_count, dt_seconds);
+    ASSERT_FALSE(own_result.target_delivery_ticks.empty());
+
+    ReferenceTrace reference_trace = load_reference_trace(
+        fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_membrane_trace.dat"));
+    const f64 el_volts = -0.07;
+    const f64 departure_epsilon = 1e-9;
+    s64 reference_arrival_row = -1;
+    for (usize row_index = 1; row_index < reference_trace.column_values.size(); ++row_index) {
+        if (std::fabs(reference_trace.column_values[row_index][1] - el_volts) > departure_epsilon) {
+            reference_arrival_row = (s64)row_index;
+            break;
+        }
+    }
+    ASSERT_NE(reference_arrival_row, -1) << "reference TargetPop trace never departs from EL";
+    // reference_trace row R is tick (R-1)'s own post-integration value (row 0 is the t=0 initial
+    // condition, matching ExitModelValidation's own established row/tick offset convention above).
+    f64 reference_arrival_time_seconds = (f64)(reference_arrival_row - 1) * (f64)dt_seconds;
+
+    f64 own_first_delivery_time_seconds = (f64)own_result.target_delivery_ticks[0] * dt_seconds;
+    EXPECT_NEAR(own_first_delivery_time_seconds, reference_arrival_time_seconds, delivery_time_tolerance_seconds);
+}
+
+TEST(ExitModelValidation, DISABLED_poisson_population_aggregate_spike_count_matches_pyneuroml_reference) {
+    // See poisson_population.nml's own header comment / this file's own header comment (Phase-2
+    // section, #4): an exact, spike-for-spike comparison is not meaningful here (jLEMS's own
+    // renewal-process algorithm and spikecorec's own per-tick Bernoulli-style algorithm draw from two
+    // entirely different PRNG streams) -- this compares AGGREGATE spike-count statistics instead, the
+    // one genuinely meaningful cross-simulator target for a stochastic generator, at this exit
+    // model's own larger (100-neuron, 8s) population scale.
+    const s32 population_size = 100;
+    const f64 rate_hz = 10.0;
+    const s64 tick_count = 8000;
+    const f32 dt_seconds = 0.001f;
+
+    PoissonPopulationRunResult own_result = run_poisson_population(population_size, tick_count, dt_seconds);
+    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+        fixture_path("reference_data/poisson_population/poisson_population_spikes.dat"));
+
+    f64 expected_spike_count = (f64)population_size * rate_hz * ((f64)tick_count * (f64)dt_seconds);
+    // Both counts are independent samples of the SAME rate-`rate_hz` Poisson process -- compared to
+    // EACH OTHER (not just each independently to the analytic expectation, ExitModelPoissonPopulation
+    // above already covers that), with a tolerance sized off ordinary Poisson count-variance
+    // (std ~= sqrt(expected_spike_count), matching inputs_lowering_tests.cpp's own established
+    // rationale).
+    f64 tolerance = std::sqrt(expected_spike_count) * 4.0; // ~4 standard deviations
+    EXPECT_NEAR((f64)own_result.total_spike_count, (f64)reference_spikes.size(), tolerance)
+        << "own=" << own_result.total_spike_count << " reference=" << reference_spikes.size();
 }

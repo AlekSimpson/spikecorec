@@ -1,0 +1,19 @@
+<Lems>
+    <!--
+      LEMS wrapper used only to drive izhikevich_network.nml through jNeuroML/
+      jLEMS (ticket #67 [H2]) - NOT parsed by spikecorec's own front-end
+      (which reads izhikevich_network.nml directly). Regenerate the checked-in
+      reference data under tests/fixtures/reference_data/izhikevich_network/
+      with, from this directory:
+
+        python3 -m pyneuroml.pynml LEMS_izhikevich_network.xml -nogui
+
+      (pyneuroml bundles its own jNeuroML jar, so this runs entirely offline
+      once pyneuroml itself is installed: `pip3 install pyneuroml`.)
+    -->
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="izhikevich_network.nml"/>
+    <Target component="sim1"/>
+</Lems>
