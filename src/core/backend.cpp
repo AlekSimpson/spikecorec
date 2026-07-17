@@ -496,14 +496,12 @@ void gpu_neighbor_weights(
                         node_count, max_neighbor_count, total_pairs);
 
 #ifdef SPIKECOREC_CUDA
-    s64 total_pairs = node_count * max_neighbor_count;
-    if (total_pairs <= 0) return;
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(total_pairs));
-    cuda::neighbor_weights_kernel<<<config.grid, config.block, 0, stream>>>(
+    cuda::launch_neighbor_weights(
         U, V,
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        node_count, max_neighbor_count, rank_float4_stride, coefficients, output_weights
+        node_count, max_neighbor_count, rank_float4_stride, coefficients, output_weights,
+        nullptr
     );
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -547,10 +545,7 @@ void gpu_scale_uv(
 #ifdef SPIKECOREC_CUDA
     if (total_float4_element_count <= 0) return;
 
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(total_float4_element_count));
-    cuda::scale_uv_kernel<<<config.grid, config.block, 0, stream>>>(
-        U, V, total_float4_element_count, scale_factor
-    );
+    cuda::launch_scale_uv(U, V, total_float4_element_count, scale_factor, nullptr);
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -576,11 +571,8 @@ void gpu_add_network_input(f32 *membrane_potentials, s32 *input_neuron_indices, 
 #ifdef SPIKECOREC_CUDA
     (void)batch;
     if (element_count <= 0) return;
-    
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(element_count));
-    cuda::add_network_input_kernel<<<config.grid, config.block, 0, stream>>>(
-        membrane_potentials, input_neuron_indices, input_values, element_count
-    );
+
+    cuda::launch_add_network_input(membrane_potentials, input_neuron_indices, input_values, element_count, nullptr);
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -615,10 +607,7 @@ void gpu_decay_all_neurons(
     (void)batch;
     if (neuron_count <= 0) return;
 
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(neuron_count));
-    cuda::decay_all_neurons_kernel<<<config.grid, config.block, 0, stream>>>(
-        membrane_potentials, last_tick_updated, neuron_count, tick, resting_mp, decay_rate
-    );
+    cuda::launch_decay_all_neurons(membrane_potentials, last_tick_updated, neuron_count, tick, resting_mp, decay_rate, nullptr);
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -650,10 +639,7 @@ void gpu_merge_input_neurons(
     (void)batch;
     if (override_count <= 0) return;
 
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(override_count));
-    cuda::merge_input_neurons_kernel<<<config.grid, config.block, 0, stream>>>(
-        active_neuron_indices, active_neuron_count, override_input_neurons, override_count
-    );
+    cuda::launch_merge_input_neurons(active_neuron_indices, active_neuron_count, override_input_neurons, override_count, nullptr);
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -690,10 +676,10 @@ void gpu_reservoir_features(
 #ifdef SPIKECOREC_CUDA
     if (neuron_count <= 0) return;
 
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(neuron_count));
-    cuda::reservoir_features_kernel<<<config.grid, config.block, 0, stream>>>(
+    cuda::launch_reservoir_features(
         neuron_count, tick, spike_tau, voltage_scale, membrane_potentials,
-        last_spiked, last_tick_updated, resting_mp, decay_rate, output_buffer
+        last_spiked, last_tick_updated, resting_mp, decay_rate, output_buffer,
+        nullptr
     );
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
@@ -738,16 +724,10 @@ void gpu_weight_update(
 #ifdef SPIKECOREC_CUDA
     if (rank_float4_stride <= 0 || iterations <= 0) return;
 
-    unsigned threads = 32u;
-    while (static_cast<s64>(threads) < rank_float4_stride) {
-        threads <<= 1;
-    }
-    threads = threads > 1024u ? 1024u : threads;
-
-    usize shared_bytes = static_cast<usize>(2 * rank_float4_stride) * sizeof(float4);
-    cuda::weight_update_kernel<<<1, threads, shared_bytes, stream>>>(
+    cuda::launch_weight_update(
         U, V, rank_float4_stride, source_node, target_node,
-        delta, learning_rate, l2_regularization, iterations
+        delta, learning_rate, l2_regularization, iterations,
+        nullptr
     );
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
@@ -796,12 +776,12 @@ void gpu_k2tree_adjacent_batch(
 #ifdef SPIKECOREC_CUDA
     if (query_count <= 0) return;
 
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(query_count));
-    cuda::k2tree_adjacent_batch_kernel<<<config.grid, config.block, 0, stream>>>(
+    cuda::launch_k2tree_adjacent_batch(
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, node_count, padded_node_count,
         tree_height, internal_bit_count, source_indices, target_indices,
-        output_buffer, query_count
+        output_buffer, query_count,
+        nullptr
     );
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
@@ -852,15 +832,12 @@ void gpu_k2tree_get_neighbors_batch(
                         query_count, max_neighbor_count, total_pairs);
 
 #ifdef SPIKECOREC_CUDA
-    s64 total_pairs = static_cast<s64>(query_count) * max_neighbor_count;
-    if (total_pairs <= 0) return;
-
-    LaunchConfig config = cuda::default_launch_config(static_cast<usize>(total_pairs));
-    cuda::k2tree_get_neighbors_batch_kernel<<<config.grid, config.block, 0, stream>>>(
+    cuda::launch_k2tree_get_neighbors_batch(
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, node_count, padded_node_count,
         tree_height, internal_bit_count, source_node_indices, query_count,
-        max_neighbor_count, output_buffer
+        max_neighbor_count, output_buffer,
+        nullptr
     );
 
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
@@ -933,23 +910,33 @@ void gpu_step(
     (void)batch;
     if (block_count <= 0 || thread_count_per_block <= 0) return;
 
+    // step_kernel/step_kernel_no_active_optimization mutate U in place (the per-source
+    // Hebbian accumulator flush) so launch_step/launch_step_no_active_optimization take
+    // non-const float4*; gpu_step's own signature takes const float4* U/V (callers only
+    // ever pass mutable GpuPointer<float4>::get_contents(), never truly-const storage).
+    float4 *mutable_U = const_cast<float4 *>(U);
+    float4 *mutable_V = const_cast<float4 *>(V);
+
     if (active_set_optimization_enabled) {
-        cuda::step_kernel<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
+        cuda::launch_step(
             tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
-            U, V, rank_float4_stride, constant_weight,
+            mutable_U, mutable_V, rank_float4_stride, constant_weight,
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
             branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
             neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
             active_neuron_indices, active_neuron_count, next_active_neuron_indices, next_active_neuron_count,
-            active_generation
+            active_generation, thread_count_per_block, block_count,
+            nullptr
         );
     }else {
-        cuda::step_kernel_no_active_optimization<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
+        cuda::launch_step_no_active_optimization(
             tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
-            U, V, rank_float4_stride, constant_weight,
+            mutable_U, mutable_V, rank_float4_stride, constant_weight,
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
             branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-            neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated
+            neuron_count, network_inputs, membrane_potentials, last_spiked, last_tick_updated,
+            thread_count_per_block, block_count,
+            nullptr
         );
     }
 
