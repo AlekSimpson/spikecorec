@@ -319,11 +319,11 @@ TEST(HeterogeneousParameters, population_with_heterogeneous_vth_spikes_at_genuin
 
 namespace {
 
-const s32 HETERO_RING_SIZE = 16;
-const String HETERO_RING_SYNAPSE_XML =
+const s32 HETEROGENEOUS_RING_SIZE = 16;
+const String HETEROGENEOUS_RING_SYNAPSE_XML =
     "  <expOneSynapse id=\"synA\" gbase=\"20nS\" erev=\"0mV\" tauDecay=\"3ms\" weight=\"1\"/>";
 
-spikecorec::Vector<IrProgram> build_hetero_ring_type_library_ir_programs(const ModelSpecification &model) {
+spikecorec::Vector<IrProgram> build_heterogeneous_ring_type_library_ir_programs(const ModelSpecification &model) {
     spikecorec::Vector<IrProgram> programs;
     programs.reserve(model.type_library.size());
     for (const auto &entry : model.type_library) {
@@ -340,7 +340,7 @@ spikecorec::Vector<IrProgram> build_hetero_ring_type_library_ir_programs(const M
     return programs;
 }
 
-WeightMatrix build_hetero_ring_weight_matrix(const ModelSpecification &model) {
+WeightMatrix build_heterogeneous_ring_weight_matrix(const ModelSpecification &model) {
     vector<vector<s32>> adjacency((usize)model.total_neuron_count);
     for (const auto &projection : model.projections) {
         for (const auto &connection : projection.connections) {
@@ -352,7 +352,7 @@ WeightMatrix build_hetero_ring_weight_matrix(const ModelSpecification &model) {
 
 // One assembled model's live (non-delay-ring) runtime buffers -- mirrors
 // tests/end_to_end_network_tests.cpp's own LiveModelBuffers/make_live_model_buffers exactly.
-struct HeteroRingLiveBuffers {
+struct HeterogeneousRingLiveBuffers {
     GpuPointer<f32> network_inputs;
     GpuPointer<s64> last_spiked;
     GpuPointer<s32> next_active_indices;
@@ -362,9 +362,9 @@ struct HeteroRingLiveBuffers {
     ModelRuntimeBuffers buffers;
 };
 
-HeteroRingLiveBuffers make_hetero_ring_live_buffers(ModelAllocation &allocation, WeightMatrix &weights,
+HeterogeneousRingLiveBuffers make_heterogeneous_ring_live_buffers(ModelAllocation &allocation, WeightMatrix &weights,
                                                      s64 total_neuron_count) {
-    HeteroRingLiveBuffers live;
+    HeterogeneousRingLiveBuffers live;
     live.network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
     memset(live.network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
 
@@ -393,37 +393,37 @@ HeteroRingLiveBuffers make_hetero_ring_live_buffers(ModelAllocation &allocation,
     return live;
 }
 
-s32 hetero_ring_population_index(const ModelSpecification &model) {
+s32 heterogeneous_ring_population_index(const ModelSpecification &model) {
     for (s32 population_index = 0; population_index < (s32)model.populations.size(); ++population_index) {
         if (model.populations[(usize)population_index].id == "Pop") return population_index;
     }
     throw std::runtime_error("heterogeneous_parameters_tests: no population named 'Pop'");
 }
 
-s32 hetero_ring_global_neuron_index(const ModelSpecification &model, s32 local_index) {
-    return model.populations[(usize)hetero_ring_population_index(model)].neuron_index_begin + local_index;
+s32 heterogeneous_ring_global_neuron_index(const ModelSpecification &model, s32 local_index) {
+    return model.populations[(usize)heterogeneous_ring_population_index(model)].neuron_index_begin + local_index;
 }
 
 // A population's cell_state chunk is structure-of-arrays: state slot `state_slot_index`'s own
 // [population_size] row sits at `cell_type_boundaries[population_index] + state_slot_index *
 // population_size` (allocator.h's own doc comment; same convention tests/end_to_end_network_tests.cpp
 // uses for its own population_state_value_index).
-s64 hetero_ring_state_value_index(const ModelAllocation &allocation, s32 population_index, s32 state_slot_index,
+s64 heterogeneous_ring_state_value_index(const ModelAllocation &allocation, s32 population_index, s32 state_slot_index,
                                    s32 local_index, s32 population_size) {
     return allocation.cell_type_boundaries.get_contents()[population_index] +
            (s64)state_slot_index * population_size + local_index;
 }
 
-f32 read_hetero_ring_glif5_state(const ModelAllocation &allocation, const ModelSpecification &model,
+f32 read_heterogeneous_ring_glif5_state(const ModelAllocation &allocation, const ModelSpecification &model,
                                   const String &state_variable_name, s32 local_index) {
-    s32 population_index = hetero_ring_population_index(model);
+    s32 population_index = heterogeneous_ring_population_index(model);
     const PopulationEntry &population = model.populations[(usize)population_index];
     s32 state_slot_index = glif_state_variable_slot(GlifVariant::Glif5, state_variable_name);
-    return allocation.cell_state.get_contents()[hetero_ring_state_value_index(
+    return allocation.cell_state.get_contents()[heterogeneous_ring_state_value_index(
         allocation, population_index, state_slot_index, local_index, population.size)];
 }
 
-bool hetero_ring_all_finite(const ModelAllocation &allocation) {
+bool heterogeneous_ring_all_finite(const ModelAllocation &allocation) {
     const f32 *cell_state = allocation.cell_state.get_contents();
     for (s64 index = 0; index < allocation.cell_state_element_count; ++index) {
         if (!std::isfinite(cell_state[index])) return false;
@@ -447,8 +447,8 @@ struct HeterogeneousGlifRingFixture {
 // continuous-current-injection test.
 HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixture_id,
                                                              const Vector<GeneratedStimulus> &stimuli) {
-    Vector<f64> theta_inf_values((usize)HETERO_RING_SIZE), asc_add1_values((usize)HETERO_RING_SIZE);
-    for (s32 local_index = 0; local_index < HETERO_RING_SIZE; ++local_index) {
+    Vector<f64> theta_inf_values((usize)HETEROGENEOUS_RING_SIZE), asc_add1_values((usize)HETEROGENEOUS_RING_SIZE);
+    for (s32 local_index = 0; local_index < HETEROGENEOUS_RING_SIZE; ++local_index) {
         // -52mV .. -43.6mV across the ring (thetaInf), -80pA .. -192pA across the ring (ascAdd1) --
         // spaced widely enough apart (0.6mV / 8pA per neuron) that neither float32 rounding nor the
         // tiny forward-Euler step taken between OnStart and a neuron's own first spike could
@@ -460,24 +460,24 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     GeneratedPopulation population;
     population.population_id = "Pop";
     population.variant = GlifVariant::Glif5;
-    population.bound_instance_id = "glif5HeteroRingInstance";
+    population.bound_instance_id = "glif5HeterogeneousRingInstance";
     // thetaInf/ascAdd1 attribute values here are an ordinary uniform-population placeholder -- never
     // actually used (this file's own established `vth_placeholder` convention, header comment above);
     // every neuron's real value comes from heterogeneous_parameter_values below instead.
     population.cell_instance_attributes =
         "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vreset=\"-70mV\" t_ref=\"5ms\" thetaInf=\"-50mV\" tauTheta=\"50ms\" "
         "thetaSpikeAdd=\"5mV\" tauAsc1=\"100ms\" tauAsc2=\"10ms\" ascAdd1=\"-100pA\" ascAdd2=\"-200pA\"";
-    population.neuron_count = HETERO_RING_SIZE;
+    population.neuron_count = HETEROGENEOUS_RING_SIZE;
 
     GeneratedProjection ring_projection;
-    ring_projection.projection_id = "HeteroRingProj";
+    ring_projection.projection_id = "HeterogeneousRingProj";
     ring_projection.presynaptic_population_id = "Pop";
     ring_projection.postsynaptic_population_id = "Pop";
     ring_projection.synapse_instance_id = "synA";
     ring_projection.out_degree = 1;
 
     String content_xml =
-        generate_network_nml("HeteroGlif5Ring", {population}, HETERO_RING_SYNAPSE_XML, {ring_projection}, stimuli);
+        generate_network_nml("HeterogeneousGlif5Ring", {population}, HETEROGENEOUS_RING_SYNAPSE_XML, {ring_projection}, stimuli);
 
     write_temp_file("spikecorec_" + fixture_id + "_content.nml", content_xml);
     String top_path = write_temp_file("spikecorec_" + fixture_id + "_top.nml",
@@ -489,7 +489,7 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     parser.parse(top_path);
     ResolvedModel resolved = resolve_and_lower(parser);
     ModelSpecification model = build_model_specification(resolved);
-    if (model.total_neuron_count != HETERO_RING_SIZE) {
+    if (model.total_neuron_count != HETEROGENEOUS_RING_SIZE) {
         throw std::runtime_error("build_heterogeneous_glif5_ring: unexpected neuron count");
     }
 
@@ -501,7 +501,7 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     model.type_library[(usize)cell_type_index].heterogeneous_parameter_values["thetaInf"] = theta_inf_values;
     model.type_library[(usize)cell_type_index].heterogeneous_parameter_values["ascAdd1"] = asc_add1_values;
 
-    spikecorec::Vector<IrProgram> programs = build_hetero_ring_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_heterogeneous_ring_type_library_ir_programs(model);
     ModelAllocation allocation = allocate_model(model, programs);
 
     // allocate_model zero-initializes cell_state without applying OnStart (this tree's own
@@ -512,22 +512,22 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     // OWN configured value). asc1/asc2 legitimately stay at their own zero-initialized default,
     // matching GLIF5's own OnStart `asc1=0`/`asc2=0`.
     {
-        s32 population_index = hetero_ring_population_index(model);
+        s32 population_index = heterogeneous_ring_population_index(model);
         const PopulationEntry &population_entry = model.populations[(usize)population_index];
         f64 resting_potential =
             model.type_library[(usize)population_entry.type_library_index].baked_constants.at("EL");
         s32 v_slot = glif_state_variable_slot(GlifVariant::Glif5, "v");
         s32 theta_slot = glif_state_variable_slot(GlifVariant::Glif5, "theta");
         for (s32 local_index = 0; local_index < population_entry.size; ++local_index) {
-            allocation.cell_state.get_contents()[hetero_ring_state_value_index(
+            allocation.cell_state.get_contents()[heterogeneous_ring_state_value_index(
                 allocation, population_index, v_slot, local_index, population_entry.size)] = (f32)resting_potential;
-            allocation.cell_state.get_contents()[hetero_ring_state_value_index(
+            allocation.cell_state.get_contents()[heterogeneous_ring_state_value_index(
                 allocation, population_index, theta_slot, local_index, population_entry.size)] =
                 (f32)theta_inf_values[(usize)local_index];
         }
     }
 
-    WeightMatrix weights = build_hetero_ring_weight_matrix(model);
+    WeightMatrix weights = build_heterogeneous_ring_weight_matrix(model);
     // Nonzero placeholder (this tree's own established convention, tests/end_to_end_network_tests.cpp's
     // own header comment finding #1: real per-edge synapse dynamics through a live network is not yet
     // built by any prior ticket) -- deliberately large (30nA-equivalent) so a single upstream spike's
@@ -548,33 +548,33 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
 // plus its `theta`/`asc1` state captured AT THE MOMENT of that first spike (NOT at the end of the run
 // -- theta/asc1 both continue evolving after a neuron's first spike, so reading them only once the
 // whole run is done would no longer reflect that neuron's own first-spike-time value).
-struct HeteroRingRunResult {
+struct HeterogeneousRingRunResult {
     Vector<s64> first_spike_tick;
     Vector<f32> theta_after_first_spike;
     Vector<f32> asc1_after_first_spike;
 };
 
-HeteroRingRunResult run_hetero_ring(HeterogeneousGlifRingFixture &fixture, AssembledModel &assembled_model,
-                                     HeteroRingLiveBuffers &live, s64 tick_count, f32 dt_seconds,
+HeterogeneousRingRunResult run_heterogeneous_ring(HeterogeneousGlifRingFixture &fixture, AssembledModel &assembled_model,
+                                     HeterogeneousRingLiveBuffers &live, s64 tick_count, f32 dt_seconds,
                                      const std::function<void(s64)> &apply_stimulus_for_tick) {
-    HeteroRingRunResult result;
-    result.first_spike_tick.assign((usize)HETERO_RING_SIZE, -1);
-    result.theta_after_first_spike.assign((usize)HETERO_RING_SIZE, 0.0f);
-    result.asc1_after_first_spike.assign((usize)HETERO_RING_SIZE, 0.0f);
+    HeterogeneousRingRunResult result;
+    result.first_spike_tick.assign((usize)HETEROGENEOUS_RING_SIZE, -1);
+    result.theta_after_first_spike.assign((usize)HETEROGENEOUS_RING_SIZE, 0.0f);
+    result.asc1_after_first_spike.assign((usize)HETEROGENEOUS_RING_SIZE, 0.0f);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
         apply_stimulus_for_tick(tick);
         assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
-        EXPECT_TRUE(hetero_ring_all_finite(fixture.allocation)) << "tick=" << tick;
+        EXPECT_TRUE(heterogeneous_ring_all_finite(fixture.allocation)) << "tick=" << tick;
 
-        for (s32 local_index = 0; local_index < HETERO_RING_SIZE; ++local_index) {
-            s32 global_index = hetero_ring_global_neuron_index(fixture.model, local_index);
+        for (s32 local_index = 0; local_index < HETEROGENEOUS_RING_SIZE; ++local_index) {
+            s32 global_index = heterogeneous_ring_global_neuron_index(fixture.model, local_index);
             if (result.first_spike_tick[(usize)local_index] < 0 && live.buffers.last_spiked[global_index] == tick) {
                 result.first_spike_tick[(usize)local_index] = tick;
                 result.theta_after_first_spike[(usize)local_index] =
-                    read_hetero_ring_glif5_state(fixture.allocation, fixture.model, "theta", local_index);
+                    read_heterogeneous_ring_glif5_state(fixture.allocation, fixture.model, "theta", local_index);
                 result.asc1_after_first_spike[(usize)local_index] =
-                    read_hetero_ring_glif5_state(fixture.allocation, fixture.model, "asc1", local_index);
+                    read_heterogeneous_ring_glif5_state(fixture.allocation, fixture.model, "asc1", local_index);
             }
         }
     }
@@ -585,8 +585,8 @@ HeteroRingRunResult run_hetero_ring(HeterogeneousGlifRingFixture &fixture, Assem
 // checked and reported at hop distances 4/8/12/15 out of this 16-neuron ring -- ticket #130's own
 // explicit requirement that multi-hop neurons (not merely the directly-driven neuron or its immediate
 // neighbor) be covered.
-void assert_hetero_ring_multi_hop_heterogeneity(const HeterogeneousGlifRingFixture &fixture,
-                                                 const HeteroRingRunResult &result, s64 tick_count,
+void assert_heterogeneous_ring_multi_hop_heterogeneity(const HeterogeneousGlifRingFixture &fixture,
+                                                 const HeterogeneousRingRunResult &result, s64 tick_count,
                                                  const String &driving_mechanism_label) {
     ASSERT_GE(result.first_spike_tick[0], 0) << "the directly-driven neuron (Pop[0]) never spiked at all";
 
@@ -637,7 +637,7 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_continuous_current_i
     GeneratedStimulus stimulus;
     stimulus.population_id = "Pop";
     stimulus.local_index = 0;
-    stimulus.pulse_generator_id = "heteroRingPulseGen";
+    stimulus.pulse_generator_id = "heterogeneousRingPulseGen";
     stimulus.delay = "0ms";
     stimulus.duration = "25ms"; // the whole run (tick_count * dt_seconds)
     stimulus.amplitude = "3nA";
@@ -646,18 +646,18 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_continuous_current_i
         build_heterogeneous_glif5_ring("heterogeneous_glif5_ring_continuous", {stimulus});
 
     AssembledModel assembled_model(fixture.model, fixture.programs);
-    HeteroRingLiveBuffers live =
-        make_hetero_ring_live_buffers(fixture.allocation, fixture.weights, fixture.model.total_neuron_count);
+    HeterogeneousRingLiveBuffers live =
+        make_heterogeneous_ring_live_buffers(fixture.allocation, fixture.weights, fixture.model.total_neuron_count);
 
     StimulusSchedule schedule = build_stimulus_schedule(fixture.model, (f64)dt_seconds);
-    s32 driven_neuron_index = hetero_ring_global_neuron_index(fixture.model, 0);
+    s32 driven_neuron_index = heterogeneous_ring_global_neuron_index(fixture.model, 0);
 
-    HeteroRingRunResult result = run_hetero_ring(fixture, assembled_model, live, tick_count, dt_seconds,
+    HeterogeneousRingRunResult result = run_heterogeneous_ring(fixture, assembled_model, live, tick_count, dt_seconds,
         [&](s64 tick) {
             live.buffers.network_inputs[driven_neuron_index] += (f32)schedule.current_at(driven_neuron_index, tick);
         });
 
-    assert_hetero_ring_multi_hop_heterogeneity(fixture, result, tick_count, "continuous_current_injection");
+    assert_heterogeneous_ring_multi_hop_heterogeneity(fixture, result, tick_count, "continuous_current_injection");
 }
 
 TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_discrete_spike_array_multi_hop_heterogeneity) {
@@ -667,10 +667,10 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_discrete_spike_array
     HeterogeneousGlifRingFixture fixture = build_heterogeneous_glif5_ring("heterogeneous_glif5_ring_discrete", {});
 
     AssembledModel assembled_model(fixture.model, fixture.programs);
-    HeteroRingLiveBuffers live =
-        make_hetero_ring_live_buffers(fixture.allocation, fixture.weights, fixture.model.total_neuron_count);
+    HeterogeneousRingLiveBuffers live =
+        make_heterogeneous_ring_live_buffers(fixture.allocation, fixture.weights, fixture.model.total_neuron_count);
 
-    s32 driven_neuron_index = hetero_ring_global_neuron_index(fixture.model, 0);
+    s32 driven_neuron_index = heterogeneous_ring_global_neuron_index(fixture.model, 0);
 
     // A literal, host-provided 0/1 array -- one value per tick -- held on for the whole run, driving
     // Pop[0] directly (tests/end_to_end_network_tests.cpp's own second established driving mechanism,
@@ -680,8 +680,8 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_discrete_spike_array
     discrete_schedule.current_amplitude_amperes = 3.0e-9f; // 3nA
     discrete_schedule.spike_bits.assign((usize)tick_count, spikecorec::Vector<u8>{1});
 
-    HeteroRingRunResult result = run_hetero_ring(fixture, assembled_model, live, tick_count, dt_seconds,
+    HeterogeneousRingRunResult result = run_heterogeneous_ring(fixture, assembled_model, live, tick_count, dt_seconds,
         [&](s64 tick) { discrete_schedule.apply_to_network_inputs(live.buffers.network_inputs, tick); });
 
-    assert_hetero_ring_multi_hop_heterogeneity(fixture, result, tick_count, "discrete_spike_array");
+    assert_heterogeneous_ring_multi_hop_heterogeneity(fixture, result, tick_count, "discrete_spike_array");
 }
