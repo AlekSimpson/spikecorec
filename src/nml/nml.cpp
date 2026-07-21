@@ -68,6 +68,9 @@ void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
 // Parameter already is (known_names, `.alloc` ParamConstantDirective emission); resolve.cpp's own
 // extract_fixed_decls separately synthesizes the `Fixed` pin that supplies its actual value, so nml.h
 // gains no new decl struct for it.
+
+// REFACTOR: Should be parameterized into a simple "extract" function
+
 Vector<ParameterDecl> extract_parameters(const NML_Node &node) {
     Vector<ParameterDecl> result;
     for (const auto *child : find_children(node, "Parameter")) {
@@ -526,6 +529,7 @@ void NML_Parser::classify_all_cataloged_types() {
 // is left unclassified — the bare ComponentTypeBase identity, raw node
 // still intact.
 ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
+    // REFACTOR: These should be sets
     static const Vector<String> cell_anchors = {"baseCell"};
     static const Vector<String> synapse_anchors = {"baseSynapse"};
     static const Vector<String> inputs_anchors = {"basePointCurrent", "baseSpikeSource"};
@@ -538,6 +542,7 @@ ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
         "continuousConnection", "continuousConnectionInstance", "continuousConnectionInstanceW",
         "continuousProjection"};
 
+    // REFACTOR: can be deleted when the vectors are switched to sets
     auto contains = [](const Vector<String> &anchors, const String &value) {
         for (const auto &anchor : anchors) {
             if (anchor == value) return true;

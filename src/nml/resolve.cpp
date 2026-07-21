@@ -17,6 +17,8 @@ namespace {
 // across translation units since nml.cpp keeps them in its own anonymous
 // namespace) ──────────────────────────────────────────────────────────────
 
+// REFACTOR: These should be methods of NML_Node instead of being redeclared in every fucking file
+
 String get_attr(const NML_Node &node, const String &name) {
     auto entry = node.attributes.find(name);
     if (entry == node.attributes.end()) return "";
@@ -30,6 +32,8 @@ bool contains(const Vector<String> &values, const String &target) {
     return false;
 }
 
+
+// REFACTOR: These should be sets
 // Instance-level attributes that are IDrefs (arch §1.2 S7): they must
 // resolve through the symbol table to another cataloged id/name, or it is a
 // resolve error. `target` is deliberately NOT here -- see below.
@@ -72,6 +76,7 @@ bool looks_like_dimensioned_literal(const String &value_text) {
 // as a separate `<Fixed parameter="X" value="V"/>` sibling. nml.cpp's own extract_parameters already
 // catalogs `X` as a ParameterDecl (so it's a legal identifier at all); this is what actually supplies
 // its baked value, reusing apply_fixed_pins/the whole existing Fixed-pin pipeline unchanged.
+// REFACTOR: Another extract function ?! should be refactored with the rest in nml.cpp
 Vector<FixedDecl> extract_fixed_decls(const NML_Node &node) {
     Vector<FixedDecl> result;
     for (const auto &child : node.body) {
@@ -283,18 +288,23 @@ ResolvedComponentType flatten_component_type(const String &name, const Unordered
     if (std::holds_alternative<CellType>(entry)) {
         resolved.flattened = merge_chain<CellType>(name, library, "CellType", merge_cell_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Dynamics;
+
     } else if (std::holds_alternative<SynapseType>(entry)) {
         resolved.flattened = merge_chain<SynapseType>(name, library, "SynapseType", merge_synapse_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Dynamics;
+
     } else if (std::holds_alternative<InputsType>(entry)) {
         resolved.flattened = merge_chain<InputsType>(name, library, "InputsType", merge_inputs_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Dynamics;
+
     } else if (std::holds_alternative<PopulationType>(entry)) {
         resolved.flattened = merge_chain<PopulationType>(name, library, "PopulationType", merge_population_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Structure;
+
     } else if (std::holds_alternative<ProjectType>(entry)) {
         resolved.flattened = merge_chain<ProjectType>(name, library, "ProjectType", merge_project_fields, resolved.fixed_parameter_values, resolved.ancestor_chain);
         resolved.bucket = ComponentTypeBucket::Structure;
+
     } else {
         // Bare ComponentTypeBase: an out-of-scope category (ion channels,
         // morphology, biophysical properties, Phase 3, ...). It has no
