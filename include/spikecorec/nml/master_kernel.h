@@ -77,6 +77,84 @@ namespace spikecorec::nml {
 // - Recording (stage 8, ticket #59 [E2]) is likewise not wired to SimulationRecorder here; a
 //   per-type program's own `.tick.record` (if declared) is still compiled into its `_tick` function.
 
+// ── ticket #132: real STDP support on AssembledModel (plasticity + delays + per-edge synapse
+// dynamics in one simulation object) ────────────────────────────────────────────────────────────
+//
+// Ticket #100 [T1]'s own investigation (see plasticity_wiring.h's header comment) found that
+// `apply_stdp_wiring`/`SpikeEngine::enable_plasticity` only ever drives the LEGACY hardcoded
+// engine's own always-running `step_apply_hebbian_update` call site (src/metal/kernels.metal
+// `step`/`step_no_active_optimization`) -- `AssembledModel` had no plasticity mechanism at all, so
+// a real NML/GLIF network run through THIS file's own dispatch could never combine cell dynamics +
+// delays + active STDP. This closes that gap.
+//
+// ── Design decision: (a), reusing the EXISTING mechanism, not a new kernel ──
+// `step_apply_hebbian_update`'s own math (a rank-1 proximal Hebbian nudge of U[source_node]/
+// V[target_node], gated on `learning_rate != 0` and "postsynaptic neuron has spiked before, but not
+// THIS tick") is, for the single-iteration case every real call site uses, ALGEBRAICALLY IDENTICAL
+// to `WeightMatrix::update()`'s own already-existing, already-tested `gpu_weight_update` dispatch
+// (its `l2_regularization * (anchor - anchor)` term is exactly zero at iteration 1, matching
+// step_apply_hebbian_update's own doc comment on kernels.metal eliding that same dead term -- see
+// weight_matrix.h/.cpp). So "porting the mechanism onto AssembledModel directly" does not mean
+// hand-duplicating new MSL/CUDA propagate-kernel math (a real risk of a subtly wrong second
+// implementation of the same formula): it means calling the SAME `WeightMatrix::update()` API the
+// engine already exposes, host-side, once per (spiking presynaptic neuron, k^2-tree neighbor) pair,
+// with the SAME call-site constants (`learning_rate=0.5f`, `l2_regularization=1.0f`,
+// `iterations=1`) and the SAME `decay_delta = -stdp_learning_rate * pow(|tick - child_last_spiked|,
+// -3)` gate every real call site already uses. `apply_stdp_plasticity` (master_kernel.cpp) is that
+// host loop -- stage 7 (arch §2), running immediately after stage 6's propagate dispatch (both the
+// flat and ring-mode branches of step_tick), reading `last_spiked` (already fresh for every neuron
+// that fired THIS tick, by construction: propagate has finished for every emit port by the time this
+// runs) -- deterministically reproducing "skip a child that has never spiked or spiked this same
+// tick" with no race, unlike the original fused kernel's own device-side same-tick ambiguity
+// (harmless: a caller cannot observe the difference outside that one racy edge case, and nothing
+// here depends on it).
+//
+// Tradeoff, documented rather than hidden: this loops host-side over (spiking neuron x its k^2-tree
+// out-degree) with one `WeightMatrix::update()` GPU dispatch (+ sync) per edge, not one fused,
+// GPU-parallel-across-edges kernel launch -- slower per tick than the legacy fused engine for a
+// large, densely-spiking network. Acceptable for this ticket's scope (a real integration point, not
+// a performance rewrite); a future ticket can fuse this into a real batched propagate-kernel variant
+// if profiling ever calls for it.
+//
+// ── Coordinating with ticket #131's per-edge synapse dispatch (the OTHER Ck/Sk writer) ──
+// `WeightMatrix::update()` mutates the SHARED `U_matrix`/`V_matrix` basis rows for `source_node`/
+// `target_node` directly (weight_matrix.h's own "single-matrix, unit-coefficient special case" of
+// the shared basis) -- rows every OTHER registered matrix's entries are ALSO reconstructed from
+// (`Σ U[i,r]·Ck[r]·V[j,r]`, arch §4.3). Nudging U/V for the weight's sake therefore also perturbs
+// any peredge synapse state (e.g. a conductance `g`) sharing that basis -- real cross-talk ticket
+// #54's own periodic `refit()` explicitly re-fits every OTHER matrix's `Ck` to compensate for (see
+// weight_matrix.h's own "expected, not a bug" note), but this ticket's own per-tick incremental
+// nudge does NOT run any compensating refit. Rather than silently letting STDP corrupt a per-edge
+// synapse's own reconstructed state, `enable_plasticity` below throws if this AssembledModel has any
+// real per-edge synapse dispatch active (`projections_` non-empty -- i.e. `model.projections` was
+// non-empty AND this instance was NOT constructed with `enable_delay_ring=true`, since ring mode
+// already forces `projections_` empty regardless of `model.projections`, matching ticket #131's own
+// established "not solved here" precedent for the ring/synapse-dispatch combination). This mirrors
+// this codebase's own established idiom for an unintegrated combination (document + hard boundary,
+// not silent conflation) rather than inventing new Ck-compensation machinery this ticket does not
+// need to ship.
+//
+// ── Relationship to ticket #129 [T8] ("STDP measurably changes weights... at network scale" on a
+// real GLIF network) -- EXPLICIT RE-SCOPE, not "satisfied directly" ──
+// #129's own written acceptance criteria ask for (1) a passing STDP test AT NETWORK SCALE (ticket
+// #100's own ~300-500 neuron / 1000-2000 tick anchor), ideally on GLIF3/GLIF5 SPECIFICALLY because
+// their after-spike-current/threshold-adaptation state is the plasticity interaction that has never
+// been exercised, and (2) a runnable `examples/glif_stdp_plasticity_example.cpp`. THIS ticket
+// delivers NEITHER of those: its own acceptance criterion #1 (see AssembledModelPlasticity's own
+// `stdp_measurably_depresses_the_weight_over_a_real_glif_run_with_a_non_trivial_delay_ring`,
+// tests/assembled_model_plasticity_tests.cpp) is a small, 2-neuron GLIF1/LIF-equivalent fixture --
+// deliberately adaptation-free, i.e. exactly the case #129 says is NOT the point -- proving only
+// that the INTEGRATION MECHANISM exists (one AssembledModel tick loop combining real cell dynamics,
+// a non-trivial per-edge delay, and active STDP together). That mechanism (this file's own
+// `enable_plasticity`/`apply_stdp_plasticity`/`apply_stdp_wiring`) is precisely what #129's own
+// investigation (ticket #100 [T1]) found #129 was BLOCKED on -- SpikeEngine-only STDP could never
+// run on a real NML/GLIF network at all, so #129 could not previously be attempted at any scale.
+// #132 REMOVES that blocker; it does not itself deliver #129's network-scale test or example.
+// **#129 stays open, re-scoped to exactly its own original two deliverables** (a network-scale
+// GLIF3/GLIF5 + STDP test built on top of THIS ticket's new plasticity API, plus
+// `examples/glif_stdp_plasticity_example.cpp`) -- both now buildable with no further engine work,
+// only test/example authoring.
+
 // ── ticket #131 [spike-scatter batch-construction subsystem]: real per-edge synapse dispatch ──────
 //
 // Closes the gap ticket #6's own scope note above used to describe: AssembledModel::step_tick now
@@ -333,6 +411,21 @@ public:
     // without re-deriving it from the model/IR programs it already handed to the constructor.
     bool population_is_closed_form_advanceable(usize population_index) const;
 
+    // ── ticket #132: real STDP support -- mirrors SpikeEngine's own SC-11 enable/disable API shape
+    // exactly (see this header's own "ticket #132" doc comment above for the full design). Disabled
+    // (learning_rate == 0.0f) by default -- byte-for-byte the same propagate/step_tick behavior as
+    // before this ticket until a caller opts in.
+    bool plasticity_enabled() const;
+
+    // No-op if already enabled (matches SpikeEngine::enable_plasticity). Throws std::runtime_error
+    // if this AssembledModel has any real per-edge synapse dispatch active (`projections_`
+    // non-empty, ticket #131) -- see this header's own "ticket #132" doc comment for why combining
+    // the two is not yet safe (both write the shared U/V basis, uncompensated).
+    void enable_plasticity(f32 learning_rate = 0.00222f);
+
+    // No-op if already disabled (matches SpikeEngine::disable_plasticity).
+    void disable_plasticity();
+
 private:
     struct PopulationRuntimeInfo {
         bool has_kernel = false;
@@ -364,6 +457,20 @@ private:
 
     KernelHandle propagate_ring_kernel_handle_{};
     Vector<String> propagate_ring_parameter_names_;
+
+    // ── ticket #132: real STDP support -- see this header's own "ticket #132" doc comment above.
+    // 0.0f == disabled (the default); mirrors SpikeEngine::learning_rate's own "> 0.0f == enabled"
+    // convention exactly.
+    f32 stdp_learning_rate_ = 0.0f;
+
+    // Stage 7 (arch §2): for every neuron whose `last_spiked == tick` (i.e. fired THIS tick -- the
+    // fixed propagate dispatch(es) above have already set this for every emit port by the time this
+    // runs), walks its real k^2-tree neighbors and applies the same rank-1 Hebbian nudge
+    // step_apply_hebbian_update's own real call sites do, via WeightMatrix::update() (see this
+    // header's own "ticket #132" doc comment for the full derivation). No-op when
+    // stdp_learning_rate_ == 0.0f. Called from both the flat and ring-mode branches of step_tick,
+    // immediately after their own propagate dispatch(es).
+    void apply_stdp_plasticity(const ModelRuntimeBuffers &buffers, s64 tick);
 
     // ── ticket #131: spike-scatter batch-construction subsystem -- see this header's own "spike-
     // scatter batch-construction subsystem" doc comment above for the full design. ──────────────────
