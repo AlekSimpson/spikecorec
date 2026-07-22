@@ -34,6 +34,17 @@ using namespace spikecorec::nml;
 // direction over the run. The remaining tests cover the smaller API surface this ticket adds
 // (enable/disable semantics, the apply_stdp_wiring(ModelSpecification&, AssembledModel&) overload,
 // and the explicit incompatibility guard against ticket #131's real per-edge synapse dispatch).
+//
+// ── What this file deliberately does NOT cover (ticket #129 [T8] stays open) ──
+// The 2-neuron GLIF1/LIF-equivalent fixture below proves the INTEGRATION MECHANISM exists (real
+// cell dynamics + a non-trivial delay + active STDP, together, in one AssembledModel tick loop) --
+// #132's own acceptance criterion. It is NOT ticket #129's own network-scale GLIF3/GLIF5 + STDP test
+// (ticket #100's own ~300-500 neuron / 1000-2000 tick anchor, specifically to exercise the
+// after-spike-current/adaptation state a 2-neuron GLIF1 fixture has none of), and this ticket adds
+// no `examples/glif_stdp_plasticity_example.cpp` either. See master_kernel.h's own "Relationship to
+// ticket #129" doc comment for the explicit re-scope: #132 unblocks #129 (a real NML/GLIF network
+// can now run with active STDP at all, via the API this file exercises) but does not satisfy it --
+// #129 remains open for its own two original deliverables.
 
 namespace {
 

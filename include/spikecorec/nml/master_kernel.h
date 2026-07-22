@@ -133,6 +133,27 @@ namespace spikecorec::nml {
 // this codebase's own established idiom for an unintegrated combination (document + hard boundary,
 // not silent conflation) rather than inventing new Ck-compensation machinery this ticket does not
 // need to ship.
+//
+// ── Relationship to ticket #129 [T8] ("STDP measurably changes weights... at network scale" on a
+// real GLIF network) -- EXPLICIT RE-SCOPE, not "satisfied directly" ──
+// #129's own written acceptance criteria ask for (1) a passing STDP test AT NETWORK SCALE (ticket
+// #100's own ~300-500 neuron / 1000-2000 tick anchor), ideally on GLIF3/GLIF5 SPECIFICALLY because
+// their after-spike-current/threshold-adaptation state is the plasticity interaction that has never
+// been exercised, and (2) a runnable `examples/glif_stdp_plasticity_example.cpp`. THIS ticket
+// delivers NEITHER of those: its own acceptance criterion #1 (see AssembledModelPlasticity's own
+// `stdp_measurably_depresses_the_weight_over_a_real_glif_run_with_a_non_trivial_delay_ring`,
+// tests/assembled_model_plasticity_tests.cpp) is a small, 2-neuron GLIF1/LIF-equivalent fixture --
+// deliberately adaptation-free, i.e. exactly the case #129 says is NOT the point -- proving only
+// that the INTEGRATION MECHANISM exists (one AssembledModel tick loop combining real cell dynamics,
+// a non-trivial per-edge delay, and active STDP together). That mechanism (this file's own
+// `enable_plasticity`/`apply_stdp_plasticity`/`apply_stdp_wiring`) is precisely what #129's own
+// investigation (ticket #100 [T1]) found #129 was BLOCKED on -- SpikeEngine-only STDP could never
+// run on a real NML/GLIF network at all, so #129 could not previously be attempted at any scale.
+// #132 REMOVES that blocker; it does not itself deliver #129's network-scale test or example.
+// **#129 stays open, re-scoped to exactly its own original two deliverables** (a network-scale
+// GLIF3/GLIF5 + STDP test built on top of THIS ticket's new plasticity API, plus
+// `examples/glif_stdp_plasticity_example.cpp`) -- both now buildable with no further engine work,
+// only test/example authoring.
 
 // ── ticket #131 [spike-scatter batch-construction subsystem]: real per-edge synapse dispatch ──────
 //
