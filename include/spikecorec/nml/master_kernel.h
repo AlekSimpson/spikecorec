@@ -62,15 +62,15 @@ namespace spikecorec::nml {
 //   `voltageClamp`'s own `require v`, itself a documented, deliberate exclusion -- see
 //   inputs_lowering.h), so this is a documented scope boundary, not a silent gap.
 // - Active-set-driven SKIP dispatch (the closed-form multi-tick lazy decay the current hardcoded
-//   `step` kernel performs for a neuron with no new input) is NOT implemented: every population's
-//   kernel runs over its FULL neuron range every tick, matching the existing engine's own
-//   `step_no_active_optimization` path (`active_set_optimization_enabled=false`), which is exactly
-//   the comparison basis master_kernel_tests.cpp's LIF-equivalence test uses. The fixed propagate
-//   stage still performs the active-set ENQUEUE bookkeeping (next_active_neuron_indices/count,
-//   active_generation) the ticket body asks for, so a future ticket can wire in the skip-dispatch
-//   fast path (CLAUDE.md's own ticket #62 [F1] is the dedicated, later ticket for the
-//   active-set-x-nonlinear-dynamics correctness rule this would need) without this ticket's own
-//   data going unpopulated in the meantime.
+//   `step` kernel performs for a neuron with no new input) was NOT implemented by THIS ticket:
+//   every population's kernel ran over its FULL neuron range every tick, matching the existing
+//   engine's own `step_no_active_optimization` path (`active_set_optimization_enabled=false`),
+//   which is exactly the comparison basis master_kernel_tests.cpp's LIF-equivalence test uses. The
+//   fixed propagate stage still performed the active-set ENQUEUE bookkeeping
+//   (next_active_neuron_indices/count, active_generation) the ticket body asked for, so a future
+//   ticket could wire in the skip-dispatch fast path without this ticket's own data going
+//   unpopulated in the meantime. **Ticket #145 is that future ticket -- see this header's own
+//   "ticket #145" doc comment below for the fast path this data now drives.**
 // - STDP/plasticity (stage 7) is not part of the fixed propagate stage (per CLAUDE.md's own ticket
 //   mapping, plasticity wiring is ticket #66 [F5]); a per-type program's OWN `.tick.plasticity` (if
 //   declared) is still assembled into its `_tick` function by ticket #55 unchanged.
@@ -248,6 +248,99 @@ namespace spikecorec::nml {
 //   built with `enable_delay_ring=true` keeps EXACTLY its pre-#131 behavior (the fixed scalar
 //   propagate-ring path), regardless of what its `model.projections` describe.
 
+// ── ticket #145: active-set skip-dispatch fast path, gated on population_is_closed_form_advanceable ──
+//
+// Closes the gap this header's own "not solved here" note above (originally written by ticket #6)
+// and step_tick's own doc comment flagged: the per-population cell-dispatch loop (stages 2-5) now
+// SKIPS a closed_form_advanceable population's per-neuron kernel entirely on a tick where nothing
+// could possibly change its state, instead of unconditionally re-dispatching its FULL neuron range
+// every tick forever.
+//
+// ── Design decision: an empirical, per-population fixed-point detector, not a symbolic multi-tick
+// jump ──
+// The legacy `step`/`step_no_active_optimization` split (SC-10) skips an INACTIVE neuron by
+// analytically fast-forwarding its single state variable to any future tick in O(1) via
+// `apply_decay`'s closed form (`resting + (v0-resting)*(1-decay_rate)^time_delta`) -- valid because
+// hardcoded LIF has exactly one state variable, decaying independently toward a fixed target. A
+// GLIF cell's own state is NOT that simple: `v`'s own TimeDerivative is always coupled to at least
+// one other state quantity (after-spike currents `ascSum`, or `iSyn`/network_inputs) and so is
+// ALWAYS lowered via cell_lowering.cpp's forward-Euler fallback, never `expression_lowering.cpp`'s
+// exact `ExpDecay` shape (see that file's own doc comment on `detect_linear_decay_shape` -- "GLIF1's
+// own `v` dynamics has an extra network_inputs term and so correctly does NOT match [the exact-decay]
+// shape"). Deriving a genuine symbolic (or numerically-probed matrix-power) closed form for this
+// coupled, per-cell-type, per-regime affine system generically from IR at runtime is real, new
+// mathematics this ticket does NOT attempt (it would also need to reproduce regime-TRANSITION timing
+// mid-gap, e.g. GLIF3/5's refractory countdown) -- squarely the "inventing new kernel math" this
+// ticket's own body says to avoid, unlike ticket #132's direct reuse of an already-existing,
+// already-tested API (`WeightMatrix::update`).
+//
+// Instead, this ticket reuses the SAME per-neuron kernel byte-for-byte (zero codegen changes) and
+// empirically DISCOVERS, rather than predicts, when further dispatch is provably a no-op: a
+// population is eligible to be skipped on tick T iff, on tick T-1, dispatching it under the EXACT
+// SAME zero-input conditions produced BIT-IDENTICAL state (a real, observed fixed point) -- checked
+// by snapshotting `cell_state` immediately before and after that dispatch. A closed_form_advanceable
+// population's fixed point, once reached exactly, is PROVABLY absorbing (an affine recurrence
+// `x' = Mx + c` that satisfies `x = Mx + c` for one input satisfies it for every subsequent tick
+// with the same input -- linearity is exactly what rules out any spontaneous departure). This is
+// precisely why #62 [F1]'s own correctness rule ("must never apply a multi-tick skip" to a
+// NONLINEAR-tagged population) is not just this ticket's policy choice but this specific mechanism's
+// own soundness boundary: a nonlinear trajectory can look numerically stationary for one tick (near
+// a saddle/unstable equilibrium) and still escape unboundedly on a later tick with no new input,
+// so "unchanged for one tick" would NOT prove "unchanged forever" the way it does for an affine
+// system -- population_is_closed_form_advanceable(index) gates every part of this mechanism below.
+//
+// ── The three per-tick "is this population quiescent right now" checks (all read-only, host-side,
+// O(population_size), reusing data this file's own fixed propagate/drain stages already populate;
+// no new bookkeeping subsystem) ──
+// - `network_inputs[n] == 0.0f` for every neuron `n` in the population's range: with delay_ring
+//   disabled (this fast path's own scope, see below), this is a real synaptic scatter
+//   (propagate/ticket #131) not yet consumed by this population's own kernel this tick.
+// - `active_generation[n] != (s32)tick` for every neuron `n`: the propagate stage's OWN enqueue
+//   bookkeeping (already populated per this file's pre-#145 doc comment) already marks exactly the
+//   neurons a spike (their own, or an upstream one) scheduled for processing THIS tick -- reused
+//   as-is, no new enqueue trigger added.
+// - `regime_indices[n] == 0` for every neuron `n`, when `ModelAllocation::has_regime_index` -- a
+//   GLIF3/4/5 neuron mid-refractory (`refractoryTimeElapsed` counting up toward `t_ref`, regime
+//   index 1) is progressing with NO new spike/input at all, so the two checks above alone would
+//   wrongly call it quiescent; index 0 is always the type's own `initial="true"` regime
+//   (cell_lowering.cpp's `gather_regime_info`), so this correctly still allows skipping while
+//   sitting in the ordinary "integrating" regime, only blocking it during an active transition.
+//
+// ── The fourth, independent guard: revalidating cell_state against the stored settled SNAPSHOT,
+// not just trusting a boolean flag (why this matters -- a real bug this ticket's own test suite
+// caught during development, not a hypothetical) ──
+// arch §0.2 documents external stimulus as added "straight into `membrane_potentials`" -- for
+// AssembledModel that means straight into a State quantity's own `cell_state` slot (e.g. `v`), NOT
+// into `network_inputs` (this file's own reproduces_hardcoded_lif_membrane_trajectory_and_spike_timing
+// test in master_kernel_tests.cpp already follows exactly this convention: `allocation.cell_state.
+// get_contents()[0] += this_tick_external_input;`, called BEFORE step_tick, with no `network_inputs`
+// involved at all -- a real, already-established calling convention this ticket cannot assume away,
+// even though a different test file, exit_model_validation_tests.cpp, happens to route its OWN
+// stimulus through `network_inputs` instead). Since a direct `cell_state` write is completely
+// invisible to the three checks above (none of them ever look at `cell_state`), trusting a plain
+// "was this population settled as of last tick" boolean would let an external stimulus injection
+// straight into a "settled" population's own state get silently skipped and LOST forever -- exactly
+// the failure this ticket's own tests reproduced before this guard was added. So
+// `population_settled_snapshots_` stores the ACTUAL cell_state values (not just a bit) the last time
+// a population was proven to be a fixed point; a skip is only ever honored when the population's
+// CURRENT cell_state still matches that stored snapshot exactly, in addition to all three quiescence
+// checks above -- any external write to `cell_state` between ticks, through ANY channel, forces a
+// real dispatch on the very next tick it is observed (self-correcting, never silently dropped),
+// regardless of which of this codebase's own two stimulus-injection conventions a caller follows.
+//
+// ── What this does NOT change ──
+// Disabled (the default, matching this ticket's own acceptance criteria -- SEE
+// active_set_optimization_enabled_'s own doc comment for why this default differs from
+// SpikeEngine's): step_tick's per-population loop is BYTE-FOR-BYTE what it was before this ticket.
+// Enabled but `buffers.delay_ring != nullptr` (ring mode): also byte-for-byte unchanged -- ticket
+// #64's delay ring and this fast path have not been integrated (matching #131/#132's own established
+// precedent above for the same combination), so this ticket's own eligibility check always requires
+// `buffers.delay_ring == nullptr`. A NONLINEAR-tagged population (population_is_closed_form_advanceable
+// == false) is likewise always dispatched in full, unconditionally, exactly as before this ticket --
+// #62's own correctness rule, unaffected. Stages 6 (synapse dispatch/propagate) and 7 (STDP) are not
+// touched by this ticket at all -- their own cost already scales with spike/edge count, not
+// population size.
+
 // ── assembly ─────────────────────────────────────────────────────────────────────────────────
 
 // The names of the two engine-fixed scaffold kernels assemble_master_kernel_source always emits
@@ -373,8 +466,18 @@ public:
     // one-tick-ahead ones -- every step_tick call then requires ModelRuntimeBuffers::delay_ring to
     // be non-null. When false (the default), behavior is exactly what it was before this ticket;
     // ModelRuntimeBuffers::delay_ring must be null (step_tick throws on either mismatch).
+    //
+    // `enable_active_set_optimization` (ticket #145): mirrors SpikeEngine::active_set_optimization_enabled
+    // -- see this header's own "ticket #145" doc comment above for the full skip-dispatch design.
+    // Defaults to false, UNLIKE SpikeEngine's own default of true: this is a deliberate difference,
+    // not an oversight -- every existing AssembledModel caller/test predates this ticket and expects
+    // today's only behavior (full-range dispatch every tick); defaulting to true here would silently
+    // change their output the moment this ticket lands. Also settable/gettable after construction via
+    // active_set_optimization_enabled()/enable_active_set_optimization()/disable_active_set_optimization()
+    // below, so a caller (ticket #126's own on/off parity test) can flip it on the SAME AssembledModel
+    // instance without rebuilding it.
     AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs,
-                   bool enable_delay_ring = false);
+                   bool enable_delay_ring = false, bool enable_active_set_optimization = false);
     AssembledModel(const AssembledModel &) = delete;
     AssembledModel &operator=(const AssembledModel &) = delete;
     ~AssembledModel();
@@ -390,17 +493,16 @@ public:
     // and type-library index), matching "recompile only when the model changes": building a new
     // AssembledModel is the only way this cached information changes.
     //
-    // Active-set x nonlinear rule (arch §0.5, ticket #62 [F1]): every population's kernel above runs
-    // over its FULL neuron range every tick, regardless of population_is_closed_form_advanceable
-    // below (see master_kernel.cpp's own header comment on this ticket's still-deliberate scope
-    // boundary) -- this is unconditionally correct for BOTH tags. A nonlinear-tagged population must
-    // never receive a closed-form multi-tick skip; running its full range every tick trivially
-    // satisfies that (no skip ever happens for anyone here). A closed_form_advanceable-tagged
-    // population's own SEPARATE closed-form fast-forward is kernels.metal/kernels.cu's pre-existing
-    // `apply_decay` + active-set mechanism on the hardcoded SpikeEngine path -- untouched by this
-    // ticket. A future skip-dispatch fast path for THIS master-kernel path (deferred by ticket #6,
-    // see master_kernel.h's own header comment) MUST gate on population_is_closed_form_advanceable
-    // and must never apply a multi-tick skip to a population for which it returns false.
+    // Active-set x nonlinear rule (arch §0.5, ticket #62 [F1]): when active-set optimization is
+    // disabled (the default), OR for a population where population_is_closed_form_advanceable
+    // returns false, every population's kernel above runs over its FULL neuron range every tick,
+    // unconditionally -- correct for a nonlinear-tagged population (must never receive a multi-tick
+    // skip; running its full range every tick trivially satisfies that, no skip ever happens for it).
+    // When active-set optimization IS enabled (see enable_active_set_optimization below), a
+    // closed_form_advanceable-tagged population may instead have its dispatch skipped entirely on a
+    // tick where nothing could change its state -- ticket #145's skip-dispatch fast path, see this
+    // header's own "ticket #145" doc comment above for the full design and why it is sound only for
+    // populations this method's own tag returns true for.
     void step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick, s64 next_tick);
 
     // Whether `model.populations[population_index]`'s cell type was tagged
@@ -410,6 +512,22 @@ public:
     // default. Exposed so a caller (or a future skip-dispatch implementer) can consult the tag
     // without re-deriving it from the model/IR programs it already handed to the constructor.
     bool population_is_closed_form_advanceable(usize population_index) const;
+
+    // ── ticket #145: active-set skip-dispatch fast path -- mirrors SpikeEngine::active_set_optimization_enabled's
+    // own get/enable/disable API shape (see this header's own "ticket #145" doc comment above for the
+    // full design). Disabled by default -- see the constructor's own doc comment above for why that
+    // default deliberately differs from SpikeEngine's.
+    bool active_set_optimization_enabled() const;
+    void enable_active_set_optimization();
+    void disable_active_set_optimization();
+
+    // Instrumentation (ticket #145's own acceptance criterion: "verified to actually skip work"):
+    // the running total of population-dispatch calls this AssembledModel has skipped outright across
+    // every step_tick call so far (never decreases; 0 for the lifetime of an instance that never
+    // enables active-set optimization, or that never reaches a real skip opportunity). A caller can
+    // assert this is > 0 after driving a network through a quiescent period as direct, deterministic
+    // proof the fast path actually skipped a dispatch, without depending on wall-clock timing.
+    s64 skipped_population_dispatch_count() const;
 
     // ── ticket #132: real STDP support -- mirrors SpikeEngine's own SC-11 enable/disable API shape
     // exactly (see this header's own "ticket #132" doc comment above for the full design). Disabled
@@ -441,6 +559,19 @@ private:
     s64 total_neuron_count_ = 0;
 
     Vector<String> emit_port_names_; // dispatch order for the propagate stage
+
+    // ── ticket #145: active-set skip-dispatch fast path -- see this header's own "ticket #145" doc
+    // comment above for the full design. `population_settled_snapshots_` is parallel to
+    // `populations_`: an EMPTY Vector<f32> means "not currently known to be settled"; a non-empty one
+    // holds the exact cell_state values (every state variable, every neuron in the population's own
+    // range) the last time a real dispatch proved this population was a fixed point under
+    // zero-input/no-active-tag/default-regime conditions. step_tick's own skip decision for tick T is
+    // "a stored snapshot exists AND cell_state still matches it exactly AND still quiescent at T" --
+    // see this header's own "fourth, independent guard" doc comment above for why the snapshot
+    // re-check (not just a boolean) is required for correctness.
+    bool active_set_optimization_enabled_ = false;
+    Vector<Vector<f32>> population_settled_snapshots_; // parallel to populations_, all empty at construction
+    s64 skipped_population_dispatch_count_ = 0;
 
     KernelHandle drain_kernel_handle_{};
     Vector<String> drain_parameter_names_;

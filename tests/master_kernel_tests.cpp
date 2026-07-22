@@ -151,6 +151,66 @@ IrProgram build_nonlinear_test_only_program(const String &type_name, f32 gL, f32
     return program;
 }
 
+// ── ticket #145 fixture: a GLIF1-equivalent cell EXTENDED with a real refractory Regime (unlike
+// gpu_source_tests.cpp's own `iafRefCell`, which enters regime 1 on spike but never counts back out
+// of it -- fine for that file's pure codegen-coverage purpose, not reusable here). Regime 1 counts
+// `refractory_elapsed` up by `dt` every tick with NO spike/network_inputs involvement at all --
+// exactly the "internal-only progression while nothing external happens" shape ticket #145's own
+// skip-dispatch fast path must never be fooled by (see master_kernel.h's own "ticket #145" doc
+// comment) -- and transitions back to regime 0 once `refractory_elapsed >= t_ref`.
+IrProgram build_refractory_lif_equivalent_program(f32 gL, f32 EL, f32 vth, f32 vreset, f32 t_ref_ticks) {
+    IrProgram program;
+    program.component_type_name = "RefractoryLifEquivalentCell";
+    program.closed_form_advanceable = true; // matches what lower_cell_to_ir tags a real GLIF3/4/5-shaped cell
+    program.alloc = {
+        StateDirective{"v", "f32", nullopt},
+        StateDirective{"refractory_elapsed", "f32", nullopt},
+        RegimeDirective{"r"},
+        ParamConstantDirective{"C", String("1.0")},
+        ParamConstantDirective{"gL", precise_float_literal(gL)},
+        ParamConstantDirective{"EL", precise_float_literal(EL)},
+        ParamConstantDirective{"vth", precise_float_literal(vth)},
+        ParamConstantDirective{"vreset", precise_float_literal(vreset)},
+        ParamConstantDirective{"t_ref", precise_float_literal(t_ref_ticks)},
+    };
+    program.tick.integrate = {
+        BinaryInstruction{BinaryOpcode::Eq, "is_ref", "r", "1"},
+        IfInstruction{
+            "is_ref",
+            spikecorec::Vector<TickInstruction>{
+                BinaryInstruction{BinaryOpcode::Add, "refractory_elapsed", "refractory_elapsed", "dt"},
+            },
+            {},
+            spikecorec::Vector<TickInstruction>{
+                BinaryInstruction{BinaryOpcode::Sub, "t0", "EL", "v"},
+                BinaryInstruction{BinaryOpcode::Mul, "t0", "gL", "t0"},
+                BinaryInstruction{BinaryOpcode::Add, "t0", "network_inputs", "t0"},
+                BinaryInstruction{BinaryOpcode::Div, "t0", "t0", "C"},
+                BinaryInstruction{BinaryOpcode::Mul, "t0", "t0", "dt"},
+                BinaryInstruction{BinaryOpcode::Add, "v", "v", "t0"},
+            },
+        },
+    };
+    program.tick.detect = {
+        BinaryInstruction{BinaryOpcode::Eq, "is_int", "r", "0"},
+        BinaryInstruction{BinaryOpcode::Gt, "over", "v", "vth"},
+        BinaryInstruction{BinaryOpcode::And, "fire", "is_int", "over"},
+        BinaryInstruction{BinaryOpcode::Ge, "ref_done", "refractory_elapsed", "t_ref"},
+        BinaryInstruction{BinaryOpcode::And, "leave_refractory", "is_ref", "ref_done"},
+    };
+    program.tick.emit = {
+        IfInstruction{"fire", {EmitInstruction{"spike"}}, {}, nullopt},
+    };
+    program.tick.reset = {
+        IfInstruction{"fire", {MoveInstruction{"v", "vreset"}, MoveInstruction{"refractory_elapsed", "0"},
+                                SetRegimeInstruction{"r", "1"}},
+                      {},
+                      nullopt},
+        IfInstruction{"leave_refractory", {SetRegimeInstruction{"r", "0"}}, {}, nullopt},
+    };
+    return program;
+}
+
 } // namespace
 
 // ── compile-failure surfacing (ticket #60 [X1]) ──────────────────────────────────────────────────
@@ -928,6 +988,423 @@ TEST(MasterKernelActiveSetNonlinearRule, nonlinear_population_never_receives_a_c
     // @integrate).
     EXPECT_NE(reference_v, EL);
     EXPECT_EQ(last_spiked.get_contents()[0], 0);
+}
+
+// ── ticket #145: active-set skip-dispatch fast path (see master_kernel.h's own "ticket #145" doc
+// comment for the full design these tests exercise) ──────────────────────────────────────────────
+
+TEST(MasterKernelActiveSetSkipDispatch, disabled_by_default_and_toggle_methods_reflect_enable_disable_calls) {
+    ModelSpecification model;
+    model.total_neuron_count = 1;
+    model.type_library.push_back(build_lif_equivalent_type_entry("LinearCell", "linearInstance", 1.0f, 0.1f, 0.0f, 1.0f));
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = 1;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = 1;
+    model.populations.push_back(population);
+
+    IrProgram program = build_lif_equivalent_program("LinearCell", 0.1f, 0.0f, 1.0f);
+    program.closed_form_advanceable = true;
+    spikecorec::Vector<IrProgram> programs = {program};
+
+    AssembledModel default_constructed(model, programs);
+    EXPECT_FALSE(default_constructed.active_set_optimization_enabled());
+    EXPECT_EQ(default_constructed.skipped_population_dispatch_count(), 0);
+
+    AssembledModel toggled(model, programs);
+    EXPECT_FALSE(toggled.active_set_optimization_enabled());
+    toggled.enable_active_set_optimization();
+    EXPECT_TRUE(toggled.active_set_optimization_enabled());
+    toggled.disable_active_set_optimization();
+    EXPECT_FALSE(toggled.active_set_optimization_enabled());
+
+    AssembledModel constructed_enabled(model, programs, /*enable_delay_ring=*/false,
+                                        /*enable_active_set_optimization=*/true);
+    EXPECT_TRUE(constructed_enabled.active_set_optimization_enabled());
+}
+
+TEST(MasterKernelActiveSetSkipDispatch, skips_a_population_once_it_has_settled_to_a_true_fixed_point) {
+    const f32 gL = 0.5f;
+    const f32 EL = 0.0f;
+    const f32 vth = 1000.0f; // never spikes -- isolates the pure settle-detection behavior
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 2; // neuron 0 is this test's own subject; neuron 1 is an unused peer
+
+    vector<vector<s32>> adjacency = {{}, {}}; // no edges at all -- neuron 0 never receives network_inputs
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(build_lif_equivalent_type_entry("LinearCell", "linearInstance", 1.0f, gL, EL, vth));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    IrProgram program = build_lif_equivalent_program("LinearCell", gL, EL, vth);
+    program.closed_form_advanceable = true; // matches what lower_cell_to_ir would tag a real GLIF-shaped cell
+    spikecorec::Vector<IrProgram> programs = {program};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count, EL);
+
+    WeightMatrix weights(adjacency, /*rank=*/1);
+
+    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/false,
+                                    /*enable_active_set_optimization=*/true);
+    ASSERT_TRUE(assembled_model.population_is_closed_form_advanceable(0));
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    const s64 tick_count = 10;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+        // Never perturbed -- already exactly at rest (EL) with zero input from tick 0 onward, so
+        // state must stay EXACTLY EL whether this tick's dispatch was a real (settle-check) run or a
+        // genuine skip.
+        EXPECT_EQ(allocation.cell_state.get_contents()[0], EL) << "tick=" << tick;
+    }
+
+    // Tick 0 is necessarily a real (settle-check) dispatch -- nothing is "settled" yet immediately
+    // after construction. Every tick after that is a genuine skip: a neuron already exactly at rest
+    // with zero pending input is trivially its own fixed point (see master_kernel.h's own "ticket
+    // #145" doc comment for why bit-exact "unchanged" is sufficient, sound proof of that for a
+    // closed_form_advanceable population).
+    EXPECT_EQ(assembled_model.skipped_population_dispatch_count(), tick_count - 1);
+}
+
+TEST(MasterKernelActiveSetSkipDispatch,
+     enabled_and_disabled_trajectories_match_exactly_and_skip_count_is_nonzero_once_a_pulse_fully_decays) {
+    const f32 gL = 0.5f; // v halves every tick with no input -- reaches EXACT float32 0.0f deterministically
+    const f32 EL = 0.0f;
+    const f32 vth = 1000.0f; // never spikes -- isolates the pure decay-to-fixed-point behavior
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 2;
+    const f32 external_pulse = 0.3f;
+    const s64 tick_count = 200; // comfortably enough halvings for 0.3f to underflow to exact float32 0.0f
+
+    vector<vector<s32>> adjacency = {{}, {}};
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(build_lif_equivalent_type_entry("LinearCell", "linearInstance", 1.0f, gL, EL, vth));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    IrProgram program = build_lif_equivalent_program("LinearCell", gL, EL, vth);
+    program.closed_form_advanceable = true;
+    spikecorec::Vector<IrProgram> programs = {program};
+
+    // ── two independent, otherwise-identical live setups, one with active-set optimization enabled,
+    // one disabled (today's only pre-#145 behavior) -- driven by the IDENTICAL external stimulus
+    // schedule, compared tick by tick for EXACT (bit-for-bit) agreement. ──
+    ModelAllocation enabled_allocation = allocate_model(model, programs);
+    std::fill(enabled_allocation.cell_state.get_contents(), enabled_allocation.cell_state.get_contents() + total_neuron_count, EL);
+    WeightMatrix enabled_weights(adjacency, /*rank=*/1);
+    AssembledModel enabled_model(model, programs, /*enable_delay_ring=*/false, /*enable_active_set_optimization=*/true);
+
+    ModelAllocation disabled_allocation = allocate_model(model, programs);
+    std::fill(disabled_allocation.cell_state.get_contents(), disabled_allocation.cell_state.get_contents() + total_neuron_count, EL);
+    WeightMatrix disabled_weights(adjacency, /*rank=*/1);
+    AssembledModel disabled_model(model, programs); // active-set optimization off (the default)
+
+    auto make_buffers = [&](ModelAllocation &allocation, WeightMatrix &weights, GpuPointer<f32> &network_inputs,
+                             GpuPointer<s64> &last_spiked, GpuPointer<s32> &next_active_indices,
+                             GpuPointer<s32> &next_active_count, GpuPointer<s32> &active_generation,
+                             GpuPointer<bool> &emit_spike) {
+        network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+        memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+        last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+        memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+        next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+        next_active_count = allocate<s32>(sizeof(s32));
+        next_active_count.get_contents()[0] = 0;
+        active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+        std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+        emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+        memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+        ModelRuntimeBuffers buffers;
+        buffers.allocation = &allocation;
+        buffers.weights = &weights;
+        buffers.network_inputs = network_inputs.get_contents();
+        buffers.last_spiked = last_spiked.get_contents();
+        buffers.next_active_neuron_indices = next_active_indices.get_contents();
+        buffers.next_active_neuron_count = next_active_count.get_contents();
+        buffers.active_generation = active_generation.get_contents();
+        buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+        return buffers;
+    };
+
+    GpuPointer<f32> enabled_network_inputs, disabled_network_inputs;
+    GpuPointer<s64> enabled_last_spiked, disabled_last_spiked;
+    GpuPointer<s32> enabled_next_active_indices, disabled_next_active_indices;
+    GpuPointer<s32> enabled_next_active_count, disabled_next_active_count;
+    GpuPointer<s32> enabled_active_generation, disabled_active_generation;
+    GpuPointer<bool> enabled_emit_spike, disabled_emit_spike;
+
+    ModelRuntimeBuffers enabled_buffers =
+        make_buffers(enabled_allocation, enabled_weights, enabled_network_inputs, enabled_last_spiked,
+                     enabled_next_active_indices, enabled_next_active_count, enabled_active_generation, enabled_emit_spike);
+    ModelRuntimeBuffers disabled_buffers =
+        make_buffers(disabled_allocation, disabled_weights, disabled_network_inputs, disabled_last_spiked,
+                     disabled_next_active_indices, disabled_next_active_count, disabled_active_generation,
+                     disabled_emit_spike);
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        f32 this_tick_external_input = (tick == 1) ? external_pulse : 0.0f;
+
+        enabled_allocation.cell_state.get_contents()[0] += this_tick_external_input;
+        disabled_allocation.cell_state.get_contents()[0] += this_tick_external_input;
+
+        enabled_model.step_tick(enabled_buffers, dt, tick, tick + 1);
+        disabled_model.step_tick(disabled_buffers, dt, tick, tick + 1);
+
+        EXPECT_EQ(enabled_allocation.cell_state.get_contents()[0], disabled_allocation.cell_state.get_contents()[0])
+            << "tick=" << tick;
+    }
+
+    // Both trajectories genuinely decayed all the way down into float32's own denormal range (not
+    // just "somewhat smaller") -- a comparison that never left the initial pulse, or that only ever
+    // agreed approximately, would be a much weaker proof than what this test claims. Not asserted as
+    // an exact `== EL` (0.0f): repeated halving's exact rounding behavior once it nears the smallest
+    // representable float is a genuine platform/codegen detail (denormal handling) this test has no
+    // reason to pin down bit-for-bit -- what matters here is that BOTH paths (checked identically,
+    // tick by tick, above) end up at the SAME tiny value, not any specific one.
+    EXPECT_LT(std::abs(enabled_allocation.cell_state.get_contents()[0]), 1e-30f);
+    EXPECT_LT(std::abs(disabled_allocation.cell_state.get_contents()[0]), 1e-30f);
+
+    // Direct, deterministic instrumentation proof that the enabled path actually skipped real
+    // dispatch work (ticket #145's own acceptance criterion), not just that it happened to produce
+    // the same numbers.
+    EXPECT_GT(enabled_model.skipped_population_dispatch_count(), 0);
+}
+
+TEST(MasterKernelActiveSetSkipDispatch,
+     refractory_regime_progression_is_never_skipped_even_though_no_new_input_arrives) {
+    const f32 gL = 0.5f;
+    const f32 EL = 0.0f;
+    const f32 vth = 1.0f;
+    const f32 vreset = -1.0f;
+    const f32 t_ref_ticks = 4.0f;
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 2;
+    const f32 external_pulse = 5.0f; // large enough to clear vth on injection
+    const s64 tick_count = 12;       // spans the whole 4-tick refractory window plus margin on both sides
+
+    vector<vector<s32>> adjacency = {{}, {}};
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    TypeLibraryEntry type_entry;
+    type_entry.component_type_name = "RefractoryLifEquivalentCell";
+    type_entry.bound_instance_id = "refractoryInstance";
+    type_entry.category = TypeLibraryCategory::Cell;
+    type_entry.state_variable_count = 2;
+    type_entry.baked_constants = {{"C", 1.0}, {"gL", (f64)gL},   {"EL", (f64)EL},
+                                   {"vth", (f64)vth}, {"vreset", (f64)vreset}, {"t_ref", (f64)t_ref_ticks}};
+    model.type_library.push_back(type_entry);
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    IrProgram program = build_refractory_lif_equivalent_program(gL, EL, vth, vreset, t_ref_ticks);
+    spikecorec::Vector<IrProgram> programs = {program};
+    ASSERT_TRUE(program.closed_form_advanceable);
+
+    ModelAllocation enabled_allocation = allocate_model(model, programs);
+    std::fill(enabled_allocation.cell_state.get_contents(), enabled_allocation.cell_state.get_contents() + total_neuron_count, EL);
+    WeightMatrix enabled_weights(adjacency, /*rank=*/1);
+    AssembledModel enabled_model(model, programs, /*enable_delay_ring=*/false, /*enable_active_set_optimization=*/true);
+    ASSERT_TRUE(enabled_model.population_is_closed_form_advanceable(0));
+
+    ModelAllocation disabled_allocation = allocate_model(model, programs);
+    std::fill(disabled_allocation.cell_state.get_contents(), disabled_allocation.cell_state.get_contents() + total_neuron_count, EL);
+    WeightMatrix disabled_weights(adjacency, /*rank=*/1);
+    AssembledModel disabled_model(model, programs);
+
+    GpuPointer<f32> enabled_network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(enabled_network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> enabled_last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(enabled_last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> enabled_next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> enabled_next_active_count = allocate<s32>(sizeof(s32));
+    enabled_next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> enabled_active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(enabled_active_generation.get_contents(), enabled_active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> enabled_emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(enabled_emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers enabled_buffers;
+    enabled_buffers.allocation = &enabled_allocation;
+    enabled_buffers.weights = &enabled_weights;
+    enabled_buffers.network_inputs = enabled_network_inputs.get_contents();
+    enabled_buffers.last_spiked = enabled_last_spiked.get_contents();
+    enabled_buffers.next_active_neuron_indices = enabled_next_active_indices.get_contents();
+    enabled_buffers.next_active_neuron_count = enabled_next_active_count.get_contents();
+    enabled_buffers.active_generation = enabled_active_generation.get_contents();
+    enabled_buffers.emit_port_flags["spike"] = enabled_emit_spike.get_contents();
+
+    GpuPointer<f32> disabled_network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(disabled_network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> disabled_last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(disabled_last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> disabled_next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> disabled_next_active_count = allocate<s32>(sizeof(s32));
+    disabled_next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> disabled_active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(disabled_active_generation.get_contents(), disabled_active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> disabled_emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(disabled_emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers disabled_buffers;
+    disabled_buffers.allocation = &disabled_allocation;
+    disabled_buffers.weights = &disabled_weights;
+    disabled_buffers.network_inputs = disabled_network_inputs.get_contents();
+    disabled_buffers.last_spiked = disabled_last_spiked.get_contents();
+    disabled_buffers.next_active_neuron_indices = disabled_next_active_indices.get_contents();
+    disabled_buffers.next_active_neuron_count = disabled_next_active_count.get_contents();
+    disabled_buffers.active_generation = disabled_active_generation.get_contents();
+    disabled_buffers.emit_port_flags["spike"] = disabled_emit_spike.get_contents();
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        f32 this_tick_external_input = (tick == 1) ? external_pulse : 0.0f;
+
+        enabled_allocation.cell_state.get_contents()[0] += this_tick_external_input;
+        disabled_allocation.cell_state.get_contents()[0] += this_tick_external_input;
+
+        enabled_model.step_tick(enabled_buffers, dt, tick, tick + 1);
+        disabled_model.step_tick(disabled_buffers, dt, tick, tick + 1);
+
+        // The enabled path must reproduce the disabled (ground-truth) path EXACTLY on every single
+        // tick throughout the refractory window -- a wrongly-skipped refractory tick would leave
+        // `refractory_elapsed`/`r` behind the reference, surfacing here immediately.
+        EXPECT_EQ(enabled_allocation.cell_state.get_contents()[0], disabled_allocation.cell_state.get_contents()[0])
+            << "v mismatch at tick=" << tick;
+        EXPECT_EQ(enabled_allocation.cell_state.get_contents()[total_neuron_count],
+                  disabled_allocation.cell_state.get_contents()[total_neuron_count])
+            << "refractory_elapsed mismatch at tick=" << tick;
+        ASSERT_TRUE(enabled_allocation.has_regime_index);
+        EXPECT_EQ(enabled_allocation.regime_indices.get_contents()[0], disabled_allocation.regime_indices.get_contents()[0])
+            << "regime mismatch at tick=" << tick;
+        EXPECT_EQ(enabled_last_spiked.get_contents()[0], disabled_last_spiked.get_contents()[0]) << "tick=" << tick;
+    }
+
+    // Never skipped while ANY neuron could still be mid-regime-transition (this fixture's whole
+    // horizon: refractory starts tick 1, ends tick 5, and afterward v is still decaying from vreset
+    // toward EL, never reaching an exact fixed point within this short a horizon) -- the fast path
+    // must have deferred to a real dispatch every single tick here.
+    EXPECT_EQ(enabled_model.skipped_population_dispatch_count(), 0);
+
+    // Sanity: the neuron actually spiked once (tick 1) and genuinely LEFT refractory afterward
+    // (regime back to 0) -- proves the regime cycle completed correctly under the fast path, not
+    // just that nothing was ever skipped.
+    EXPECT_NE(enabled_last_spiked.get_contents()[0], 0);
+    EXPECT_EQ(enabled_allocation.regime_indices.get_contents()[0], 0);
+}
+
+TEST(MasterKernelActiveSetSkipDispatch, nonlinear_population_is_never_skipped_even_with_the_toggle_enabled) {
+    const f32 gL = 0.1f;
+    const f32 EL = 0.0f;
+    const f32 vth = 1000.0f; // never spikes -- isolates the pure integrate step from reset/regime noise
+    const f32 dt = 1.0f;
+    const s64 total_neuron_count = 2;
+
+    vector<vector<s32>> adjacency = {{}, {}};
+
+    ModelSpecification model;
+    model.total_neuron_count = (s32)total_neuron_count;
+    model.type_library.push_back(
+        build_lif_equivalent_type_entry("NonlinearTestOnlyCell", "nonlinearTestOnlyInstance", 1.0f, gL, EL, vth));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = (s32)total_neuron_count;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = (s32)total_neuron_count;
+    model.populations.push_back(population);
+
+    spikecorec::Vector<IrProgram> programs = {build_nonlinear_test_only_program("NonlinearTestOnlyCell", gL, EL, vth)};
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + total_neuron_count, EL);
+
+    WeightMatrix weights(adjacency, /*rank=*/1);
+
+    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/false,
+                                    /*enable_active_set_optimization=*/true);
+    ASSERT_FALSE(assembled_model.population_is_closed_form_advanceable(0));
+
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + total_neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    // Never perturbed at all (v stays exactly EL, network_inputs stays exactly 0.0f every tick) --
+    // exactly the condition under which a closed_form_advanceable population WOULD be skipped after
+    // its first tick. A nonlinear-tagged population must never be skipped regardless (#62 [F1]'s own
+    // correctness rule) -- checked here with the toggle genuinely ON, unlike
+    // MasterKernelActiveSetNonlinearRule's own test above (which never enables it at all).
+    const s64 tick_count = 10;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+    }
+
+    EXPECT_EQ(assembled_model.skipped_population_dispatch_count(), 0);
 }
 
 // ── ticket #64 [F3]: spike-delay subsystem (delay ring) ──────────────────────────────────────────

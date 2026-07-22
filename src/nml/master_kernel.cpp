@@ -103,6 +103,84 @@ s32 state_variable_offset(const IrProgram &program, const String &state_name) {
     return -1;
 }
 
+// ── ticket #145: active-set skip-dispatch fast path -- see master_kernel.h's own "ticket #145" doc
+// comment for the full design these helpers implement. ────────────────────────────────────────────
+
+// The count of StateDirective entries in `program.alloc`, in the SAME declaration order
+// state_variable_offset above walks -- the number of contiguous f32 elements per neuron a
+// population's cell_state chunk devotes to state (arch §4.1's SoA layout).
+s32 count_state_variables(const IrProgram &program) {
+    s32 count = 0;
+    for (const auto &directive : program.alloc) {
+        if (std::holds_alternative<StateDirective>(directive)) ++count;
+    }
+    return count;
+}
+
+// True iff any neuron in [neuron_index_begin, neuron_index_begin+population_size) has a nonzero
+// pending `network_inputs` entry -- a real synaptic scatter (propagate/ticket #131) or a caller's
+// own externally-injected stimulus write (stimulus_schedule.h's documented convention: added
+// straight into per-neuron state before step_tick runs), either of which this population's kernel
+// must actually consume this tick.
+bool population_has_pending_network_input(const f32 *network_inputs, s32 neuron_index_begin, s32 population_size) {
+    for (s32 offset = 0; offset < population_size; ++offset) {
+        if (network_inputs[neuron_index_begin + offset] != 0.0f) return true;
+    }
+    return false;
+}
+
+// True iff any neuron in the population's range was tagged by the fixed propagate stage's OWN
+// enqueue bookkeeping (already populated, see master_kernel.h) as needing processing THIS tick.
+bool population_has_active_tag_this_tick(const s32 *active_generation, s32 neuron_index_begin,
+                                          s32 population_size, s64 tick) {
+    s32 tick_as_generation = (s32)tick;
+    for (s32 offset = 0; offset < population_size; ++offset) {
+        if (active_generation[neuron_index_begin + offset] == tick_as_generation) return true;
+    }
+    return false;
+}
+
+// True iff any neuron in the population's range is sitting in a non-default (index != 0) regime --
+// e.g. GLIF3/4/5 mid-refractory -- meaning its own state (refractoryTimeElapsed) is still
+// progressing toward a regime TRANSITION with no new spike/input at all. Regime index 0 is always
+// the type's own `initial="true"` regime (cell_lowering.cpp's gather_regime_info), so this does not
+// block skipping while sitting in the ordinary "integrating" regime.
+bool population_has_non_default_regime(const s32 *regime_indices, s32 neuron_index_begin, s32 population_size) {
+    for (s32 offset = 0; offset < population_size; ++offset) {
+        if (regime_indices[neuron_index_begin + offset] != 0) return true;
+    }
+    return false;
+}
+
+// The combined "is this population quiescent RIGHT NOW" check -- all three of master_kernel.h's own
+// "ticket #145" conditions must hold for a population's dispatch to even be a SKIP CANDIDATE this
+// tick (whether that candidacy is actually acted on additionally depends on
+// population_settled_snapshots_, see AssembledModel::step_tick).
+bool population_is_quiescent_this_tick(const ModelRuntimeBuffers &buffers, const f32 *network_inputs,
+                                        s32 neuron_index_begin, s32 population_size, s64 tick) {
+    if (population_has_pending_network_input(network_inputs, neuron_index_begin, population_size)) return false;
+    if (population_has_active_tag_this_tick(buffers.active_generation, neuron_index_begin, population_size, tick)) {
+        return false;
+    }
+    if (buffers.allocation->has_regime_index &&
+        population_has_non_default_regime(buffers.allocation->regime_indices.get_contents(), neuron_index_begin,
+                                           population_size)) {
+        return false;
+    }
+    return true;
+}
+
+// A plain host-side copy of one population's whole cell_state chunk (every declared state variable,
+// every neuron in its range) -- taken immediately before and after a real dispatch to empirically
+// detect a fixed point (bit-exact equality, see master_kernel.h's own "ticket #145" doc comment for
+// why bit-exact equality is the correct, sound test for a closed_form_advanceable population).
+Vector<f32> snapshot_population_cell_state(const ModelAllocation &allocation, s64 chunk_base_offset,
+                                            s32 population_size, s32 state_variable_count) {
+    const f32 *chunk_base = allocation.cell_state.get_contents() + chunk_base_offset;
+    s64 element_count = (s64)state_variable_count * (s64)population_size;
+    return Vector<f32>(chunk_base, chunk_base + element_count);
+}
+
 // ── dispatch argument construction ──────────────────────────────────────────────────────────────
 //
 // Builds the args[]/arg_sizes[] pair metal_dispatch/cuda_dispatch expect, owning stable storage
@@ -879,14 +957,16 @@ KernelHandle compile_kernel_or_throw_with_source(const String &source_text, cons
 }
 
 AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs,
-                                bool enable_delay_ring) {
+                                bool enable_delay_ring, bool enable_active_set_optimization) {
     AssembledMasterKernelSource assembled = assemble_master_kernel_source(model, type_library_ir_programs);
 
     type_library_ir_programs_ = type_library_ir_programs;
     total_neuron_count_ = model.total_neuron_count;
     emit_port_names_ = collect_emit_port_names(model, type_library_ir_programs);
+    active_set_optimization_enabled_ = enable_active_set_optimization;
 
     populations_.resize(model.populations.size());
+    population_settled_snapshots_.assign(model.populations.size(), Vector<f32>{});
     for (usize index = 0; index < model.populations.size(); ++index) {
         const PopulationEntry &population = model.populations[index];
         const GpuSource &source = assembled.population_gpu_sources[index];
@@ -1026,6 +1106,17 @@ bool AssembledModel::population_is_closed_form_advanceable(usize population_inde
     return type_library_ir_programs_.at((usize)info.type_library_index).closed_form_advanceable;
 }
 
+// ── ticket #145: active-set skip-dispatch fast path -- see master_kernel.h's own "ticket #145" doc
+// comment for the full design.
+
+bool AssembledModel::active_set_optimization_enabled() const { return active_set_optimization_enabled_; }
+
+void AssembledModel::enable_active_set_optimization() { active_set_optimization_enabled_ = true; }
+
+void AssembledModel::disable_active_set_optimization() { active_set_optimization_enabled_ = false; }
+
+s64 AssembledModel::skipped_population_dispatch_count() const { return skipped_population_dispatch_count_; }
+
 void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick, s64 next_tick) {
     if (buffers.allocation == nullptr || buffers.weights == nullptr) {
         fail("step_tick: ModelRuntimeBuffers::allocation/weights must be non-null");
@@ -1066,18 +1157,60 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
     // cell-type-boundary dispatch -- one dispatch per boundary, not a single mega-dispatch with a
     // runtime branch; see master_kernel.h's own header comment for why this is faithful to "one
     // thread per neuron, dispatching by cell-type boundary" without needing to merge every type's
-    // generated code into one literal kernel function). Every population dispatches its FULL range
-    // here regardless of population_is_closed_form_advanceable (arch §0.5, ticket #62 [F1]'s own
-    // still-deliberate scope boundary -- see master_kernel.h's step_tick doc comment): this is safe
-    // for a nonlinear-tagged population (never fast-forwarded/skipped, exactly the correctness rule
-    // requires) and does not yet exploit the tag for a closed_form_advanceable population's own
-    // optimization (a separate, future skip-dispatch ticket's job).
+    // generated code into one literal kernel function). A nonlinear-tagged population (or any
+    // population when active-set optimization is disabled, or when running in delay-ring mode)
+    // always dispatches its FULL range here, unconditionally (arch §0.5, ticket #62 [F1]'s own
+    // correctness rule). A closed_form_advanceable-tagged population may instead have this tick's
+    // dispatch skipped entirely -- ticket #145's skip-dispatch fast path, see master_kernel.h's own
+    // "ticket #145" doc comment for the full design this loop implements.
     for (usize index = 0; index < populations_.size(); ++index) {
         const PopulationRuntimeInfo &info = populations_[index];
         if (!info.has_kernel) continue;
 
         const IrProgram &program = type_library_ir_programs_[(usize)info.type_library_index];
         s64 chunk_base_offset = chunk_base_offsets[index];
+
+        bool skip_dispatch_eligible = active_set_optimization_enabled_ && buffers.delay_ring == nullptr &&
+                                       population_is_closed_form_advanceable(index);
+
+        s32 state_variable_count = 0;
+        bool quiescent_this_tick = false;
+        if (skip_dispatch_eligible) {
+            state_variable_count = count_state_variables(program);
+            quiescent_this_tick = population_is_quiescent_this_tick(
+                buffers, network_inputs_for_this_tick, info.neuron_index_begin, info.population_size, tick);
+
+            Vector<f32> &stored_snapshot = population_settled_snapshots_[index];
+            if (quiescent_this_tick && !stored_snapshot.empty()) {
+                // A stored settled snapshot exists and the population is still quiescent -- only
+                // honor the skip if cell_state STILL matches that snapshot exactly (see
+                // master_kernel.h's own "fourth, independent guard" doc comment for why a plain
+                // boolean is not enough: an external write straight into cell_state, e.g. a stimulus
+                // injection per arch §0.2's own convention, is otherwise completely invisible to the
+                // quiescence checks alone).
+                Vector<f32> current_state = snapshot_population_cell_state(*buffers.allocation, chunk_base_offset,
+                                                                             info.population_size, state_variable_count);
+                if (current_state == stored_snapshot) {
+                    // Genuine skip: this population's cell_state is EXACTLY the fixed point a real
+                    // dispatch already proved it settles to under these conditions -- see
+                    // master_kernel.h's own "ticket #145" doc comment for why bit-exact "unchanged"
+                    // is absorbing for a closed_form_advanceable population.
+                    ++skipped_population_dispatch_count_;
+                    continue;
+                }
+            }
+            stored_snapshot.clear(); // no longer a valid skip candidate -- re-derive below, if possible
+        }
+
+        // Snapshot cell_state before a real dispatch only when this tick's outcome could actually
+        // settle the fixed-point question (quiescent conditions hold) -- avoids the extra host-side
+        // copy on every ordinary (non-skip-eligible, or actively-driven) dispatch.
+        bool checking_for_settle = skip_dispatch_eligible && quiescent_this_tick;
+        Vector<f32> state_before_dispatch;
+        if (checking_for_settle) {
+            state_before_dispatch =
+                snapshot_population_cell_state(*buffers.allocation, chunk_base_offset, info.population_size, state_variable_count);
+        }
 
         DispatchArgumentBuilder builder;
         for (const String &parameter_name : info.parameter_names_in_order) {
@@ -1087,6 +1220,20 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
                                        buffers.emit_port_flags);
         }
         builder.dispatch(info.handle, launch_config_for(info.population_size));
+
+        if (skip_dispatch_eligible) {
+            if (checking_for_settle) {
+                Vector<f32> state_after_dispatch = snapshot_population_cell_state(
+                    *buffers.allocation, chunk_base_offset, info.population_size, state_variable_count);
+                if (state_after_dispatch == state_before_dispatch) {
+                    population_settled_snapshots_[index] = std::move(state_after_dispatch);
+                } else {
+                    population_settled_snapshots_[index].clear();
+                }
+            } else {
+                population_settled_snapshots_[index].clear(); // real input/active-tag/regime activity this tick
+            }
+        }
     }
 
     if (buffers.delay_ring == nullptr) {
