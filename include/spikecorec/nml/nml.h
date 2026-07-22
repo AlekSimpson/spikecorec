@@ -40,6 +40,8 @@ struct NML_Node {
 // stays plain NML_Node — this classification only applies to what
 // NML_Parser catalogs into `library`.
 
+// REFACTOR: these can be consolidated
+
 // `Parameter` (§3.1): a named, time-invariant, dimensioned quantity an
 // instance carries. Whether it ends up baked or per-neuron is decided later,
 // at resolve — not readable from the declaration alone.
@@ -186,6 +188,8 @@ struct ComponentTypeBase {
         : name(std::move(name)), extends(std::move(extends)), raw(std::move(raw)) {}
 };
 
+// REFACTOR: These can also be consolidated, maybe even into one type that holds all of the cell type data as a matrix
+
 // CellType — Dynamics/point-cell ComponentTypes (arch §3.3 D1): `iafCell`,
 // `iafRefCell`, `izhikevich2007Cell`, `adExIaFCell`, GLIF variants, etc.
 // Classified by an `extends` chain reaching `baseCell`.
@@ -275,6 +279,7 @@ using ConnectionType = ProjectType;
 // (for anything the arch doc's §3.3 buckets don't cover — ion channels,
 // morphology, biophysical properties, Phase 3) left as the bare identity
 // with its raw node still intact.
+// REFACTOR: This can be removed if we consolidate into one main type, every individual type instance would just be an index into the type data structure
 using ComponentTypeEntry = std::variant<ComponentTypeBase, CellType, SynapseType, InputsType, PopulationType, ProjectType>;
 
 #ifndef SPIKECOREC_NML_STD_LIB_DIR
