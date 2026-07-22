@@ -13,6 +13,8 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest", "numpy"]
+# examples/render_spire_video.py (ticket #138) — renders a .spire recording as an mp4/gif.
+examples = ["numpy", "matplotlib"]
 
 [tool.setuptools.packages.find]
 where = ["python"]

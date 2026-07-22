@@ -154,7 +154,7 @@ PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('
 PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
 
 # ── Top-level targets ────────────────────────────────────────
-.PHONY: all cuda metal python test examples clean info
+.PHONY: all cuda metal python test examples examples-cuda examples-metal clean info
 
 all: $(BACKEND)
 
@@ -254,18 +254,36 @@ test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
 	$(BUILD_DIR)/test_runner_metal
 
 # ── Examples ─────────────────────────────────────────────────
+# Every examples/*.cpp builds into its own binary under $(BUILD_DIR)/examples/.
+# On Metal those binaries need default.metallib sitting alongside them: backend.cpp
+# locates the ahead-of-time-compiled kernel library next to the loaded binary (via
+# dladdr), not relative to the working directory.
+EX_BINS := $(patsubst $(EX_DIR)/%.cpp, $(BUILD_DIR)/examples/%, $(EX_SRCS))
+
+EX_LINK = -L$(BUILD_DIR) -l$(PROJECT)_$(BACKEND) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread
+ifeq ($(BACKEND),metal)
+  EX_LINK += $(METAL_LDFLAGS)
+  EX_DEPS  = $(METAL_LIB) $(BUILD_DIR)/examples/default.metallib
+else
+  EX_LINK += $(CUDA_LINK)
+  EX_DEPS  = $(CUDA_LIB)
+endif
+
 examples: examples-$(BACKEND)
 
-examples-cuda: check-cuda $(CUDA_LIB)
-	$(NVCC) $(NVCCFLAGS) $(EX_DIR)/cuda_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda \
-	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/cuda_example
+examples-cuda: check-cuda $(EX_BINS)
+	@echo "[spikecorec] examples built → $(BUILD_DIR)/examples/"
 
-examples-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) $(EX_DIR)/metal_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/metal_example
+examples-metal: check-metal $(EX_BINS)
+	@echo "[spikecorec] examples built → $(BUILD_DIR)/examples/"
+
+$(BUILD_DIR)/examples/default.metallib: $(BUILD_DIR)/default.metallib
+	@mkdir -p $(@D)
+	cp $< $@
+
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_DIR)/nml_pipeline_support.h $(EX_DEPS)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -I$(EX_DIR) $< $(EX_LINK) -o $@
 
 # ── Utilities ────────────────────────────────────────────────
 info:

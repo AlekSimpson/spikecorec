@@ -31,6 +31,13 @@ xcuserdata/
 /examples/*.out
 /tests/*.out
 
+# .spire recordings the torus examples write at runtime (NetworkActivityRecorder,
+# nml_pipeline_support.h) and their rendered videos (examples/render_spire_video.py)
+/recordings/
+*.spire
+*.mp4
+*.gif
+
 # Python
 .pytest_cache/
 __pycache__/

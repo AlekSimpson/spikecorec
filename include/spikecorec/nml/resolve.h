@@ -36,6 +36,8 @@ namespace spikecorec::nml {
 // `R = "8.3144621 J_per_K_per_mol"` gas constant, used by ion-channel/HH ComponentTypes) must not
 // fail resolution for every model, only real ones. See apply_fixed_pins's own doc comment for the
 // resulting warn-and-skip (rather than throw) handling this flag selects.
+//
+// REFACTOR: ANOTHER DECL STRUCT ?!
 struct FixedDecl {
     String parameter;
     String value;
