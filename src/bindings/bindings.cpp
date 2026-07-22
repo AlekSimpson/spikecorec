@@ -111,7 +111,7 @@ PYBIND11_MODULE(_spikecorec, m) {
              py::arg("input_values"), py::arg("tick"),
              py::arg("override_input_neurons") = vector<s64>{},
              py::arg("decay_all_neurons") = false)
-        .def("is_alive", &SpikeEngine::is_alive)
+        .def("is_alive", [](const SpikeEngine &self) { return self.alive; })
         .def("estimate_bifurcation_weight", &SpikeEngine::estimate_bifurcation_weight,
              py::arg("input_period") = 1)
         .def("scale_uniform_weights_near_bifurcation",
@@ -137,7 +137,7 @@ PYBIND11_MODULE(_spikecorec, m) {
             #ifdef SPIKECOREC_CUDA
                  borrowed.pointer = output.pointer;
             #elif defined(SPIKECOREC_METAL)
-                 borrowed.buffer = output.buffer;
+                 borrowed.pointer = output.pointer;
             #endif
                  self.get_reservoir_features_vector(tick, spike_tau, voltage_scale, std::move(borrowed));
 
@@ -205,7 +205,7 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readwrite("spike_period", &SpikeEngine::spike_period)
         .def_readwrite("spike_threshold", &SpikeEngine::spike_threshold)
         .def_readwrite("use_constant_weight", &SpikeEngine::use_constant_weight)
-        .def_readonly("running", &SpikeEngine::running);
+        .def_readonly("alive", &SpikeEngine::alive);
 
     // Decodes a `.spire`/`.spire.gz`/`.spire.xz`/`.spire.bz2` recording (as
     // written by start_static_record / SimulationRecorder, or by the
