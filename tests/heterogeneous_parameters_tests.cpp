@@ -321,7 +321,7 @@ namespace {
 
 const s32 HETEROGENEOUS_RING_SIZE = 16;
 const String HETEROGENEOUS_RING_SYNAPSE_XML =
-    "  <expOneSynapse id=\"synA\" gbase=\"20nS\" erev=\"0mV\" tauDecay=\"3ms\" weight=\"1\"/>";
+    "  <expOneSynapse id=\"synA\" gbase=\"100nS\" erev=\"0mV\" tauDecay=\"3ms\" weight=\"1\"/>";
 
 spikecorec::Vector<IrProgram> build_heterogeneous_ring_type_library_ir_programs(const ModelSpecification &model) {
     spikecorec::Vector<IrProgram> programs;
@@ -528,14 +528,18 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     }
 
     WeightMatrix weights = build_heterogeneous_ring_weight_matrix(model);
-    // Nonzero placeholder (this tree's own established convention, tests/end_to_end_network_tests.cpp's
-    // own header comment finding #1: real per-edge synapse dynamics through a live network is not yet
-    // built by any prior ticket) -- deliberately large (30nA-equivalent) so a single upstream spike's
-    // own scattered contribution reliably carries the wave to the very next ring neuron in one hop
-    // regardless of that neuron's own heterogeneous thetaInf. Purely a ROUTING vehicle -- the
-    // heterogeneity claim in both tests below never depends on this weight's own magnitude or the
-    // wave's own timing, only on each neuron's own post-first-spike state (see this section's own
-    // header comment).
+    // ticket #131: AssembledModel now dispatches HETEROGENEOUS_RING_SYNAPSE_XML's own real
+    // expOneSynapse per-edge dynamics for this model (it has real projections), so this
+    // constant-weight placeholder is inert (its own scalar propagate contribution is forced to zero
+    // whenever real per-edge synapse dispatch is active -- see master_kernel.h) -- left set anyway
+    // as an explicit, harmless no-op rather than deleting the call, matching this tree's established
+    // "state the placeholder was here" convention. HETEROGENEOUS_RING_SYNAPSE_XML's own `gbase` is
+    // tuned strong enough (100nS) that a single upstream spike's real, decaying conductance still
+    // reliably carries the wave across all 16 ring hops within this section's own tick budgets,
+    // regardless of each hop's own heterogeneous thetaInf. Purely a ROUTING vehicle -- the
+    // heterogeneity claim in both tests below never depends on the propagated current's own
+    // magnitude or the wave's own timing, only on each neuron's own post-first-spike state (see this
+    // section's own header comment).
     weights.set_constant_weight(3.0e-8f);
 
     return {std::move(model), std::move(programs), std::move(allocation), std::move(weights),

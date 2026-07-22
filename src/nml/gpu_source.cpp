@@ -121,10 +121,24 @@ AllocIndex build_alloc_index(const Vector<AllocDirective> &alloc) {
             [&](const RegimeDirective &regime) {
                 index.by_name[regime.name] = AllocInfo{AllocCategory::Regime, "s32", ""};
             },
+            // `Expose`/`Require` are read/observe-only categories, never real storage of their own
+            // (arch §3.1's `Exposure`: "no behavior by itself"; `Requirement`: "a binding... storage
+            // lives with the owner"). A name already registered under a storage category above
+            // (State/Accum/Peredge/Regime/ParamDynamic/ParamConstant*) in THIS SAME `.alloc` -- true
+            // of every real self-exposing StateVariable, e.g. `<StateVariable name="g" .../
+            // exposure="g"/>`, which synapse_lowering.cpp always emits as BOTH a `PeredgeDirective`
+            // AND (later, since exposures are appended last) an `ExposeDirective` for the identical
+            // name -- must keep its real category; only an as-yet-unseen name gets the Expose/
+            // Require fallback. Without this, `.alloc`'s own declaration order (storage directives
+            // before exposures, for a synapse) would let a later ExposeDirective silently overwrite
+            // an earlier PeredgeDirective's entry (ticket #131 first surfaced this: nothing before it
+            // ever compiled a REAL, self-exposing conductance-based synapse's GPU source).
             [&](const ExposeDirective &expose) {
+                if (index.by_name.count(expose.name) > 0) return;
                 index.by_name[expose.name] = AllocInfo{AllocCategory::Expose, "f32", ""};
             },
             [&](const RequireDirective &require) {
+                if (index.by_name.count(require.name) > 0) return;
                 index.by_name[require.name] = AllocInfo{AllocCategory::Require, "f32", ""};
             },
         }, directive);
@@ -398,13 +412,24 @@ String resolve_operand(const String &name, FunctionKind kind, const AllocIndex &
             case AllocCategory::Accum:
             case AllocCategory::Regime:
             case AllocCategory::Expose:
-            case AllocCategory::Require:
                 if (kind != FunctionKind::PerNeuron) {
                     fail("per-neuron array quantity '" + name + "' referenced as a plain operand inside a "
                          "deliver/onevent function -- which endpoint (source/target) should index it is "
                          "ambiguous and unsupported by this ticket's lowering");
                 }
                 return name + "[neuron_index]";
+            case AllocCategory::Require:
+                if (kind == FunctionKind::PerNeuron) return name + "[neuron_index]";
+                // ticket #131: unlike the per-neuron-array categories above, a `require <name> from
+                // postsynaptic` binding is UNAMBIGUOUS inside a Deliver-kind (one-thread-per-edge)
+                // function -- the postsynaptic neuron IS target_node, whichever endpoint's array this
+                // is. No existing onevent body references one (every real fixture's onevent body only
+                // ever does `accedge`), so this only WIDENS what a Deliver-kind function can express;
+                // it is exactly what a synapse's own edge-parallel `.tick.integrate` gather (this
+                // ticket's `<Type>_integrate_edges` function, generated the same way an onevent
+                // function is -- see lower_synapse_ir_program_to_gpu_source) needs to read the
+                // postsynaptic cell's own exposed state (e.g. `g*(erev-v)`'s `v`).
+                return name + "[target_node]";
         }
     }
 
@@ -610,6 +635,33 @@ void emit_instructions(const Vector<TickInstruction> &instructions, Backend back
 
 void emit_binary(const BinaryInstruction &leaf, Backend backend, EmitContext &context, int indent_level,
                   ostringstream &output) {
+    // ticket #131: `add network_inputs, network_inputs, <value>` (synapse_lowering.cpp's own sole
+    // network_inputs-writing shape) inside an edge-parallel (Deliver-kind) function -- a synapse's
+    // own `_integrate_edges`, the only caller that ever reaches this from that function kind --
+    // dispatches one GPU thread PER EDGE, so multiple threads may target the SAME postsynaptic
+    // neuron's `network_inputs` slot concurrently whenever it has more than one incoming edge (an
+    // ordinary, common topology) -- a plain, non-atomic read-modify-write would race and silently
+    // drop a contribution. A per-neuron function never shares `network_inputs[neuron_index]`
+    // across threads (one thread per neuron), so it keeps the plain form below unchanged. Mirrors
+    // the fixed propagate kernel's own identical atomic-add pattern for network_inputs, for the
+    // exact same reason (master_kernel.cpp's `build_propagate_kernel_gpu_source`).
+    if (leaf.opcode == BinaryOpcode::Add && leaf.destination == "network_inputs" &&
+        leaf.operand_a == "network_inputs" && context.kind != FunctionKind::PerNeuron) {
+        String value = resolve_operand(leaf.operand_b, context.kind, *context.alloc_index);
+        if (backend == Backend::Msl) {
+            output << indent(indent_level) << "{\n";
+            output << indent(indent_level + 1)
+                   << "device atomic_float *network_inputs_atomic_slot = (device atomic_float *)(network_inputs + "
+                      "target_node);\n";
+            output << indent(indent_level + 1) << "atomic_fetch_add_explicit(network_inputs_atomic_slot, " << value
+                   << ", memory_order_relaxed);\n";
+            output << indent(indent_level) << "}\n";
+        } else {
+            output << indent(indent_level) << "atomicAdd(&network_inputs[target_node], " << value << ");\n";
+        }
+        return;
+    }
+
     String destination = resolve_operand(leaf.destination, context.kind, *context.alloc_index);
     String a = resolve_operand(leaf.operand_a, context.kind, *context.alloc_index);
     String b = resolve_operand(leaf.operand_b, context.kind, *context.alloc_index);
@@ -1299,28 +1351,32 @@ std::optional<FunctionResult> generate_per_neuron_function(const IrProgram &prog
     return FunctionResult{msl.str(), cuda.str(), GpuFunctionSignature{function_name, parameter_names}};
 }
 
-// One function per `onevent <port> { ... }` block found at the top level of `.tick.deliver` (see
-// gpu_source.h's doc comment for the batch-of-delivered-edges calling convention).
-FunctionResult generate_deliver_function(const IrProgram &program, const AllocIndex &alloc_index,
-                                          const OnEventInstruction &onevent, const String &function_name) {
+// Shared machinery behind BOTH kinds of "one thread per edge" function this file generates: an
+// onevent/deliver body (below), AND -- ticket #131 -- a Synapse-category program's own
+// `.tick.integrate` gather (lower_synapse_ir_program_to_gpu_source), whose single top-level
+// `forall neuron_in { ... }` wrapper the caller has already stripped before calling this. `body` is
+// already edge-scoped either way (its own `loadedge`/`accedge` reference `@edge` directly, needing
+// no walk -- the edge is given as source_node/target_node/edge_slot, see EdgeContext below).
+FunctionResult generate_edge_parallel_function(const IrProgram &program, const AllocIndex &alloc_index,
+                                                const Vector<TickInstruction> &body, const String &function_name) {
     ScanResult scan;
     unordered_set<String> locals_seen;
     unordered_set<String> edge_variable_names_referenced;
-    bool needs_rng = contains_random(onevent.body);
+    bool needs_rng = contains_random(body);
     Vector<String> emit_ports;
     unordered_set<String> emit_ports_seen;
-    collect_emit_ports(onevent.body, emit_ports, emit_ports_seen);
-    scan_operands(onevent.body, alloc_index, scan, locals_seen);
-    collect_edge_variable_names(onevent.body, edge_variable_names_referenced);
-    if (contains_forall(onevent.body) || contains_whole_set_edge_op(onevent.body)) {
-        fail("forall / whole-set edge ops inside an onevent/deliver body are not supported by this ticket's "
-             "lowering (the edge is already known from the delivered spike -- no walk is needed)");
+    collect_emit_ports(body, emit_ports, emit_ports_seen);
+    scan_operands(body, alloc_index, scan, locals_seen);
+    collect_edge_variable_names(body, edge_variable_names_referenced);
+    if (contains_forall(body) || contains_whole_set_edge_op(body)) {
+        fail("forall / whole-set edge ops inside an onevent/deliver/edge-parallel body are not supported by "
+             "this ticket's lowering (the edge is already known -- no walk is needed)");
     }
-    // An onevent body's edge is already known (source_node/target_node/edge_slot, no walk) -- but a
-    // `loadedge` on a peredge var there still needs the shared basis (U/V/rank_float4_stride/
-    // coefficients_<name>) to reconstruct that edge's value; `accedge` alone never does
-    // (weight_matrix.h: Sk accumulate is O(1), no basis touched).
-    bool needs_shared_basis_block = contains_loadedge(onevent.body);
+    // The edge is already known (source_node/target_node/edge_slot, no walk) -- but a `loadedge` on a
+    // peredge var still needs the shared basis (U/V/rank_float4_stride/coefficients_<name>) to
+    // reconstruct that edge's value; `accedge` alone never does (weight_matrix.h: Sk accumulate is
+    // O(1), no basis touched).
+    bool needs_shared_basis_block = contains_loadedge(body);
 
     Vector<ParamDescriptor> parameters =
         build_common_parameters(scan, edge_variable_names_referenced, /*needs_tree_walk_block=*/false,
@@ -1336,7 +1392,7 @@ FunctionResult generate_deliver_function(const IrProgram &program, const AllocIn
     {
         EmitContext context{FunctionKind::Deliver, &alloc_index,
                              EdgeContext{"source_node", "target_node", "edge_slot"}, 0};
-        emit_instructions(onevent.body, Backend::Msl, context, 1, msl);
+        emit_instructions(body, Backend::Msl, context, 1, msl);
     }
     msl << "}\n";
 
@@ -1346,7 +1402,7 @@ FunctionResult generate_deliver_function(const IrProgram &program, const AllocIn
     {
         EmitContext context{FunctionKind::Deliver, &alloc_index,
                              EdgeContext{"source_node", "target_node", "edge_slot"}, 0};
-        emit_instructions(onevent.body, Backend::Cuda, context, 1, cuda);
+        emit_instructions(body, Backend::Cuda, context, 1, cuda);
     }
     cuda << "}\n";
 
@@ -1355,6 +1411,36 @@ FunctionResult generate_deliver_function(const IrProgram &program, const AllocIn
     for (const auto &parameter : parameters) parameter_names.push_back(parameter.name);
 
     return FunctionResult{msl.str(), cuda.str(), GpuFunctionSignature{function_name, parameter_names}};
+}
+
+// One function per `onevent <port> { ... }` block found at the top level of `.tick.deliver` (see
+// gpu_source.h's doc comment for the batch-of-delivered-edges calling convention).
+FunctionResult generate_deliver_function(const IrProgram &program, const AllocIndex &alloc_index,
+                                          const OnEventInstruction &onevent, const String &function_name) {
+    return generate_edge_parallel_function(program, alloc_index, onevent.body, function_name);
+}
+
+// Validates and unwraps a Synapse-category program's `.tick.integrate` -- synapse_lowering.cpp's
+// own, sole shape: exactly one top-level `forall neuron_in { ... }` (ir_spec.md §4's expOne/NMDA
+// examples). Throws otherwise (a Cell-category or otherwise-unexpected program was passed to
+// lower_synapse_ir_program_to_gpu_source).
+const Vector<TickInstruction> &unwrap_synapse_integrate_forall_body(const IrProgram &program) {
+    if (program.tick.integrate.size() != 1) {
+        fail("lower_synapse_ir_program_to_gpu_source: program '" + program.component_type_name +
+             "'.tick.integrate must contain exactly one top-level instruction (a `forall neuron_in { ... }`, "
+             "synapse_lowering.cpp's own sole shape), found " + std::to_string(program.tick.integrate.size()));
+    }
+    const auto *forall = std::get_if<ForAllInstruction>(&program.tick.integrate[0].operation);
+    if (forall == nullptr) {
+        fail("lower_synapse_ir_program_to_gpu_source: program '" + program.component_type_name +
+             "'.tick.integrate's one instruction must be a ForAllInstruction (synapse_lowering.cpp's own "
+             "sole shape)");
+    }
+    if (forall->edge_set != EdgeSetReference::NeuronIn && forall->edge_set != EdgeSetReference::NeuronOut) {
+        fail("lower_synapse_ir_program_to_gpu_source: program '" + program.component_type_name +
+             "'.tick.integrate's forall must iterate NeuronIn/NeuronOut");
+    }
+    return forall->body;
 }
 
 } // namespace
@@ -1410,6 +1496,91 @@ GpuSource lower_ir_program_to_gpu_source(const IrProgram &program) {
     String cuda_source;
     if (needs_edge_walk_anywhere) cuda_source += "#include <vector_types.h>\n";
     if (needs_edge_walk_anywhere) cuda_source += k2tree_preamble(Backend::Cuda);
+    if (needs_rng_anywhere) cuda_source += rng_preamble(Backend::Cuda);
+    for (const auto &function : function_results) cuda_source += "\n" + function.cuda_text;
+
+    Vector<GpuFunctionSignature> signatures;
+    signatures.reserve(function_results.size());
+    for (const auto &function : function_results) signatures.push_back(function.signature);
+
+    return GpuSource{msl_source, cuda_source, signatures};
+}
+
+// ticket #131: see gpu_source.h's own doc comment for the full design.
+GpuSource lower_synapse_ir_program_to_gpu_source(const IrProgram &program) {
+    for (const Vector<TickInstruction> *stage :
+         {&program.tick.detect, &program.tick.emit, &program.tick.reset, &program.tick.propagate,
+          &program.tick.plasticity, &program.tick.record}) {
+        if (!stage->empty()) {
+            fail("lower_synapse_ir_program_to_gpu_source: program '" + program.component_type_name +
+                 "' has a non-empty @detect/@emit/@reset/@propagate/@plasticity/@record -- only "
+                 "@deliver/@integrate are supported for a Synapse-category program (synapse_lowering.cpp "
+                 "never populates the others; use lower_ir_program_to_gpu_source for a Cell-category program)");
+        }
+    }
+    const Vector<TickInstruction> &integrate_body = unwrap_synapse_integrate_forall_body(program);
+
+    AllocIndex alloc_index = build_alloc_index(program.alloc);
+
+    // An `ExposeDirective` name with no OTHER backing directive (a plain-value DerivedVariable's own
+    // exposure, e.g. expOneSynapse's `i = g*(erev-v)`) carries no real storage for a Synapse-category
+    // type: allocator.cpp's own derived_exposure_scratch_buffers is deliberately Cell-only ("scratch
+    // is Cell-only"), so a synapse never gets a scratch slot for one. resolve_operand's Expose case
+    // only supports FunctionKind::PerNeuron (there is no synapse-side per-neuron function anymore,
+    // ticket #131) -- so here, every such name must instead behave as a plain transient local
+    // (computed and consumed within the SAME edge-parallel function body, exactly how expOneSynapse's
+    // own `i` is used: written once via a DerivedVariable, read back once for `network_inputs +=
+    // i`). Removing it from the index BEFORE any function is generated makes record_operand/
+    // resolve_operand treat it as an ordinary local uniformly, for every function this lowering
+    // produces (onevent AND `_integrate_edges` alike).
+    for (auto entry = alloc_index.by_name.begin(); entry != alloc_index.by_name.end();) {
+        if (entry->second.category == AllocCategory::Expose) {
+            entry = alloc_index.by_name.erase(entry);
+        } else {
+            ++entry;
+        }
+    }
+
+    Vector<FunctionResult> function_results;
+
+    unordered_set<String> deliver_function_names_seen;
+    for (const auto &instruction : program.tick.deliver) {
+        const auto *onevent = std::get_if<OnEventInstruction>(&instruction.operation);
+        if (onevent == nullptr) fail("lower_synapse_ir_program_to_gpu_source: .tick.deliver may only contain "
+                                      "top-level onevent blocks");
+
+        String base_name = program.component_type_name + "_deliver_" + onevent->port_name;
+        String function_name = base_name;
+        int suffix = 2;
+        while (deliver_function_names_seen.count(function_name) > 0) {
+            function_name = base_name + "_" + std::to_string(suffix++);
+        }
+        deliver_function_names_seen.insert(function_name);
+
+        function_results.push_back(generate_deliver_function(program, alloc_index, *onevent, function_name));
+    }
+
+    // The `_integrate_edges` function is always last (AssembledModel::AssembledModel, ticket #131,
+    // relies on this exact ordering to tell it apart from the deliver functions above without
+    // re-deriving a name-matching scheme).
+    String integrate_edges_function_name = program.component_type_name + "_integrate_edges";
+    function_results.push_back(
+        generate_edge_parallel_function(program, alloc_index, integrate_body, integrate_edges_function_name));
+
+    bool needs_rng_anywhere = contains_random(integrate_body);
+    for (const auto &instruction : program.tick.deliver) {
+        if (const auto *onevent = std::get_if<OnEventInstruction>(&instruction.operation)) {
+            needs_rng_anywhere = needs_rng_anywhere || contains_random(onevent->body);
+        }
+    }
+
+    // No k^2-tree walk preamble: every function this lowering generates is edge-parallel (the edge
+    // is always already known), unlike lower_ir_program_to_gpu_source's own per-neuron function.
+    String msl_source = "#include <metal_stdlib>\nusing namespace metal;\n";
+    if (needs_rng_anywhere) msl_source += rng_preamble(Backend::Msl);
+    for (const auto &function : function_results) msl_source += "\n" + function.msl_text;
+
+    String cuda_source;
     if (needs_rng_anywhere) cuda_source += rng_preamble(Backend::Cuda);
     for (const auto &function : function_results) cuda_source += "\n" + function.cuda_text;
 

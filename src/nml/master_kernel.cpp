@@ -263,6 +263,100 @@ void append_cell_tick_argument(DispatchArgumentBuilder &builder, const String &p
          "(forall/loadedge/accedge), out of scope for a Phase-1 GLIF-family cell (see master_kernel.h)");
 }
 
+// ── ticket #131: spike-scatter batch-construction subsystem -- dispatch-argument resolution ────────
+//
+// Resolves a `require <name> from postsynaptic` binding (gpu_source.cpp's `name[target_node]`) to a
+// real pointer into the postsynaptic cell's own packed `cell_state` chunk, offset so that indexing
+// it with a GLOBAL `target_node` lands on the right LOCAL slot (see master_kernel.h's own doc
+// comment for why this is safe only because dispatch is per-projection, one postsynaptic population
+// per call). Only a name matching a StateDirective on the postsynaptic cell type is supported (every
+// real Phase-1 GLIF cell's `v`) -- a derived-only (Expose-without-State) postsynaptic quantity throws.
+f32 *resolve_require_binding_pointer(const String &name, const IrProgram &postsynaptic_cell_program,
+                                      ModelAllocation &allocation, s64 postsynaptic_chunk_base_offset,
+                                      s32 postsynaptic_population_size, s32 postsynaptic_neuron_index_begin) {
+    for (const auto &directive : postsynaptic_cell_program.alloc) {
+        const auto *state = std::get_if<StateDirective>(&directive);
+        if (state == nullptr || state->name != name) continue;
+        s32 offset_within_type = state_variable_offset(postsynaptic_cell_program, name);
+        return allocation.cell_state.get_contents() + postsynaptic_chunk_base_offset +
+               (s64)offset_within_type * postsynaptic_population_size - postsynaptic_neuron_index_begin;
+    }
+    fail("synapse dispatch: require '" + name + "' does not match any StateDirective on the postsynaptic cell "
+         "type '" + postsynaptic_cell_program.component_type_name + "' -- a derived-only (Expose-without-State) "
+         "postsynaptic quantity is not supported by this ticket's dispatch (see master_kernel.h)");
+    return nullptr;
+}
+
+// Resolves one synapse edge-parallel function (`_integrate_edges` or `_deliver_<port>`) parameter
+// name to a dispatch argument, appended onto `builder` -- the edge-parallel analogue of
+// append_cell_tick_argument above (see master_kernel.h's own doc comment for the full design).
+// `matrix_index_by_peredge_name` is this synapse type's own registered WeightMatrix matrix indices
+// (plain data, not AssembledModel::SynapseTypeRuntimeInfo itself -- that type is private to
+// AssembledModel, matching how append_cell_tick_argument above already takes plain fields rather
+// than a whole PopulationRuntimeInfo).
+void append_synapse_edge_argument(DispatchArgumentBuilder &builder, const String &parameter_name,
+                                   const IrProgram &synapse_program,
+                                   const UnorderedMap<String, s64> &matrix_index_by_peredge_name,
+                                   const IrProgram &postsynaptic_cell_program, s32 postsynaptic_population_size,
+                                   s32 postsynaptic_neuron_index_begin, ModelAllocation &allocation,
+                                   s64 postsynaptic_chunk_base_offset, WeightMatrix &weights, f32 dt, s64 tick,
+                                   f32 *network_inputs, const s32 *source_node_indices, const s32 *target_node_indices,
+                                   const s32 *edge_slot_indices, s64 event_count) {
+    if (parameter_name == "dt") { builder.add_f32(dt); return; }
+    if (parameter_name == "tick") { builder.add_s64(tick); return; }
+    if (parameter_name == "network_inputs") { builder.add_pointer(network_inputs); return; }
+    if (parameter_name == "source_node_indices") { builder.add_pointer(source_node_indices); return; }
+    if (parameter_name == "target_node_indices") { builder.add_pointer(target_node_indices); return; }
+    if (parameter_name == "edge_slot_indices") { builder.add_pointer(edge_slot_indices); return; }
+    if (parameter_name == "event_count") { builder.add_s64(event_count); return; }
+    if (parameter_name == "U") { builder.add_pointer(weights.U_matrix.get_contents()); return; }
+    if (parameter_name == "V") { builder.add_pointer(weights.V_matrix.get_contents()); return; }
+    if (parameter_name == "rank_float4_stride") { builder.add_s64(weights.rank_float4_stride); return; }
+    if (parameter_name == "max_neighbor_count") { builder.add_s64(weights.max_neighbor_count); return; }
+    if (parameter_name == "rng_state") {
+        fail("synapse dispatch: parameter 'rng_state' (rand/randn) is not supported -- no Phase-1 synapse "
+             "ComponentType references it (see master_kernel.h)");
+    }
+    if (parameter_name.rfind("coefficients_", 0) == 0) {
+        String peredge_name = parameter_name.substr(String("coefficients_").size());
+        auto found = matrix_index_by_peredge_name.find(peredge_name);
+        if (found == matrix_index_by_peredge_name.end()) {
+            fail("synapse dispatch: peredge '" + peredge_name + "' has no registered WeightMatrix matrix_index");
+        }
+        builder.add_pointer(weights.coefficient_vectors[(usize)found->second].get_contents());
+        return;
+    }
+    if (parameter_name.rfind("sparse_delta_", 0) == 0) {
+        String peredge_name = parameter_name.substr(String("sparse_delta_").size());
+        auto found = matrix_index_by_peredge_name.find(peredge_name);
+        if (found == matrix_index_by_peredge_name.end()) {
+            fail("synapse dispatch: peredge '" + peredge_name + "' has no registered WeightMatrix matrix_index");
+        }
+        builder.add_pointer(weights.sparse_delta_buffers[(usize)found->second].get_contents());
+        return;
+    }
+
+    for (const auto &directive : synapse_program.alloc) {
+        if (const auto *param_constant = std::get_if<ParamConstantDirective>(&directive)) {
+            if (param_constant->name != parameter_name) continue;
+            fail("synapse dispatch: parameter '" + parameter_name + "' is an un-baked (bare) `param` -- "
+                 "Phase-1's allocate_model has no established value source for this case (matches "
+                 "append_cell_tick_argument's own established scope boundary)");
+        }
+        if (const auto *require = std::get_if<RequireDirective>(&directive)) {
+            if (require->name != parameter_name) continue;
+            builder.add_pointer(resolve_require_binding_pointer(parameter_name, postsynaptic_cell_program, allocation,
+                                                                 postsynaptic_chunk_base_offset,
+                                                                 postsynaptic_population_size,
+                                                                 postsynaptic_neuron_index_begin));
+            return;
+        }
+    }
+
+    fail("synapse dispatch: parameter '" + parameter_name + "' is not a recognized reserved name, .alloc name, "
+         "or edge-dispatch parameter for ticket #131's synapse dispatch (see master_kernel.h)");
+}
+
 } // namespace
 
 // ── assembly ─────────────────────────────────────────────────────────────────────────────────
@@ -839,6 +933,64 @@ AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrP
             source_text_for_this_backend(propagate_ring_source), propagate_ring_source.functions.at(0).function_name,
             "the engine-fixed ring propagate kernel (ticket #64)", "");
     }
+
+    // ── ticket #131: spike-scatter batch-construction subsystem -- compile every USED synapse
+    // type's edge-parallel functions once (topology/matrix-index registration is deferred to the
+    // first step_tick call, see ensure_synapse_dispatch_topology_built). Deliberately NOT activated
+    // when `enable_delay_ring` is true (ticket #64's delay ring and this ticket's synapse dispatch
+    // have not been integrated with each other, see master_kernel.h) -- rather than throwing on a
+    // model that happens to combine the two (every existing delay-ring test/example ALREADY builds
+    // its model with real projections, since those previously had zero effect either way -- nothing
+    // ever dispatched a synapse type's own functions before this ticket), `projections_` is simply
+    // left empty in that case, so step_tick's `!projections_.empty()` gate leaves ring-mode
+    // step_tick's behavior exactly as it was before this ticket. ─────────────────────────────────
+    projections_ = enable_delay_ring ? Vector<ProjectionEntry>{} : model.projections;
+    projection_edge_topology_.resize(projections_.size());
+
+    for (const ProjectionEntry &projection : projections_) {
+        if (projection.postsynaptic_population_index < 0 ||
+            (usize)projection.postsynaptic_population_index >= model.populations.size()) {
+            fail("AssembledModel: projection '" + projection.id + "' has an out-of-range postsynaptic_population_index (" +
+                 std::to_string(projection.postsynaptic_population_index) + ")");
+        }
+        s32 synapse_type_index = projection.synapse_type_library_index;
+        if (synapse_type_index < 0 || (usize)synapse_type_index >= model.type_library.size()) {
+            fail("AssembledModel: projection '" + projection.id + "' has an out-of-range synapse_type_library_index (" +
+                 std::to_string(synapse_type_index) + ")");
+        }
+        if (model.type_library[(usize)synapse_type_index].category != TypeLibraryCategory::Synapse) {
+            fail("AssembledModel: projection '" + projection.id + "' references type_library[" +
+                 std::to_string(synapse_type_index) + "], which is not a Synapse-category entry");
+        }
+        if (synapse_types_by_type_library_index_.count(synapse_type_index) > 0) continue; // already compiled
+
+        const IrProgram &synapse_program = type_library_ir_programs[(usize)synapse_type_index];
+        GpuSource synapse_source = lower_synapse_ir_program_to_gpu_source(synapse_program);
+        if (synapse_source.functions.empty()) {
+            fail("AssembledModel: synapse type '" + synapse_program.component_type_name +
+                 "' lowered to zero GPU functions (lower_synapse_ir_program_to_gpu_source should always emit "
+                 "at least the `_integrate_edges` function)");
+        }
+
+        SynapseTypeRuntimeInfo synapse_info;
+        for (usize function_index = 0; function_index < synapse_source.functions.size(); ++function_index) {
+            const GpuFunctionSignature &signature = synapse_source.functions[function_index];
+            bool is_integrate_edges_function = (function_index + 1 == synapse_source.functions.size());
+            String label = "synapse type '" + synapse_program.component_type_name + "' function '" +
+                            signature.function_name + "'";
+            KernelHandle handle = compile_kernel_or_throw_with_source(
+                source_text_for_this_backend(synapse_source), signature.function_name, label,
+                print_ir_program(synapse_program));
+            if (is_integrate_edges_function) {
+                synapse_info.integrate_edges_handle = handle;
+                synapse_info.integrate_edges_parameter_names_in_order = signature.parameter_names_in_order;
+            } else {
+                synapse_info.deliver_functions.push_back(
+                    DeliverFunctionRuntimeInfo{handle, signature.parameter_names_in_order});
+            }
+        }
+        synapse_types_by_type_library_index_.emplace(synapse_type_index, std::move(synapse_info));
+    }
 }
 
 AssembledModel::~AssembledModel() {
@@ -850,6 +1002,20 @@ AssembledModel::~AssembledModel() {
     if (delay_ring_enabled_) {
         release_kernel(drain_ring_kernel_handle_);
         release_kernel(propagate_ring_kernel_handle_);
+    }
+
+    // ── ticket #131: spike-scatter batch-construction subsystem ─────────────────────────────────
+    for (auto &type_entry : synapse_types_by_type_library_index_) {
+        release_kernel(type_entry.second.integrate_edges_handle);
+        for (auto &deliver_function : type_entry.second.deliver_functions) release_kernel(deliver_function.handle);
+    }
+    for (auto &topology : projection_edge_topology_) {
+        deallocate(std::move(topology.source_nodes));
+        deallocate(std::move(topology.target_nodes));
+        deallocate(std::move(topology.forward_slots));
+        deallocate(std::move(topology.delivery_scratch_source_nodes));
+        deallocate(std::move(topology.delivery_scratch_target_nodes));
+        deallocate(std::move(topology.delivery_scratch_edge_slots));
     }
 }
 
@@ -866,6 +1032,18 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
     if (delay_ring_enabled_ != (buffers.delay_ring != nullptr)) {
         fail("step_tick: ModelRuntimeBuffers::delay_ring must be non-null if and only if this "
              "AssembledModel was constructed with enable_delay_ring=true (ticket #64)");
+    }
+
+    // ── ticket #131: spike-scatter batch-construction subsystem -- topology is built lazily here
+    // (needs buffers.weights, only available at step_tick time); the two new dispatches themselves
+    // run later, at the SAME point in the tick the fixed scalar propagate stage already writes
+    // network_inputs (see below) -- not before this tick's cell dispatches -- so that
+    // network_inputs already reflects THIS tick's fresh synaptic current by the time step_tick
+    // RETURNS, exactly matching the existing scalar-weight path's own observable timing (arch §0.2/
+    // ir_spec.md §3.5: a write becomes visible right after the tick it's computed in, read at the
+    // NEXT tick's cell dispatch) -- see master_kernel.h's own doc comment for the full derivation.
+    if (!projections_.empty()) {
+        ensure_synapse_dispatch_topology_built(buffers);
     }
 
     const s64 *chunk_base_offsets = buffers.allocation->cell_type_boundaries.get_contents();
@@ -933,9 +1111,30 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         // [total_neuron_count] allocation.
         *buffers.next_active_neuron_count = 0;
 
+        // ── ticket #131: spike-scatter batch-construction subsystem -- delivery-event construction
+        // + `_deliver_<port>` dispatch (bumps Sk for this tick's fresh spikes), immediately followed
+        // by `_integrate_edges` (reads that same, now-fresh Sk, decays, and writes the finished
+        // current into network_inputs, already drained above) -- so by the time step_tick returns,
+        // network_inputs already reflects this tick's synaptic contribution, exactly matching the
+        // fixed scalar propagate stage's own observable timing (see master_kernel.h). Delivery must
+        // run BEFORE the fixed scalar propagate dispatch below, which reads+clears
+        // buffers.emit_port_flags for its own last_spiked/active-set bookkeeping (this dispatch
+        // reads, but does not clear, the SAME flags). ──────────────────────────────────────────────
+        if (!projections_.empty()) {
+            dispatch_synapse_delivery_events(buffers, dt, tick);
+            dispatch_synapse_integrate_edges(buffers, dt, tick);
+        }
+
         // fixed k^2-tree propagate/scatter + active-set-enqueue (stage 6/9): one dispatch per distinct
         // emit-port name, each over the WHOLE model's neuron range (a spiking neuron's downstream
-        // targets come from the model-wide k^2-tree/WeightMatrix, not a population-scoped one).
+        // targets come from the model-wide k^2-tree/WeightMatrix, not a population-scoped one). A
+        // model with real per-edge synapse projections (ticket #131) has this dispatch's OWN weight
+        // contribution forced to zero -- `buffers.weights` itself is left untouched -- since
+        // dispatch_synapse_delivery_events/dispatch_synapse_integrate_edges above/below already
+        // supply the real per-edge current; last_spiked + active-set enqueue are unaffected.
+        f32 constant_weight_for_this_dispatch = projections_.empty() ? buffers.weights->constant_weight : 0.0f;
+        s32 using_constant_weight_for_this_dispatch =
+            projections_.empty() ? (buffers.weights->using_constant_weight ? 1 : 0) : 1;
         for (const String &port_name : emit_port_names_) {
             auto found = buffers.emit_port_flags.find(port_name);
             if (found == buffers.emit_port_flags.end()) {
@@ -950,8 +1149,8 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
             builder.add_pointer(buffers.weights->U_matrix.get_contents());
             builder.add_pointer(buffers.weights->V_matrix.get_contents());
             builder.add_s64(buffers.weights->rank_float4_stride);
-            builder.add_f32(buffers.weights->constant_weight);
-            builder.add_s32(buffers.weights->using_constant_weight ? 1 : 0);
+            builder.add_f32(constant_weight_for_this_dispatch);
+            builder.add_s32(using_constant_weight_for_this_dispatch);
             builder.add_pointer(buffers.weights->k2tree.internal_node_words.get_contents());
             builder.add_pointer(buffers.weights->k2tree.leaf_node_words.get_contents());
             builder.add_pointer(buffers.weights->k2tree.rank_superblock_table.get_contents());
@@ -1032,6 +1231,199 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         builder.add_pointer(buffers.delay_ring->pending_active_generation.get_contents());
         builder.add_pointer(found->second);
         builder.dispatch(propagate_ring_kernel_handle_, launch_config_for(total_neuron_count_));
+    }
+}
+
+// ── ticket #131: spike-scatter batch-construction subsystem ──────────────────────────────────────
+//
+// (see master_kernel.h's own "spike-scatter batch-construction subsystem" doc comment for the full
+// design this implements.)
+
+void AssembledModel::ensure_synapse_dispatch_topology_built(const ModelRuntimeBuffers &buffers) {
+    if (synapse_dispatch_topology_built_) return;
+
+    s64 max_neighbor_count = buffers.weights->max_neighbor_count;
+    Vector<s32> neighbor_scratch((usize)(max_neighbor_count > 0 ? max_neighbor_count : 0));
+
+    for (usize projection_index = 0; projection_index < projections_.size(); ++projection_index) {
+        const ProjectionEntry &projection = projections_[projection_index];
+        ProjectionEdgeTopology &topology = projection_edge_topology_[projection_index];
+
+        s32 synapse_type_index = projection.synapse_type_library_index;
+        SynapseTypeRuntimeInfo &synapse_info = synapse_types_by_type_library_index_.at(synapse_type_index);
+        if (!synapse_info.matrix_indices_registered) {
+            // Every peredge variable this synapse type declares gets a real WeightMatrix
+            // matrix_index, its coefficient vector all-zeros (arch §4.3: a peredge state variable's
+            // Phase-1 default initial value is 0 everywhere -- a zero Ck makes the shared-basis
+            // reconstruction contribute exactly 0 regardless of U/V's own random values, so a
+            // never-yet-delivered edge's per-edge state reads back as exactly 0, matching that
+            // default; only accedge's own Sk accumulation ever moves it away from 0 thereafter).
+            // add_coefficient_vector's own logical-rank coefficients ARE all-zero, but it (like
+            // set_coefficient_vector) unconditionally fills every PADDING lane (beyond the logical
+            // `rank`, up to `rank_float4_stride*4` -- real whenever rank isn't a multiple of 4) with
+            // 1.0f, a neutral multiplier suited to DEFAULT_MATRIX_INDEX's own "reduces to dot(U,V)"
+            // contract, not to a genuinely-all-zero matrix -- U/V's OWN padding lanes are real,
+            // random values (needed for that same default-matrix contract), so a 1.0f padding
+            // coefficient would reconstruct a real, nonzero, spurious contribution from them. Zero
+            // the WHOLE registered coefficient buffer (a public WeightMatrix field) directly
+            // afterward, overriding that padding fill, so this matrix's reconstruction is exactly 0
+            // until a real accedge Sk bump moves it.
+            const IrProgram &synapse_program = type_library_ir_programs_[(usize)synapse_type_index];
+            Vector<f32> zero_coefficients((usize)buffers.weights->rank, 0.0f);
+            for (const auto &directive : synapse_program.alloc) {
+                if (const auto *peredge = std::get_if<PeredgeDirective>(&directive)) {
+                    s64 matrix_index = buffers.weights->add_coefficient_vector(zero_coefficients);
+                    s64 effective_lane_count = buffers.weights->rank_float4_stride * 4;
+                    memset(buffers.weights->coefficient_vectors[(usize)matrix_index].get_contents(), 0,
+                           (usize)effective_lane_count * sizeof(f32));
+                    synapse_info.matrix_index_by_peredge_name[peredge->name] = matrix_index;
+                }
+            }
+            synapse_info.matrix_indices_registered = true;
+        }
+
+        Vector<s32> source_nodes_host;
+        Vector<s32> target_nodes_host;
+        Vector<s32> forward_slots_host;
+        source_nodes_host.reserve(projection.connections.size());
+        target_nodes_host.reserve(projection.connections.size());
+        forward_slots_host.reserve(projection.connections.size());
+
+        for (const ConnectionEntry &connection : projection.connections) {
+            s64 neighbor_count = buffers.weights->k2tree.get_neighbors(connection.source_neuron_index,
+                                                                        neighbor_scratch.data(), max_neighbor_count);
+            s32 forward_slot = -1;
+            for (s64 slot = 0; slot < neighbor_count; ++slot) {
+                if (neighbor_scratch[(usize)slot] == connection.target_neuron_index) {
+                    forward_slot = (s32)slot;
+                    break;
+                }
+            }
+            if (forward_slot < 0) {
+                fail("ensure_synapse_dispatch_topology_built: connection " +
+                     std::to_string(connection.source_neuron_index) + " -> " +
+                     std::to_string(connection.target_neuron_index) + " (projection '" + projection.id +
+                     "') is not a real edge in ModelRuntimeBuffers::weights's k^2-tree -- weights must reflect "
+                     "the SAME adjacency model.projections describes");
+            }
+            source_nodes_host.push_back(connection.source_neuron_index);
+            target_nodes_host.push_back(connection.target_neuron_index);
+            forward_slots_host.push_back(forward_slot);
+        }
+
+        topology.edge_count = (s64)source_nodes_host.size();
+        if (topology.edge_count > 0) {
+            usize byte_count = (usize)topology.edge_count * sizeof(s32);
+            topology.source_nodes = allocate<s32>(byte_count);
+            topology.target_nodes = allocate<s32>(byte_count);
+            topology.forward_slots = allocate<s32>(byte_count);
+            memcpy(topology.source_nodes.get_contents(), source_nodes_host.data(), byte_count);
+            memcpy(topology.target_nodes.get_contents(), target_nodes_host.data(), byte_count);
+            memcpy(topology.forward_slots.get_contents(), forward_slots_host.data(), byte_count);
+
+            // Reused every tick, refilled with THIS tick's fired-source subset -- see
+            // dispatch_synapse_delivery_events.
+            topology.delivery_scratch_source_nodes = allocate<s32>(byte_count);
+            topology.delivery_scratch_target_nodes = allocate<s32>(byte_count);
+            topology.delivery_scratch_edge_slots = allocate<s32>(byte_count);
+        }
+    }
+
+    synapse_dispatch_topology_built_ = true;
+}
+
+void AssembledModel::dispatch_synapse_integrate_edges(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick) {
+    const s64 *chunk_base_offsets = buffers.allocation->cell_type_boundaries.get_contents();
+
+    for (usize projection_index = 0; projection_index < projections_.size(); ++projection_index) {
+        const ProjectionEntry &projection = projections_[projection_index];
+        const ProjectionEdgeTopology &topology = projection_edge_topology_[projection_index];
+        if (topology.edge_count == 0) continue;
+
+        s32 synapse_type_index = projection.synapse_type_library_index;
+        const SynapseTypeRuntimeInfo &synapse_info = synapse_types_by_type_library_index_.at(synapse_type_index);
+        const IrProgram &synapse_program = type_library_ir_programs_[(usize)synapse_type_index];
+
+        const PopulationRuntimeInfo &postsynaptic_population =
+            populations_.at((usize)projection.postsynaptic_population_index);
+        const IrProgram &postsynaptic_cell_program =
+            type_library_ir_programs_[(usize)postsynaptic_population.type_library_index];
+        s64 postsynaptic_chunk_base_offset = chunk_base_offsets[(usize)projection.postsynaptic_population_index];
+
+        DispatchArgumentBuilder builder;
+        for (const String &parameter_name : synapse_info.integrate_edges_parameter_names_in_order) {
+            append_synapse_edge_argument(
+                builder, parameter_name, synapse_program, synapse_info.matrix_index_by_peredge_name,
+                postsynaptic_cell_program, postsynaptic_population.population_size,
+                postsynaptic_population.neuron_index_begin, *buffers.allocation, postsynaptic_chunk_base_offset,
+                *buffers.weights, dt, tick, buffers.network_inputs, topology.source_nodes.get_contents(),
+                topology.target_nodes.get_contents(), topology.forward_slots.get_contents(), topology.edge_count);
+        }
+        builder.dispatch(synapse_info.integrate_edges_handle, launch_config_for(topology.edge_count));
+    }
+}
+
+void AssembledModel::dispatch_synapse_delivery_events(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick) {
+    const s64 *chunk_base_offsets = buffers.allocation->cell_type_boundaries.get_contents();
+
+    // "did this neuron fire THIS tick, on any tracked port" -- a union across every distinct
+    // EventPort name (mirrors the fixed scalar propagate stage's own per-port dispatch loop, which
+    // likewise treats firing on ANY tracked port as "scatter to every downstream target" -- see
+    // master_kernel.h). Read here, NOT cleared -- the fixed scalar propagate dispatch immediately
+    // after this call still does that, once, for its own last_spiked/active-set bookkeeping.
+    Vector<bool> fired_this_tick((usize)total_neuron_count_, false);
+    for (const auto &port_entry : buffers.emit_port_flags) {
+        const bool *port_flags = port_entry.second;
+        for (s64 neuron_index = 0; neuron_index < total_neuron_count_; ++neuron_index) {
+            if (port_flags[neuron_index]) fired_this_tick[(usize)neuron_index] = true;
+        }
+    }
+
+    for (usize projection_index = 0; projection_index < projections_.size(); ++projection_index) {
+        const ProjectionEntry &projection = projections_[projection_index];
+        ProjectionEdgeTopology &topology = projection_edge_topology_[projection_index];
+        if (topology.edge_count == 0) continue;
+
+        const s32 *all_source_nodes = topology.source_nodes.get_contents();
+        const s32 *all_target_nodes = topology.target_nodes.get_contents();
+        const s32 *all_forward_slots = topology.forward_slots.get_contents();
+        s32 *scratch_source_nodes = topology.delivery_scratch_source_nodes.get_contents();
+        s32 *scratch_target_nodes = topology.delivery_scratch_target_nodes.get_contents();
+        s32 *scratch_edge_slots = topology.delivery_scratch_edge_slots.get_contents();
+
+        s64 delivered_event_count = 0;
+        for (s64 edge_index = 0; edge_index < topology.edge_count; ++edge_index) {
+            if (!fired_this_tick[(usize)all_source_nodes[edge_index]]) continue;
+            scratch_source_nodes[delivered_event_count] = all_source_nodes[edge_index];
+            scratch_target_nodes[delivered_event_count] = all_target_nodes[edge_index];
+            scratch_edge_slots[delivered_event_count] = all_forward_slots[edge_index];
+            ++delivered_event_count;
+        }
+        if (delivered_event_count == 0) continue;
+
+        s32 synapse_type_index = projection.synapse_type_library_index;
+        const SynapseTypeRuntimeInfo &synapse_info = synapse_types_by_type_library_index_.at(synapse_type_index);
+        const IrProgram &synapse_program = type_library_ir_programs_[(usize)synapse_type_index];
+
+        const PopulationRuntimeInfo &postsynaptic_population =
+            populations_.at((usize)projection.postsynaptic_population_index);
+        const IrProgram &postsynaptic_cell_program =
+            type_library_ir_programs_[(usize)postsynaptic_population.type_library_index];
+        s64 postsynaptic_chunk_base_offset = chunk_base_offsets[(usize)projection.postsynaptic_population_index];
+
+        for (const DeliverFunctionRuntimeInfo &deliver_function : synapse_info.deliver_functions) {
+            DispatchArgumentBuilder builder;
+            for (const String &parameter_name : deliver_function.parameter_names_in_order) {
+                append_synapse_edge_argument(builder, parameter_name, synapse_program,
+                                              synapse_info.matrix_index_by_peredge_name, postsynaptic_cell_program,
+                                              postsynaptic_population.population_size,
+                                              postsynaptic_population.neuron_index_begin, *buffers.allocation,
+                                              postsynaptic_chunk_base_offset, *buffers.weights, dt, tick,
+                                              buffers.network_inputs, scratch_source_nodes, scratch_target_nodes,
+                                              scratch_edge_slots, delivered_event_count);
+            }
+            builder.dispatch(deliver_function.handle, launch_config_for(delivered_event_count));
+        }
     }
 }
 
