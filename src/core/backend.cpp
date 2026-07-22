@@ -232,6 +232,18 @@ KernelHandle compile_kernel(const char *source, const char *function_name) {
     NS::Error *error = nullptr;
     NS::String *source_string   = NS::String::string(source, NS::UTF8StringEncoding);
     MTL::CompileOptions *options = MTL::CompileOptions::alloc()->init();
+    // Explicit, not left at CompileOptions's own default: newLibrary's default Metal Shading
+    // Language version is derived from the CALLING PROCESS's own macOS deployment target
+    // (LC_BUILD_VERSION/LC_VERSION_MIN_MACOS), not from the actual running OS/GPU — a process built
+    // with an old deployment target (e.g. a pybind11 extension built inside a conda environment,
+    // which commonly targets macOS 11.0 for portability regardless of the machine it's built on)
+    // gets an older implicit default that lacks `atomic_float`/`atomic<float>` (added in Metal 3.0),
+    // even though every kernel this engine compiles — both this runtime path and the AOT
+    // `src/metal/kernels.metal` — already uses it unconditionally. Pinning the version explicitly
+    // makes runtime-compiled kernel source behave identically regardless of which process/deployment
+    // target loaded this code (ticket #133 surfaced this: the standalone C++ examples/tests, always
+    // built with a "current" implicit deployment target, never hit it).
+    options->setLanguageVersion(MTL::LanguageVersion3_0);
     MTL::Library *library = global_device->newLibrary(source_string, options, &error);
     options->release();
     if (!library) {

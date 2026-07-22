@@ -230,6 +230,12 @@ ifeq ($(BACKEND),metal)
 endif
 	@echo "[spikecorec] Python extension installed (backend=$(BACKEND))"
 
+# Builds the extension (if needed) then runs the pytest suite under python/tests/ (ticket #133).
+# Needs `pip install -e .[dev]` for pytest/numpy — see BUILDME.md.
+.PHONY: test-python
+test-python: python
+	$(PYTHON) -m pytest python/tests -v
+
 # ── Tests ────────────────────────────────────────────────────
 .PHONY: test test-cuda test-metal
 

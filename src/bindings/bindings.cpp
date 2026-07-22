@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 
 #include <pybind11/pybind11.h>
@@ -18,6 +19,17 @@
 #include "spikecorec/core/topologies.h"
 #include "spikecorec/core/recording.h"
 
+// ── NeuroML -> GPU codegen path (epic #1) -- ticket #133's own binding surface ──────────────────
+#include "spikecorec/nml/nml.h"
+#include "spikecorec/nml/resolve.h"
+#include "spikecorec/nml/model_specification.h"
+#include "spikecorec/nml/cell_lowering.h"
+#include "spikecorec/nml/synapse_lowering.h"
+#include "spikecorec/nml/ir.h"
+#include "spikecorec/nml/allocator.h"
+#include "spikecorec/nml/master_kernel.h"
+#include "spikecorec/nml/stimulus_schedule.h"
+
 namespace py = pybind11;
 using namespace spikecorec;
 
@@ -31,6 +43,221 @@ namespace {
         std::memcpy(result.mutable_data(), data, static_cast<usize>(count) * sizeof(T));
         return result;
     }
+
+    // ── ticket #133: minimum-viable Python surface for the NML/GLIF codegen path ───────────────
+    //
+    // Before this, `SpikeEngine` (the legacy, hardcoded LIF-over-k²-tree engine) was the only
+    // simulation object exposed to Python — the entire NeuroML -> GPU codegen epic (#1) was
+    // unreachable from Python. Rather than binding every pipeline stage individually
+    // (`NML_Parser`, `ResolvedModel`, `ModelSpecification`, `IrProgram`, `ModelAllocation`,
+    // `AssembledModel`, each with their own Python-facing lifetime/ownership story), this wraps the
+    // whole parse -> resolve -> lower -> allocate -> assemble -> step_tick pipeline (the exact
+    // sequence every examples/*_torus_network_example.cpp already drives from C++ — see
+    // examples/nml_pipeline_support.h / examples/glif_torus_network.h, example-only headers not
+    // linked into this extension, hence the small amount of logic duplicated below) behind ONE
+    // class. A Python caller only ever sees this class's constructor plus a handful of run/read-back
+    // methods — everything else stays C++-internal. This is deliberately the MINIMUM surface that
+    // satisfies "construct, run, and read back a GLIF network from Python" — not a binding of the
+    // whole codegen pipeline.
+    //
+    // Scope boundary: only the Phase-1 stimulus shape `nml::build_stimulus_schedule` already covers
+    // (`explicitInput` + `pulseGenerator`) is driven automatically. A model whose stimulus uses
+    // `<inputList>` instead (a different, jLEMS-only-compatible XML shape the front end does not
+    // lower to a `StimulusEntry` at all — see tests/exit_model_validation_tests.cpp's own header
+    // comment) sees no automatic current injection here.
+    class NmlNetworkRunner {
+    public:
+        NmlNetworkRunner(const string &nml_file_path, f32 dt_seconds)
+            : model_(load_model(nml_file_path)),
+              programs_(lower_type_library(model_)),
+              allocation_(nml::allocate_model(model_, programs_)),
+              weights_(build_weight_matrix(model_)),
+              assembled_model_(model_, programs_),
+              stimulus_schedule_(nml::build_stimulus_schedule(model_, (f64)dt_seconds)),
+              dt_seconds_(dt_seconds) {
+            seed_membrane_potentials_from_resting_parameter();
+
+            const usize neuron_count = (usize)model_.total_neuron_count;
+
+            network_inputs_ = allocate<f32>(neuron_count * sizeof(f32));
+            std::memset(network_inputs_.get_contents(), 0, neuron_count * sizeof(f32));
+
+            last_spiked_ = allocate<s64>(neuron_count * sizeof(s64));
+            std::fill(last_spiked_.get_contents(), last_spiked_.get_contents() + model_.total_neuron_count, (s64)-1);
+
+            next_active_neuron_indices_ = allocate<s32>(neuron_count * sizeof(s32));
+            next_active_neuron_count_ = allocate<s32>(sizeof(s32));
+            next_active_neuron_count_.get_contents()[0] = 0;
+
+            active_generation_ = allocate<s32>(neuron_count * sizeof(s32));
+            std::fill(active_generation_.get_contents(), active_generation_.get_contents() + model_.total_neuron_count, -1);
+
+            buffers_.allocation = &allocation_;
+            buffers_.weights = &weights_;
+            buffers_.network_inputs = network_inputs_.get_contents();
+            buffers_.last_spiked = last_spiked_.get_contents();
+            buffers_.next_active_neuron_indices = next_active_neuron_indices_.get_contents();
+            buffers_.next_active_neuron_count = next_active_neuron_count_.get_contents();
+            buffers_.active_generation = active_generation_.get_contents();
+
+            // Every emit port name a Cell-category type-in-use's IR fires `emit` on (every Phase-1
+            // GLIF cell fires exactly one, "spike") — see nml::collect_emit_port_names's own doc
+            // comment for why this is derived rather than hardcoded.
+            spikecorec::Vector<String> emit_port_names = nml::collect_emit_port_names(model_, programs_);
+            emit_port_flags_.reserve(emit_port_names.size());
+            for (const String &port_name : emit_port_names) {
+                GpuPointer<bool> flags = allocate<bool>(neuron_count * sizeof(bool));
+                std::memset(flags.get_contents(), 0, neuron_count * sizeof(bool));
+                buffers_.emit_port_flags[port_name] = flags.get_contents();
+                emit_port_flags_.push_back(std::move(flags));
+            }
+        }
+
+        NmlNetworkRunner(const NmlNetworkRunner &) = delete;
+        NmlNetworkRunner &operator=(const NmlNetworkRunner &) = delete;
+
+        // GpuPointer<T> has no RAII destructor anywhere in this codebase (deallocation is always
+        // explicit — see ModelAllocation::~ModelAllocation for the same pattern); unlike a one-shot
+        // example binary that leaks its own live buffers until process exit, a Python session may
+        // construct/destroy many of these, so this explicitly frees every buffer this class itself
+        // allocated (allocation_/weights_/assembled_model_ already free their own via their own
+        // destructors, run afterward in the usual reverse-declaration-order).
+        ~NmlNetworkRunner() {
+            deallocate(std::move(network_inputs_));
+            deallocate(std::move(last_spiked_));
+            deallocate(std::move(next_active_neuron_indices_));
+            deallocate(std::move(next_active_neuron_count_));
+            deallocate(std::move(active_generation_));
+            for (GpuPointer<bool> &flags : emit_port_flags_) deallocate(std::move(flags));
+        }
+
+        // Advances the simulation by exactly one tick: injects this tick's precomputed
+        // pulseGenerator stimulus contribution (if any) into every neuron's network_inputs, then
+        // dispatches one AssembledModel::step_tick call.
+        void step() {
+            for (s32 neuron_index = 0; neuron_index < model_.total_neuron_count; ++neuron_index) {
+                buffers_.network_inputs[neuron_index] += (f32)stimulus_schedule_.current_at(neuron_index, tick_);
+            }
+            assembled_model_.step_tick(buffers_, dt_seconds_, tick_, tick_ + 1);
+            ++tick_;
+        }
+
+        // Convenience loop over step() — keeps a multi-thousand-tick run's per-tick host loop in
+        // C++ instead of paying Python call overhead once per tick.
+        void run(s64 tick_count) {
+            for (s64 index = 0; index < tick_count; ++index) step();
+        }
+
+        s64 neuron_count() const { return model_.total_neuron_count; }
+        s64 current_tick() const { return tick_; }
+
+        // Every neuron's membrane potential ("v", always cell-state slot 0 for every GLIF variant),
+        // by GLOBAL neuron index. cell_state is structure-of-arrays within per-population chunks
+        // (allocator.h §4.1), so this gathers across populations rather than a single memcpy.
+        py::array_t<f32> membrane_potentials() const {
+            py::array_t<f32> result(static_cast<py::ssize_t>(model_.total_neuron_count));
+            f32 *destination = result.mutable_data();
+            for (s32 population_index = 0; population_index < (s32)model_.populations.size(); ++population_index) {
+                const nml::PopulationEntry &population = model_.populations[(usize)population_index];
+                for (s32 local_index = 0; local_index < population.size; ++local_index) {
+                    destination[population.neuron_index_begin + local_index] =
+                        allocation_.cell_state.get_contents()[state_element_index(population_index, 0, local_index)];
+                }
+            }
+            return result;
+        }
+
+        // Tick each neuron (global index) last spiked, or -1 if it never has.
+        py::array_t<s64> last_spiked() const {
+            prefetch_to_cpu(last_spiked_, (usize)model_.total_neuron_count * sizeof(s64));
+            return to_numpy(last_spiked_.get_contents(), model_.total_neuron_count);
+        }
+
+    private:
+        static nml::ModelSpecification load_model(const string &nml_file_path) {
+            nml::NML_Parser parser;
+            parser.parse(nml_file_path);
+            nml::ResolvedModel resolved = nml::resolve_and_lower(parser);
+            return nml::build_model_specification(resolved);
+        }
+
+        // One IrProgram per model.type_library entry, matching allocate_model/AssembledModel's own
+        // parallel-array convention. Mirrors examples/nml_pipeline_support.h's own
+        // lower_type_library_to_ir (an examples-only header not linked into this extension, hence
+        // reimplemented here) with lower_inputs_on_device left at its Phase-1 default (false):
+        // pulseGenerator is host-precomputed (build_stimulus_schedule), never lowered to a kernel.
+        static spikecorec::Vector<nml::IrProgram> lower_type_library(const nml::ModelSpecification &model) {
+            spikecorec::Vector<nml::IrProgram> programs;
+            programs.reserve(model.type_library.size());
+            for (const auto &entry : model.type_library) {
+                if (entry.category == nml::TypeLibraryCategory::Cell) {
+                    programs.push_back(nml::lower_cell_to_ir(entry));
+                } else if (entry.category == nml::TypeLibraryCategory::Synapse) {
+                    programs.push_back(nml::lower_synapse_to_ir(entry));
+                } else {
+                    nml::IrProgram placeholder;
+                    placeholder.component_type_name = entry.component_type_name;
+                    programs.push_back(std::move(placeholder));
+                }
+            }
+            return programs;
+        }
+
+        // The exact-edge-set WeightMatrix AssembledModel::step_tick's ModelRuntimeBuffers::weights
+        // requires (non-null regardless of whether the model has any real projections at all) —
+        // mirrors examples/nml_pipeline_support.h's own build_weight_matrix.
+        static WeightMatrix build_weight_matrix(const nml::ModelSpecification &model) {
+            spikecorec::Vector<spikecorec::Vector<s32>> adjacency((usize)model.total_neuron_count);
+            for (const auto &projection : model.projections) {
+                for (const auto &connection : projection.connections) {
+                    adjacency[(usize)connection.source_neuron_index].push_back(connection.target_neuron_index);
+                }
+            }
+            return WeightMatrix(adjacency, /*rank=*/1);
+        }
+
+        s64 state_element_index(s32 population_index, s32 state_slot_index, s32 local_neuron_index) const {
+            const nml::PopulationEntry &population = model_.populations[(usize)population_index];
+            return allocation_.cell_type_boundaries.get_contents()[population_index]
+                   + (s64)state_slot_index * population.size + local_neuron_index;
+        }
+
+        // allocate_model zero-initializes cell_state and never evaluates a cell type's own OnStart
+        // (allocator.h/examples/nml_pipeline_support.h) — every population whose cell type bakes an
+        // `EL` constant (every GLIF variant's OnStart is `v = EL`) gets that seeded into its own `v`
+        // (state slot 0) by hand here; a population whose cell type has no `EL` (out of this class's
+        // GLIF-shaped scope) is left at allocate_model's own zero default rather than throwing.
+        void seed_membrane_potentials_from_resting_parameter() {
+            for (s32 population_index = 0; population_index < (s32)model_.populations.size(); ++population_index) {
+                const nml::PopulationEntry &population = model_.populations[(usize)population_index];
+                const nml::TypeLibraryEntry &cell_entry = model_.type_library[(usize)population.type_library_index];
+                auto resting_potential = cell_entry.baked_constants.find("EL");
+                if (resting_potential == cell_entry.baked_constants.end()) continue;
+                for (s32 local_index = 0; local_index < population.size; ++local_index) {
+                    allocation_.cell_state.get_contents()[state_element_index(population_index, 0, local_index)] =
+                        (f32)resting_potential->second;
+                }
+            }
+        }
+
+        nml::ModelSpecification model_;
+        spikecorec::Vector<nml::IrProgram> programs_;
+        nml::ModelAllocation allocation_;
+        WeightMatrix weights_;
+        nml::AssembledModel assembled_model_;
+        nml::StimulusSchedule stimulus_schedule_;
+        f32 dt_seconds_;
+
+        GpuPointer<f32> network_inputs_;
+        GpuPointer<s64> last_spiked_;
+        GpuPointer<s32> next_active_neuron_indices_;
+        GpuPointer<s32> next_active_neuron_count_;
+        GpuPointer<s32> active_generation_;
+        spikecorec::Vector<GpuPointer<bool>> emit_port_flags_;
+        nml::ModelRuntimeBuffers buffers_;
+
+        s64 tick_ = 0;
+    };
 }
 
 PYBIND11_MODULE(_spikecorec, m) {
@@ -246,4 +473,22 @@ PYBIND11_MODULE(_spikecorec, m) {
             self.record_frame(membrane_potentials.data(), membrane_potentials.size());
         }, py::arg("membrane_potentials"))
         .def("finish", &SimulationRecorder::finish);
+
+    // ── NeuroML -> GPU codegen path (epic #1), ticket #133 ────────────────────────────────────────
+    // Runs an arbitrary Phase-1 NML model (GLIF-family cell populations, optionally wired through
+    // real per-edge synapse projections, driven by pulseGenerator-based explicitInput stimuli) end
+    // to end, without touching SpikeEngine. See NmlNetworkRunner's own class comment above for the
+    // scope decision (this is the minimum viable binding surface, not a full pipeline exposure).
+    py::class_<NmlNetworkRunner>(m, "NmlNetworkRunner")
+        .def(py::init<const string &, f32>(), py::arg("nml_file_path"), py::arg("dt_seconds") = 1e-4f)
+        .def("step", &NmlNetworkRunner::step)
+        .def("run", &NmlNetworkRunner::run, py::arg("tick_count"),
+             // May run thousands of ticks per call — release the GIL so other Python threads (and
+             // any background compression thread from an unrelated SimulationRecorder) keep making
+             // progress meanwhile, matching start_static_record's own established precedent.
+             py::call_guard<py::gil_scoped_release>())
+        .def("membrane_potentials", &NmlNetworkRunner::membrane_potentials)
+        .def("last_spiked", &NmlNetworkRunner::last_spiked)
+        .def_property_readonly("neuron_count", &NmlNetworkRunner::neuron_count)
+        .def_property_readonly("current_tick", &NmlNetworkRunner::current_tick);
 }

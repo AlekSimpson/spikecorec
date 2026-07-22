@@ -1,0 +1,92 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif3RingNetworkContent">
+  <!--
+    A small (8-neuron ring) GLIF3 network fixture for python/tests/test_glif_network.py (ticket
+    #133). The ComponentType below is copied verbatim from examples/glif_torus_network.h's own
+    GLIF3_COMPONENT_TYPE_XML / glif_cell_instance_attributes(Glif3) (an examples only header, not
+    linked into the Python extension, already proven to parse, resolve, lower, and compile through
+    the full pipeline via examples/glif3_torus_network_example.cpp and
+    tests/cell_lowering_tests.cpp), so this fixture exercises the exact same, already validated
+    GLIF3 dynamics, just wired into a plain unidirectional ring instead of a torus so the
+    connection list stays small and hand typed.
+
+    Neuron 0 receives a real pulseGenerator explicitInput (matches
+    examples/glif_torus_network.h's own defaults); expOneSynapse (a real, vendored
+    conductance based synapse) wires neuron n to neuron (n+1) mod 8, so a real per-edge synapse
+    dispatch (ticket #131) is exercised end to end, not just an isolated single cell.
+
+    This document deliberately omits the xsi/schemaLocation attributes: it is consumed only by
+    spikecorec's own front end (via NmlNetworkRunner), never by jNeuroML/pyneuroml, matching
+    examples/glif_torus_network.h's own generated-document precedent.
+  -->
+  <ComponentType name="GLIF3Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Parameter name="tauAsc1" dimension="time"/>
+    <Parameter name="tauAsc2" dimension="time"/>
+    <Parameter name="ascAdd1" dimension="current"/>
+    <Parameter name="ascAdd2" dimension="current"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="asc1" dimension="current" exposure="asc1"/>
+      <StateVariable name="asc2" dimension="current" exposure="asc2"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
+      <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
+      <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+        <StateAssignment variable="asc1" value="0"/>
+        <StateAssignment variable="asc2" value="0"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn + ascSum) / C"/>
+        <OnCondition test="v .gt. vth">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset"/>
+          <StateAssignment variable="asc1" value="asc1 + ascAdd1"/>
+          <StateAssignment variable="asc2" value="asc2 + ascAdd2"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF3Cell id="glif3CellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             t_ref="5ms" tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-100pA" ascAdd2="-200pA"/>
+
+  <expOneSynapse id="ringSynapse" gbase="10nS" erev="0mV" tauDecay="5ms" weight="1"/>
+
+  <pulseGenerator id="pulseGen0" delay="10ms" duration="200ms" amplitude="600pA"/>
+
+  <network id="Glif3RingNet">
+    <population id="RingPop" component="glif3CellInstance" size="8"/>
+
+    <explicitInput target="RingPop[0]" input="pulseGen0"/>
+
+    <projection id="RingProj" presynapticPopulation="RingPop" postsynapticPopulation="RingPop" synapse="ringSynapse">
+      <connection id="0" preCellId="RingPop/0/glif3CellInstance" postCellId="RingPop/1/glif3CellInstance"/>
+      <connection id="1" preCellId="RingPop/1/glif3CellInstance" postCellId="RingPop/2/glif3CellInstance"/>
+      <connection id="2" preCellId="RingPop/2/glif3CellInstance" postCellId="RingPop/3/glif3CellInstance"/>
+      <connection id="3" preCellId="RingPop/3/glif3CellInstance" postCellId="RingPop/4/glif3CellInstance"/>
+      <connection id="4" preCellId="RingPop/4/glif3CellInstance" postCellId="RingPop/5/glif3CellInstance"/>
+      <connection id="5" preCellId="RingPop/5/glif3CellInstance" postCellId="RingPop/6/glif3CellInstance"/>
+      <connection id="6" preCellId="RingPop/6/glif3CellInstance" postCellId="RingPop/7/glif3CellInstance"/>
+      <connection id="7" preCellId="RingPop/7/glif3CellInstance" postCellId="RingPop/0/glif3CellInstance"/>
+    </projection>
+  </network>
+</neuroml>
