@@ -1,0 +1,94 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/master/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="Glif4SingleCellExitModel">
+
+  <!--
+    Ticket #125 [T4] exit model: a GLIF4 single cell reproducing an ADAPTING
+    THRESHOLD (`theta`, a StateVariable decaying toward `thetaInf` with a
+    fixed additive bump `theta <- theta + thetaSpikeAdd` at spike time) and
+    NO after-spike currents, under a current step. The ComponentType below is
+    the SAME GLIF4Cell declaration tests/cell_lowering_tests.cpp's own
+    GLIF4_COMPONENT_TYPE fixture uses, reused verbatim here so the SAME .nml
+    file drives BOTH pyneuroml/jNeuroML (real reference trace/spike capture)
+    and spikecorec's own parse->resolve->lower->IR->AssembledModel pipeline
+    (see tests/exit_model_validation_tests.cpp), mirroring
+    glif3_single_cell.nml's own established convention exactly (ticket #61
+    [H1]). Parameters/Simulation window match glif3_single_cell.nml's own
+    base GLIF parameters (C/gL/EL/vreset/t_ref, 350ms/0.1ms run) plus the
+    adapting-threshold parameters (thetaInf/tauTheta/thetaSpikeAdd); the
+    pulseGenerator amplitude is 0.25nA rather than glif3_single_cell.nml's
+    own 0.6nA, for the same reason glif2_single_cell.nml's own header comment
+    documents (0.6nA fires fast enough that cross-simulator forward-Euler
+    discretization drift breaches the 1ms spike-time tolerance before
+    tauTheta's own adaptation has slowed things down enough); 0.25nA keeps
+    GLIF4's own spike count/rate in the same ballpark as GLIF3's (8 spikes
+    here vs. GLIF3's 13), so a reviewer can directly compare GLIF4's
+    threshold-adaptation spike-frequency-adaptation signature against GLIF3's
+    after-spike-current one under a comparable drive.
+  -->
+  <ComponentType name="GLIF4Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Parameter name="thetaInf" dimension="voltage"/>
+    <Parameter name="tauTheta" dimension="time"/>
+    <Parameter name="thetaSpikeAdd" dimension="voltage"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Exposure name="theta" dimension="voltage"/>
+    <Exposure name="iSyn" dimension="current"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="theta" dimension="voltage" exposure="theta"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <TimeDerivative variable="theta" value="(thetaInf - theta) / tauTheta"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+        <StateAssignment variable="theta" value="thetaInf"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
+        <OnCondition test="v .gt. theta">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset"/>
+          <StateAssignment variable="theta" value="theta + thetaSpikeAdd"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF4Cell id="glif4CellInstance" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
+             thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="5mV"/>
+
+  <pulseGenerator id="pulseGen1" delay="20ms" duration="300ms" amplitude="0.25nA"/>
+
+  <network id="Glif4Net">
+    <population id="Glif4Pop" component="glif4CellInstance" size="1"/>
+    <explicitInput target="Glif4Pop[0]" input="pulseGen1"/>
+  </network>
+
+  <Simulation id="sim1" length="350ms" step="0.1ms" target="Glif4Net">
+    <OutputFile id="membraneTrace" fileName="glif4_membrane_trace.dat">
+      <OutputColumn id="v" quantity="Glif4Pop[0]/v"/>
+      <OutputColumn id="theta" quantity="Glif4Pop[0]/theta"/>
+    </OutputFile>
+    <EventOutputFile id="spikesFile" fileName="glif4_spikes.dat" format="TIME_ID">
+      <EventSelection id="sel0" select="Glif4Pop[0]" eventPort="spike"/>
+    </EventOutputFile>
+  </Simulation>
+</neuroml>

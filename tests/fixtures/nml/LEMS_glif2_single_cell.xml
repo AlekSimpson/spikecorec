@@ -1,0 +1,19 @@
+<Lems>
+    <!--
+      LEMS wrapper used only to drive glif2_single_cell.nml through jNeuroML/
+      jLEMS (ticket #125 [T4]) - NOT parsed by spikecorec's own front-end
+      (which reads glif2_single_cell.nml directly). Regenerate the checked-in
+      reference data under tests/fixtures/reference_data/glif2_single_cell/
+      with, from this directory:
+
+        python3 -m pyneuroml.pynml LEMS_glif2_single_cell.xml -nogui
+
+      (pyneuroml bundles its own jNeuroML jar, so this runs entirely offline
+      once pyneuroml itself is installed: `pip3 install pyneuroml`.)
+    -->
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="glif2_single_cell.nml"/>
+    <Target component="sim1"/>
+</Lems>
