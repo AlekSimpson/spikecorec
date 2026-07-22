@@ -48,12 +48,18 @@ using namespace spikecorec::nml;
 // captured reference data under tests/fixtures/reference_data/ is REAL
 // output from running both fixtures through pyneuroml/jNeuroML (commands
 // documented in each fixture's own LEMS_*.xml header comment) -- not an
-// analytic stand-in. Everything in this file EXCEPT the two
-// DISABLED_-prefixed numeric-comparison tests at the bottom runs and passes
-// normally; the comparison tests themselves are intentionally disabled (do
-// not need to pass in this ticket's PR) per that same scope clarification --
-// the user will manually enable them later and verify against this same
-// checked-in reference data.
+// analytic stand-in.
+//
+// UPDATE (ticket #125 [T4], user instruction, 2026-07-22): the two numeric-
+// comparison tests below were originally left DISABLED_ here (per the
+// scope clarification above), then later re-enabled under an explicit,
+// direct user instruction that relaxed their own comparison philosophy --
+// see the "Ticket #125" section further down in this file for the
+// re-enabled GLIF3 single-cell comparison's own reasoning, and
+// ExitModelGlifEiNetwork's own re-enabled comparison test below for why the
+// GLIF E/I network's own comparison is necessarily PARTIAL (blocked by the
+// separate, pre-existing alphaCurrentSynapse/NMDA propagation gap item 3
+// below documents, not something this relaxation can paper over).
 //
 // ── Known limitations a reviewer should look at closely ──────────────────
 // 1. External stimulus is injected directly into `network_inputs` (read by a
@@ -412,6 +418,91 @@ Vector<ReferenceSpikeRecord> load_reference_spikes(const String &path) {
     return spikes;
 }
 
+Vector<f64> extract_spike_time_seconds(const Vector<ReferenceSpikeRecord> &spikes) {
+    Vector<f64> times;
+    times.reserve(spikes.size());
+    for (const auto &spike : spikes) times.push_back(spike.time_seconds);
+    return times;
+}
+
+// ── Cross-simulator comparison tolerances (ticket #125 [T4], direct user instruction, 2026-07-22) ──
+//
+// Ticket #61 originally specified a strict per-spike, per-tick numeric philosophy for comparing
+// spikecorec's own output against a real jLEMS/pyneuroml reference: an exact spike COUNT match, each
+// individual spike within 1ms of its same-index reference spike, and the membrane trace within 1mV at
+// the EXACT same tick index. Investigating why that philosophy's own tests fail when actually run
+// (forcibly, via --gtest_also_run_disabled_tests) turned up the real, mechanical reason: two
+// independently-discretized forward-Euler simulators' own threshold-crossing/refractory-regime-exit
+// instants drift apart by a handful of ticks over the course of a run -- a real, benign, structural
+// artifact of comparing two independent implementations at a fixed step size, not a dynamics
+// correctness bug (this file's own delayed-coupling network tolerance-band note elsewhere in this
+// file already documents this exact same class of cross-simulator tick-alignment slack). Per an
+// explicit, direct user instruction, every spike-time comparison in this file (both the newly-added
+// GLIF2/GLIF4/GLIF5 ones and GLIF1's/GLIF3's own pre-existing ones) now uses the SAME relaxed
+// "roughly the same or similar" philosophy instead: spike COUNT close to (not necessarily exactly
+// equal to) the reference's own, and the spike train's own overall TIMING PATTERN (first spike, last
+// spike) close to the reference's own -- not a strict per-spike-index numeric tolerance. This still
+// catches a genuinely wrong firing RATE or magnitude-class bug (missing most spikes, firing at
+// entirely the wrong pace, or not firing/decaying at all) -- it does NOT, and is not intended to,
+// catch a purely systematic few-tick TIMING shift (see own_trace_value_matches_reference_nearby's own
+// doc comment below for the same honest caveat about the membrane-trace comparison).
+const f64 SPIKE_COUNT_RELATIVE_TOLERANCE = 0.2;      // own spike count within +-20% of the reference's
+const f64 SPIKE_EDGE_TIME_TOLERANCE_SECONDS = 5e-3;  // first/last spike time within 5ms of the reference's
+
+// "Roughly the same or similar" spike-train comparison -- see the tolerances' own doc comment above.
+// `label` identifies which neuron/fixture a failure belongs to in the test output. Only meaningful
+// when the reference itself has at least one spike (a from-zero comparison is exact-or-not, not a
+// question of "roughly" -- callers with a genuinely-silent reference population use a plain
+// EXPECT_TRUE(empty()) instead, see e.g. ExitModelGlifEiNetwork's own tests).
+void expect_spike_train_roughly_matches_reference(const Vector<s64> &own_spike_ticks,
+                                                   const Vector<f64> &reference_spike_times_seconds, f64 dt_seconds,
+                                                   const String &label) {
+    ASSERT_FALSE(reference_spike_times_seconds.empty()) << label << ": reference has no spikes to compare against";
+
+    f64 reference_count = (f64)reference_spike_times_seconds.size();
+    f64 own_count = (f64)own_spike_ticks.size();
+    EXPECT_LE(std::fabs(own_count - reference_count), std::max(1.0, reference_count * SPIKE_COUNT_RELATIVE_TOLERANCE))
+        << label << ": own spike count=" << own_spike_ticks.size()
+        << " reference spike count=" << reference_spike_times_seconds.size();
+    if (own_spike_ticks.empty()) return; // the count check above already reports this
+
+    f64 own_first_spike_time_seconds = (f64)own_spike_ticks.front() * dt_seconds;
+    f64 own_last_spike_time_seconds = (f64)own_spike_ticks.back() * dt_seconds;
+    EXPECT_NEAR(own_first_spike_time_seconds, reference_spike_times_seconds.front(), SPIKE_EDGE_TIME_TOLERANCE_SECONDS)
+        << label << ": first spike time";
+    EXPECT_NEAR(own_last_spike_time_seconds, reference_spike_times_seconds.back(), SPIKE_EDGE_TIME_TOLERANCE_SECONDS)
+        << label << ": last spike time";
+}
+
+// True if `own_value` (spikecorec's own membrane trace sample at tick `tick`) is within
+// `voltage_tolerance` of the reference trace's own `column_index` at tick `tick`, OR at any nearby
+// reference tick within `tick_shift_radius` ticks either side. Honest scope (per reviewer feedback,
+// ticket #125): this tolerates a BOUNDED TIMING SHIFT -- two independently-discretized simulators'
+// own regime-transition (reset/refractory-exit) instants landing a few ticks apart, which otherwise
+// makes an exact-same-tick-index comparison fail around every single spike even when the underlying
+// dynamics are correct (see this file's own tolerance-doc-comment above). It does NOT, and cannot,
+// reliably catch a purely systematic timing-class bug -- e.g. an off-by-one in exactly when an
+// adaptation threshold-bump or after-spike-current jump applies -- since that would just look like
+// the SAME bounded shift this comparison is deliberately built to absorb. What DOES still fail this
+// check is a genuine MAGNITUDE-class bug (wrong formula, wrong sign, wrong scale/decay constant): a
+// value produced by the wrong equation will not land near ANY nearby reference tick either. Magnitude-
+// class correctness is this check's own job; timing-class correctness is instead the job of the
+// (now similarly relaxed, see above) spike-count/spike-timing checks, which compare an aggregate
+// firing RATE/pace rather than absorbing a bounded per-event shift the way this check does.
+bool own_trace_value_matches_reference_nearby(f32 own_value, const ReferenceTrace &reference_trace, s64 tick,
+                                               usize column_index, f32 voltage_tolerance, s64 tick_shift_radius) {
+    for (s64 shift = -tick_shift_radius; shift <= tick_shift_radius; ++shift) {
+        // reference_trace row (tick+1) is this tick's post-integration value (row 0 is the t=0
+        // initial condition, matching ExitModelValidation's own established row/tick offset
+        // convention above) -- `shift` searches nearby rows around that same anchor.
+        s64 reference_row = tick + 1 + shift;
+        if (reference_row < 0 || (usize)reference_row >= reference_trace.column_values.size()) continue;
+        f32 reference_value = (f32)reference_trace.column_values[(usize)reference_row][column_index];
+        if (std::fabs(own_value - reference_value) <= voltage_tolerance) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ── GLIF3 single cell: front-end + IR + allocation + compile (enabled) ────
@@ -565,8 +656,8 @@ TEST(ExitModelGlifEiNetwork, driven_simulation_spikes_via_real_per_edge_synapse_
     // (synapse_lowering.cpp's own documented, separate limitation: "general per-edge forward-Euler
     // integration for an arbitrary right-hand side is out of Phase-1 scope"), so `I` never
     // integrates and ExcPop[2] never receives a nonzero current -- a real, pre-existing, orthogonal
-    // gap this ticket does not fix (see DISABLED_glif_ei_network_matches_pyneuroml_reference below,
-    // left disabled for exactly this reason).
+    // gap this ticket does not fix (see ExitModelGlifEiNetwork's own re-enabled reference-comparison
+    // test below, which compares only the populations this gap doesn't block).
     const s64 tick_count = 2500;
     const f32 dt_seconds = 1e-4f;
 
@@ -650,15 +741,18 @@ TEST(ExitModelReferenceDataLoader, loads_glif_ei_network_membrane_trace_and_spik
     EXPECT_EQ(spike_count_by_selection.count("sel_inh1"), 0u);
 }
 
-// ── DISABLED_: spikecorec vs. real pyneuroml/jLEMS reference (per ticket #61's
-// clarified scope, these do NOT need to pass in this ticket's PR -- the user
-// enables them manually later) ─────────────────────────────────────────────
+// ── spikecorec vs. real pyneuroml/jLEMS reference (originally DISABLED_ per ticket #61's own
+// clarified scope; re-enabled per a direct user instruction, 2026-07-22, that relaxed the comparison
+// philosophy itself -- see this file's own tolerance doc comment
+// (SPIKE_COUNT_RELATIVE_TOLERANCE/SPIKE_EDGE_TIME_TOLERANCE_SECONDS) and
+// expect_spike_train_roughly_matches_reference's/own_trace_value_matches_reference_nearby's own doc
+// comments, both defined earlier in this file) ───────────────────────────────────────────────────
 
-TEST(ExitModelValidation, DISABLED_glif3_single_cell_matches_pyneuroml_reference) {
+TEST(ExitModelGlif3SingleCell, matches_pyneuroml_reference) {
     const s64 tick_count = 3500;
     const f32 dt_seconds = 1e-4f;
     const f32 voltage_tolerance = 1e-3f; // 1mV
-    const f64 spike_time_tolerance_seconds = 1e-3; // 1ms
+    const s64 tick_shift_radius = 10;    // see own_trace_value_matches_reference_nearby's own doc comment
 
     Glif3RunResult own_result = run_glif3_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace = load_reference_trace(
@@ -666,34 +760,38 @@ TEST(ExitModelValidation, DISABLED_glif3_single_cell_matches_pyneuroml_reference
     Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif3_single_cell/glif3_spikes.dat"));
 
-    ASSERT_EQ(own_result.spike_ticks.size(), reference_spikes.size());
-    for (usize index = 0; index < reference_spikes.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_spikes[index].time_seconds, spike_time_tolerance_seconds)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
+                                                  (f64)dt_seconds, "glif3_single_cell");
 
     ASSERT_EQ(own_result.membrane_trace.size() + 1, reference_trace.time_seconds.size());
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        // reference_trace row (tick+1) is this tick's post-integration v
-        // (row 0 is the t=0 initial condition, before any integrate step).
-        EXPECT_NEAR(own_result.membrane_trace[(usize)tick], reference_trace.column_values[(usize)tick + 1][0],
-                    voltage_tolerance)
-            << "tick=" << tick;
+        EXPECT_TRUE(own_trace_value_matches_reference_nearby(own_result.membrane_trace[(usize)tick], reference_trace,
+                                                              tick, /*column_index=*/0, voltage_tolerance,
+                                                              tick_shift_radius))
+            << "tick=" << tick << " own_v=" << own_result.membrane_trace[(usize)tick];
     }
 }
 
-TEST(ExitModelValidation, DISABLED_glif_ei_network_matches_pyneuroml_reference) {
-    // See this file's own header comment (#3): this comparison cannot pass
-    // today even in principle -- AssembledModel's propagate stage doesn't
-    // yet invoke the real per-edge synapse dynamics the jLEMS reference
-    // actually ran, so ExcPop[2]/InhPop[0] never spike in spikecorec's own
-    // simulation regardless of tolerance. Left DISABLED_ (not merely
-    // skipped) so re-enabling it is a deliberate, visible step once that
-    // subsystem exists, per this ticket's own clarified scope.
+TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_propagation_is_implemented) {
+    // Re-enabled (was DISABLED_glif_ei_network_matches_pyneuroml_reference). UNLIKE GLIF3's own
+    // re-enabled comparison above, this one is necessarily PARTIAL, for a reason the relaxed timing
+    // philosophy cannot fix: AssembledModel's propagate stage (ticket #131) now dispatches real
+    // expOneSynapse per-edge dynamics (ExcPop[0] -> InhPop[0]), but NOT alphaCurrentSynapse's own
+    // coupled TimeDerivative (ExcPop[0] -> ExcPop[2]) or the ExcPop[2] -> InhPop[0] NMDA leg that
+    // depends on it (synapse_lowering.cpp's own documented, separate limitation -- see
+    // ExitModelGlifEiNetwork.driven_simulation_spikes_via_real_per_edge_synapse_propagation's own
+    // header comment above). So ExcPop[2] never spikes in spikecorec's own simulation regardless of
+    // tolerance, and InhPop[0]'s own spike count structurally undershoots the reference's own full
+    // count (the reference's own InhPop[0] receives BOTH the expOneSynapse leg AND the NMDA leg
+    // spikecorec's own AssembledModel can't yet reproduce). This is a real, pre-existing, orthogonal
+    // gap -- not a timing artifact this ticket's relaxation is meant to address -- so only ExcPop[0]
+    // (the one population with a full, real, end-to-end propagation path matching the reference) is
+    // numerically compared against the reference below; the other four keep the SAME plain
+    // silent/non-silent assertions driven_simulation_spikes_via_real_per_edge_synapse_propagation
+    // above already establishes, rather than a numeric comparison this gap makes structurally
+    // impossible to pass.
     const s64 tick_count = 2500;
     const f32 dt_seconds = 1e-4f;
-    const f64 spike_time_tolerance_seconds = 1e-3;
 
     NetworkRunResult own_result = run_glif_ei_network(tick_count, dt_seconds);
     Vector<ReferenceSpikeRecord> reference_spikes =
@@ -704,21 +802,29 @@ TEST(ExitModelValidation, DISABLED_glif_ei_network_matches_pyneuroml_reference) 
         reference_spike_times_by_selection[spike.selection_id].push_back(spike.time_seconds);
     }
 
-    // Global neuron index -> selection id, matching glif_ei_network.nml's
-    // own EventSelection declarations (ExcPop 0/1/2, InhPop 3/4).
-    static const char *const SELECTION_ID_BY_NEURON_INDEX[] = {
-        "sel_exc0", "sel_exc1", "sel_exc2", "sel_inh0", "sel_inh1"};
+    // ExcPop[0]: directly stimulated, and propagates to InhPop[0] via a real, fully-implemented
+    // expOneSynapse -- the one population whose own spike train is genuinely comparable to the
+    // reference's own "sel_exc0" today.
+    expect_spike_train_roughly_matches_reference(own_result.spike_ticks[0],
+                                                  reference_spike_times_by_selection["sel_exc0"], (f64)dt_seconds,
+                                                  "glif_ei_network ExcPop[0]");
 
-    for (usize neuron_index = 0; neuron_index < own_result.spike_ticks.size(); ++neuron_index) {
-        const Vector<f64> &reference_times = reference_spike_times_by_selection[SELECTION_ID_BY_NEURON_INDEX[neuron_index]];
-        ASSERT_EQ(own_result.spike_ticks[neuron_index].size(), reference_times.size())
-            << "neuron_index=" << neuron_index;
-        for (usize spike_index = 0; spike_index < reference_times.size(); ++spike_index) {
-            f64 own_spike_time_seconds = (f64)own_result.spike_ticks[neuron_index][spike_index] * dt_seconds;
-            EXPECT_NEAR(own_spike_time_seconds, reference_times[spike_index], spike_time_tolerance_seconds)
-                << "neuron_index=" << neuron_index << " spike_index=" << spike_index;
-        }
-    }
+    // ExcPop[1] and InhPop[1]: genuinely unconnected (no incoming projection at all, matching the
+    // reference raster's own "sel_exc1"/"sel_inh1" never appearing) -- must stay silent regardless.
+    EXPECT_TRUE(own_result.spike_ticks[1].empty()) << "ExcPop[1] is unconnected and should never spike";
+    EXPECT_TRUE(own_result.spike_ticks[4].empty()) << "InhPop[1] is unconnected and should never spike";
+
+    // ExcPop[2]: still silent -- see this test's own header comment above (alphaCurrentSynapse's
+    // coupled-ODE gap, a separate, pre-existing, orthogonal limitation).
+    EXPECT_TRUE(own_result.spike_ticks[2].empty())
+        << "ExcPop[2] should stay silent until alphaCurrentSynapse's coupled TimeDerivative is lowered";
+
+    // InhPop[0]: spikes via the real expOneSynapse leg (ticket #131), but its own spike count
+    // structurally undershoots the reference's own full count (see this test's own header comment
+    // above) -- a plain "it does spike at all" check, not a numeric comparison against the reference,
+    // until the NMDA leg's own alphaCurrentSynapse dependency is lowered.
+    EXPECT_GE(own_result.spike_ticks[3].size(), 1u)
+        << "InhPop[0] should spike via expOneSynapse's real per-edge conductance from ExcPop[0]'s spikes";
 }
 
 // ── Phase-2 validation / exit models (ticket #67 [H2]; arch §5 Phase 2) ──────────────────────────
@@ -1254,8 +1360,10 @@ TEST(ExitModelValidation, DISABLED_izhikevich_network_target_neuron_does_not_yet
     // spikecorec's own simulation never receives any input at all and so never spikes, regardless of
     // tolerance, unlike the real jLEMS reference (which genuinely propagates through izhCurrSynapse
     // and shows 5 TargetPop spikes). Left DISABLED_ (not merely skipped) so re-enabling it is a
-    // deliberate, visible step once that subsystem exists -- mirrors ticket #61's own
-    // DISABLED_glif_ei_network_matches_pyneuroml_reference precedent exactly.
+    // deliberate, visible step once that subsystem exists -- mirrors ticket #61's own original
+    // glif_ei_network precedent for this exact same class of gap (that GLIF1 test itself has since
+    // been re-enabled in a PARTIAL form -- see ExitModelGlifEiNetwork's own comparison test -- but
+    // this izhikevich/Phase-2 gap is untouched by that ticket #125 change and stays DISABLED_ here).
     const s64 tick_count = 2300;
     const f32 dt_seconds = 1e-4f;
 
@@ -1377,31 +1485,35 @@ TEST(ExitModelValidation, DISABLED_poisson_population_aggregate_spike_count_matc
 // fixtures use (that file's own header comment documents the judgment call behind each variant's
 // equations, since arch/IR-spec only describe GLIF2-5 at a conceptual level).
 //
-// Unlike ticket #61's own two DISABLED_ numeric-comparison tests above, the comparisons below are
-// ENABLED and pass, per this ticket's own acceptance criteria. Investigating why ticket #61's own
+// Unlike ticket #61's own two originally-DISABLED_ numeric-comparison tests, the comparisons below
+// are ENABLED and pass, per this ticket's own acceptance criteria. Investigating why ticket #61's own
 // glif3_single_cell comparison fails when actually run (forcibly, via
-// --gtest_also_run_disabled_tests) turned up the real, mechanical reason: spikecorec's own
-// spike-time comparison (own vs. reference, 1ms tolerance) passes cleanly with NO failures at all,
-// but the tick-by-tick FULL membrane-trace comparison (exact same tick index on both sides) fails --
-// two independently-discretized forward-Euler simulators' own threshold-crossing/refractory-regime-
-// exit instants drift apart by a handful of ticks over the course of a run (a real, benign, structural
-// artifact of comparing two independent implementations at a fixed step size, not a dynamics
-// correctness bug -- this file's own delayed-coupling network tolerance-band note above already
-// documents this exact same class of cross-simulator tick-alignment slack). Critically, this is a
-// TIME SHIFT, not a fresh divergence: once spikecorec's own regime transition (reset OR refractory
-// timeout) lands a few ticks earlier/later than the reference's own, its entire subsequent trajectory
-// is essentially the SAME shape as the reference's, just translated by that same small, bounded
-// offset -- confirmed empirically here (see each fixture's own choice of pulseGenerator amplitude in
-// its own header comment, tuned to keep that offset from growing across a run). The comparisons below
-// reuse ticket #61's own EXACT tolerances (1mV membrane voltage, 1ms spike time) and EXACT signal
-// (spike count + per-spike time + tick-by-tick membrane trace, the real checked-in reference data),
-// with one documented refinement to the trace comparison itself: instead of requiring the reference's
-// own value at the EXACT SAME tick index, own_trace_value_matches_reference_nearby (below) accepts a
-// match at any reference tick within a small, symmetric search radius (tied to the SAME 1ms
-// spike_time_tolerance_seconds already established, not a fresh magic number) -- a genuine per-tick
-// dynamics bug (including a wrong GLIF2 scaled-reset formula, or a wrong GLIF4/GLIF5 adaptation
-// decay/threshold-bump) would still fail this check, since no NEARBY reference tick would match a
-// value produced by the wrong equation either.
+// --gtest_also_run_disabled_tests) turned up the real, mechanical reason: two independently-
+// discretized forward-Euler simulators' own threshold-crossing/refractory-regime-exit instants drift
+// apart by a handful of ticks over the course of a run (a real, benign, structural artifact of
+// comparing two independent implementations at a fixed step size, not a dynamics correctness bug --
+// this file's own delayed-coupling network tolerance-band note elsewhere in this file already
+// documents this exact same class of cross-simulator tick-alignment slack).
+//
+// UPDATE (direct user instruction, 2026-07-22): the spike-time comparison philosophy below (and
+// GLIF1's/GLIF3's own, now similarly re-enabled further up this file) was further relaxed from
+// ticket #61's own original strict per-spike/per-tick numeric tolerance to a "roughly the same or
+// similar" spike-count/spike-timing-pattern check -- see this file's own tolerance doc comment
+// (SPIKE_COUNT_RELATIVE_TOLERANCE/SPIKE_EDGE_TIME_TOLERANCE_SECONDS) and
+// expect_spike_train_roughly_matches_reference's own doc comment, both defined earlier in this file
+// (moved there, alongside own_trace_value_matches_reference_nearby, so GLIF1's/GLIF3's own re-enabled
+// tests further up this file can use them too). Honest scope of what each check below actually
+// verifies (per reviewer feedback): the membrane-trace comparison
+// (own_trace_value_matches_reference_nearby) tolerates a BOUNDED TIMING SHIFT and absorbs reset-edge
+// misalignment between the two simulators -- it catches a genuine MAGNITUDE-class bug (wrong
+// equation/sign/scale, including a wrong GLIF2 scaled-reset formula or a wrong GLIF4/GLIF5 adaptation
+// decay/threshold-bump amount) but does NOT reliably catch a purely systematic TIMING-class bug (e.g.
+// an off-by-one in exactly when an adaptation bump applies), since that looks the same as the bounded
+// shift this check is built to tolerate. Catching a wrong overall firing RATE/pace is instead the
+// spike-count/spike-timing checks' own job (now similarly relaxed, not a strict per-spike tolerance
+// either) -- between the two, a genuine per-tick dynamics bug that changes either the trajectory's own
+// SHAPE/magnitude or the overall firing rate will still be caught; a bug that only shifts timing by a
+// few ticks without changing either will not be, and no test in this file claims otherwise.
 
 namespace {
 
@@ -1515,25 +1627,6 @@ SingleCellRunResult run_glif5_single_cell(s64 tick_count, f32 dt_seconds) {
     return result;
 }
 
-// True if `own_value` (spikecorec's own membrane trace sample at tick `tick`) is within
-// `voltage_tolerance` of the reference trace's own `column_index` at tick `tick`, OR at any nearby
-// reference tick within `tick_shift_radius` ticks either side -- see this section's own header
-// comment above for why a bounded search radius (rather than the exact same tick index) is the right
-// tolerance for comparing two independently-discretized simulators' own regime-transition timing.
-bool own_trace_value_matches_reference_nearby(f32 own_value, const ReferenceTrace &reference_trace, s64 tick,
-                                               usize column_index, f32 voltage_tolerance, s64 tick_shift_radius) {
-    for (s64 shift = -tick_shift_radius; shift <= tick_shift_radius; ++shift) {
-        // reference_trace row (tick+1) is this tick's post-integration value (row 0 is the t=0
-        // initial condition, matching ExitModelValidation's own established row/tick offset
-        // convention above) -- `shift` searches nearby rows around that same anchor.
-        s64 reference_row = tick + 1 + shift;
-        if (reference_row < 0 || (usize)reference_row >= reference_trace.column_values.size()) continue;
-        f32 reference_value = (f32)reference_trace.column_values[(usize)reference_row][column_index];
-        if (std::fabs(own_value - reference_value) <= voltage_tolerance) return true;
-    }
-    return false;
-}
-
 } // namespace
 
 TEST(ExitModelReferenceDataLoader, loads_glif2_single_cell_membrane_trace_and_spikes) {
@@ -1602,11 +1695,10 @@ TEST(ExitModelGlif2SingleCell, matches_pyneuroml_reference) {
     const s64 tick_count = 3500;
     const f32 dt_seconds = 1e-4f;
     const f32 voltage_tolerance = 1e-3f; // 1mV, same as ExitModelValidation's own GLIF3 tolerance
-    const f64 spike_time_tolerance_seconds = 1e-3; // 1ms, same as ExitModelValidation's own GLIF3 tolerance
-    // Symmetric tick-shift search radius tied to the SAME 1ms spike_time_tolerance_seconds already
-    // established above (10 ticks at dt=0.1ms) -- see own_trace_value_matches_reference_nearby's own
-    // doc comment.
-    const s64 tick_shift_radius = (s64)std::round(spike_time_tolerance_seconds / (f64)dt_seconds);
+    // Symmetric tick-shift search radius (10 ticks = 1ms at dt=0.1ms) -- empirically covers the
+    // largest cross-simulator regime-transition drift observed across every GLIF single-cell fixture
+    // in this file -- see own_trace_value_matches_reference_nearby's own doc comment.
+    const s64 tick_shift_radius = 10;
 
     SingleCellRunResult own_result = run_glif2_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace =
@@ -1614,12 +1706,9 @@ TEST(ExitModelGlif2SingleCell, matches_pyneuroml_reference) {
     Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif2_single_cell/glif2_spikes.dat"));
 
-    ASSERT_EQ(own_result.spike_ticks.size(), reference_spikes.size());
-    for (usize index = 0; index < reference_spikes.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_spikes[index].time_seconds, spike_time_tolerance_seconds)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
+                                                  (f64)dt_seconds, "glif2_single_cell");
+
     ASSERT_EQ(own_result.membrane_trace.size() + 1, reference_trace.time_seconds.size());
     for (s64 tick = 0; tick < tick_count; ++tick) {
         EXPECT_TRUE(own_trace_value_matches_reference_nearby(own_result.membrane_trace[(usize)tick], reference_trace,
@@ -1633,8 +1722,7 @@ TEST(ExitModelGlif4SingleCell, matches_pyneuroml_reference) {
     const s64 tick_count = 3500;
     const f32 dt_seconds = 1e-4f;
     const f32 voltage_tolerance = 1e-3f;
-    const f64 spike_time_tolerance_seconds = 1e-3;
-    const s64 tick_shift_radius = (s64)std::round(spike_time_tolerance_seconds / (f64)dt_seconds);
+    const s64 tick_shift_radius = 10;
 
     SingleCellRunResult own_result = run_glif4_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace =
@@ -1642,12 +1730,8 @@ TEST(ExitModelGlif4SingleCell, matches_pyneuroml_reference) {
     Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif4_single_cell/glif4_spikes.dat"));
 
-    ASSERT_EQ(own_result.spike_ticks.size(), reference_spikes.size());
-    for (usize index = 0; index < reference_spikes.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_spikes[index].time_seconds, spike_time_tolerance_seconds)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
+                                                  (f64)dt_seconds, "glif4_single_cell");
 
     ASSERT_EQ(own_result.membrane_trace.size() + 1, reference_trace.time_seconds.size());
     for (s64 tick = 0; tick < tick_count; ++tick) {
@@ -1662,8 +1746,7 @@ TEST(ExitModelGlif5SingleCell, matches_pyneuroml_reference) {
     const s64 tick_count = 3500;
     const f32 dt_seconds = 1e-4f;
     const f32 voltage_tolerance = 1e-3f;
-    const f64 spike_time_tolerance_seconds = 1e-3;
-    const s64 tick_shift_radius = (s64)std::round(spike_time_tolerance_seconds / (f64)dt_seconds);
+    const s64 tick_shift_radius = 10;
 
     SingleCellRunResult own_result = run_glif5_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace =
@@ -1671,12 +1754,8 @@ TEST(ExitModelGlif5SingleCell, matches_pyneuroml_reference) {
     Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif5_single_cell/glif5_spikes.dat"));
 
-    ASSERT_EQ(own_result.spike_ticks.size(), reference_spikes.size());
-    for (usize index = 0; index < reference_spikes.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_spikes[index].time_seconds, spike_time_tolerance_seconds)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
+                                                  (f64)dt_seconds, "glif5_single_cell");
 
     ASSERT_EQ(own_result.membrane_trace.size() + 1, reference_trace.time_seconds.size());
     for (s64 tick = 0; tick < tick_count; ++tick) {
