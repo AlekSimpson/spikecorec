@@ -397,6 +397,57 @@ wm.set_constant_weight(value)                      # set the constant-weight val
 | `min_value` | `float` | `after` | `WeightStats` |
 | `max_value` | `float` | | |
 
+## `NmlNetworkRunner` — the NeuroML → GPU codegen path
+
+`SpikeEngine` above is the legacy, hardcoded leaky-integrate-and-fire engine. `NmlNetworkRunner`
+is the separate, newer surface (ticket #133) over the NeuroML/LEMS → GPU codegen pipeline (epic
+#1): it parses a NeuroML model, resolves/lowers/allocates/assembles it into a compiled master
+kernel, and steps it — so any Phase-1 GLIF-family cell network described in NeuroML can be run
+from Python without touching `SpikeEngine` at all.
+
+This is deliberately the *minimum* binding surface for "construct, run, and read back a GLIF
+network" — not a binding of the whole codegen pipeline. `ModelSpecification`, `IrProgram`,
+`ModelAllocation`, and `AssembledModel` all stay C++-internal; `NmlNetworkRunner` is the only
+class exposed.
+
+```python
+import numpy as np
+import spikecorec
+
+# nml_file_path is a TOP-LEVEL NeuroML document (may <include> other files from the same
+# directory) — e.g. one of the fixtures under tests/fixtures/nml/, or your own model.
+network = spikecorec.NmlNetworkRunner("path/to/model_top.nml", dt_seconds=1e-4)
+
+network.run(3000)                       # advance 3000 ticks in one call (releases the GIL)
+# network.step()                        # or one tick at a time
+
+membrane_potentials = network.membrane_potentials()  # float32[neuron_count], state "v" per neuron
+last_spiked = network.last_spiked()                  # int64[neuron_count], tick each last fired (-1 = never)
+
+print(network.neuron_count, network.current_tick)
+assert np.all(np.isfinite(membrane_potentials))
+```
+
+- `NmlNetworkRunner(nml_file_path, dt_seconds=1e-4)` — parses `nml_file_path` (a top-level
+  `<neuroml>` document; `<include href="...">` targets resolve relative to its own directory),
+  resolves/lowers/allocates/assembles it, and seeds every population's membrane potential to its
+  cell type's own `EL` (its `OnStart`'s `v = EL`) when one is baked. Only the Phase-1 stimulus
+  shape `explicitInput` + `pulseGenerator` is driven automatically each tick — a model using
+  `<inputList>` for its stimulus instead sees no automatic current injection.
+- `step()` — advances exactly one tick.
+- `run(tick_count)` — convenience loop over `step()`, releasing the GIL so a multi-thousand-tick
+  run doesn't pay per-tick Python call overhead or block other threads.
+- `membrane_potentials()` — `np.ndarray[float32]`, shape `(neuron_count,)`, every neuron's `v`
+  (cell-state slot 0), by global neuron index across every population.
+- `last_spiked()` — `np.ndarray[int64]`, shape `(neuron_count,)`, tick each neuron last fired
+  (`-1` if never).
+- `neuron_count`, `current_tick` — read-only `int` properties.
+
+See `python/tests/test_glif_network.py` for a complete, committed end-to-end example (an 8-neuron
+GLIF3 ring network with a real per-edge `expOneSynapse` projection), and
+`tests/fixtures/nml/*_top.nml` / `examples/glif_torus_network.h` for more NeuroML model shapes
+this same class can run.
+
 ## Putting it together: a minimal reservoir-readout loop
 
 ```python
@@ -439,4 +490,12 @@ The project's intended Python environment is the `spike_engine` conda env
 
 ```bash
 make python PYTHON=/path/to/envs/spike_engine/bin/python
+```
+
+The Python bindings themselves (`spikecorec.SpikeEngine`, `spikecorec.NmlNetworkRunner`, etc.) have
+their own pytest suite under `python/tests/` (requires `pip install -e .[dev]` for `pytest`/`numpy`):
+
+```bash
+make test-python                                          # builds the extension, then runs pytest
+pytest python/tests -v                                    # or directly, once already built
 ```

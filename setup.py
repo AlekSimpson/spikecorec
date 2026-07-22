@@ -80,13 +80,58 @@ SRCS = [
     "src/core/k2tree.cpp",
     "src/core/log.cpp",
     "src/core/recording.cpp",
+    "src/core/time_utilities.cpp",
     "src/core/topologies.cpp",
     "src/core/types.cpp",
     "src/core/weight_matrix.cpp",
+    # NeuroML/LEMS -> GPU codegen front+back end (epic #1) — ticket #133 exposes this to Python via
+    # bindings.cpp's own NmlNetworkRunner, so it must actually be compiled/linked into the extension
+    # (previously it was not: the Python surface was limited to SpikeEngine/WeightMatrix).
+    "src/nml/allocator.cpp",
+    "src/nml/cell_lowering.cpp",
+    "src/nml/delay_ring.cpp",
+    "src/nml/discrete_spike_input.cpp",
+    "src/nml/expression_lowering.cpp",
+    "src/nml/gpu_source.cpp",
+    "src/nml/inputs_lowering.cpp",
+    "src/nml/ir.cpp",
+    "src/nml/master_kernel.cpp",
+    "src/nml/model_specification.cpp",
+    "src/nml/nml.cpp",
+    "src/nml/output_recording.cpp",
+    "src/nml/plasticity_wiring.cpp",
+    "src/nml/resolve.cpp",
+    "src/nml/stimulus_schedule.cpp",
+    "src/nml/synapse_lowering.cpp",
 ]
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
 EXTRA_LINK_ARGS = []
 DEFINE_MACROS = [("SPDLOG_ACTIVE_LEVEL", "SPDLOG_LEVEL_TRACE")]  # spdlog is header-only by default
+
+# ── NeuroML2 vendored bundle paths (std-lib + XSD schema, ticket #133) ───────
+# Baked in as absolute path macros, mirroring the Makefile's own NML_STD_LIB_DIR/NML_SCHEMA_PATH
+# ($(abspath ...)) — NML_Parser::STANDARD_LIBRARY_PATH/NML_SCHEMA_PATH (resolve.h) resolve from these
+# at runtime regardless of the interpreter's current working directory.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_NML_STD_LIB_DIR = os.path.join(_REPO_ROOT, "third_party", "neuroml2", "std_lib")
+_NML_SCHEMA_PATH = os.path.join(_REPO_ROOT, "third_party", "neuroml2", "schema", "NeuroML_v2.3.xsd")
+DEFINE_MACROS.append(("SPIKECOREC_NML_STD_LIB_DIR", '"%s"' % _NML_STD_LIB_DIR))
+DEFINE_MACROS.append(("SPIKECOREC_NML_SCHEMA_PATH", '"%s"' % _NML_SCHEMA_PATH))
+
+# ── XML parsing (libxml2 — NML/LEMS front-end) ───────────────────────────────
+# nml.h/resolve.h include <libxml/parser.h>/<libxml/tree.h>/<libxml/xmlschemastypes.h>
+# unconditionally (no #ifdef guard) — every NML/GLIF source file above needs libxml2's headers on
+# the include path to compile at all. Detected the same way as the compression codecs below (via
+# pkg-config), mirroring the Makefile's own HAS_LIBXML2 probe.
+_libxml2_libs = _pkg_config("--libs", package="libxml-2.0")
+if _libxml2_libs is not None:
+    for _flag in _pkg_config("--cflags", package="libxml-2.0") or []:
+        if _flag.startswith("-I"):
+            INC.append(_flag[2:])
+        else:
+            EXTRA_COMPILE_ARGS.append(_flag)
+    for _flag in _libxml2_libs:
+        EXTRA_LINK_ARGS.append(_flag)
 
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ──────────────
 # Mirrors the Makefile's HAS_ZLIB/HAS_LZMA/HAS_BZ2 probing: query pkg-config

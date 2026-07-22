@@ -15,6 +15,7 @@ All signatures below reflect the actual pybind11 bindings
 - [`SpikeEngine`](#spikeengine)
 - [`WeightMatrix`](#weightmatrix)
 - [`SimulationRecorder`](#simulationrecorder)
+- [`NmlNetworkRunner`](#nmlnetworkrunner)
 - [Result types](#result-types)
 
 ---
@@ -432,6 +433,69 @@ compressed, possibly async) sink once `chunk_bytes` is reached.
 
 Flushes any remaining buffered bytes and closes the underlying file. Call
 exactly once.
+
+---
+
+## `NmlNetworkRunner`
+
+The NeuroML/LEMS → GPU codegen path (epic #1), exposed to Python (ticket #133) — separate from,
+and never dependent on, `SpikeEngine`. Wraps the whole parse → resolve → lower → allocate →
+assemble → step_tick pipeline behind one class; this is the minimum surface for "construct, run,
+and read back a GLIF network," not a binding of every pipeline stage (`ModelSpecification`,
+`IrProgram`, `ModelAllocation`, and `AssembledModel` all stay C++-internal).
+
+### Constructor
+
+```python
+NmlNetworkRunner(nml_file_path, dt_seconds=1e-4)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `nml_file_path` | `str` | required | Path to a top-level `<neuroml>` document. `<include href="...">` targets resolve relative to this file's own directory |
+| `dt_seconds` | `float` | `1e-4` | Simulation timestep, seconds |
+
+Seeds every population's membrane potential (`v`) to its cell type's own `EL` when one is baked
+(every GLIF variant's `OnStart` is `v = EL`); a cell type with no `EL` is left at zero. Only the
+Phase-1 stimulus shape `explicitInput` + `pulseGenerator` is driven automatically each tick — a
+model using `<inputList>` for its stimulus instead sees no automatic current injection here.
+
+### Methods
+
+#### `step() -> None`
+
+Advances the simulation by exactly one tick: injects this tick's precomputed pulseGenerator
+stimulus contribution (if any) into every neuron, then runs one tick of cell/synapse dynamics.
+
+---
+
+#### `run(tick_count) -> None`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `tick_count` | `int` | required | Number of ticks to advance |
+
+Convenience loop over `step()`. Releases the GIL for the duration of the call.
+
+---
+
+#### `membrane_potentials() -> np.ndarray[float32]`
+
+**Returns:** shape `(neuron_count,)` — every neuron's `v` (cell-state slot 0), by global neuron
+index across every population.
+
+---
+
+#### `last_spiked() -> np.ndarray[int64]`
+
+**Returns:** shape `(neuron_count,)` — tick each neuron last fired, or `-1` if it never has.
+
+### Properties
+
+| Name | Type | Access | Description |
+|---|---|---|---|
+| `neuron_count` | `int` | read-only | Total neurons across every population in the model |
+| `current_tick` | `int` | read-only | Number of ticks advanced so far |
 
 ---
 

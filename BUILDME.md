@@ -56,6 +56,17 @@ The Makefile auto-detects backend by platform: `metal` on macOS (Darwin),
 - `SPIKECOREC_CUDA_ARCH=sm_87 SPIKECOREC_BACKEND=cuda pip install -e .`
   Direct pip build, pin CUDA arch (passed to `nvcc -arch=`).
 
+### Python tests
+
+- `make test-python`
+  Builds the extension (`make python`) then runs the pytest suite under `python/tests/`
+  (`pip install -e .[dev]` first, for `pytest`/`numpy`). Includes `test_glif_network.py`
+  (ticket #133) — an end-to-end run of the NeuroML → GPU codegen path via
+  `spikecorec.NmlNetworkRunner`, never touching `SpikeEngine`.
+
+- `pytest python/tests` (or `python -m pytest python/tests`)
+  Same thing directly, once the extension is already built.
+
 ### Tests
 
 Tests use [GoogleTest](https://github.com/google/googletest), compiled from the
