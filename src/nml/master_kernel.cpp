@@ -4,6 +4,7 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_set>
@@ -1170,6 +1171,11 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
             builder.add_pointer(found->second);
             builder.dispatch(propagate_kernel_handle_, launch_config_for(total_neuron_count_));
         }
+
+        // ── ticket #132: stage 7 STDP plasticity -- runs immediately after propagate above, once
+        // every emit port's dispatch has finished writing this tick's own `last_spiked` entries (see
+        // master_kernel.h's own "ticket #132" doc comment). No-op when plasticity is disabled.
+        apply_stdp_plasticity(buffers, tick);
         return;
     }
 
@@ -1231,6 +1237,62 @@ void AssembledModel::step_tick(const ModelRuntimeBuffers &buffers, f32 dt, s64 t
         builder.add_pointer(buffers.delay_ring->pending_active_generation.get_contents());
         builder.add_pointer(found->second);
         builder.dispatch(propagate_ring_kernel_handle_, launch_config_for(total_neuron_count_));
+    }
+
+    // ── ticket #132: stage 7 STDP plasticity -- same call as the flat branch above (the delay ring
+    // only changes WHEN network_inputs is delivered, not spike-timing/last_spiked, so the exact same
+    // host loop applies unchanged in ring mode -- see master_kernel.h's own "ticket #132" doc comment).
+    apply_stdp_plasticity(buffers, tick);
+}
+
+// ── ticket #132: real STDP support on AssembledModel ─────────────────────────────────────────────
+//
+// (see master_kernel.h's own "ticket #132" doc comment for the full design this implements.)
+
+bool AssembledModel::plasticity_enabled() const { return stdp_learning_rate_ > 0.0f; }
+
+void AssembledModel::enable_plasticity(f32 learning_rate) {
+    if (plasticity_enabled()) return;
+
+    if (!projections_.empty()) {
+        fail("enable_plasticity: this AssembledModel has real per-edge synapse dispatch active "
+             "(ticket #131 projections) -- STDP's rank-1 nudge of the shared U/V basis is not yet "
+             "compensated against a peredge synapse's own Ck reconstruction sharing that basis, so "
+             "combining the two is not supported (see master_kernel.h's own 'ticket #132' doc "
+             "comment)");
+    }
+
+    stdp_learning_rate_ = learning_rate;
+}
+
+void AssembledModel::disable_plasticity() {
+    if (!plasticity_enabled()) return;
+
+    stdp_learning_rate_ = 0.0f;
+}
+
+void AssembledModel::apply_stdp_plasticity(const ModelRuntimeBuffers &buffers, s64 tick) {
+    if (stdp_learning_rate_ == 0.0f) return;
+
+    s64 max_neighbor_count = buffers.weights->max_neighbor_count;
+    if (max_neighbor_count <= 0) return;
+    Vector<s32> neighbor_scratch((usize)max_neighbor_count);
+
+    for (s64 source_node = 0; source_node < total_neuron_count_; ++source_node) {
+        if (buffers.last_spiked[source_node] != tick) continue; // did not fire this tick
+
+        s64 neighbor_count = buffers.weights->get_neighbors(source_node, neighbor_scratch.data());
+        for (s64 slot = 0; slot < neighbor_count; ++slot) {
+            s32 child = neighbor_scratch[(usize)slot];
+            s64 child_last_spiked = buffers.last_spiked[child];
+            if (child_last_spiked == 0 || child_last_spiked == tick) continue;
+
+            s64 signed_tick_delta = tick - child_last_spiked;
+            f32 tick_delta = (f32)(signed_tick_delta < 0 ? -signed_tick_delta : signed_tick_delta);
+            f32 decay_delta = -stdp_learning_rate_ * std::pow(tick_delta, -3.0f);
+            buffers.weights->update((s32)source_node, child, decay_delta, /*learning_rate=*/0.5f,
+                                     /*l2_regularization=*/1.0f, /*iterations=*/1);
+        }
     }
 }
 

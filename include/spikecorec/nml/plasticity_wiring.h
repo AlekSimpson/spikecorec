@@ -3,6 +3,7 @@
 #include <optional>
 
 #include "spikecorec/core/engine.h"
+#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/model_specification.h"
 
 namespace spikecorec::nml {
@@ -114,5 +115,17 @@ f32 map_stdp_spec_to_learning_rate(const StdpSpec &spec);
 // freshly-constructed engine (or one with `disable_plasticity()` already called) if the model's
 // own STDP spec should take effect.
 void apply_stdp_wiring(const ModelSpecification &model, SpikeEngine &engine);
+
+// ── ticket #132: the same wiring, targeting a real NML/GLIF AssembledModel ──────────────────────
+//
+// Identical scan/mapping rule as the SpikeEngine overload above (first STDP-shaped Synapse-category
+// type-library entry found wins; a warning logs on a conflicting second one), driving
+// AssembledModel::enable_plasticity/disable_plasticity instead -- so a real NML model gets active
+// STDP the SAME way regardless of which simulation object runs it. See master_kernel.h's own
+// "ticket #132" doc comment for what `enable_plasticity` itself does (and the one combination it
+// rejects: a model whose `assembled_model` also has real per-edge synapse dispatch active, ticket
+// #131 -- call this only on an AssembledModel built from a model with no projections, or one built
+// with `enable_delay_ring=true`).
+void apply_stdp_wiring(const ModelSpecification &model, AssembledModel &assembled_model);
 
 } // namespace spikecorec::nml
