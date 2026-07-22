@@ -305,13 +305,12 @@ NetworkRunResult run_glif_ei_network(s64 tick_count, f32 dt_seconds) {
     ModelAllocation allocation = allocate_model(model, programs);
     seed_initial_membrane_potentials(allocation, model);
     WeightMatrix weights = build_weight_matrix(model);
-    // See this file's own header comment (#3): AssembledModel's fixed
-    // propagate stage does not yet invoke a real synapse ComponentType's own
-    // per-edge dynamics, so a nonzero (arbitrary, random low-rank
-    // reconstructed) scattered weight would not be meaningful either --
-    // forcing it to exactly zero makes that explicit rather than silently
-    // scattering a number that looks plausible but isn't derived from any
-    // of this model's own expOneSynapse/alphaCurrentSynapse/NMDA parameters.
+    // ticket #131: AssembledModel now dispatches this model's real expOneSynapse/
+    // alphaCurrentSynapse/NMDA per-edge dynamics for a model with real projections (which this one
+    // has), forcing this constant-weight placeholder's own scattered contribution to zero
+    // regardless (see master_kernel.h) -- left set anyway as an explicit, harmless no-op rather
+    // than deleting the call, matching this file's own established "state the placeholder was
+    // here" convention, previously documented at this file's own header comment (#3).
     weights.set_constant_weight(0.0f);
 
     AssembledModel assembled_model(model, programs);
@@ -552,7 +551,22 @@ TEST(ExitModelGlifEiNetwork, front_end_does_not_recognize_inputList_yet_document
 
 // ── GLIF E/I network: driven simulation sanity (enabled) ──────────────────
 
-TEST(ExitModelGlifEiNetwork, driven_simulation_spikes_the_directly_stimulated_neuron_only) {
+TEST(ExitModelGlifEiNetwork, driven_simulation_spikes_via_real_per_edge_synapse_propagation) {
+    // ticket #131: was `driven_simulation_spikes_the_directly_stimulated_neuron_only`, asserting
+    // that NO other neuron ever spiked (run_glif_ei_network's own constant weight was forced to
+    // exactly zero, and nothing dispatched any synapse ComponentType's own dynamics, so nothing
+    // COULD propagate). AssembledModel now dispatches this model's real expOneSynapse/
+    // alphaCurrentSynapse/NMDA per-edge dynamics (run_glif_ei_network's own constant-weight
+    // placeholder is now inert -- see master_kernel.h), so real propagation happens exactly as the
+    // checked-in jLEMS reference (glif_ei_network_spikes.dat) shows: ExcPop[0] -> InhPop[0] via a
+    // real expOneSynapse. ExcPop[0] -> ExcPop[2] (via alphaCurrentSynapse) and the ExcPop[2] ->
+    // InhPop[0] NMDA leg do NOT yet reproduce the reference -- alphaCurrentSynapse's own two-
+    // state-variable coupled TimeDerivative (`I`/`J`) isn't a recognized linear-decay shape
+    // (synapse_lowering.cpp's own documented, separate limitation: "general per-edge forward-Euler
+    // integration for an arbitrary right-hand side is out of Phase-1 scope"), so `I` never
+    // integrates and ExcPop[2] never receives a nonzero current -- a real, pre-existing, orthogonal
+    // gap this ticket does not fix (see DISABLED_glif_ei_network_matches_pyneuroml_reference below,
+    // left disabled for exactly this reason).
     const s64 tick_count = 2500;
     const f32 dt_seconds = 1e-4f;
 
@@ -565,16 +579,22 @@ TEST(ExitModelGlifEiNetwork, driven_simulation_spikes_the_directly_stimulated_ne
     // file's own manually-reconstructed stimulus window -- it should spike.
     EXPECT_GE(result.spike_ticks[0].size(), 1u);
 
-    // See this file's own header comment (#3): with the propagate stage's
-    // scattered weight forced to exactly zero (no real per-edge synapse
-    // dynamics wired in yet), no OTHER neuron receives any input at all, so
-    // none of them should spike -- unlike the real jLEMS reference, which
-    // genuinely propagates through expOneSynapse/alphaCurrentSynapse/NMDA to
-    // ExcPop[2] and InhPop[0] (see glif_ei_network_spikes.dat).
-    for (usize neuron_index = 1; neuron_index < result.spike_ticks.size(); ++neuron_index) {
-        EXPECT_TRUE(result.spike_ticks[neuron_index].empty())
-            << "neuron_index=" << neuron_index << " unexpectedly spiked with zero propagated weight";
-    }
+    // ExcPop[1] and InhPop[1] are genuinely unconnected (no incoming projection at all, matching
+    // the reference raster's own "sel_exc1"/"sel_inh1" never appearing) -- they must stay silent
+    // regardless of synapse dispatch.
+    EXPECT_TRUE(result.spike_ticks[1].empty()) << "ExcPop[1] is unconnected and should never spike";
+    EXPECT_TRUE(result.spike_ticks[4].empty()) << "InhPop[1] is unconnected and should never spike";
+
+    // ExcPop[2]: still silent -- see this test's own header comment above (alphaCurrentSynapse's
+    // coupled-ODE gap, not a "zero propagated weight" placeholder anymore).
+    EXPECT_TRUE(result.spike_ticks[2].empty())
+        << "ExcPop[2] should stay silent until alphaCurrentSynapse's coupled TimeDerivative is lowered";
+
+    // InhPop[0]: the ticket #131 acceptance criterion, exercised directly -- ExcPop[0]'s own spike
+    // reaches InhPop[0] through expOneSynapse's real, gbase/tauDecay/erev-derived per-edge current
+    // (arch §4.3), not a constant-weight placeholder.
+    EXPECT_GE(result.spike_ticks[3].size(), 1u)
+        << "InhPop[0] should spike via expOneSynapse's real per-edge conductance from ExcPop[0]'s spikes";
 }
 
 // ── Reference-data loader (enabled -- loads the checked-in fixture data, does

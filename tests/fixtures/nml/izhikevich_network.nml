@@ -58,14 +58,20 @@
   <izhikevich2007Cell id="izhRsCellInstance" v0="-60mV" C="100pF" k="0.7nS_per_mV"
                       vr="-60mV" vt="-40mV" vpeak="35mV" a="0.03per_ms" b="-2nS" c="-50mV" d="100pA"/>
 
-  <!-- alphaCurrentSynapse's own "weight" Property is left at its defaultValue (1) here - this
-       exact jLEMS build ignores a plain XML attribute override of a Property with a defaultValue
-       (warns "Unused attribute ... weight" at simulation time, silently keeping the default
-       instead), so setting one explicitly here would be misleading; the connectionWD element
-       below carries the ACTUAL per-edge weight spikecorec's own front-end reads
-       (ConnectionEntry::weight, model_specification.cpp's own numeric_attribute_or on the
-       <connectionWD> element itself, a structurally different attribute from this Property). -->
-  <alphaCurrentSynapse id="izhCurrSynapse" tau="2ms" ibase="1nA"/>
+  <!-- alphaCurrentSynapse's own "weight" Property is set here to exactly its own defaultValue (1)
+       - this exact jLEMS build ignores a plain XML attribute override of a Property with a
+       defaultValue (warns "Unused attribute ... weight" at simulation time, silently keeping the
+       default instead), so this is a no-op against the real reference (both still simulate
+       weight=1); it is set explicitly here only because spikecorec's own synapse dispatch (ticket
+       #131) needs "weight" baked into TypeLibraryEntry::baked_constants to compile this synapse's
+       real per-edge `_deliver_<port>`/`_integrate_edges` functions, and model_specification.cpp's
+       own baking does not (yet) fall back to a Property's bare `defaultValue` when the bound
+       instance leaves it unset (a separate, pre-existing front-end gap this ticket does not fix).
+       The connectionWD element below carries the SEPARATE, ACTUAL per-edge weight spikecorec's own
+       front-end reads (ConnectionEntry::weight, model_specification.cpp's own numeric_attribute_or
+       on the <connectionWD> element itself, a structurally different attribute from this
+       Property). -->
+  <alphaCurrentSynapse id="izhCurrSynapse" tau="2ms" ibase="1nA" weight="1"/>
 
   <pulseGenerator id="pulseGen1" delay="10ms" duration="200ms" amplitude="150pA"/>
 

@@ -47,13 +47,41 @@ namespace spikecorec::nml {
 //    kernels, e.g. `k2tree_get_neighbors_batch_kernel`). `source_node`/`target_node`/`edge_slot`
 //    inside the body are `int` locals read from those arrays at the thread's event index --
 //    `edge_slot` is the slot within `source_node`'s own k^2-tree row (WeightMatrix's own Sk
-//    indexing convention, weight_matrix.h), which the engine's not-yet-built spike-scatter
-//    machinery would supply per delivered edge; this ticket does not build that machinery, only
-//    documents the parameter shape it must eventually feed.
+//    indexing convention, weight_matrix.h). The engine's spike-scatter batch-construction subsystem
+//    that builds these three arrays per tick (filtering a Synapse-category type's whole, static edge
+//    list down to the edges whose source fired this tick) is now built -- ticket #131,
+//    `master_kernel.cpp`'s `AssembledModel::dispatch_synapse_delivery_events` -- reusing this same
+//    calling convention unchanged.
 //
 // If a program's `.tick` has nothing in the 7 per-neuron stages, function (1) is omitted; if
 // `.tick.deliver` is empty, no function (2) is generated. A program can have zero, one, or several
 // deliver functions (one per onevent block).
+//
+// ── ticket #131: a Synapse-category program's OWN `.tick` lowering, `lower_synapse_ir_program_to_
+// gpu_source` ────────────────────────────────────────────────────────────────────────────────────
+//
+// `lower_ir_program_to_gpu_source` above is generic over any IrProgram, but for a Synapse-category
+// program specifically (arch §3.3 D3), function (1)'s per-neuron k^2-tree walk cannot give a
+// postsynaptic neuron's TRUE incoming edges without a real k^2-tree transpose (this header's own
+// `loadedge`/`accedge` doc comment below documents that gap in full) -- so `lower_synapse_ir_
+// program_to_gpu_source` sidesteps it entirely rather than solving it: a synapse's `.tick.integrate`
+// is, in every real fixture (synapse_lowering.cpp), exactly one top-level `forall neuron_in { ... }`
+// wrapping per-edge `loadedge`/`accedge` ops; this lowering strips that wrapper and lowers the body
+// with the EXACT SAME one-thread-per-edge calling convention (2) already uses, naming the result
+// `<component_type_name>_integrate_edges`. Dispatched over a synapse's WHOLE, static edge list every
+// tick (unfiltered -- decay must run whether or not anything was newly delivered), instead of a
+// per-neuron walk, this never needs a transposed tree: the edge list a projection's own
+// `ConnectionEntry`s already give (`ModelSpecification`) is reused directly, in the SAME (source,
+// slot) addressing `WeightMatrix`'s Sk already uses, keeping this fully composed with the existing
+// shared-basis `WeightMatrix` (arch §4.3) rather than bypassing it. See master_kernel.h's own header
+// comment for the full per-tick integration (where `_integrate_edges`/`_deliver_<port>` land in the
+// tick, and how a `require <name> from postsynaptic` binding resolves to the correct postsynaptic
+// neuron's own state despite being dispatched model-wide). Because this runs one GPU thread PER
+// EDGE (rather than one per neuron with an internal gather loop), `add network_inputs,
+// network_inputs, <value>` -- the sole shape synapse_lowering.cpp ever emits for it -- is lowered to
+// an ATOMIC add whenever it appears outside a per-neuron function (gpu_source.cpp's `emit_binary`),
+// since multiple edges may converge on the same postsynaptic neuron in the same dispatch; a
+// per-neuron function keeps the plain (single-threaded-per-neuron) form unchanged.
 //
 // ── Operand resolution (ir_spec.md §3.1) ────────────────────────────────────────────────────
 //
@@ -224,6 +252,23 @@ struct GpuSource {
 // parameter names/types/order -- `.alloc` itself is engine-interpreted at init (ticket #5), not
 // compiled.
 GpuSource lower_ir_program_to_gpu_source(const IrProgram &program);
+
+// Lowers a Synapse-category program's `.tick` to standalone, compilable MSL/CUDA source using the
+// edge-parallel dispatch model this header's own "ticket #131" doc comment above describes: one
+// function per `onevent <port> { ... }` block in `.tick.deliver` (identical to what
+// lower_ir_program_to_gpu_source's own function (2) generates, in the same order), followed by one
+// `<component_type_name>_integrate_edges` function lowering `.tick.integrate`'s single top-level
+// `forall neuron_in { ... }` body (synapse_lowering.cpp's own, sole shape) with that SAME
+// one-thread-per-edge calling convention instead of a per-neuron k^2-tree walk. `GpuSource::
+// functions` is therefore, in order: every deliver function, then `_integrate_edges` last (always
+// present -- a Synapse-category program always has non-empty `.tick.integrate`).
+//
+// Throws std::runtime_error if `.tick.detect`/`.tick.emit`/`.tick.reset`/`.tick.propagate`/
+// `.tick.plasticity`/`.tick.record` is non-empty (synapse_lowering.cpp never populates them -- a
+// Cell-category or otherwise-unexpected program was passed here; use
+// lower_ir_program_to_gpu_source for those instead), or if `.tick.integrate` is not exactly one
+// top-level `ForAllInstruction` over `NeuronIn`/`NeuronOut` (synapse_lowering.cpp's own, sole shape).
+GpuSource lower_synapse_ir_program_to_gpu_source(const IrProgram &program);
 
 // The shared k^2-tree bit-walk preamble (`k2t_find_nth_neighbor` + its rank/bit helpers) this
 // lowering emits into a generated source whenever a program's `forall`/whole-set edge op needs it

@@ -35,18 +35,20 @@ namespace spikecorec::nml {
 //
 // ── Scope of this ticket (explicitly NOT solved here) ───────────────────────────────────────────
 // - Full synaptic-network wiring (routing a spike through a projection's SYNAPSE ComponentType --
-//   its own onevent/deliver handler, ticket #55's `<Type>_deliver_<port>` functions) is NOT wired
-//   up: this needs a "spike-scatter batch construction" subsystem (building the per-tick
-//   source/target/edge-slot arrays a deliver function's calling convention expects) that
-//   gpu_source.h's own header comment already flags as not yet built by ANY prior ticket. This
-//   ticket's fixed propagate stage instead reproduces exactly what the CURRENT hardcoded engine's
-//   own connectivity already does: a spiking neuron's own k^2-tree row, reconstructed via
-//   WeightMatrix's shared U/V basis (or a constant weight) -- the same mechanism arch §5 says Phase
-//   1 "reuses... directly." A model with real per-edge synapse ComponentTypes still gets ITS
-//   `_tick`/`_deliver_<port>` functions correctly compiled by assemble_master_kernel_source (they
-//   are, after all, just more IrPrograms), but this ticket's AssembledModel::step_tick only
-//   dispatches Cell-category population kernels + the two fixed stages -- a synapse type's own
-//   generated functions are compiled-and-ready, not yet invoked.
+//   its own onevent/deliver handler, ticket #55's `<Type>_deliver_<port>` functions) was NOT wired
+//   up by THIS ticket (#6): it needed a "spike-scatter batch construction" subsystem (building the
+//   per-tick source/target/edge-slot arrays a deliver function's calling convention expects) that
+//   gpu_source.h's own header comment used to flag as not yet built by ANY prior ticket. **That
+//   subsystem is now built -- ticket #131, see this header's own "spike-scatter batch-construction
+//   subsystem" section below** (`AssembledModel::dispatch_synapse_delivery_events`/
+//   `dispatch_synapse_integrate_edges`, `ModelSpecification::projections` driven). This ticket's own
+//   fixed propagate stage is UNCHANGED by #131 for a model with no projections (it still reproduces
+//   exactly what the CURRENT hardcoded engine's own connectivity does: a spiking neuron's own
+//   k^2-tree row, reconstructed via WeightMatrix's shared U/V basis or a constant weight); for a
+//   model WITH projections, #131 suppresses this stage's own weight contribution (constant_weight
+//   forced to 0 for that dispatch only, `buffers.weights` itself untouched) since real per-edge
+//   synapse dispatch now supplies it instead, while this stage still performs `last_spiked`/
+//   active-set-enqueue bookkeeping for every spike exactly as before.
 // - Per-type parameter resolution (ModelRuntimeBuffers -> a population kernel's actual dispatch
 //   arguments) supports the parameter KINDS Phase-1's own GLIF-family cell lowering (cell_lowering.cpp)
 //   emits: `dt`/`network_inputs` (reserved), `state`/`accum`/`regime`/`param:dyn`/`expose`-scratch
@@ -74,6 +76,99 @@ namespace spikecorec::nml {
 //   declared) is still assembled into its `_tick` function by ticket #55 unchanged.
 // - Recording (stage 8, ticket #59 [E2]) is likewise not wired to SimulationRecorder here; a
 //   per-type program's own `.tick.record` (if declared) is still compiled into its `_tick` function.
+
+// ── ticket #131 [spike-scatter batch-construction subsystem]: real per-edge synapse dispatch ──────
+//
+// Closes the gap ticket #6's own scope note above used to describe: AssembledModel::step_tick now
+// dispatches a projection's own SYNAPSE ComponentType -- not just its Cell-category populations --
+// whenever `model.projections` is non-empty, composing with the existing shared-basis WeightMatrix
+// (arch §4.3) rather than bypassing it (a peredge variable's `Ck`/`Sk` are real `WeightMatrix`
+// storage, registered via `WeightMatrix::add_coefficient_vector` the first time a projection using
+// that variable is dispatched). `ModelRuntimeBuffers`/the constructor's own parameter list are
+// UNCHANGED -- everything this needs (`model.projections`, each projection's own
+// `ConnectionEntry`s, the synapse type's own IrProgram) was already available; a model with no
+// projections sees byte-for-byte the same behavior as before this ticket.
+//
+// ── Why edge-parallel, not a per-neuron `forall neuron_in` walk ──
+// gpu_source.h's own `loadedge`/`accedge` doc comment documents a real, pre-existing gap: `forall
+// neuron_in`/`neuron_out` both lower identically (walk the CURRENT neuron's own k^2-tree row --
+// there is no transposed adjacency anywhere in this codebase), so a per-neuron dispatch of a
+// synapse's OWN generated `_tick` function cannot give a postsynaptic neuron its TRUE incoming
+// edges without either a real k^2-tree transpose or a second, per-synapse-type tree -- both
+// substantial, undecided infrastructure this ticket does not build. Instead,
+// `lower_synapse_ir_program_to_gpu_source` (gpu_source.h/.cpp) lowers a synapse's `.tick.integrate`
+// (synapse_lowering.cpp's own sole shape: exactly one top-level `forall neuron_in { ... }`) with
+// the SAME one-thread-per-edge calling convention its `.tick.deliver` onevent functions already use
+// (`source_node_indices`/`target_node_indices`/`edge_slot_indices`/`event_count`) -- summing over a
+// postsynaptic neuron's incoming edges by running one thread PER EDGE and atomically adding each
+// edge's own finished current into `network_inputs[target_node]`, instead of one thread per neuron
+// looping its own (wrong-direction) row. This needs no transpose at all: the edge list a
+// projection's own `connections` already give (ModelSpecification, arch §1.4) is reused directly,
+// addressed exactly the way WeightMatrix's Sk already is (row = the edge's PRESYNAPTIC node, slot =
+// that node's own forward k^2-tree row position -- weight_matrix.h's own convention, unchanged).
+//
+// ── The two new per-tick dispatches, and why this ordering ──
+// Both run at the SAME point in the tick the fixed scalar propagate stage already does (after this
+// tick's Cell-category population dispatches + the network_inputs drain), NOT before the cell
+// dispatches -- so that network_inputs already reflects this tick's fresh synaptic contribution by
+// the time `step_tick` RETURNS, exactly matching the existing scalar-weight path's own OBSERVABLE
+// timing (arch §0.2/ir_spec.md §3.5: a write becomes visible right after the tick it is computed
+// in, drained+read at the NEXT tick's cell dispatch) -- every existing test/caller checks
+// `network_inputs` right after a `step_tick` call returns, so a write that only becomes visible
+// transiently DURING a later `step_tick` call (invisible from outside it) would never be observable
+// at all. Within this point in the tick, in order:
+// - `dispatch_synapse_delivery_events` (`<Type>_deliver_<port>`) filters each projection's static
+//   edge list down to the edges whose presynaptic neuron fired THIS tick (host-side, reading --
+//   but, per its own established contract, NOT clearing -- `ModelRuntimeBuffers::emit_port_flags`,
+//   unioned across every tracked port the same way the fixed propagate stage's own per-port
+//   dispatch loop already treats "any tracked port" as "this neuron fired," see below) and
+//   dispatches each delivered edge's synapse type's own onevent handler(s) against that filtered
+//   batch -- bumping Sk for this tick's fresh spikes.
+// - `dispatch_synapse_integrate_edges` (`<Type>_integrate_edges`, one dispatch per PROJECTION,
+//   reusing a KernelHandle compiled once per distinct synapse type) runs immediately after, over a
+//   projection's WHOLE, static edge list every tick (unfiltered -- decay must run whether or not
+//   anything was newly delivered), reading Sk (now including THIS tick's fresh bump above),
+//   decaying, and adding each edge's finished current into `network_inputs[target_node]` (already
+//   drained earlier this same tick) -- giving exactly the same one-tick latency the constant-weight
+//   path already has (a spike delivered/bumped at tick T is first visible, decayed, at tick T+1's
+//   cell dispatch), just computed within tick T's OWN `step_tick` call instead of straddling two.
+// - Both must run BEFORE the fixed scalar propagate dispatch immediately after them (which still
+//   runs, still reads+clears the SAME `emit_port_flags` for its own last_spiked/active-set
+//   bookkeeping, but has its own weight contribution to network_inputs forced to zero for a model
+//   with projections -- see above) -- delivery specifically needs the flags UNCLEARED when IT reads
+//   them.
+//
+// ── The one new host-side buffer this needs, and why a single dispatch call cannot merge across
+//    projections targeting different populations ──
+// A synapse's `require <name> from postsynaptic` binding (gpu_source.cpp's `resolve_operand`, this
+// ticket's own small extension: `name[target_node]` inside a Deliver-kind/edge-parallel function --
+// unambiguous there, unlike the per-neuron-array categories, since target_node IS the postsynaptic
+// neuron) needs a real pointer into the postsynaptic CELL's own packed, per-population `cell_state`
+// chunk (allocator.h §4.1's SoA layout) -- but `target_node` is a GLOBAL neuron index (it doubles as
+// the shared-basis `V[target_node]` lookup, which spans the whole model). Rather than adding a new,
+// globally-indexed scratch buffer refreshed every tick (an extra per-tick copy this ticket avoids),
+// the pointer FED for that parameter is offset by `chunk_base_offset - neuron_index_begin` (the same
+// pointer-arithmetic trick `append_cell_tick_argument` already uses in the other direction for
+// `network_inputs`/`emit_<port>`), so indexing it with the GLOBAL `target_node` lands on the right
+// LOCAL slot -- valid only when every event in one dispatch call shares the same postsynaptic
+// population, which is exactly what dispatching per-PROJECTION (rather than merging every
+// projection sharing a synapse type into one call) guarantees for free (`ProjectionEntry` already
+// pins one synapse type to one postsynaptic population). `network_inputs`/`emit_<port>` themselves
+// need no such offset -- they are already whole-model arrays matching `target_node`'s own global
+// indexing directly.
+//
+// ── Not solved here (documented, not silently dropped) ──
+// - `require`-category resolution supports only a name matching a StateDirective on the
+//   postsynaptic cell type (every real Phase-1 GLIF cell's `v`) -- a derived-only (Expose-without-
+//   State) postsynaptic quantity throws a clear std::runtime_error, matching
+//   append_cell_tick_argument's own established scope-boundary style.
+// - `enable_delay_ring=true` silently disables this ticket's own synapse dispatch entirely (its
+//   `model.projections` are not even read) -- ticket #64's delay ring and this ticket's synapse
+//   dispatch have not been integrated with each other, and every existing delay-ring test/example
+//   already builds its model with real projections that had zero effect before this ticket, so a
+//   hard throw on the combination would regress all of them for no correctness reason; a model
+//   built with `enable_delay_ring=true` keeps EXACTLY its pre-#131 behavior (the fixed scalar
+//   propagate-ring path), regardless of what its `model.projections` describe.
 
 // ── assembly ─────────────────────────────────────────────────────────────────────────────────
 
@@ -269,6 +364,67 @@ private:
 
     KernelHandle propagate_ring_kernel_handle_{};
     Vector<String> propagate_ring_parameter_names_;
+
+    // ── ticket #131: spike-scatter batch-construction subsystem -- see this header's own "spike-
+    // scatter batch-construction subsystem" doc comment above for the full design. ──────────────────
+    Vector<ProjectionEntry> projections_; // cached copy of model.projections at construction time
+
+    // One compiled onevent/deliver function (`<Type>_deliver_<port>`, ticket #131).
+    struct DeliverFunctionRuntimeInfo {
+        KernelHandle handle{};
+        Vector<String> parameter_names_in_order;
+    };
+
+    // One entry per DISTINCT synapse_type_library_index actually used by some projection -- compiled
+    // once (constructor) and reused by every projection sharing that synapse type; the WeightMatrix
+    // matrix_index registered for each of that type's OWN peredge variables is likewise shared
+    // (WeightMatrix's Sk is addressed by (presynaptic node, that node's own forward-row slot),
+    // model-wide, independent of which projection an edge belongs to -- see this header's own doc
+    // comment above).
+    struct SynapseTypeRuntimeInfo {
+        KernelHandle integrate_edges_handle{};
+        Vector<String> integrate_edges_parameter_names_in_order;
+        Vector<DeliverFunctionRuntimeInfo> deliver_functions; // in lower_synapse_ir_program_to_gpu_source's own order
+
+        bool matrix_indices_registered = false;
+        UnorderedMap<String, s64> matrix_index_by_peredge_name; // populated lazily, see ensure_synapse_dispatch_topology_built
+    };
+    UnorderedMap<s32, SynapseTypeRuntimeInfo> synapse_types_by_type_library_index_;
+
+    // One entry per ProjectionEntry (parallel to projections_), built LAZILY on the first step_tick
+    // call that has any projections (needs ModelRuntimeBuffers::weights's own real k^2-tree/
+    // max_neighbor_count, only available at step_tick time -- ModelSpecification::adjacency is often
+    // unset for a hand-built ModelSpecification fixture, see this header's own doc comment above).
+    struct ProjectionEdgeTopology {
+        s64 edge_count = 0;
+        GpuPointer<s32> source_nodes;  // [edge_count] -- global presynaptic neuron index (Sk row)
+        GpuPointer<s32> target_nodes;  // [edge_count] -- global postsynaptic neuron index
+        GpuPointer<s32> forward_slots; // [edge_count] -- source's own forward k^2-tree row slot (Sk column)
+
+        // Reused every tick, refilled (memcpy) with THIS tick's fired-source subset of the three
+        // arrays above -- see dispatch_synapse_delivery_events.
+        GpuPointer<s32> delivery_scratch_source_nodes;
+        GpuPointer<s32> delivery_scratch_target_nodes;
+        GpuPointer<s32> delivery_scratch_edge_slots;
+    };
+    Vector<ProjectionEdgeTopology> projection_edge_topology_; // parallel to projections_
+    bool synapse_dispatch_topology_built_ = false;
+
+    // Builds projection_edge_topology_ (from buffers.weights's real k^2-tree) and registers every
+    // used synapse type's peredge variables as real WeightMatrix matrix_index(es) -- exactly once,
+    // idempotent thereafter. Throws if a projection's ConnectionEntry is not a real edge in
+    // buffers.weights's k^2-tree (a mismatched ModelRuntimeBuffers::weights/model.projections pairing).
+    void ensure_synapse_dispatch_topology_built(const ModelRuntimeBuffers &buffers);
+
+    // Dispatches every projection's `<Type>_integrate_edges` function over its WHOLE, static edge
+    // list (unfiltered), reading+decaying Sk and adding each edge's finished current into
+    // `buffers.network_inputs[target_node]`.
+    void dispatch_synapse_integrate_edges(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick);
+
+    // Filters every projection's static edge list down to this tick's fired sources (reads, but
+    // does not clear, buffers.emit_port_flags) and dispatches that projection's synapse type's own
+    // `<Type>_deliver_<port>` function(s) against the filtered batch.
+    void dispatch_synapse_delivery_events(const ModelRuntimeBuffers &buffers, f32 dt, s64 tick);
 };
 
 } // namespace spikecorec::nml

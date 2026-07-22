@@ -1324,3 +1324,192 @@ TEST(MasterKernelDelayRing, step_tick_throws_on_a_delay_ring_enablement_mismatch
     buffers.delay_ring = nullptr;
     EXPECT_THROW(assembled_model_ring.step_tick(buffers, 1.0f, 0, 1), std::runtime_error);
 }
+
+// ── ticket #131: spike-scatter batch-construction subsystem -- real per-edge synapse dynamics ────
+//
+// The ticket's own acceptance criterion: a live AssembledModel network delivers a spike whose
+// downstream effect is measurably derived from the target synapse's own ComponentType parameters --
+// two otherwise-identical networks differing only in a synapse's `gbase` must produce measurably
+// different postsynaptic trajectories. A hand-built IrProgram fixture (this file's own established
+// pattern, see this file's header comment) standing in for a real, resolved conductance-based
+// synapse (exactly synapse_lowering.cpp's own generated shape for something like expOneSynapse:
+// `require v from postsynaptic`, one `peredge g`, an `onevent` bumping `g` by `gbase`, and
+// `.tick.integrate`'s single top-level `forall neuron_in` decaying `g` and adding `g*(erev-v)` into
+// `network_inputs`) -- proving the subsystem end-to-end without depending on the real NML/LEMS
+// front-end this file's own sibling tests (synapse_lowering_tests.cpp) already cover in isolation.
+
+namespace {
+
+// Mirrors synapse_lowering.cpp's own generated shape for a conductance-based synapse (arch §4.3;
+// ir_spec.md §4's expOne example) -- `g` bumped by `gbase` on delivery, decaying with time constant
+// `tauDecay`, contributing `g*(erev-v)` into `network_inputs` every tick via `_integrate_edges`
+// (lower_synapse_ir_program_to_gpu_source, ticket #131).
+IrProgram build_conductance_synapse_program(const String &type_name, f32 gbase, f32 erev, f32 tau_decay) {
+    IrProgram program;
+    program.component_type_name = type_name;
+    program.alloc = {
+        RequireDirective{"v", "postsynaptic"},
+        PeredgeDirective{"g"},
+        ParamConstantDirective{"gbase", precise_float_literal(gbase)},
+        ParamConstantDirective{"erev", precise_float_literal(erev)},
+        ParamConstantDirective{"tauDecay", precise_float_literal(tau_decay)},
+    };
+    program.tick.deliver = {
+        OnEventInstruction{"in", {AccumulateEdgeInstruction{"g", EdgeSetReference::CurrentEdge, "gbase"}}},
+    };
+    program.tick.integrate = {
+        ForAllInstruction{
+            EdgeSetReference::NeuronIn,
+            {
+                LoadEdgeInstruction{"edge_g_old", "g", EdgeSetReference::CurrentEdge},
+                BinaryInstruction{BinaryOpcode::ExpDecay, "edge_g", "edge_g_old", "tauDecay"},
+                BinaryInstruction{BinaryOpcode::Sub, "edge_g_delta", "edge_g", "edge_g_old"},
+                AccumulateEdgeInstruction{"g", EdgeSetReference::CurrentEdge, "edge_g_delta"},
+                BinaryInstruction{BinaryOpcode::Sub, "i", "erev", "v"},
+                BinaryInstruction{BinaryOpcode::Mul, "i", "edge_g", "i"},
+                BinaryInstruction{BinaryOpcode::Add, "network_inputs", "network_inputs", "i"},
+            },
+        },
+    };
+    return program;
+}
+
+TypeLibraryEntry build_conductance_synapse_type_entry(const String &type_name, const String &bound_instance_id,
+                                                       f32 gbase, f32 erev, f32 tau_decay) {
+    TypeLibraryEntry entry;
+    entry.component_type_name = type_name;
+    entry.bound_instance_id = bound_instance_id;
+    entry.category = TypeLibraryCategory::Synapse;
+    entry.is_conductance_based = true;
+    entry.state_variable_count = 1;
+    entry.baked_constants = {{"gbase", (f64)gbase}, {"erev", (f64)erev}, {"tauDecay", (f64)tau_decay}};
+    return entry;
+}
+
+// One presynaptic cell ("Pop"'s neuron 0) driving one postsynaptic cell (neuron 1) through one
+// conductance-based synapse edge, for `tick_count` ticks. Neuron 0 is driven over threshold by a
+// single large external pulse on tick 1 (mirroring this file's own `reproduces_hardcoded_lif_
+// membrane_trajectory_and_spike_timing` "priming tick" convention); everything else (cell
+// parameters, adjacency, dt, the pulse) is IDENTICAL across calls -- only `gbase` varies. Returns
+// neuron 1's own membrane-potential trajectory, one sample per tick.
+spikecorec::Vector<f32> run_two_neuron_conductance_synapse_network_and_capture_postsynaptic_trajectory(f32 gbase) {
+    const f32 resting_mp = 0.0f;
+    const f32 decay_rate = 0.1f;
+    const f32 spike_threshold = 1.0f;
+    const f32 erev = 2.0f;
+    const f32 tau_decay = 2.0f;
+    const f32 dt = 1.0f;
+    const s64 tick_count = 20;
+
+    ModelSpecification model;
+    model.total_neuron_count = 2;
+    model.type_library.push_back(
+        build_lif_equivalent_type_entry("PostCell", "postInstance", 1.0f, decay_rate, resting_mp, spike_threshold));
+    model.type_library.push_back(
+        build_conductance_synapse_type_entry("CondSynapse", "synInstance", gbase, erev, tau_decay));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = 2;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = 2;
+    model.populations.push_back(population);
+
+    ProjectionEntry projection;
+    projection.id = "Proj";
+    projection.presynaptic_population_index = 0;
+    projection.postsynaptic_population_index = 0;
+    projection.synapse_type_library_index = 1;
+    projection.connections.push_back(ConnectionEntry{/*source=*/0, /*target=*/1, /*weight=*/1.0, /*delay=*/0.0});
+    model.projections.push_back(projection);
+
+    spikecorec::Vector<IrProgram> programs = {
+        build_lif_equivalent_program("PostCell", decay_rate, resting_mp, spike_threshold),
+        build_conductance_synapse_program("CondSynapse", gbase, erev, tau_decay),
+    };
+
+    ModelAllocation allocation = allocate_model(model, programs);
+    std::fill(allocation.cell_state.get_contents(), allocation.cell_state.get_contents() + 2, resting_mp);
+
+    vector<vector<s32>> adjacency = {{1}, {}};
+    WeightMatrix weights(adjacency, /*rank=*/1);
+
+    AssembledModel assembled_model(model, programs);
+
+    GpuPointer<f32> network_inputs = allocate<f32>(2 * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, 2 * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>(2 * sizeof(s64));
+    memset(last_spiked.get_contents(), 0, 2 * sizeof(s64));
+    GpuPointer<s32> next_active_indices = allocate<s32>(2 * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>(2 * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + 2, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>(2 * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, 2 * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    spikecorec::Vector<f32> postsynaptic_trajectory;
+    postsynaptic_trajectory.reserve((usize)tick_count);
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        if (tick == 1) allocation.cell_state.get_contents()[0] += 5.0f; // drives neuron 0 over threshold
+        assembled_model.step_tick(buffers, dt, tick, tick + 1);
+        postsynaptic_trajectory.push_back(allocation.cell_state.get_contents()[1]);
+    }
+
+    deallocate(std::move(network_inputs));
+    deallocate(std::move(last_spiked));
+    deallocate(std::move(next_active_indices));
+    deallocate(std::move(next_active_count));
+    deallocate(std::move(active_generation));
+    deallocate(std::move(emit_spike));
+
+    return postsynaptic_trajectory;
+}
+
+} // namespace
+
+TEST(MasterKernelSynapseDispatch,
+     two_networks_differing_only_in_synapse_gbase_produce_measurably_different_postsynaptic_trajectories) {
+    spikecorec::Vector<f32> weak_synapse_trajectory =
+        run_two_neuron_conductance_synapse_network_and_capture_postsynaptic_trajectory(/*gbase=*/0.5f);
+    spikecorec::Vector<f32> strong_synapse_trajectory =
+        run_two_neuron_conductance_synapse_network_and_capture_postsynaptic_trajectory(/*gbase=*/2.0f);
+    ASSERT_EQ(weak_synapse_trajectory.size(), strong_synapse_trajectory.size());
+
+    // The postsynaptic neuron must have actually moved away from rest under the strong-gbase
+    // network -- proving the synapse's own current genuinely reached it (not merely "technically
+    // different by float noise").
+    bool postsynaptic_neuron_moved_under_strong_gbase = false;
+    for (f32 voltage : strong_synapse_trajectory) {
+        if (std::fabs(voltage - 0.0f) > 1e-3f) {
+            postsynaptic_neuron_moved_under_strong_gbase = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(postsynaptic_neuron_moved_under_strong_gbase)
+        << "postsynaptic neuron never moved away from rest -- the synapse's own current never reached it";
+
+    // The two otherwise-identical networks (same cells, same adjacency, same dt, same external
+    // pulse) must diverge measurably once gbase differs.
+    bool trajectories_differ_measurably = false;
+    for (usize tick = 0; tick < weak_synapse_trajectory.size(); ++tick) {
+        if (std::fabs(weak_synapse_trajectory[tick] - strong_synapse_trajectory[tick]) > 1e-4f) {
+            trajectories_differ_measurably = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(trajectories_differ_measurably)
+        << "postsynaptic trajectory is identical regardless of gbase -- not actually derived from the "
+           "synapse's own parameters";
+}
