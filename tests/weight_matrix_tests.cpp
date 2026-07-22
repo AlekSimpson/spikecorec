@@ -6,6 +6,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
@@ -16,6 +18,20 @@
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/topologies.h"
+
+// ── ticket #127 [T6]'s own long-duration soak test needs the real NML front-end + master-kernel
+// infra (a real GLIF3 network) on top of everything else in this file -- pulled in separately here
+// rather than mixed into the includes above, since nothing else in this file needs them.
+#include "spikecorec/nml/allocator.h"
+#include "spikecorec/nml/cell_lowering.h"
+#include "spikecorec/nml/master_kernel.h"
+#include "spikecorec/nml/model_specification.h"
+#include "spikecorec/nml/nml.h"
+#include "spikecorec/nml/resolve.h"
+#include "spikecorec/nml/stimulus_schedule.h"
+#include "spikecorec/nml/synapse_lowering.h"
+
+#include "nml_network_generator.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -1459,4 +1475,341 @@ TEST(WeightMatrix, refit_occupancy_threshold_triggers_early_when_enabled) {
     }
 
     EXPECT_TRUE(weight_matrix.is_refit_due()); // occupancy trigger fired, even with 0 ticks elapsed
+}
+
+// ── ticket #127 [T6]: long-duration WeightMatrix refit/Ck[DEFAULT_MATRIX_INDEX] soak test on a real
+// GLIF network ─────────────────────────────────────────────────────────────────────────────────────
+//
+// Commit 8eacd1d (ticket #103) fixed WeightMatrix::refit() silently re-fitting
+// Ck[DEFAULT_MATRIX_INDEX] along with every other registered matrix's Ck, desyncing it from the live
+// GPU propagate kernel (master_kernel.cpp), which reconstructs a default-matrix edge weight via a raw
+// dot(U,V) and never reads any coefficient vector at all -- it hardcodes the "DEFAULT_MATRIX_INDEX is
+// all-ones" invariant unconditionally. That bug only manifested after refit() had run some number of
+// cycles -- master_kernel_tests.cpp's own
+// refit_default_matrix_reconstruction_stays_synced_with_a_real_propagate_kernel_dispatch regression
+// test (added alongside the fix) only exercises a SINGLE refit() call, which would not by itself have
+// caught a regression that only showed up after many periodic-refit cycles. This test closes that
+// gap: a real GLIF3 network, run long enough to trigger 10+ distinct refit() cycles back to back,
+// re-running the exact same two checks (Ck[DEFAULT_MATRIX_INDEX] pinned all-ones + a real GPU
+// propagate-kernel dispatch matching WeightMatrix::get()'s reconstruction) after EVERY cycle, not
+// just once.
+//
+// ── Why a real GLIF network, and why manual accumulate_edge_delta on top of it ──
+// A live AssembledModel tick loop never itself writes to DEFAULT_MATRIX_INDEX's own Sk (STDP's own
+// WeightMatrix::update() nudges U/V directly, not any Ck/Sk; real per-edge synapse dynamics register
+// and mutate a SEPARATE matrix, never DEFAULT_MATRIX_INDEX -- see master_kernel.h's own header
+// comment on ticket #131). So this test drives realistic, continuously-varying per-edge drift onto
+// DEFAULT_MATRIX_INDEX (and a second registered matrix -- ticket #103's own reproduction required
+// refit()'s full multi-matrix Ck sweep to actually run, not a single-matrix shortcut) via deterministic
+// accumulate_edge_delta bumps every tick, while a REAL, compiled GLIF3 population (driven by a real
+// continuous current injection, so it genuinely spikes and scatters through this SAME WeightMatrix's
+// own propagate path too) runs its own step_tick loop concurrently against the exact same WeightMatrix
+// instance -- proving periodic refit and a live GLIF simulation can safely share one WeightMatrix
+// without desyncing.
+//
+// ── The consistency check itself ──
+// Immediately after every refit() call, every matrix's Sk is guaranteed cleared (refit()'s own
+// documented contract), so WeightMatrix::get()'s reconstruction reduces to the pure
+// Σ U[i,r]·Ck[r]·V[j,r] the live propagate kernel also computes -- the exact moment a
+// Ck[DEFAULT_MATRIX_INDEX] desync becomes observable. A tiny "AlwaysSpikeCell" probe AssembledModel
+// (mirroring master_kernel_tests.cpp's own regression test exactly) sharing the SAME WeightMatrix
+// instance is dispatched at each checkpoint -- every neuron spikes unconditionally, so one dispatch
+// exercises the propagate kernel's real dot(U,V) scatter across every real edge in the network at
+// once -- and its network_inputs output is compared against WeightMatrix::get()'s own reconstruction
+// for every real edge.
+
+namespace {
+using namespace spikecorec::nml;
+using namespace spikecorec::nml::network_generation;
+
+String refit_soak_write_temp_file(const String &filename, const String &contents) {
+    String path = (std::filesystem::temp_directory_path() / filename).string();
+    std::ofstream out(path);
+    out << contents;
+    out.close();
+    return path;
+}
+
+// Parses/resolves/lowers a generated GLIF network the same way every other *_tests.cpp fixture in
+// this tree does (NML_Parser only XSD-validates the TOP-LEVEL file it is given, so a generated
+// content-file needs a thin "<include>-only top.nml" wrapper -- see nml_network_generator.h's own
+// header comment).
+ModelSpecification refit_soak_load_glif_network(const String &fixture_id, const String &content_xml) {
+    String content_filename = "spikecorec_refit_soak_" + fixture_id + "_content.nml";
+    refit_soak_write_temp_file(content_filename, content_xml);
+
+    String top_path = refit_soak_write_temp_file("spikecorec_refit_soak_" + fixture_id + "_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"RefitSoak" + fixture_id + "Top\">"
+        "  <include href=\"" + content_filename + "\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+    return build_model_specification(resolved);
+}
+
+// Parallel to model.type_library -- same convention every other *_tests.cpp fixture in this tree uses.
+spikecorec::Vector<IrProgram> refit_soak_build_type_library_ir_programs(const ModelSpecification &model) {
+    spikecorec::Vector<IrProgram> programs;
+    programs.reserve(model.type_library.size());
+    for (const auto &entry : model.type_library) {
+        if (entry.category == TypeLibraryCategory::Cell) {
+            programs.push_back(lower_cell_to_ir(entry));
+        } else if (entry.category == TypeLibraryCategory::Synapse) {
+            programs.push_back(lower_synapse_to_ir(entry));
+        } else {
+            IrProgram placeholder;
+            placeholder.component_type_name = entry.component_type_name;
+            programs.push_back(std::move(placeholder));
+        }
+    }
+    return programs;
+}
+
+// The exact-edge-set adjacency AssembledModel's propagate stage needs (arch §0.3), built from every
+// projection's real connections -- same convention as end_to_end_network_tests.cpp's own
+// build_weight_matrix, kept as a plain adjacency (rather than a WeightMatrix-returning helper) so this
+// test can construct its WeightMatrix with its own, deliberately non-trivial rank.
+vector<vector<s32>> refit_soak_adjacency_from_model(const ModelSpecification &model) {
+    vector<vector<s32>> adjacency((usize)model.total_neuron_count);
+    for (const auto &projection : model.projections) {
+        for (const auto &connection : projection.connections) {
+            adjacency[(usize)connection.source_neuron_index].push_back(connection.target_neuron_index);
+        }
+    }
+    return adjacency;
+}
+
+// allocate_model zero-initializes cell_state without applying a cell type's own OnStart (matching
+// end_to_end_network_tests.cpp's own established convention) -- seeds `v` to EL for the single GLIF3
+// population here, so the soak's real network starts from a physically sensible resting potential
+// rather than 0.
+void refit_soak_seed_glif3_initial_v(ModelAllocation &allocation, const ModelSpecification &model) {
+    const PopulationEntry &population = model.populations[0];
+    const TypeLibraryEntry &type_entry = model.type_library[(usize)population.type_library_index];
+    f64 resting_potential = type_entry.baked_constants.at("EL");
+    s32 v_slot = glif_state_variable_slot(GlifVariant::Glif3, "v");
+    s64 chunk_base_offset = allocation.cell_type_boundaries.get_contents()[0];
+    for (s32 local_index = 0; local_index < population.size; ++local_index) {
+        allocation.cell_state.get_contents()[chunk_base_offset + (s64)v_slot * population.size + local_index] =
+            (f32)resting_potential;
+    }
+}
+
+bool refit_soak_all_finite(const ModelAllocation &allocation) {
+    const f32 *cell_state = allocation.cell_state.get_contents();
+    for (s64 index = 0; index < allocation.cell_state_element_count; ++index) {
+        if (!std::isfinite(cell_state[index])) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kernel_across_many_refit_cycles) {
+    using namespace spikecorec::nml;
+    using namespace spikecorec::nml::network_generation;
+
+    const s32 neuron_count = 60;
+    const s64 tick_count = 500;
+    const f32 dt_seconds = 1e-4f; // 50ms total
+    const s64 rank = 6;
+    const s32 out_degree = 3; // 180 real edges -- "enough connections" for a non-trivial refit
+    const s64 refit_every_n_ticks = 40; // -> 12 refit cycles over 500 ticks
+
+    GeneratedPopulation population;
+    population.population_id = "Pop3";
+    population.variant = GlifVariant::Glif3;
+    population.bound_instance_id = "glif3Instance";
+    // Verbatim from tests/fixtures/nml/glif3_single_cell.nml's own real, jLEMS-verified parameter set
+    // (the same fixture end_to_end_network_tests.cpp's own medium-anchor GLIF3 test reuses).
+    population.cell_instance_attributes =
+        "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vth=\"-50mV\" vreset=\"-70mV\" t_ref=\"5ms\" tauAsc1=\"100ms\" "
+        "tauAsc2=\"10ms\" ascAdd1=\"-100pA\" ascAdd2=\"-200pA\"";
+    population.neuron_count = neuron_count;
+
+    GeneratedProjection ring_projection;
+    ring_projection.projection_id = "RingProj3";
+    ring_projection.presynaptic_population_id = "Pop3";
+    ring_projection.postsynaptic_population_id = "Pop3";
+    ring_projection.synapse_instance_id = "synA";
+    ring_projection.out_degree = out_degree;
+
+    GeneratedStimulus stimulus;
+    stimulus.population_id = "Pop3";
+    stimulus.local_index = 0;
+    stimulus.pulse_generator_id = "pulseGen1";
+    stimulus.delay = "5ms";
+    stimulus.duration = "40ms";
+    stimulus.amplitude = "0.6nA";
+
+    const String synapse_xml = "  <expOneSynapse id=\"synA\" gbase=\"20nS\" erev=\"0mV\" tauDecay=\"3ms\" weight=\"1\"/>";
+    String content_xml =
+        generate_network_nml("RefitSoakGlif3", {population}, synapse_xml, {ring_projection}, {stimulus});
+    ModelSpecification model = refit_soak_load_glif_network("glif3_refit_soak", content_xml);
+    ASSERT_EQ(model.total_neuron_count, neuron_count);
+
+    spikecorec::Vector<IrProgram> programs = refit_soak_build_type_library_ir_programs(model);
+    ModelAllocation allocation = allocate_model(model, programs);
+    refit_soak_seed_glif3_initial_v(allocation, model);
+    AssembledModel assembled_model(model, programs);
+
+    vector<vector<s32>> adjacency = refit_soak_adjacency_from_model(model);
+    WeightMatrix weight_matrix(adjacency, rank, /*check_indexing=*/true, /*max_neighbor_count=*/-1,
+                                /*weight_seed=*/2026);
+    ASSERT_EQ(weight_matrix.total_edge_count, (s64)neuron_count * out_degree);
+    weight_matrix.refit_every_n_ticks = refit_every_n_ticks;
+
+    // A second registered matrix sharing the same basis -- ticket #103's own reproduction of the bug
+    // required refit()'s full multi-matrix Ck sweep to actually run, not a single-matrix shortcut.
+    s64 matrix_b = weight_matrix.add_coefficient_vector(vector<f32>((usize)rank, 1.5f));
+
+    // ── real network runtime buffers ──
+    GpuPointer<f32> network_inputs = allocate<f32>((usize)neuron_count * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, (usize)neuron_count * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>((usize)neuron_count * sizeof(s64));
+    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + neuron_count, (s64)-1);
+    GpuPointer<s32> next_active_indices = allocate<s32>((usize)neuron_count * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>((usize)neuron_count * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + neuron_count, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>((usize)neuron_count * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, (usize)neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weight_matrix;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt_seconds);
+    const s32 driven_neuron_index = 0; // Pop3/0 -- the only population, so global index == local index
+
+    // ── the "AlwaysSpikeCell" propagate-kernel probe (mirrors master_kernel_tests.cpp's own
+    // refit_default_matrix_reconstruction_stays_synced_with_a_real_propagate_kernel_dispatch),
+    // sharing the SAME live weight_matrix, dispatched once per refit checkpoint below ──
+    ModelSpecification probe_model;
+    probe_model.total_neuron_count = neuron_count;
+    TypeLibraryEntry probe_type_entry;
+    probe_type_entry.component_type_name = "AlwaysSpikeCell";
+    probe_type_entry.bound_instance_id = "alwaysSpikeInstance";
+    probe_type_entry.category = TypeLibraryCategory::Cell;
+    probe_type_entry.state_variable_count = 1;
+    probe_model.type_library.push_back(probe_type_entry);
+
+    PopulationEntry probe_population;
+    probe_population.id = "ProbePop";
+    probe_population.type_library_index = 0;
+    probe_population.size = neuron_count;
+    probe_population.neuron_index_begin = 0;
+    probe_population.neuron_index_end = neuron_count;
+    probe_model.populations.push_back(probe_population);
+
+    IrProgram probe_program;
+    probe_program.component_type_name = "AlwaysSpikeCell";
+    probe_program.alloc = {StateDirective{"v", "f32", nullopt}};
+    probe_program.tick.detect = {BinaryInstruction{BinaryOpcode::Gt, "spiked", "0.0", "-1.0"}};
+    probe_program.tick.emit = {IfInstruction{"spiked", {EmitInstruction{"spike"}}, {}, nullopt}};
+    spikecorec::Vector<IrProgram> probe_programs = {probe_program};
+
+    ModelAllocation probe_allocation = allocate_model(probe_model, probe_programs);
+    AssembledModel probe_assembled_model(probe_model, probe_programs);
+
+    GpuPointer<f32> probe_network_inputs = allocate<f32>((usize)neuron_count * sizeof(f32));
+    memset(probe_network_inputs.get_contents(), 0, (usize)neuron_count * sizeof(f32));
+    GpuPointer<s64> probe_last_spiked = allocate<s64>((usize)neuron_count * sizeof(s64));
+    memset(probe_last_spiked.get_contents(), 0, (usize)neuron_count * sizeof(s64));
+    GpuPointer<s32> probe_next_active_indices = allocate<s32>((usize)neuron_count * sizeof(s32));
+    GpuPointer<s32> probe_next_active_count = allocate<s32>(sizeof(s32));
+    probe_next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> probe_active_generation = allocate<s32>((usize)neuron_count * sizeof(s32));
+    std::fill(probe_active_generation.get_contents(), probe_active_generation.get_contents() + neuron_count, -1);
+    GpuPointer<bool> probe_emit_spike = allocate<bool>((usize)neuron_count * sizeof(bool));
+    memset(probe_emit_spike.get_contents(), 0, (usize)neuron_count * sizeof(bool));
+
+    ModelRuntimeBuffers probe_buffers;
+    probe_buffers.allocation = &probe_allocation;
+    probe_buffers.weights = &weight_matrix; // the SAME live WeightMatrix under soak
+    probe_buffers.network_inputs = probe_network_inputs.get_contents();
+    probe_buffers.last_spiked = probe_last_spiked.get_contents();
+    probe_buffers.next_active_neuron_indices = probe_next_active_indices.get_contents();
+    probe_buffers.next_active_neuron_count = probe_next_active_count.get_contents();
+    probe_buffers.active_generation = probe_active_generation.get_contents();
+    probe_buffers.emit_port_flags["spike"] = probe_emit_spike.get_contents();
+    s64 probe_tick_counter = 0;
+
+    s64 refit_cycle_count = 0;
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        buffers.network_inputs[driven_neuron_index] += (f32)schedule.current_at(driven_neuron_index, tick);
+        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        ASSERT_TRUE(refit_soak_all_finite(allocation)) << "tick=" << tick;
+
+        // Deterministic, continuously-varying per-edge drift on BOTH DEFAULT_MATRIX_INDEX and
+        // matrix_b -- no live AssembledModel path writes to DEFAULT_MATRIX_INDEX's own Sk (see this
+        // test's own header comment), so this stands in for the ongoing per-edge weight updates
+        // periodic refit exists to compact.
+        for (s32 source_node = 0; source_node < neuron_count; ++source_node) {
+            for (s32 target_node : adjacency[(usize)source_node]) {
+                f32 delta_default = (f32)((source_node * 7 + target_node * 13 + tick * 3) % 9 - 4) * 0.02f;
+                f32 delta_b = (f32)((source_node * 11 + target_node * 17 + tick * 5) % 11 - 5) * 0.02f;
+                weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node, target_node,
+                                                      delta_default);
+                weight_matrix.accumulate_edge_delta(matrix_b, source_node, target_node, delta_b);
+            }
+        }
+
+        weight_matrix.advance_tick();
+        if (!weight_matrix.is_refit_due()) continue;
+
+        weight_matrix.refit(/*sweep_count=*/4, /*ridge_regularization=*/1e-4f);
+        ++refit_cycle_count;
+
+        // ── invariant 1: Ck[DEFAULT_MATRIX_INDEX] pinned all-ones (ticket #103) ──
+        const f32 *default_ck =
+            weight_matrix.coefficient_vectors[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX].get_contents();
+        s64 lane_count = weight_matrix.rank_float4_stride * 4;
+        for (s64 lane = 0; lane < lane_count; ++lane) {
+            EXPECT_EQ(default_ck[lane], 1.0f)
+                << "refit_cycle=" << refit_cycle_count << " lane=" << lane
+                << " -- Ck[DEFAULT_MATRIX_INDEX] must never move away from all-ones";
+        }
+
+        // ── invariant 2: WeightMatrix::get() reconstruction stays synced with a REAL propagate-kernel
+        // dispatch (reproduces 8eacd1d's own regression check, re-run at every cycle) ──
+        memset(probe_network_inputs.get_contents(), 0, (usize)neuron_count * sizeof(f32));
+        probe_assembled_model.step_tick(probe_buffers, /*dt=*/1.0f, probe_tick_counter, probe_tick_counter + 1);
+        ++probe_tick_counter;
+
+        vector<f32> expected_network_inputs((usize)neuron_count, 0.0f);
+        for (s32 source_node = 0; source_node < neuron_count; ++source_node) {
+            for (s32 target_node : adjacency[(usize)source_node]) {
+                expected_network_inputs[(usize)target_node] += weight_matrix.get(source_node, target_node);
+            }
+        }
+
+        bool any_nonzero_input = false;
+        for (s32 neuron_index = 0; neuron_index < neuron_count; ++neuron_index) {
+            f32 expected = expected_network_inputs[(usize)neuron_index];
+            f32 got = probe_network_inputs.get_contents()[neuron_index];
+            if (got != 0.0f) any_nonzero_input = true;
+            f32 tolerance = std::fabs(expected) * 1e-3f;
+            if (tolerance < 1e-3f) tolerance = 1e-3f;
+            EXPECT_NEAR(expected, got, tolerance)
+                << "refit_cycle=" << refit_cycle_count << " neuron_index=" << neuron_index
+                << " -- host WeightMatrix::get() reconstruction and a real GPU propagate kernel "
+                   "dispatch disagree on the default matrix's weight after refit() (ticket #103)";
+        }
+        EXPECT_TRUE(any_nonzero_input) << "refit_cycle=" << refit_cycle_count;
+    }
+
+    EXPECT_GE(refit_cycle_count, 10)
+        << "soak must trigger at least 10 distinct refit cycles to exercise the long-duration desync "
+           "the pre-8eacd1d bug only manifested after";
 }
