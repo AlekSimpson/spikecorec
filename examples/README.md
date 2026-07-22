@@ -32,17 +32,17 @@ The torus/discrete-spike-input examples add:
 | --- | --- |
 | `--side <length>` | torus edge length; the network holds `length²` neurons (default 8 → 64) |
 | `--gbase <siemens>` | the torus's real `expOneSynapse` conductance amplitude, e.g. `10nS` (default `10nS`/`15nS` — see below) |
-| `--record-dir <path>` | where the GLIF3/GLIF5 torus examples write their `.spire` pairs (default `recordings/`) |
+| `--record-dir <path>` | where the GLIF torus examples write their `.spire` pairs (default `recordings/`) |
 | `--no-record` | skip writing `.spire` files entirely |
 | `--couple` | `discrete_spike_input_example` only — rebuild the torus WITH its real 4-neighbor wiring (off by default; see that example's own entry) |
 
 ### Where models come from
 
-Two of the examples (plus `discrete_spike_input_example`) **generate** their NeuroML
-(`glif_torus_network.h`) because a 64-neuron torus has 256 connections and hand-typing that is not
-reasonable. The rest load checked-in files from `tests/fixtures/nml/` — the same ones that drive
-both spikecorec and the reference simulator. Point the fixture-loading examples at your own models
-with:
+Five of the examples (one per GLIF variant, plus `discrete_spike_input_example`) **generate**
+their NeuroML (`glif_torus_network.h`) because a 64-neuron torus has 256 connections and
+hand-typing that is not reasonable. The rest load checked-in files from `tests/fixtures/nml/` — the
+same ones that drive both spikecorec and the reference simulator. Point the fixture-loading
+examples at your own models with:
 
 ```bash
 SPIKECOREC_NML_MODEL_DIR=/path/to/models ./build/examples/izhikevich_network_example
@@ -63,7 +63,8 @@ automatically — no opt-in needed, and a `WeightMatrix::set_constant_weight` ca
 such a model (its contribution is forced to zero, since the real per-edge dispatch already supplies
 it). Concretely:
 
-- the torus examples (`glif3_torus_network_example`, `glif5_torus_network_example`,
+- the torus examples (`glif1_torus_network_example`, `glif2_torus_network_example`,
+  `glif3_torus_network_example`, `glif4_torus_network_example`, `glif5_torus_network_example`,
   `discrete_spike_input_example --couple`) are wired through a real, vendored `expOneSynapse` —
   `--gbase` sets its actual conductance amplitude, not a stand-in current;
 - `glif_ei_network_example` shows real `ExcPop[0] → InhPop[0]` propagation through a real
@@ -81,7 +82,7 @@ projection exists.
 
 ### Recording network activity to `.spire`, and rendering it
 
-The GLIF3/GLIF5 torus examples each drive a `NetworkActivityRecorder`
+Every GLIF torus example (all five variants) drives a `NetworkActivityRecorder`
 (`nml_pipeline_support.h`) that writes two parallel `.spire` files per run, one frame per tick each:
 whole-population membrane potential, and a 0.0/1.0 spike-raster mask (matching
 `include/spikecorec/nml/output_recording.h`'s own `RecordingSourceKind::SpikeRaster` convention).
@@ -154,6 +155,40 @@ For orientation across the family: **GLIF1** is plain leaky integrate-and-fire, 
 scaled reset, **GLIF3** adds the after-spike currents, **GLIF4** adds the adaptive threshold instead,
 and **GLIF5** combines the last two. All five are linear in their own state variables, so all five
 are tagged `closed_form_advanceable`. Also records to `.spire`, same as the GLIF3 example.
+
+### `glif1_torus_network_example.cpp` — plain leaky integrate-and-fire
+
+The same torus running **GLIF1**, the simplest variant: one state variable (`v`), a fixed threshold
+`vth`, and a flat reset to `vreset` — no after-spike currents, no adaptive threshold, just the
+refractory-regime timer every GLIF variant shares. There is no spike-frequency adaptation here:
+under a constant current the inter-spike intervals settle to a constant steady-state rate rather
+than continuously lengthening, the baseline the other four variants' adaptation mechanisms are
+contrasted against. A separate, hand-typed GLIF1 network already exists
+(`glif_ei_network_example.cpp`, below); this is the GLIF1 counterpart to the GLIF3/GLIF5 torus
+walkthroughs instead — a single, homogeneous, generated 64-neuron network with real per-edge
+synaptic propagation and its own `.spire` recording.
+
+### `glif2_torus_network_example.cpp` — scaled reset
+
+The same torus running **GLIF2**: GLIF1 plus a reset rule that scales with how far past `vth` the
+membrane potential overshot on the triggering tick — `v <- vreset + resetScale * (v - vth)` rather
+than GLIF1's flat `v <- vreset`. This example uses `resetScale=0.4` (the more interesting,
+non-degenerate case — `resetScale=0` would be bit-exactly GLIF1's own reset) and prints `v` right
+after every spike, showing it land measurably above `vreset` rather than snapping back to it — the
+same flat-vs-scaled contrast `tests/end_to_end_network_tests.cpp`'s own
+`glif2_ring_network_discrete_spike_array_smallest_anchor` asserts.
+
+### `glif4_torus_network_example.cpp` — adaptive threshold, no after-spike currents
+
+The same torus running **GLIF4**: leaky integrate-and-fire with an adaptive threshold instead of
+after-spike currents. `theta` is a state variable that relaxes toward `thetaInf` and jumps by
+`thetaSpikeAdd` on every spike, so the firing condition is `v > theta` rather than `v > vth` — read
+`glif5_torus_network_example` afterward to see the SAME threshold mechanism combined with GLIF3's
+after-spike currents. This example isolates the threshold mechanism on its own, plotting `v` and
+`theta` together the same way the GLIF5 example does, and prints the matching adaptation signature
+(`tests/end_to_end_network_tests.cpp`'s own `glif4_ring_network_discrete_spike_array_medium_anchor`
+asserts `theta` strictly increasing across the first few spikes) — lengthening inter-spike intervals
+and a `theta` that climbs well above its resting `thetaInf` under sustained drive.
 
 ### `glif_ei_network_example.cpp` — many populations, many synapse types
 
@@ -281,7 +316,7 @@ setup, `cell_state` addressing, console output, and `NetworkActivityRecorder` (t
 per-tick `.spire` recording driver). Model-specific logic — stimulus, initial state, what gets
 measured — stays inline in each example, because that is the part worth reading.
 
-`glif_torus_network.h` builds on it with the network generator: the GLIF3/GLIF5 ComponentType
+`glif_torus_network.h` builds on it with the network generator: all five GLIF ComponentType
 declarations (reused verbatim from the lowering tests' fixtures), `square_torus` → `<connection>`/
 real `expOneSynapse` rendering (`include_lateral_connections` toggles whether a projection is
 emitted at all), per-variant state-variable slot lookup, initial-state seeding, and the torus grid

@@ -36,11 +36,98 @@
 
 namespace spikecorec::examples {
 
-// The GLIF variants this builder emits. GLIF3 adds two after-spike currents to a plain LIF; GLIF5
-// adds an adaptive threshold on top of those. See each ComponentType below.
-enum class GlifVariant { Glif3 = 3, Glif5 = 5 };
+// The GLIF variants this builder emits. GLIF1 is plain leaky integrate-and-fire; GLIF2 adds a
+// biologically realistic reset that scales with how far past threshold `v` overshot; GLIF3 adds two
+// after-spike currents to a plain LIF; GLIF4 adds an adaptive threshold instead; GLIF5 combines
+// GLIF3's after-spike currents with GLIF4's adaptive threshold. See each ComponentType below.
+enum class GlifVariant { Glif1 = 1, Glif2 = 2, Glif3 = 3, Glif4 = 4, Glif5 = 5 };
 
 // ── ComponentType declarations ──────────────────────────────────────────────────────────────────
+//
+// Every GLIF1/GLIF2/GLIF4 block below is reused verbatim (same equations, same Parameter/dimension
+// declarations, same declared StateVariable order) from tests/cell_lowering_tests.cpp's own
+// GLIF1_COMPONENT_TYPE/GLIF2_COMPONENT_TYPE/GLIF4_COMPONENT_TYPE fixtures (ticket #50), the same
+// precedent GLIF3/GLIF5 above already followed.
+
+// GLIF1: plain leaky integrate-and-fire against a FIXED threshold `vth`, with a flat reset to
+// `vreset` and a fixed refractory period.
+inline const String GLIF1_COMPONENT_TYPE_XML =
+    "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+    "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+    "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+    "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"t_ref\" dimension=\"time\"/>"
+    "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>"
+    "    <Dynamics>"
+    "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+    "      <StateVariable name=\"refractoryTimeElapsed\" dimension=\"time\"/>"
+    "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\" select=\"synapses[*]/i\" reduce=\"add\"/>"
+    "      <OnStart>"
+    "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+    "        <StateAssignment variable=\"refractoryTimeElapsed\" value=\"0\"/>"
+    "      </OnStart>"
+    "      <Regime name=\"integrating\" initial=\"true\">"
+    "        <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn) / C\"/>"
+    "        <OnCondition test=\"v .gt. vth\">"
+    "          <EventOut port=\"spike\"/>"
+    "          <StateAssignment variable=\"v\" value=\"vreset\"/>"
+    "          <Transition regime=\"refractory\"/>"
+    "        </OnCondition>"
+    "      </Regime>"
+    "      <Regime name=\"refractory\">"
+    "        <OnEntry>"
+    "          <StateAssignment variable=\"refractoryTimeElapsed\" value=\"0\"/>"
+    "        </OnEntry>"
+    "        <TimeDerivative variable=\"refractoryTimeElapsed\" value=\"1\"/>"
+    "        <OnCondition test=\"refractoryTimeElapsed .geq. t_ref\">"
+    "          <Transition regime=\"integrating\"/>"
+    "        </OnCondition>"
+    "      </Regime>"
+    "    </Dynamics>"
+    "  </ComponentType>";
+
+// GLIF2: GLIF1 plus a reset rule that scales with how far past `vth` the membrane potential
+// overshot on the triggering tick — `v <- vreset + resetScale * (v - vth)` rather than a flat
+// `v <- vreset`. `resetScale=0` degenerates to GLIF1's exact flat reset; a nonzero value lands
+// measurably above `vreset`, a more biologically realistic reset rule.
+inline const String GLIF2_COMPONENT_TYPE_XML =
+    "  <ComponentType name=\"GLIF2Cell\" extends=\"baseCell\">"
+    "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+    "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+    "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vth\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"resetScale\" dimension=\"none\"/>"
+    "    <Parameter name=\"t_ref\" dimension=\"time\"/>"
+    "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>"
+    "    <Dynamics>"
+    "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+    "      <StateVariable name=\"refractoryTimeElapsed\" dimension=\"time\"/>"
+    "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\" select=\"synapses[*]/i\" reduce=\"add\"/>"
+    "      <OnStart>"
+    "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+    "      </OnStart>"
+    "      <Regime name=\"integrating\" initial=\"true\">"
+    "        <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn) / C\"/>"
+    "        <OnCondition test=\"v .gt. vth\">"
+    "          <EventOut port=\"spike\"/>"
+    "          <StateAssignment variable=\"v\" value=\"vreset + resetScale * (v - vth)\"/>"
+    "          <Transition regime=\"refractory\"/>"
+    "        </OnCondition>"
+    "      </Regime>"
+    "      <Regime name=\"refractory\">"
+    "        <OnEntry>"
+    "          <StateAssignment variable=\"refractoryTimeElapsed\" value=\"0\"/>"
+    "        </OnEntry>"
+    "        <TimeDerivative variable=\"refractoryTimeElapsed\" value=\"1\"/>"
+    "        <OnCondition test=\"refractoryTimeElapsed .geq. t_ref\">"
+    "          <Transition regime=\"integrating\"/>"
+    "        </OnCondition>"
+    "      </Regime>"
+    "    </Dynamics>"
+    "  </ComponentType>";
 
 // GLIF3: leaky integrate-and-fire plus two after-spike currents (`asc1`/`asc2`) that step up on every
 // spike and decay between them, against a FIXED threshold `vth`.
@@ -78,6 +165,52 @@ inline const String GLIF3_COMPONENT_TYPE_XML =
     "          <StateAssignment variable=\"v\" value=\"vreset\"/>"
     "          <StateAssignment variable=\"asc1\" value=\"asc1 + ascAdd1\"/>"
     "          <StateAssignment variable=\"asc2\" value=\"asc2 + ascAdd2\"/>"
+    "          <Transition regime=\"refractory\"/>"
+    "        </OnCondition>"
+    "      </Regime>"
+    "      <Regime name=\"refractory\">"
+    "        <OnEntry>"
+    "          <StateAssignment variable=\"refractoryTimeElapsed\" value=\"0\"/>"
+    "        </OnEntry>"
+    "        <TimeDerivative variable=\"refractoryTimeElapsed\" value=\"1\"/>"
+    "        <OnCondition test=\"refractoryTimeElapsed .geq. t_ref\">"
+    "          <Transition regime=\"integrating\"/>"
+    "        </OnCondition>"
+    "      </Regime>"
+    "    </Dynamics>"
+    "  </ComponentType>";
+
+// GLIF4: leaky integrate-and-fire plus an adaptive threshold instead of after-spike currents.
+// `theta` is a state variable (not a constant) that relaxes toward `thetaInf` with time constant
+// `tauTheta` and jumps by `thetaSpikeAdd` on every spike, so the firing condition is `v > theta`
+// rather than `v > vth`.
+inline const String GLIF4_COMPONENT_TYPE_XML =
+    "  <ComponentType name=\"GLIF4Cell\" extends=\"baseCell\">"
+    "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+    "    <Parameter name=\"gL\" dimension=\"conductance\"/>"
+    "    <Parameter name=\"EL\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"vreset\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"t_ref\" dimension=\"time\"/>"
+    "    <Parameter name=\"thetaInf\" dimension=\"voltage\"/>"
+    "    <Parameter name=\"tauTheta\" dimension=\"time\"/>"
+    "    <Parameter name=\"thetaSpikeAdd\" dimension=\"voltage\"/>"
+    "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>"
+    "    <Dynamics>"
+    "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+    "      <StateVariable name=\"theta\" dimension=\"voltage\" exposure=\"theta\"/>"
+    "      <StateVariable name=\"refractoryTimeElapsed\" dimension=\"time\"/>"
+    "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\" select=\"synapses[*]/i\" reduce=\"add\"/>"
+    "      <TimeDerivative variable=\"theta\" value=\"(thetaInf - theta) / tauTheta\"/>"
+    "      <OnStart>"
+    "        <StateAssignment variable=\"v\" value=\"EL\"/>"
+    "        <StateAssignment variable=\"theta\" value=\"thetaInf\"/>"
+    "      </OnStart>"
+    "      <Regime name=\"integrating\" initial=\"true\">"
+    "        <TimeDerivative variable=\"v\" value=\"(gL * (EL - v) + iSyn) / C\"/>"
+    "        <OnCondition test=\"v .gt. theta\">"
+    "          <EventOut port=\"spike\"/>"
+    "          <StateAssignment variable=\"v\" value=\"vreset\"/>"
+    "          <StateAssignment variable=\"theta\" value=\"theta + thetaSpikeAdd\"/>"
     "          <Transition regime=\"refractory\"/>"
     "        </OnCondition>"
     "      </Regime>"
@@ -152,23 +285,55 @@ inline const String GLIF5_COMPONENT_TYPE_XML =
     "  </ComponentType>";
 
 inline String glif_component_type_name(GlifVariant variant) {
-    return variant == GlifVariant::Glif3 ? "GLIF3Cell" : "GLIF5Cell";
+    switch (variant) {
+        case GlifVariant::Glif1: return "GLIF1Cell";
+        case GlifVariant::Glif2: return "GLIF2Cell";
+        case GlifVariant::Glif3: return "GLIF3Cell";
+        case GlifVariant::Glif4: return "GLIF4Cell";
+        case GlifVariant::Glif5: return "GLIF5Cell";
+    }
+    throw std::runtime_error("glif_component_type_name: unknown GlifVariant");
 }
 
 inline String glif_component_type_xml(GlifVariant variant) {
-    return variant == GlifVariant::Glif3 ? GLIF3_COMPONENT_TYPE_XML : GLIF5_COMPONENT_TYPE_XML;
+    switch (variant) {
+        case GlifVariant::Glif1: return GLIF1_COMPONENT_TYPE_XML;
+        case GlifVariant::Glif2: return GLIF2_COMPONENT_TYPE_XML;
+        case GlifVariant::Glif3: return GLIF3_COMPONENT_TYPE_XML;
+        case GlifVariant::Glif4: return GLIF4_COMPONENT_TYPE_XML;
+        case GlifVariant::Glif5: return GLIF5_COMPONENT_TYPE_XML;
+    }
+    throw std::runtime_error("glif_component_type_xml: unknown GlifVariant");
 }
 
-// Parameter values for one bound cell instance, verbatim from the real, jLEMS-verified parameter set
-// in tests/fixtures/nml/glif3_single_cell.nml (and its GLIF5 counterpart in the end-to-end tests).
+// Parameter values for one bound cell instance. GLIF3/GLIF5 are verbatim from the real,
+// jLEMS-verified parameter set in tests/fixtures/nml/glif3_single_cell.nml (and its GLIF5
+// counterpart in the end-to-end tests); GLIF1/GLIF2/GLIF4 are verbatim from the parameter sets
+// tests/end_to_end_network_tests.cpp's own anchor tests already validate
+// (`glif1_ring_network_current_injection_smallest_anchor`,
+// `glif2_ring_network_discrete_spike_array_smallest_anchor`,
+// `glif4_ring_network_discrete_spike_array_medium_anchor`). GLIF2's `resetScale=0.4` is that same
+// test's "scaled" instance — the more interesting of its two reset rules to demonstrate, since
+// `resetScale=0` degenerates to GLIF1's exact flat reset.
 inline String glif_cell_instance_attributes(GlifVariant variant) {
-    if (variant == GlifVariant::Glif3) {
-        return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vth=\"-50mV\" vreset=\"-70mV\" t_ref=\"5ms\" "
-               "tauAsc1=\"100ms\" tauAsc2=\"10ms\" ascAdd1=\"-100pA\" ascAdd2=\"-200pA\"";
+    switch (variant) {
+        case GlifVariant::Glif1:
+            return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vth=\"-50mV\" vreset=\"-70mV\" t_ref=\"2ms\"";
+        case GlifVariant::Glif2:
+            return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vth=\"-50mV\" vreset=\"-70mV\" resetScale=\"0.4\" "
+                   "t_ref=\"2ms\"";
+        case GlifVariant::Glif3:
+            return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vth=\"-50mV\" vreset=\"-70mV\" t_ref=\"5ms\" "
+                   "tauAsc1=\"100ms\" tauAsc2=\"10ms\" ascAdd1=\"-100pA\" ascAdd2=\"-200pA\"";
+        case GlifVariant::Glif4:
+            return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vreset=\"-70mV\" t_ref=\"2ms\" thetaInf=\"-50mV\" "
+                   "tauTheta=\"50ms\" thetaSpikeAdd=\"5mV\"";
+        case GlifVariant::Glif5:
+            return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vreset=\"-70mV\" t_ref=\"5ms\" thetaInf=\"-50mV\" "
+                   "tauTheta=\"50ms\" thetaSpikeAdd=\"5mV\" tauAsc1=\"100ms\" tauAsc2=\"10ms\" "
+                   "ascAdd1=\"-100pA\" ascAdd2=\"-200pA\"";
     }
-    return "C=\"100pF\" gL=\"10nS\" EL=\"-70mV\" vreset=\"-70mV\" t_ref=\"5ms\" thetaInf=\"-50mV\" "
-           "tauTheta=\"50ms\" thetaSpikeAdd=\"5mV\" tauAsc1=\"100ms\" tauAsc2=\"10ms\" "
-           "ascAdd1=\"-100pA\" ascAdd2=\"-200pA\"";
+    throw std::runtime_error("glif_cell_instance_attributes: unknown GlifVariant");
 }
 
 // The declared-order slot index of `state_variable_name` within `variant`'s `<Dynamics>`.
@@ -177,13 +342,25 @@ inline String glif_cell_instance_attributes(GlifVariant variant) {
 // `cell_type_boundaries[population_index] + k * population.size` — this index is exactly what a
 // caller needs to read that variable back out for any neuron.
 inline s32 glif_state_variable_slot(GlifVariant variant, const String &state_variable_name) {
+    const UnorderedMap<String, s32> glif1_slots = {{"v", 0}, {"refractoryTimeElapsed", 1}};
+    const UnorderedMap<String, s32> glif2_slots = {{"v", 0}, {"refractoryTimeElapsed", 1}};
     const UnorderedMap<String, s32> glif3_slots = {{"v", 0}, {"asc1", 1}, {"asc2", 2}, {"refractoryTimeElapsed", 3}};
+    const UnorderedMap<String, s32> glif4_slots = {{"v", 0}, {"theta", 1}, {"refractoryTimeElapsed", 2}};
     const UnorderedMap<String, s32> glif5_slots = {
         {"v", 0}, {"theta", 1}, {"asc1", 2}, {"asc2", 3}, {"refractoryTimeElapsed", 4}};
 
-    const UnorderedMap<String, s32> &slots = variant == GlifVariant::Glif3 ? glif3_slots : glif5_slots;
-    auto found = slots.find(state_variable_name);
-    if (found == slots.end()) {
+    const UnorderedMap<String, s32> *slots = nullptr;
+    switch (variant) {
+        case GlifVariant::Glif1: slots = &glif1_slots; break;
+        case GlifVariant::Glif2: slots = &glif2_slots; break;
+        case GlifVariant::Glif3: slots = &glif3_slots; break;
+        case GlifVariant::Glif4: slots = &glif4_slots; break;
+        case GlifVariant::Glif5: slots = &glif5_slots; break;
+    }
+    if (slots == nullptr) throw std::runtime_error("glif_state_variable_slot: unknown GlifVariant");
+
+    auto found = slots->find(state_variable_name);
+    if (found == slots->end()) {
         throw std::runtime_error(
             "glif_state_variable_slot: " + glif_component_type_name(variant)
             + " has no state variable named '" + state_variable_name + "'");
@@ -349,17 +526,18 @@ inline nml::ModelSpecification load_generated_model(const String &document_id, c
 
 // ── Initial state ───────────────────────────────────────────────────────────────────────────────
 
-// Applies the variant's OnStart block by hand: `v = EL` for both, plus `theta = thetaInf` for GLIF5.
+// Applies the variant's OnStart block by hand: `v = EL` for every variant, plus `theta = thetaInf`
+// for GLIF4/GLIF5 (the two variants that declare an adaptive threshold).
 //
-// allocate_model zero-initializes cell_state and does not evaluate OnStart, so without this a GLIF5
-// network starts with `theta = 0`, which is ABOVE the -50 mV threshold it should have — every neuron
-// would sit permanently sub-threshold and the network would never fire.
+// allocate_model zero-initializes cell_state and does not evaluate OnStart, so without this a
+// GLIF4/GLIF5 network starts with `theta = 0`, which is ABOVE the -50 mV threshold it should have —
+// every neuron would sit permanently sub-threshold and the network would never fire.
 inline void seed_glif_initial_state(
     nml::ModelAllocation &allocation, const nml::ModelSpecification &model, GlifVariant variant
 ) {
     seed_membrane_potentials_from_resting_parameter(allocation, model);
 
-    if (variant != GlifVariant::Glif5) return;
+    if (variant != GlifVariant::Glif4 && variant != GlifVariant::Glif5) return;
 
     for (s32 population_index = 0; population_index < (s32)model.populations.size(); ++population_index) {
         const nml::PopulationEntry &population = model.populations[(usize)population_index];
