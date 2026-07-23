@@ -170,6 +170,8 @@ make              # auto-detect (Metal on macOS, CUDA elsewhere)
 make metal
 make cuda
 make python       # builds pybind11 Python extension
+make test         # build + run the GoogleTest suite
+make test-asan    # same suite under AddressSanitizer+UBSan, host/CPU code only (ticket #134) — see BUILDME.md
 make clean
 ```
 

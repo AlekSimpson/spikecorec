@@ -7,6 +7,7 @@
 #   make metal        — build Metal backend
 #   make python       — build Python extension (pip editable install)
 #   make test         — build and run C++ tests
+#   make test-asan    — build and run C++ tests under ASan+UBSan (host/CPU code only)
 #   make examples     — build examples
 #   make clean        — remove build artifacts
 #   make info         — show detected platform/toolchain
@@ -31,6 +32,15 @@ EX_DIR     := examples
 CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -I$(INC_DIR)
 NVCCFLAGS  := -std=c++17 -O2 -I$(INC_DIR) --expt-relaxed-constexpr
 ARFLAGS    := rcs
+
+# ── Sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer, ticket #134) ──
+# Host/CPU C++ only — deliberately NOT added to NVCCFLAGS, since GPU-side CUDA/Metal
+# device kernel code isn't sanitizable this way (see ticket #134's own scope note).
+# Invoked via `make test-asan` (which sets SANITIZE=1 and redirects BUILD_DIR so
+# sanitized objects never collide with a normal `make`/`make test` build).
+ifeq ($(SANITIZE),1)
+  CXXFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g -O1
+endif
 
 # ── Platform detection ───────────────────────────────────────
 UNAME_S    := $(shell uname -s)
@@ -104,7 +114,22 @@ CXXFLAGS   += -I$(GTEST_DIR)/include
 
 ifeq ($(UNAME_S),Darwin)
   HAS_METAL     := yes
-  CXX           := clang++
+  ifeq ($(SANITIZE),1)
+    # Homebrew LLVM's AddressSanitizer runtime has been observed to hang (livelock
+    # in its own shadow-memory init, spinning on a self-held lock — reproduced with
+    # a minimal `-fsanitize=address` hello-world, unrelated to this codebase) on
+    # some macOS versions, apparently from an SDK/dyld version mismatch (Homebrew
+    # clang++ resolves an older Command Line Tools SDK instead of the SDK matching
+    # the running OS). `/usr/bin/clang++` is the standard `xcrun`-brokered entry
+    # point that always resolves the SDK matching the running OS, and doesn't have
+    # this issue, so sanitized builds pin to it explicitly instead of trusting
+    # PATH-resolved `clang++` (which normal, non-sanitized builds use without
+    # issue). Override with `CXX=... make test-asan` if your machine's Homebrew
+    # LLVM ASan works fine.
+    CXX         := /usr/bin/clang++
+  else
+    CXX         := clang++
+  endif
   METALC        := xcrun -sdk macosx metal
   METALLIB      := xcrun -sdk macosx metallib
   METALFLAGS    := -O2
@@ -237,9 +262,20 @@ test-python: python
 	$(PYTHON) -m pytest python/tests -v
 
 # ── Tests ────────────────────────────────────────────────────
-.PHONY: test test-cuda test-metal
+.PHONY: test test-cuda test-metal test-asan
 
 test: test-$(BACKEND)
+
+# Sanitized (ASan+UBSan) test build+run — ticket #134. Re-invokes this same Makefile
+# with SANITIZE=1 and BUILD_DIR redirected to build-asan/, so it reuses every rule
+# above unchanged (compile flags, link flags, the full test binary) instead of
+# duplicating them. Host/CPU code only, per ticket #134's scope note.
+# Sanitized builds/runs are much slower than a normal `make test` — the largest
+# fixture alone (2000 neurons / 10000 ticks, tests/end_to_end_network_tests.cpp
+# EndToEndGlifNetworks.glif5_large_network_current_injection_largest_anchor) is
+# reported by the runner itself; budget several minutes for the full suite.
+test-asan:
+	$(MAKE) BUILD_DIR=build-asan SANITIZE=1 test
 
 CUDA_LINK := -L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc
 
