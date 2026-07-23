@@ -186,6 +186,9 @@ struct ModelRuntimeBuffers {
 // ModelRuntimeBuffers::emit_port_flags before calling AssembledModel::step_tick.
 Vector<String> collect_emit_port_names(const ModelSpecification &model, const Vector<IrProgram> &type_library_ir_programs);
 
+// REFACTOR: All of this should be folded into the SpikeEngine, it should not be declared separately as a new thing
+//
+
 // Owns every compiled KernelHandle for one assembled model (one per population with a non-empty
 // per-neuron tick kernel, plus the fixed drain/propagate kernels, one propagate dispatch per
 // distinct emit-port name) -- compiled once from assemble_master_kernel_source()'s output and
@@ -239,6 +242,8 @@ public:
     bool population_is_closed_form_advanceable(usize population_index) const;
 
 private:
+    // REFACTOR: The separate populations don't need to be kept track of during runtime, when we parse the NML into our engine representation we only care about how the populations in NML 
+    //           TRANSLATE into the allocations into the SpikeEngine, they don't need to be explicitly modeled in memory during runtime
     struct PopulationRuntimeInfo {
         bool has_kernel = false;
         KernelHandle handle{};
@@ -249,6 +254,9 @@ private:
     };
 
     Vector<PopulationRuntimeInfo> populations_;   // parallel to model.populations at construction time
+                                                  //
+
+    // REFACTOR: Why do we have a vector of this? the compiled IR should just be a list of instructions that we compile into gpu kernels
     Vector<IrProgram> type_library_ir_programs_;  // owned copy, indexed by type_library_index
     s64 total_neuron_count_ = 0;
 
@@ -260,6 +268,7 @@ private:
     KernelHandle propagate_kernel_handle_{};
     Vector<String> propagate_parameter_names_;
 
+    // REFACTOR: IF DELAY RING IS NOT ENABLED THEN THE network_inputs ARRAY SHOULD JUST BE 1D, THE "DELAY RING" IS JUST A MULTI DIMENSIONAL VERSION OF network_inputs WHERE WE WRITE INTO USING A DELAY VARIABLE
     // ── ticket #64 [F3]: ring-based deliver-drain/propagate kernels -- only assembled/compiled
     // when constructed with enable_delay_ring=true (see the constructor's own doc comment above). ──
     bool delay_ring_enabled_ = false;

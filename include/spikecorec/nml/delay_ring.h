@@ -36,6 +36,10 @@ namespace spikecorec::nml {
 // `pending_active_generation` (mirrors `active_generation`'s own compare-exchange dedup pattern,
 // truncated to a 32-bit tick number for the same reason the existing `active_generation` already is
 // -- see master_kernel.cpp's propagate kernel).
+//
+// REFACTOR: LITERALLY NONE OF THIS IS NEEDED, ITS JUST REDECLARATIONS OF WHAT WE NEED IN SpikeEngine
+//           also the delays for each edge should be a variable that is stored in the WeightMatrix
+//           if delay is global then we just store it as a global constant
 
 struct DelayRingAllocation {
     s64 neuron_count = 0;

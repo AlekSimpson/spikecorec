@@ -825,6 +825,10 @@ AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrP
         "the engine-fixed propagate kernel", "");
 
     // ── ticket #64 [F3]: ring-based deliver-drain/propagate, only when opted into ─────────────────
+    //
+    // REFACTOR: WHY THE FUCK ARE WE HAVING A WHOLE SEPARATE KERNEL COMPILED FOR MODELS THAT USE DELAYED INPUT SCHEME?????? 
+    //           ALL MODEL SETTINGS SHOULD IDEALLY CONVERGE INTO A SINGLE SET OF KERNELS / KERNEL FUNCTIONS THAT COVERS ALL NETWORK/MODEL FEATURES
+    //
     delay_ring_enabled_ = enable_delay_ring;
     if (delay_ring_enabled_) {
         GpuSource drain_ring_source = build_drain_ring_kernel_gpu_source();

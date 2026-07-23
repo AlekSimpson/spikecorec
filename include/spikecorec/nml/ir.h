@@ -276,6 +276,7 @@ struct IrProgram {
     Vector<AllocDirective> alloc;
     TickProgram tick;
 
+    // REFACTOR: THIS FLAG IS NOT NEEDED, IT SHOULD JUST BE AN INITIALIZATION / PROCESSING CONDITIONAL THAT CRASHES IF IT DETECTS INVALID SETUP / UNSUPPORTED MODEL
     // Active-set x nonlinear-dynamics tag (ticket #62 [F1]; arch §0.5): whether this program's
     // Dynamics are safe for the engine's active-set closed-form multi-tick lazy decay -- true
     // ("closed_form_advanceable") iff every TimeDerivative is affine in the type's own state
