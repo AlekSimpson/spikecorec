@@ -542,11 +542,11 @@ TEST(ExitModelGlif3SingleCell, explicit_input_resolves_to_a_real_stimulus_schedu
     EXPECT_EQ(model.stimuli[0].target_neuron_index, 0);
 
     StimulusSchedule schedule = build_stimulus_schedule(model, /*seconds_step=*/1e-4);
-    ASSERT_EQ(schedule.windows.size(), 1u);
+    ASSERT_EQ(schedule.window_count, 1);
     // delay=20ms, duration=300ms, amplitude=0.6nA (glif3_single_cell.nml).
-    EXPECT_EQ(schedule.windows[0].start_tick, 200);
-    EXPECT_EQ(schedule.windows[0].end_tick, 3200);
-    EXPECT_NEAR(schedule.windows[0].current_value, 0.6e-9, 1e-15);
+    EXPECT_EQ(schedule.start_ticks[0], 200);
+    EXPECT_EQ(schedule.end_ticks[0], 3200);
+    EXPECT_NEAR(schedule.current_values[0], 0.6e-9, 1e-15);
 }
 
 // ── GLIF3 single cell: driven simulation sanity (enabled) ─────────────────

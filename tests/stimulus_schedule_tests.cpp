@@ -272,29 +272,28 @@ TEST(StimulusSchedule, builds_window_with_default_weight_when_property_omitted) 
     ModelSpecification specification = build_single_pulse_fixture("default_weight", "10ms", "100ms", "1nA");
     StimulusSchedule schedule = build_stimulus_schedule(specification, /*seconds_step=*/0.001); // 1ms ticks
 
-    ASSERT_EQ(schedule.windows.size(), 1u);
-    const StimulusWindow &window = schedule.windows[0];
-    EXPECT_EQ(window.target_neuron_index, 0);
-    EXPECT_EQ(window.start_tick, 10);
-    EXPECT_EQ(window.end_tick, 110);
-    EXPECT_NEAR(window.current_value, 1e-9, 1e-15); // amplitude * default weight (1.0)
+    ASSERT_EQ(schedule.window_count, 1);
+    EXPECT_EQ(schedule.target_neurons[0], 0);
+    EXPECT_EQ(schedule.start_ticks[0], 10);
+    EXPECT_EQ(schedule.end_ticks[0], 110);
+    EXPECT_NEAR(schedule.current_values[0], 1e-9, 1e-15); // amplitude * default weight (1.0)
 }
 
 TEST(StimulusSchedule, honors_explicit_weight_property) {
     ModelSpecification specification = build_single_pulse_fixture("explicit_weight", "10ms", "100ms", "1nA", "2");
     StimulusSchedule schedule = build_stimulus_schedule(specification, 0.001);
 
-    ASSERT_EQ(schedule.windows.size(), 1u);
-    EXPECT_NEAR(schedule.windows[0].current_value, 2e-9, 1e-15);
+    ASSERT_EQ(schedule.window_count, 1);
+    EXPECT_NEAR(schedule.current_values[0], 2e-9, 1e-15);
 }
 
 TEST(StimulusSchedule, treats_zero_delay_as_starting_at_tick_zero) {
     ModelSpecification specification = build_single_pulse_fixture("zero_delay", "0ms", "50ms", "0.5nA");
     StimulusSchedule schedule = build_stimulus_schedule(specification, 0.001);
 
-    ASSERT_EQ(schedule.windows.size(), 1u);
-    EXPECT_EQ(schedule.windows[0].start_tick, 0);
-    EXPECT_EQ(schedule.windows[0].end_tick, 50);
+    ASSERT_EQ(schedule.window_count, 1);
+    EXPECT_EQ(schedule.start_ticks[0], 0);
+    EXPECT_EQ(schedule.end_ticks[0], 50);
 }
 
 TEST(StimulusSchedule, throws_on_non_positive_duration) {
@@ -335,7 +334,7 @@ TEST(StimulusSchedule, sums_current_from_multiple_windows_on_the_same_neuron) {
     ModelSpecification specification = build_two_overlapping_pulses_fixture();
     // seconds_step=1ms: pulseGenA is [0,100) ticks @1nA, pulseGenB is [20,70) ticks @2nA.
     StimulusSchedule schedule = build_stimulus_schedule(specification, 0.001);
-    ASSERT_EQ(schedule.windows.size(), 2u);
+    ASSERT_EQ(schedule.window_count, 2);
 
     EXPECT_NEAR(schedule.current_at(0, 10), 1e-9, 1e-15);       // only pulseGenA active
     EXPECT_NEAR(schedule.current_at(0, 30), 3e-9, 1e-15);       // both active: 1nA + 2nA
@@ -346,7 +345,7 @@ TEST(StimulusSchedule, sums_current_from_multiple_windows_on_the_same_neuron) {
 TEST(StimulusSchedule, wires_separate_explicit_inputs_to_distinct_non_interfering_target_neurons) {
     ModelSpecification specification = build_two_neuron_targets_fixture();
     StimulusSchedule schedule = build_stimulus_schedule(specification, 0.001); // 1ms ticks
-    ASSERT_EQ(schedule.windows.size(), 2u);
+    ASSERT_EQ(schedule.window_count, 2);
 
     // pulseGenA -> Pop[0] (neuron 0): [5, 25) ticks @ 1nA.
     EXPECT_NEAR(schedule.current_at(0, 4), 0.0, 1e-15);

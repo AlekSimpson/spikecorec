@@ -104,12 +104,12 @@ int main(int argument_count, char **argument_values) {
     // ── 6. Stimulus ─────────────────────────────────────────────────────────────────────────────
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)options.base.dt_seconds);
     print_heading("Stimulus schedule");
-    for (const StimulusWindow &window : schedule.windows) {
-        std::cout << "  neuron " << window.target_neuron_index
-                  << "  ticks [" << window.start_tick << ", " << window.end_tick << ")"
-                  << "  = " << format_seconds((f64)window.start_tick * options.base.dt_seconds)
-                  << " … " << format_seconds((f64)window.end_tick * options.base.dt_seconds)
-                  << "  current " << window.current_value * 1e12 << " pA\n";
+    for (s32 window_index = 0; window_index < schedule.window_count; ++window_index) {
+        std::cout << "  neuron " << schedule.target_neurons[window_index]
+                  << "  ticks [" << schedule.start_ticks[window_index] << ", " << schedule.end_ticks[window_index] << ")"
+                  << "  = " << format_seconds((f64)schedule.start_ticks[window_index] * options.base.dt_seconds)
+                  << " … " << format_seconds((f64)schedule.end_ticks[window_index] * options.base.dt_seconds)
+                  << "  current " << schedule.current_values[window_index] * 1e12 << " pA\n";
     }
 
     // ── 7. Recording (ticket #138) ──────────────────────────────────────────────────────────────

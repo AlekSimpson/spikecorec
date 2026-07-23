@@ -40,32 +40,57 @@ namespace spikecorec::nml {
 // That wiring belongs to ticket #61 [H1] (Phase-1 validation & wiring, which
 // depends on this ticket). This module only produces the schedule.
 
-// One half-open, constant-current window precomputed from a single
-// `pulseGenerator`-driven `StimulusEntry`: `current_value` (canonical SI
-// amperes, `amplitude * weight`) applies to `target_neuron_index` for every
-// tick in `[start_tick, end_tick)`.
-struct StimulusWindow {
-    s32 target_neuron_index = -1;
-    s64 start_tick = 0; // inclusive
-    s64 end_tick = 0;   // exclusive
-    f64 current_value = 0.0;
-};
+// pulseGenerator's own documented default (third_party/neuroml2/std_lib/
+// Inputs.xml: `<Property name="weight" dimension="none" defaultValue="1"/>`)
+// -- see build_stimulus_schedule's doc comment for why this can't be read
+// off `baked_constants` itself.
+constexpr f64 DEFAULT_PULSE_GENERATOR_WEIGHT = 1.0;
 
 // The host-precomputed stimulus schedule for one model (ticket #58 [E1]).
-// Deliberately a flat list of windows (one per `StimulusEntry`), not a dense
-// `[neuron_count x tick_count]` array -- Phase-1 stimulus counts are tiny
-// (dozens, not millions), so a dense per-tick buffer would waste memory for
-// no benefit; `to_dense_input_spikes` below renders exactly the dense slice
-// an engine call actually needs, on demand.
+// Flat, parallel arrays -- one slot per `StimulusEntry` -- rather than a
+// dense `[neuron_count x tick_count]` array (Phase-1 stimulus counts are
+// tiny, so a dense per-tick buffer would waste memory for no benefit;
+// `to_dense_input_spikes` below renders exactly the dense slice an engine
+// call actually needs, on demand) or a `Vector` of small heap-boxed window
+// structs (this avoids one heap allocation per window; `window_count` is
+// known up front from `model.stimuli.size()`, so the arrays are sized once
+// at construction and never resized).
 struct StimulusSchedule {
-    Vector<StimulusWindow> windows;
+    // neuron_index -> every schedule slot targeting it. Almost always exactly
+    // one entry, but current_at() sums however many are present -- e.g. two
+    // separate `explicitInput`s (two overlapping pulseGenerators) bound to
+    // the same neuron legitimately sum, the same way two physical current
+    // sources into one cell would.
+    UnorderedMap<s64, Vector<s32>> windows_by_neuron;
+
+    s64 *start_ticks = nullptr;    // [window_count], inclusive
+    s64 *end_ticks = nullptr;      // [window_count], exclusive
+    f64 *current_values = nullptr; // [window_count], canonical SI amperes
+    s32 *target_neurons = nullptr; // [window_count] -- which neuron slot `i` targets
+
+    s32 window_count = 0;
+
+    StimulusSchedule(StimulusSchedule &&other) noexcept;
+    StimulusSchedule &operator=(StimulusSchedule &&other) noexcept;
+    StimulusSchedule(const StimulusSchedule &) = delete;
+    StimulusSchedule &operator=(const StimulusSchedule &) = delete;
+
+    // Allocates window_count_ slots, all initially unassigned to any neuron.
+    // A caller fills every slot via set_window() before reading current_at()/
+    // to_dense_input_spikes() (build_stimulus_schedule below always does).
+    explicit StimulusSchedule(s32 window_count_);
+    ~StimulusSchedule();
+
+    // Assigns schedule slot `index` (< window_count, passed to the
+    // constructor) to `neuron_index`'s window list, with the given
+    // half-open [start_tick, end_tick) range and constant current.
+    void set_window(s32 index, s64 neuron_index, s64 start_tick, s64 end_tick, f64 current);
 
     // Total injected current for `neuron_index` at `tick` -- the sum of
     // every window that targets that neuron and contains `tick` (0.0 if
-    // none match; multiple pulseGenerators driving the same neuron via
-    // separate `explicitInput`s legitimately sum, the same way multiple
-    // physical current sources into one cell would).
-    f64 current_at(s32 neuron_index, s64 tick) const;
+    // no window targets that neuron at all, or none of the ones that do
+    // contain `tick`).
+    [[nodiscard]] f64 current_at(s32 neuron_index, s64 tick) const;
 
     // Renders this schedule as a tick-major matrix: result[tick][index] is
     // `current_at(target_neuron_indices[index], tick)`, for
@@ -74,7 +99,7 @@ struct StimulusSchedule {
     // already expects (positionally matched to a set of input neurons), so
     // this schedule can drive a real simulation with no new engine-side
     // plumbing (see this header's doc comment above).
-    Vector<Vector<f32>> to_dense_input_spikes(const Vector<s32> &target_neuron_indices, s64 tick_count) const;
+    [[nodiscard]] Vector<Vector<f32>> to_dense_input_spikes(const Vector<s32> &target_neuron_indices, s64 tick_count) const;
 };
 
 // Builds the stimulus schedule from every `StimulusEntry` in `model` (ticket

@@ -44,7 +44,7 @@ struct DiscreteSpikeInputSchedule {
 
     // Adds `current_amplitude_amperes` to `network_inputs[target_neuron_indices[index]]` for every
     // `index` whose `spike_bits[tick][index]` is nonzero. Call once per tick, before
-    // `AssembledModel::step_tick`, mirroring exactly how a continuous StimulusWindow is applied
+    // `AssembledModel::step_tick`, mirroring exactly how a continuous StimulusSchedule window is applied
     // (exit_model_validation_tests.cpp's own established per-tick injection pattern). `network_inputs`
     // must have at least as many elements as the model's own total_neuron_count (or, in delay-ring
     // mode, be the caller's own current ring-slot slice -- see delay_ring.h); a no-op if
