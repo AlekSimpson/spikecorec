@@ -97,6 +97,19 @@ namespace spikecorec {
         // over the whole array in the common untouched case).
         Vector<bool> sparse_delta_touched;
 
+        // Per-edge spike delay, in whole ticks (ticket #64/F3's future consumer;
+        // this stage only adds the storage). Sized [node_count * max_neighbor_count],
+        // the SAME row-major-by-source-node / same-slot-order addressing convention
+        // sparse_delta_buffers/neighbor_weights() already use: entry
+        // edge_delay_ticks[source_node * max_neighbor_count + slot] is the delay for
+        // the edge to the neighbor at that slot in the same order
+        // k2tree.get_neighbors(source_node, ...) enumerates it. Padding slots (beyond
+        // a node's real degree) are never read by anything edge-scoped, so their
+        // value is meaningless filler — currently defaulted to 1 like every real
+        // slot, simply because the whole array is filled uniformly at construction
+        // (see allocate_edge_delay_ticks in weight_matrix.cpp).
+        GpuPointer<s32> edge_delay_ticks;
+
         s64 node_count;
         s64 max_neighbor_count;             // upper bound on neighbors per node — bounds the padded
                                             // [node_count * max_neighbor_count] neighbor_weights output;
@@ -106,6 +119,24 @@ namespace spikecorec {
         f32 constant_weight;
         bool check_indexing;
         bool using_constant_weight;
+
+        // Delay (in whole ticks) every edge uses when using_constant_delay_ticks is
+        // true. Defaults to 1 — the engine's existing implicit one-tick
+        // network_inputs latency (CLAUDE.md's engine execution model) — so an
+        // ordinary WeightMatrix, constructed the same way it always has been, needs
+        // zero new caller-side work to keep behaving exactly like today's undelayed
+        // engine.
+        s32 constant_delay_ticks;
+
+        // True by default (see constant_delay_ticks): whether a "no explicit delay
+        // configured" WeightMatrix should read as constant_delay_ticks everywhere,
+        // matching the using_constant_weight/constant_weight pattern above exactly.
+        // set_constant_delay_ticks() sets this true as a side effect;
+        // set_edge_delay_ticks() does NOT flip it — whatever code reads delay in a
+        // future stage is responsible for choosing per-edge vs constant, the same
+        // way propagate-kernel dispatch already chooses constant_weight vs U*V via
+        // using_constant_weight.
+        bool using_constant_delay_ticks;
 
         // Number of per-edge synapse-state variables (arch §4.3's `Ck`/`Sk` family)
         // this WeightMatrix's shared U/V basis is configured to support, on top of
@@ -221,6 +252,14 @@ namespace spikecorec {
         // neighbor slots can never have anything accumulated into it.
         [[nodiscard]] GpuPointer<f32> allocate_sparse_delta_buffer() const;
 
+        // Allocates edge_delay_ticks: node_count * max_neighbor_count elements,
+        // every slot initialized to 1 (the default single-tick delay — see
+        // constant_delay_ticks's header comment). Returns a default-constructed
+        // (null) GpuPointer when node_count * max_neighbor_count is 0, following
+        // the exact same zero-byte-avoidance pattern allocate_sparse_delta_buffer
+        // uses.
+        [[nodiscard]] GpuPointer<s32> allocate_edge_delay_ticks() const;
+
         // Host-side-only slot search: returns target_node's position within
         // source_node's neighbor list (the same order k2tree.get_neighbors
         // enumerates it, and the same slot convention sparse_delta_buffers/
@@ -260,6 +299,22 @@ namespace spikecorec {
         [[nodiscard]] s64 get_neighbors(s64 node_index, s32 *output_buffer) const;
 
         void set_constant_weight(f32 value);
+
+        // Sets constant_delay_ticks to `ticks` and using_constant_delay_ticks to
+        // true (mirroring set_constant_weight()'s using_constant_weight side
+        // effect). Throws std::invalid_argument if ticks < 1 — delay is always at
+        // least 1 tick.
+        void set_constant_delay_ticks(s32 ticks);
+
+        // Per-edge point-setter for edge_delay_ticks (mirrors
+        // accumulate_edge_delta()'s shape): sets the delay for the real k^2-tree
+        // edge (source_node, target_node) to delay_ticks. Throws
+        // std::invalid_argument if (source_node, target_node) is not a real edge
+        // (checked via k2tree.adjacent, same as accumulate_edge_delta — see its own
+        // comment for why this doesn't reuse check_index_inbounds), or if
+        // delay_ticks < 1. Does NOT flip using_constant_delay_ticks — see that
+        // field's own header comment.
+        void set_edge_delay_ticks(s32 source_node, s32 target_node, s32 delay_ticks);
 
         // writes node_count * max_neighbor_count dot products into output_weights, row-major
         // by source node; slots beyond a node's actual neighbor count are sentinel-padded

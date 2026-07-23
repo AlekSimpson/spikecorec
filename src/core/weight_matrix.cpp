@@ -61,6 +61,8 @@ WeightMatrix::WeightMatrix(
     , constant_weight(0.0f)
     , check_indexing(check_indexing)
     , using_constant_weight(false)
+    , constant_delay_ticks(1)
+    , using_constant_delay_ticks(true)
     , total_edge_count(0)
     , refit_every_n_ticks(DEFAULT_REFIT_EVERY_N_TICKS)
     , refit_occupancy_threshold_fraction(-1.0f)
@@ -127,6 +129,12 @@ WeightMatrix::WeightMatrix(
     sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
     sparse_delta_touched.push_back(false);
 
+    // edge_delay_ticks (ticket #64/F3's future consumer): allocated to
+    // node_count*max_neighbor_count elements, every slot initialized to 1 (the
+    // default single-tick delay — see constant_delay_ticks's header comment),
+    // matching the engine's existing implicit one-tick network_inputs latency.
+    edge_delay_ticks = allocate_edge_delay_ticks();
+
     // total_edge_count (ticket #54/D4): computed via the same get_neighbors()
     // walk the refit pass itself uses (not a raw sum of `network`'s row
     // lengths), so it stays consistent with an explicitly-truncating
@@ -158,6 +166,7 @@ WeightMatrix::~WeightMatrix() {
     for (auto &delta_buffer : sparse_delta_buffers) {
         deallocate(std::move(delta_buffer));
     }
+    deallocate(std::move(edge_delay_ticks));
 }
 
 WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
@@ -180,6 +189,9 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
         deallocate(std::move(delta_buffer));
     }
     sparse_delta_buffers.clear();
+    // edge_delay_ticks (ticket #64/F3's future consumer) is GpuPointer-backed —
+    // same deallocate-before-move hazard-avoidance as U_matrix/V_matrix above.
+    deallocate(std::move(edge_delay_ticks));
 
     // k2tree is a K2Tree sub-object (not a pointer), and K2Tree's own defaulted
     // move-assignment operator has the identical GpuPointer-assert problem as
@@ -197,6 +209,7 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     // sparse_delta_touched is plain host memory (vector<bool>) — an ordinary
     // vector move-assignment, no GPU-asserting-move hazard to work around here.
     sparse_delta_touched = std::move(other.sparse_delta_touched);
+    edge_delay_ticks = std::move(other.edge_delay_ticks);
     node_count = other.node_count;
     max_neighbor_count = other.max_neighbor_count;
     rank = other.rank;
@@ -204,6 +217,8 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     constant_weight = other.constant_weight;
     check_indexing = other.check_indexing;
     using_constant_weight = other.using_constant_weight;
+    constant_delay_ticks = other.constant_delay_ticks;
+    using_constant_delay_ticks = other.using_constant_delay_ticks;
     total_edge_count = other.total_edge_count;
     refit_every_n_ticks = other.refit_every_n_ticks;
     refit_occupancy_threshold_fraction = other.refit_occupancy_threshold_fraction;
@@ -248,6 +263,16 @@ void WeightMatrix::set_constant_weight(f32 value) {
     }
     constant_weight = value;
     using_constant_weight = true;
+}
+
+void WeightMatrix::set_constant_delay_ticks(s32 ticks) {
+    if (ticks < 1) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_constant_delay_ticks: ticks must be >= 1 (got {})", ticks));
+    }
+    log::logger().debug("set_constant_delay_ticks: ticks={}", ticks);
+    constant_delay_ticks = ticks;
+    using_constant_delay_ticks = true;
 }
 
 bool WeightMatrix::check_index_inbounds(s32 node_index) const {
@@ -325,6 +350,23 @@ GpuPointer<f32> WeightMatrix::allocate_sparse_delta_buffer() const {
     // mean all-zero, so zero it explicitly here.
     memset(delta_buffer.get_contents(), 0, (usize)element_count * sizeof(f32));
     return delta_buffer;
+}
+
+GpuPointer<s32> WeightMatrix::allocate_edge_delay_ticks() const {
+    s64 element_count = node_count * max_neighbor_count;
+    if (element_count <= 0) {
+        // Same zero-byte-avoidance pattern as allocate_sparse_delta_buffer.
+        return GpuPointer<s32>();
+    }
+    GpuPointer<s32> delay_ticks = allocate<s32>((usize)element_count * sizeof(s32));
+    // allocate<s32> does not zero-initialize — fill every slot (including
+    // padding, whose value is never read by anything edge-scoped) with the
+    // default single-tick delay.
+    s32 *delay_data = delay_ticks.get_contents();
+    for (s64 index = 0; index < element_count; ++index) {
+        delay_data[index] = 1;
+    }
+    return delay_ticks;
 }
 
 optional<s64> WeightMatrix::find_neighbor_slot(s32 source_node, s32 target_node) const {
@@ -523,6 +565,47 @@ void WeightMatrix::accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 
     f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
     delta_data[source_node * max_neighbor_count + *slot] += delta;
     sparse_delta_touched[(usize)matrix_index] = true;
+}
+
+void WeightMatrix::set_edge_delay_ticks(s32 source_node, s32 target_node, s32 delay_ticks) {
+    log::logger().trace("set_edge_delay_ticks: source_node={} target_node={} delay_ticks={}",
+                        source_node, target_node, delay_ticks);
+
+    if (delay_ticks < 1) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_delay_ticks: delay_ticks must be >= 1 (got {})", delay_ticks));
+    }
+
+    // Deliberately does not reuse check_index_inbounds()/check_indexing here —
+    // same reasoning accumulate_edge_delta's own comment gives: this is a
+    // deliberately edge-scoped operation with its own contract, independent of
+    // that pre-existing knob.
+    bool in_bounds = source_node >= 0 && source_node < node_count &&
+                      target_node >= 0 && target_node < node_count;
+    if (!in_bounds) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_delay_ticks: (source_node={}, target_node={}) "
+                        "out of bounds for node_count={}", source_node, target_node, node_count));
+    }
+    if (!k2tree.adjacent(source_node, target_node)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_delay_ticks: (source_node={}, target_node={}) "
+                        "is not a real edge", source_node, target_node));
+    }
+
+    // See accumulate_edge_delta's own comment: a real edge is normally
+    // representable within max_neighbor_count, except under an explicit
+    // max_neighbor_count override smaller than a node's true degree.
+    optional<s64> slot = find_neighbor_slot(source_node, target_node);
+    if (!slot.has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_delay_ticks: (source_node={}, target_node={}) "
+                        "is a real edge but not representable within max_neighbor_count={}",
+                        source_node, target_node, max_neighbor_count));
+    }
+
+    s32 *delay_data = edge_delay_ticks.get_contents();
+    delay_data[source_node * max_neighbor_count + *slot] = delay_ticks;
 }
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {

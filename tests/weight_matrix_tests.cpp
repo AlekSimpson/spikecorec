@@ -1184,6 +1184,107 @@ TEST(WeightMatrix, load_from_disk_resets_sparse_delta_buffer_on_reallocation) {
     EXPECT_TRUE(approx(destination.get(0, 1), 0.42f)); // pure reconstruction, no leftover Sk
 }
 
+// ── per-edge delay storage (ticket #64/F3's future consumer) ──────────────────
+//
+// This stage only adds storage + setters; nothing reads edge_delay_ticks/
+// constant_delay_ticks yet (a future stage wires that in) -- see the header
+// comment on using_constant_delay_ticks.
+
+TEST(WeightMatrix, constant_delay_ticks_defaults_to_one_tick) {
+    // A "no explicit delay configured" WeightMatrix must behave byte-for-byte
+    // like today's undelayed engine -- the engine's existing implicit one-tick
+    // network_inputs latency.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    EXPECT_TRUE(weight_matrix.using_constant_delay_ticks);
+    EXPECT_EQ(weight_matrix.constant_delay_ticks, 1);
+}
+
+TEST(WeightMatrix, set_constant_delay_ticks_updates_value_and_flag) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+
+    weight_matrix.set_constant_delay_ticks(5);
+    EXPECT_TRUE(weight_matrix.using_constant_delay_ticks);
+    EXPECT_EQ(weight_matrix.constant_delay_ticks, 5);
+}
+
+TEST(WeightMatrix, set_constant_delay_ticks_rejects_non_positive_values) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+
+    EXPECT_THROW(weight_matrix.set_constant_delay_ticks(0), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.set_constant_delay_ticks(-1), std::invalid_argument);
+}
+
+// Every real edge's edge_delay_ticks slot must default to 1 (the default
+// single-tick delay), before any set_edge_delay_ticks call -- checked across a
+// real multi-edge, irregular-degree adjacency, not just one edge.
+TEST(WeightMatrix, edge_delay_ticks_defaults_to_one_for_every_edge) {
+    auto network = make_irregular_network();
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    const s32 *delay_data = weight_matrix.edge_delay_ticks.get_contents();
+    for (s64 node = 0; node < weight_matrix.node_count; ++node) {
+        s64 degree = weight_matrix.get_neighbors(node, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            s64 index = node * weight_matrix.max_neighbor_count + slot;
+            EXPECT_EQ(delay_data[index], 1)
+                << "node=" << node << " slot=" << slot;
+        }
+    }
+}
+
+TEST(WeightMatrix, set_edge_delay_ticks_updates_the_correct_slot) {
+    auto network = make_irregular_network();
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+
+    s32 source_node = 2, target_node = 3; // node 2: out-degree 4, {0,1,3,4}
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(source_node, target_node));
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    s64 degree = weight_matrix.get_neighbors(source_node, neighbor_buffer.data());
+    s64 expected_slot = -1;
+    for (s64 slot = 0; slot < degree; ++slot) {
+        if (neighbor_buffer[(usize)slot] == target_node) {
+            expected_slot = slot;
+            break;
+        }
+    }
+    ASSERT_NE(expected_slot, -1);
+
+    weight_matrix.set_edge_delay_ticks(source_node, target_node, 7);
+
+    const s32 *delay_data = weight_matrix.edge_delay_ticks.get_contents();
+    s64 total_slots = weight_matrix.node_count * weight_matrix.max_neighbor_count;
+    s64 expected_index = source_node * weight_matrix.max_neighbor_count + expected_slot;
+    for (s64 index = 0; index < total_slots; ++index) {
+        if (index == expected_index) {
+            EXPECT_EQ(delay_data[index], 7);
+        } else {
+            EXPECT_EQ(delay_data[index], 1);
+        }
+    }
+}
+
+TEST(WeightMatrix, set_edge_delay_ticks_rejects_non_edge) {
+    auto network = make_irregular_network();
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    ASSERT_FALSE(weight_matrix.k2tree.adjacent(3, 0)); // node 3 has no outgoing edges at all
+
+    EXPECT_THROW(weight_matrix.set_edge_delay_ticks(3, 0, 2), std::invalid_argument);
+}
+
+TEST(WeightMatrix, set_edge_delay_ticks_rejects_non_positive_delay) {
+    auto network = make_irregular_network();
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    s32 source_node = 0, target_node = 1;
+    ASSERT_TRUE(weight_matrix.k2tree.adjacent(source_node, target_node));
+
+    EXPECT_THROW(weight_matrix.set_edge_delay_ticks(source_node, target_node, 0), std::invalid_argument);
+}
+
 // ── total_edge_count (ticket #54/D4) ──────────────────────────────────────────
 
 TEST(WeightMatrix, total_edge_count_matches_the_network) {
