@@ -72,9 +72,9 @@ it). Concretely:
   `izhikevich_network_example`) still doesn't propagate — a real, orthogonal, documented lowering
   gap (its coupled `I`/`J` TimeDerivative isn't a shape `synapse_lowering.cpp` recognizes yet), not a
   placeholder;
-- `delayed_coupling_example` (ring mode) and `poisson_population_example` (no projections at all) are
-  the two remaining cases where a constant scattered weight is still the real mechanism — see each
-  file's own header comment for why.
+- `delayed_coupling_example`, `glif_stdp_plasticity_example` (both ring mode) and
+  `poisson_population_example` (no projections at all) are the remaining cases where a constant
+  scattered weight is still the real mechanism — see each file's own header comment for why.
 
 Every example's own header comment states which of these applies to it. Topology, routing, and
 timing were always real; what changed is that synaptic *magnitude* now is too, wherever a real
@@ -308,6 +308,27 @@ with real per-edge synapse dispatch active (ticket #131), and succeeds once the 
 model is instead built with a real per-edge delay and `enable_delay_ring=true` (which disables that
 dispatch). See `tests/assembled_model_plasticity_tests.cpp` for a full run that actually steps this
 combination and measures a weight depress.
+
+### `glif_stdp_plasticity_example.cpp` — STDP on a real GLIF network (ticket #129)
+
+`stdp_plasticity_example.cpp`'s own `AssembledModel` section uses a deliberately minimal, 2-neuron
+GLIF1/LIF-equivalent fixture — adaptation-free by construction, so it never shows a real GLIF cell's
+own after-spike-current state interacting with a weight-changing plasticity rule. This is the GLIF
+counterpart: the SAME 8×8 GLIF3 torus every other torus example uses, but wired with a real per-edge
+delay (`enable_delay_ring=true`, required for `enable_plasticity` — it throws on real per-edge synapse
+dispatch, ticket #131's dispatch is off in ring mode) and driven with active STDP for the whole run.
+`--gbase` therefore has no effect here — the same documented exception `delayed_coupling_example`/
+`poisson_population_example` already are.
+
+The scattered weight (`weights.set_constant_weight(0.5f)`) stays fixed for the whole run — ring mode
+scatters `constant_weight` directly, never the U/V reconstruction STDP mutates — so the torus's own
+propagation stays exactly as reliable as any other torus example while `WeightMatrix::get()` (always a
+real U/V reconstruction) shows STDP's own rank-1 nudge moving the stored weight underneath it. The run
+prints that: the driven corner's own 4 real edges, before and after. Recording follows the same
+`NetworkActivityRecorder` pattern as every other torus example — `--side 8` on
+`render_spire_video.py` renders the same wavefront, with real per-tick multi-neuron spike markers
+confirming genuine network-wide activity, not just the driven corner. See
+`tests/glif_stdp_network_tests.cpp` for the network-scale GLIF3/GLIF5 test this example mirrors.
 
 ## Shared code
 
