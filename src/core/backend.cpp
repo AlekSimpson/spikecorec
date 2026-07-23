@@ -173,7 +173,14 @@ void* allocate_bytes(usize byte_size) {
     return pointer;
 
 #elif defined(SPIKECOREC_METAL)
-    MTL::Buffer *buffer = global_device->newBuffer(byte_size, MTL::ResourceStorageModeShared);
+    // Zero-byte requests are legitimate (e.g. a K2Tree small enough to have no internal-node
+    // words, only leaf words -- see k2tree.cpp's make_k2tree_from_arrays), but MTL::Device::
+    // newBuffer(0, ...) can return a null MTL::Buffer*, and every caller downstream
+    // unconditionally dereferences it via GpuPointer::get_contents() (`pointer->contents()`).
+    // Round up to 1 byte so the returned buffer is always non-null and contents() is always
+    // valid; callers doing a 0-length memcpy/fill into it remain no-ops either way (found via
+    // ticket #134's ASan/UBSan run: "member call on null pointer of type 'MTL::Buffer'").
+    MTL::Buffer *buffer = global_device->newBuffer(byte_size > 0 ? byte_size : 1, MTL::ResourceStorageModeShared);
     // index by the unified-memory data pointer — that's what callers pass around
     // (GpuPointer::get_contents()), and what dispatch() must resolve back to a buffer
     global_buffer_map[buffer->contents()] = buffer;

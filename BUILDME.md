@@ -107,6 +107,30 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
     # List all test names without running them
     ./build/test_runner_metal --gtest_list_tests
 
+### Sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer)
+
+- `make test-asan`
+  Builds and runs the same GoogleTest suite as `make test`, but compiled with
+  `-fsanitize=address,undefined` (host/CPU C++ code only — GPU-side Metal/CUDA
+  device kernel code isn't sanitizable this way, so it's out of scope for this
+  target). Objects land under `build-asan/` (a separate directory from `build/`,
+  via `SANITIZE=1 BUILD_DIR=build-asan`), so a sanitized build never collides with
+  a normal one — no `make clean` needed between the two.
+
+  Sanitized runs are substantially slower than a normal `make test` (ASan/UBSan
+  instrumentation overhead, plus `-O1` instead of `-O2`) — budget several minutes
+  for the full suite, most of it in the two largest fixtures in
+  `tests/end_to_end_network_tests.cpp` (`EndToEndGlifNetworks.
+  glif5_large_network_current_injection_largest_anchor`, 2000 neurons / 10000
+  ticks, and `EndToEndGlifNetworks.
+  isolated_pair_subgraph_behaves_identically_regardless_of_surrounding_network_size`,
+  a 2000-neuron population run twice). Both already report their own wall-clock
+  time to stdout.
+
+  Equivalent to running `make SANITIZE=1 BUILD_DIR=build-asan test-metal` (or
+  `test-cuda`) directly, if you want the sanitizer flags without the separate
+  build directory.
+
 **Test suite index:**
 
 | Suite | File | What it covers |
@@ -140,7 +164,8 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
   Regenerate `compile_commands.json` via `bear` (needs `bear` installed).
 
 - `make clean`
-  Remove `build/`.
+  Remove `build/`. (`make clean BUILD_DIR=build-asan` removes the separate
+  sanitized build directory from `make test-asan`.)
 
 ### Overriding toolchain variables
 

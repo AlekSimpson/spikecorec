@@ -122,6 +122,7 @@ Tests use [GoogleTest](https://github.com/google/googletest) (vendored as a subm
 make test          # build + run all tests (auto-detects backend)
 make test-metal    # Metal backend explicitly
 make test-cuda     # CUDA backend explicitly
+make test-asan     # same suite under AddressSanitizer+UBSan (host/CPU code only, much slower)
 ```
 
 To run a subset after the initial build, invoke the runner directly with `--gtest_filter`:
