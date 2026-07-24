@@ -222,6 +222,20 @@ ModelAllocation allocate_model(ModelSpecification &model, const Vector<IrProgram
     }
 
     // ── WeightMatrix per-edge variable count (arch §4.3) ────────────────────
+    //
+    // NOTE (investigated a `make test-asan` UBSan report at this exact line: "load of value
+    // N, which is not a valid value for type 'bool'" inside optional::has_value()): root-caused
+    // to a STALE INCREMENTAL BUILD, not a real bug here. ModelSpecification is a plain aggregate
+    // (model_specification.h) and `adjacency` is only ever `.emplace()`d when a real edge exists
+    // (model_specification.cpp) -- every path that reaches this line with adjacency unset leaves
+    // it in std::optional's own default-constructed (disengaged) state the whole time, which is
+    // always well-defined. The failure only reproduced from ONE pre-existing build-asan/ directory
+    // whose nml/allocator.o predated later edits to WeightMatrix/ModelSpecification's own layout
+    // (headers this TU only reaches transitively) -- this Makefile had no -MMD/-MP header
+    // dependency tracking, so `make` never knew to recompile allocator.o after those header
+    // changes, leaving it computing member offsets against a stale layout. A byte-identical fresh
+    // build of the exact same source never reproduces this. Fixed by adding -MMD/-MP tracking to
+    // the Makefile; no source change was needed/justified here.
     allocation.per_edge_variable_count = total_peredge_variable_count;
     if (model.adjacency.has_value()) {
         model.adjacency->configure_per_edge_variable_count(total_peredge_variable_count);

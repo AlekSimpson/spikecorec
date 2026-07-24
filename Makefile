@@ -212,22 +212,36 @@ $(METAL_LIB): $(CORE_OBJS) $(NML_OBJS) $(METAL_OBJS)
 # ── Core objects (platform-agnostic C++) ─────────────────────
 $(BUILD_DIR)/core/%.o: $(SRC_DIR)/core/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 # ── NML/LEMS front-end objects (platform-agnostic C++) ───────
 $(BUILD_DIR)/nml/%.o: $(SRC_DIR)/nml/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 # ── CUDA objects (.cu) ───────────────────────────────────────
 $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
 	@mkdir -p $(@D)
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
 
 # ── Metal objects (.cpp via metal-cpp) ───────────────────────
 $(BUILD_DIR)/metal/%.o: $(SRC_DIR)/metal/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+# Auto-generated per-TU header dependencies (-MMD -MP above) — without this,
+# `make`'s pattern rules above only ever re-check a .o against its OWN .cpp's
+# mtime, never the headers it transitively #includes. Editing a shared header
+# (e.g. WeightMatrix/ModelSpecification's layout) then re-running an
+# incremental `make`/`make test-asan` leaves any .o that only reaches that
+# header transitively (not via its own .cpp's mtime) stale: it keeps stale
+# machine code computing member offsets against the OLD layout while every
+# freshly-rebuilt .o/the actual runtime objects use the NEW one — a real
+# object-layout mismatch that can surface as bizarre, non-representative
+# failures (up to and including sanitizer reports of "impossible" values at
+# a completely unrelated-looking line). `-include` here is deliberately
+# silent about missing .d files (a clean $(BUILD_DIR) has none yet).
+-include $(CORE_OBJS:.o=.d) $(NML_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(METAL_OBJS:.o=.d)
 
 # ── Metal shaders (.metal → .air → .metallib) ────────────────
 $(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal
