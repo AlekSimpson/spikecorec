@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/allocator.h"
 #include "spikecorec/nml/cell_lowering.h"
@@ -186,6 +187,19 @@ using namespace spikecorec::nml;
 //    (checked: `SC-100_EndToEndGlifNetworkTests` had zero commits beyond `nightly` at that point).
 //    task_master reconciles any duplicate/divergent approach at merge time, per this session's own
 //    coordination note.
+//
+// ── SpikeEngine migration status (added when this file was migrated off AssembledModel/
+// ModelRuntimeBuffers onto SpikeEngine) ─────────────────────────────────────────────────────────────
+// The isolation test and the three CONTINUOUS-current-injection anchor tests below (anchor_a/b/c) now
+// run through SpikeEngine directly (`run_chain_network_via_spike_engine`, defined below). The
+// discrete-spike-array test (`anchor_a_50_neurons_50_ticks_discrete_spike_array_drives_input_neuron`)
+// and the combined per-edge-storage/delay/STDP test
+// (`anchor_b_combines_real_per_edge_synapse_storage_spike_delays_and_active_stdp_together`) are NOT
+// migrated: both need to force `emit_port_flags["spike"][neuron] = true` directly before a tick, and
+// SpikeEngine has no public accessor for its own private `nml_emit_port_flags_` equivalent -- a real,
+// newly-discovered gap, not something this migration papers over. See this file's own "SpikeEngine
+// migration gap" comment further down (immediately above `run_chain_network_via_spike_engine`) for
+// the full detail. Both stay on `run_chain_network`/`AssembledModel`/`ModelRuntimeBuffers`, unchanged.
 
 namespace {
 
@@ -460,6 +474,87 @@ ChainNetworkRunResult run_chain_network(
     return result;
 }
 
+// ── SpikeEngine migration gap (found while migrating this file off AssembledModel/
+// ModelRuntimeBuffers onto SpikeEngine) ───────────────────────────────────────────────────────────
+//
+// SpikeEngine (src/core/engine.cpp) has no public accessor for its own private
+// `nml_emit_port_flags_` map -- unlike `ModelRuntimeBuffers::emit_port_flags` (a plain public
+// `UnorderedMap<String, bool*>`), there is currently no way for a caller outside SpikeEngine to force
+// `emit_<port>[neuron] = true` for a given neuron/tick before calling `step_tick`. That is exactly
+// this file's own "discrete spike-array driving mechanism" (this file's own header comment above) --
+// the ONLY way to make a neuron's own real k^2-tree propagate/scatter (and hence any downstream
+// cascade, and `apply_nml_stdp_plasticity`'s own "did the source genuinely fire, with a real
+// propagate-stage-driven last_spiked" precondition) run as though that neuron spiked externally, not
+// from its own accumulate/threshold dynamics. Manually poking `engine.last_spiked` directly does NOT
+// substitute for this: the fixed propagate stage decides whether to scatter by reading the
+// emit-port flag buffer, not `last_spiked` (engine.cpp's own step_tick), so a neuron "forced" only via
+// `last_spiked` would never actually propagate to its downstream targets.
+//
+// `SimpleAccumulatorNetwork.anchor_a_50_neurons_50_ticks_discrete_spike_array_drives_input_neuron`
+// and `SimpleAccumulatorNetwork.anchor_b_combines_real_per_edge_synapse_storage_spike_delays_and_
+// active_stdp_together` both need exactly this mechanism (the latter ALSO combines it with real,
+// distinct per-edge U/V weights and delay-ring mode, this file's own header comment #2/#3) -- so, per
+// this migration's own explicit instruction not to force a broken/hacky substitute, both are left
+// exactly as they were (still built on `run_chain_network`/`AssembledModel`/`ModelRuntimeBuffers`
+// directly below) rather than migrated. Every OTHER test in this file (the isolation test above, and
+// the three CONTINUOUS-current-injection anchor tests below) drives its network purely through
+// `network_inputs`/ring writes, which SpikeEngine's own public `network_inputs` field already
+// supports byte-for-byte the same way -- those are migrated onto the new
+// `run_chain_network_via_spike_engine` helper just below.
+
+// SpikeEngine-based counterpart to run_chain_network above, for the CONTINUOUS-current-injection
+// drive mechanism only (see this file's own "SpikeEngine migration gap" comment just above for why
+// the discrete-spike-array mechanism has its own, separate helper that stays on AssembledModel).
+// `drive_tick` receives the engine itself, the model's own ring_slot_count (computed once here via
+// delay_ring.h's own already-tested `compute_max_delay_ticks`, since SpikeEngine's own internal ring
+// size is a private field with no public accessor -- see engine.h's own doc comment on
+// nml_ring_slot_count_ for why this is exactly the same value the engine derives internally for a
+// uniform per-edge delay), and the tick -- mirrors `drive_continuous`'s own
+// `(ModelRuntimeBuffers&, DelayRingAllocation&, s64)` shape, just reading ring_slot_count/neuron_count
+// off the engine/a plain s64 instead of a separate DelayRingAllocation struct.
+ChainNetworkRunResult run_chain_network_via_spike_engine(
+    const String &fixture_id, s32 population_size, s64 tick_count, s64 delay_ticks, f32 constant_weight,
+    f64 spike_threshold_volts, f64 resting_potential_volts, f32 dt_seconds, const spikecorec::Vector<s32> &watched_neuron_indices,
+    const std::function<void(SpikeEngine &, s64, s64)> &drive_tick) {
+    spikecorec::Vector<GeneratedConnection> connections =
+        build_chain_connections(population_size, (f64)constant_weight, (f64)delay_ticks * (f64)dt_seconds);
+    ModelSpecification model = load_generated_network_model(
+        fixture_id, build_network_content_xml(fixture_id, population_size, spike_threshold_volts,
+                                               resting_potential_volts, connections, /*a_minus_stdp_amplitude=*/0.0));
+
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    SpikeEngine engine(model, programs, dt_seconds);
+    engine.weights.set_constant_weight(constant_weight);
+
+    // Every connection built by build_chain_connections above shares this SAME uniform delay, so this
+    // matches engine.cpp's own constructor-time `weights.set_constant_delay_ticks(...)` derivation
+    // exactly (compute_max_delay_ticks performs the identical "seconds -> whole ticks, floored to 1"
+    // conversion delay_ring.cpp's own delay_seconds_to_ticks/engine.cpp's own
+    // nml_delay_seconds_to_ticks both already use).
+    s64 ring_slot_count = compute_max_delay_ticks(model, dt_seconds);
+
+    ChainNetworkRunResult result;
+    for (s32 neuron_index : watched_neuron_indices) result.spike_ticks_by_watched_neuron[neuron_index] = {};
+
+    auto start_time = std::chrono::steady_clock::now();
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        drive_tick(engine, ring_slot_count, tick);
+        engine.step_tick(dt_seconds, tick, tick + 1);
+
+        for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
+            if (!std::isfinite(engine.nml_allocation_.cell_state.get_contents()[neuron_index])) result.all_values_finite = false;
+            if (engine.last_spiked.get_contents()[neuron_index] == tick) {
+                ++result.total_spike_count;
+                auto watched = result.spike_ticks_by_watched_neuron.find(neuron_index);
+                if (watched != result.spike_ticks_by_watched_neuron.end()) watched->second.push_back(tick);
+            }
+        }
+    }
+    auto end_time = std::chrono::steady_clock::now();
+    result.wall_clock_seconds = std::chrono::duration<double>(end_time - start_time).count();
+    return result;
+}
+
 // Reproduces kernels.metal's own `step_apply_hebbian_update` call-site formula exactly (see this
 // file's own header comment #2 for why this is invoked manually here, and exactly which existing,
 // already-tested API it reuses -- WeightMatrix::update(), not new math): for every connection whose
@@ -529,45 +624,20 @@ TEST(SimpleAccumulatorCellIsolation, accumulate_threshold_reset_cycle_matches_ha
     ASSERT_EQ(model.total_neuron_count, 1);
 
     spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ModelAllocation allocation = allocate_model(model, programs);
-    AssembledModel assembled_model(model, programs);
-
-    vector<vector<s32>> adjacency(1); // one edge-free neuron -- same convention
-                                       // exit_model_validation_tests.cpp's own build_weight_matrix uses
-                                       // for a single-cell model.
-    WeightMatrix weights(adjacency, /*rank=*/1);
-
-    GpuPointer<f32> network_inputs = allocate<f32>(sizeof(f32));
-    network_inputs.get_contents()[0] = 0.0f;
-    GpuPointer<s64> last_spiked = allocate<s64>(sizeof(s64));
-    last_spiked.get_contents()[0] = -1;
-    GpuPointer<s32> next_active_indices = allocate<s32>(sizeof(s32));
-    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
-    next_active_count.get_contents()[0] = 0;
-    GpuPointer<s32> active_generation = allocate<s32>(sizeof(s32));
-    active_generation.get_contents()[0] = -1;
-    GpuPointer<bool> emit_spike = allocate<bool>(sizeof(bool));
-    emit_spike.get_contents()[0] = false;
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+    // One edge-free neuron -- SpikeEngine builds its own (empty-adjacency) WeightMatrix/ModelAllocation
+    // internally from `model`, matching exit_model_validation_tests.cpp's own build_weight_matrix
+    // convention for a single-cell model.
+    SpikeEngine engine(model, programs, dt_seconds);
 
     spikecorec::Vector<s64> observed_spike_ticks;
     f64 hand_computed_v = 0.0;
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        buffers.network_inputs[0] += injected_current_per_tick;
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        engine.network_inputs.get_contents()[0] += injected_current_per_tick;
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
-        f32 observed_v = allocation.cell_state.get_contents()[0];
-        if (buffers.last_spiked[0] == tick) observed_spike_ticks.push_back(tick);
+        f32 observed_v = engine.nml_allocation_.cell_state.get_contents()[0];
+        if (engine.last_spiked.get_contents()[0] == tick) observed_spike_ticks.push_back(tick);
 
         // Hand-computed reference: accumulate, then reset to resting_potential EXACTLY when the sum
         // first exceeds threshold -- the accumulate/threshold/reset/emit cycle this deliverable exists
@@ -601,13 +671,13 @@ TEST(SimpleAccumulatorNetwork, anchor_a_50_neurons_50_ticks_continuous_current_i
     spikecorec::Vector<s32> watched_neuron_indices;
     for (s32 index = 0; index < population_size; ++index) watched_neuron_indices.push_back(index);
 
-    auto drive_continuous = [injected_current_per_tick](ModelRuntimeBuffers &, DelayRingAllocation &ring, s64 tick) {
-        s64 current_slot = tick % ring.ring_slot_count;
-        ring.input_ring.get_contents()[current_slot * ring.neuron_count + 0] += injected_current_per_tick;
+    auto drive_continuous = [injected_current_per_tick](SpikeEngine &engine, s64 ring_slot_count, s64 tick) {
+        s64 current_slot = tick % ring_slot_count;
+        engine.network_inputs.get_contents()[current_slot * engine.neuron_count + 0] += injected_current_per_tick;
     };
 
     ChainNetworkRunResult result =
-        run_chain_network("anchor_a_continuous", population_size, tick_count, delay_ticks, constant_weight,
+        run_chain_network_via_spike_engine("anchor_a_continuous", population_size, tick_count, delay_ticks, constant_weight,
                            spike_threshold_volts, resting_potential_volts, dt_seconds, watched_neuron_indices,
                            drive_continuous);
 
@@ -681,13 +751,13 @@ TEST(SimpleAccumulatorNetwork, anchor_b_400_neurons_1500_ticks_continuous_curren
 
     spikecorec::Vector<s32> watched_neuron_indices = {0, 1, 5, 20, 100, 200, 399};
 
-    auto drive_continuous = [injected_current_per_tick](ModelRuntimeBuffers &, DelayRingAllocation &ring, s64 tick) {
-        s64 current_slot = tick % ring.ring_slot_count;
-        ring.input_ring.get_contents()[current_slot * ring.neuron_count + 0] += injected_current_per_tick;
+    auto drive_continuous = [injected_current_per_tick](SpikeEngine &engine, s64 ring_slot_count, s64 tick) {
+        s64 current_slot = tick % ring_slot_count;
+        engine.network_inputs.get_contents()[current_slot * engine.neuron_count + 0] += injected_current_per_tick;
     };
 
     ChainNetworkRunResult result =
-        run_chain_network("anchor_b_continuous", population_size, tick_count, delay_ticks, constant_weight,
+        run_chain_network_via_spike_engine("anchor_b_continuous", population_size, tick_count, delay_ticks, constant_weight,
                            spike_threshold_volts, resting_potential_volts, dt_seconds, watched_neuron_indices,
                            drive_continuous);
 
@@ -916,13 +986,13 @@ TEST(SimpleAccumulatorNetwork, anchor_c_2000_neurons_10000_ticks_scaling_sanity)
 
     spikecorec::Vector<s32> watched_neuron_indices = {0, 1, 2, 10, 100, 500, 1000, 1500, 1999};
 
-    auto drive_continuous = [injected_current_per_tick](ModelRuntimeBuffers &, DelayRingAllocation &ring, s64 tick) {
-        s64 current_slot = tick % ring.ring_slot_count;
-        ring.input_ring.get_contents()[current_slot * ring.neuron_count + 0] += injected_current_per_tick;
+    auto drive_continuous = [injected_current_per_tick](SpikeEngine &engine, s64 ring_slot_count, s64 tick) {
+        s64 current_slot = tick % ring_slot_count;
+        engine.network_inputs.get_contents()[current_slot * engine.neuron_count + 0] += injected_current_per_tick;
     };
 
     ChainNetworkRunResult result =
-        run_chain_network("anchor_c_continuous", population_size, tick_count, delay_ticks, constant_weight,
+        run_chain_network_via_spike_engine("anchor_c_continuous", population_size, tick_count, delay_ticks, constant_weight,
                            spike_threshold_volts, resting_potential_volts, dt_seconds, watched_neuron_indices,
                            drive_continuous);
 

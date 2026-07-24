@@ -5,19 +5,16 @@
 #endif
 
 #include <cmath>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/backend.h"
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/allocator.h"
 #include "spikecorec/nml/cell_lowering.h"
-#include "spikecorec/nml/delay_ring.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
@@ -29,6 +26,13 @@ using namespace std;
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::nml::network_generation;
+
+// spikecorec/core/engine.h (pulled in by this file's own SpikeEngine migration) declares a
+// file-scope `using namespace spikecorec::log;`, which makes the ALIAS TEMPLATE
+// `spikecorec::log::Vector` ambiguous with `spikecorec::Vector` for plain unqualified `Vector<...>`
+// lookup -- mirrors tests/simple_lif_stdp_network_tests.cpp's/tests/end_to_end_network_tests.cpp's
+// own identical, already-documented issue. `Vector<...>` below is spelled out fully as
+// `spikecorec::Vector<...>` for this same reason.
 
 // ── STDP plasticity on a real GLIF network (ticket #129 [T8]) ────────────────────────────────────
 //
@@ -138,8 +142,8 @@ ModelSpecification load_model_from_generated_content(const String &fixture_id, c
 }
 
 // Parallel to model.type_library -- same convention every other *_tests.cpp fixture in this tree uses.
-Vector<IrProgram> build_type_library_ir_programs(const ModelSpecification &model) {
-    Vector<IrProgram> programs;
+spikecorec::Vector<IrProgram> build_type_library_ir_programs(const ModelSpecification &model) {
+    spikecorec::Vector<IrProgram> programs;
     programs.reserve(model.type_library.size());
     for (const auto &entry : model.type_library) {
         if (entry.category == TypeLibraryCategory::Cell) {
@@ -211,9 +215,9 @@ bool all_finite(const ModelAllocation &allocation) {
 }
 
 struct GlifStdpNetworkRunResult {
-    Vector<f32> weight_before; // weight_before[n] == the ring's own (n -> (n+1)%neuron_count) edge
-    Vector<f32> weight_after;
-    Vector<s64> last_spiked_by_neuron;
+    spikecorec::Vector<f32> weight_before; // weight_before[n] == the ring's own (n -> (n+1)%neuron_count) edge
+    spikecorec::Vector<f32> weight_after;
+    spikecorec::Vector<s64> last_spiked_by_neuron;
 };
 
 // Builds one fresh GLIF ring network (`neuron_count` neurons of `variant`, real per-edge delay,
@@ -250,38 +254,42 @@ GlifStdpNetworkRunResult run_glif_ring_stdp_network(
         throw std::runtime_error("run_glif_ring_stdp_network: unexpected total_neuron_count");
     }
 
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_ring_glif_initial_state(allocation, model, variant);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    // SpikeEngine builds its own ModelAllocation/WeightMatrix/delay-ring configuration internally
+    // (folding what AssembledModel/ModelRuntimeBuffers/DelayRingAllocation used to require the caller
+    // to assemble by hand -- see include/spikecorec/core/engine.h). Its own ModelSpecification
+    // constructor seeds `weights`' own constant_delay_ticks from this model's real "1s" per-connection
+    // delay attribute (the SAME conversion delay_ring.cpp's own compute_max_delay_ticks performs), and
+    // (since that delay is far longer than 1 tick) forces its own real per-edge synapse dispatch off
+    // entirely for this model -- mirrors AssembledModel's own `enable_delay_ring=true` precedent
+    // exactly (master_kernel.h's own doc comment: "ticket #64's delay ring and this ticket's synapse
+    // dispatch have not been integrated with each other"), so `enable_plasticity` below is not
+    // rejected by the real-per-edge-synapse-dispatch guard (see this file's own header comment).
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_ring_glif_initial_state(engine.nml_allocation_, model, variant);
 
     // Real, natural-scale random weights -- see this file's own header comment for why NOT calling
-    // set_constant_weight()/scale_neighbor_weights_to_root_mean_square() here is deliberate.
-    WeightMatrix weights = build_ring_weight_matrix(model, /*rank=*/8, /*weight_seed=*/7);
+    // set_constant_weight()/scale_neighbor_weights_to_root_mean_square() here is deliberate. Captures
+    // the engine's own already-established constant_delay_ticks (derived above from this model's real
+    // "1s" delay attribute) before replacing U/V wholesale, then reapplies it -- swapping in a whole
+    // fresh WeightMatrix would otherwise reset delay back to its own default (1 tick), desyncing it
+    // from the engine's own already-fixed ring size (a private field, sized once at construction and
+    // never recomputed).
+    if (!engine.weights.using_constant_delay_ticks) {
+        throw std::runtime_error(
+            "run_glif_ring_stdp_network: expected a uniform per-connection delay (every generated ring "
+            "connection shares the SAME delay_attribute)");
+    }
+    s32 established_delay_ticks = engine.weights.constant_delay_ticks;
+    engine.weights = build_ring_weight_matrix(model, /*rank=*/8, /*weight_seed=*/7);
+    engine.weights.set_constant_delay_ticks(established_delay_ticks);
 
-    DelayRingAllocation ring = allocate_delay_ring(model, weights, dt_seconds);
-    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
-    if (stdp_learning_rate > 0.0f) assembled_model.enable_plasticity(stdp_learning_rate);
-
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)neuron_count * sizeof(s64));
-    // 0 == "never spiked" -- apply_stdp_plasticity's own sentinel convention (master_kernel.cpp), NOT
-    // -1 (the convention every OTHER example/test that never drives STDP uses instead -- see this
-    // file's own header comment's "drive scheme" section for why tick 0 itself is never a real drive
-    // tick, avoiding the resulting ambiguity).
-    memset(last_spiked.get_contents(), 0, (usize)neuron_count * sizeof(s64));
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)neuron_count * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)neuron_count * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    buffers.delay_ring = &ring;
+    if (stdp_learning_rate > 0.0f) engine.enable_plasticity(stdp_learning_rate);
 
     GlifStdpNetworkRunResult result;
     result.weight_before.resize((usize)neuron_count);
     for (s32 neuron_index = 0; neuron_index < neuron_count; ++neuron_index) {
-        result.weight_before[(usize)neuron_index] = weights.get(neuron_index, (neuron_index + 1) % neuron_count);
+        result.weight_before[(usize)neuron_index] = engine.weights.get(neuron_index, (neuron_index + 1) % neuron_count);
     }
 
     const f32 external_pulse = 0.03f; // 30mV -- comfortably above every fixture's own 20mV EL-to-threshold gap
@@ -291,20 +299,21 @@ GlifStdpNetworkRunResult run_glif_ring_stdp_network(
             s64 pass_index = (tick - 1) / drive_gap_ticks;
             if (pass_index < neuron_count) {
                 s32 neuron_to_drive = (s32)(neuron_count - 1 - pass_index);
-                s64 v_index = membrane_potential_element_index(allocation, neuron_to_drive);
-                allocation.cell_state.get_contents()[v_index] += external_pulse;
+                s64 v_index = membrane_potential_element_index(engine.nml_allocation_, neuron_to_drive);
+                engine.nml_allocation_.cell_state.get_contents()[v_index] += external_pulse;
             }
         }
 
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
-        EXPECT_TRUE(all_finite(allocation)) << "tick=" << tick;
+        engine.step_tick(dt_seconds, tick, tick + 1);
+        EXPECT_TRUE(all_finite(engine.nml_allocation_)) << "tick=" << tick;
     }
 
     result.weight_after.resize((usize)neuron_count);
     for (s32 neuron_index = 0; neuron_index < neuron_count; ++neuron_index) {
-        result.weight_after[(usize)neuron_index] = weights.get(neuron_index, (neuron_index + 1) % neuron_count);
+        result.weight_after[(usize)neuron_index] = engine.weights.get(neuron_index, (neuron_index + 1) % neuron_count);
     }
-    result.last_spiked_by_neuron.assign(last_spiked.get_contents(), last_spiked.get_contents() + neuron_count);
+    result.last_spiked_by_neuron.assign(engine.last_spiked.get_contents(),
+                                        engine.last_spiked.get_contents() + neuron_count);
 
     return result;
 }
