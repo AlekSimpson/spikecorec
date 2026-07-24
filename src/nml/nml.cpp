@@ -2,6 +2,7 @@
 #include <libxml/tree.h>
 #include <libxml/xmlschemastypes.h>
 #include <filesystem>
+#include <unordered_set>
 
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/core/log.h"
@@ -23,25 +24,11 @@ namespace {
 // structural extraction (bake-vs-parameterize, extends-merge, etc. stay
 // resolve-pass concerns, ticket #49).
 
-String get_attr(const NML_Node &node, const String &name) {
-    auto entry = node.attributes.find(name);
-    if (entry == node.attributes.end()) return "";
-    return std::any_cast<String>(entry->second);
-}
-
 const NML_Node *find_child(const NML_Node &node, const String &tag) {
     for (const auto &child : node.body) {
         if (child.tag_name == tag) return &child;
     }
     return nullptr;
-}
-
-Vector<const NML_Node *> find_children(const NML_Node &node, const String &tag) {
-    Vector<const NML_Node *> matches;
-    for (const auto &child : node.body) {
-        if (child.tag_name == tag) matches.push_back(&child);
-    }
-    return matches;
 }
 
 // xmlSchemaSetValidStructuredErrors callback: collects each reported validation error's line number
@@ -69,156 +56,117 @@ void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
 // extract_fixed_decls separately synthesizes the `Fixed` pin that supplies its actual value, so nml.h
 // gains no new decl struct for it.
 
-// REFACTOR: Should be parameterized into a simple "extract" function
+// Every extractor below is a thin call into the shared extract_decls (nml.h) -- one line naming which
+// tag(s) mirror this DeclType and how to build one from a matched child's attributes.
 
 Vector<ParameterDecl> extract_parameters(const NML_Node &node) {
-    Vector<ParameterDecl> result;
-    for (const auto *child : find_children(node, "Parameter")) {
-        result.push_back(ParameterDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
-    }
-    for (const auto *child : find_children(node, "Constant")) {
-        result.push_back(ParameterDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
-    }
-    return result;
+    return extract_decls<ParameterDecl>(node, {"Parameter", "Constant"}, [](const NML_Node &child) {
+        return ParameterDecl{child.get_attr("name"), child.get_attr("dimension")};
+    });
 }
 
 Vector<PropertyDecl> extract_properties(const NML_Node &node) {
-    Vector<PropertyDecl> result;
-    for (const auto *child : find_children(node, "Property")) {
-        result.push_back(PropertyDecl{get_attr(*child, "name"), get_attr(*child, "dimension"), get_attr(*child, "defaultValue")});
-    }
-    return result;
+    return extract_decls<PropertyDecl>(node, {"Property"}, [](const NML_Node &child) {
+        return PropertyDecl{child.get_attr("name"), child.get_attr("dimension"), child.get_attr("defaultValue")};
+    });
 }
 
 Vector<ExposureDecl> extract_exposures(const NML_Node &node) {
-    Vector<ExposureDecl> result;
-    for (const auto *child : find_children(node, "Exposure")) {
-        result.push_back(ExposureDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
-    }
-    return result;
+    return extract_decls<ExposureDecl>(node, {"Exposure"}, [](const NML_Node &child) {
+        return ExposureDecl{child.get_attr("name"), child.get_attr("dimension")};
+    });
 }
 
 Vector<EventPortDecl> extract_event_ports(const NML_Node &node) {
-    Vector<EventPortDecl> result;
-    for (const auto *child : find_children(node, "EventPort")) {
-        result.push_back(EventPortDecl{get_attr(*child, "name"), get_attr(*child, "direction")});
-    }
-    return result;
+    return extract_decls<EventPortDecl>(node, {"EventPort"}, [](const NML_Node &child) {
+        return EventPortDecl{child.get_attr("name"), child.get_attr("direction")};
+    });
 }
 
 Vector<AttachmentDecl> extract_attachments(const NML_Node &node) {
-    Vector<AttachmentDecl> result;
-    for (const auto *child : find_children(node, "Attachments")) {
-        result.push_back(AttachmentDecl{get_attr(*child, "name"), get_attr(*child, "type")});
-    }
-    return result;
+    return extract_decls<AttachmentDecl>(node, {"Attachments"}, [](const NML_Node &child) {
+        return AttachmentDecl{child.get_attr("name"), child.get_attr("type")};
+    });
 }
 
 Vector<RequirementDecl> extract_requirements(const NML_Node &node) {
-    Vector<RequirementDecl> result;
-    for (const auto *child : find_children(node, "Requirement")) {
-        result.push_back(RequirementDecl{get_attr(*child, "name"), get_attr(*child, "dimension")});
-    }
-    return result;
+    return extract_decls<RequirementDecl>(node, {"Requirement"}, [](const NML_Node &child) {
+        return RequirementDecl{child.get_attr("name"), child.get_attr("dimension")};
+    });
 }
 
 // `ComponentReference`/`Link`, plus the electrical/graded-synapse and
 // projection-family equivalents (`InstanceRequirement`, `ComponentRequirement`)
 // — all "a reference to another component's type," unified into one list.
 Vector<ComponentReferenceDecl> extract_component_references(const NML_Node &node) {
-    Vector<ComponentReferenceDecl> result;
-    for (const char *tag : {"ComponentReference", "Link", "InstanceRequirement", "ComponentRequirement"}) {
-        for (const auto *child : find_children(node, tag)) {
-            result.push_back(ComponentReferenceDecl{get_attr(*child, "name"), get_attr(*child, "type")});
-        }
-    }
-    return result;
+    return extract_decls<ComponentReferenceDecl>(
+        node, {"ComponentReference", "Link", "InstanceRequirement", "ComponentRequirement"}, [](const NML_Node &child) {
+            return ComponentReferenceDecl{child.get_attr("name"), child.get_attr("type")};
+        });
 }
 
 Vector<ChildrenDecl> extract_children_decls(const NML_Node &node) {
-    Vector<ChildrenDecl> result;
-    for (const char *tag : {"Children", "Child"}) {
-        for (const auto *child : find_children(node, tag)) {
-            result.push_back(ChildrenDecl{get_attr(*child, "name"), get_attr(*child, "type")});
-        }
-    }
-    return result;
+    return extract_decls<ChildrenDecl>(node, {"Children", "Child"}, [](const NML_Node &child) {
+        return ChildrenDecl{child.get_attr("name"), child.get_attr("type")};
+    });
 }
 
 Vector<PathDecl> extract_path_fields(const NML_Node &node) {
-    Vector<PathDecl> result;
-    for (const char *tag : {"Path", "Text"}) {
-        for (const auto *child : find_children(node, tag)) {
-            result.push_back(PathDecl{get_attr(*child, "name")});
-        }
-    }
-    return result;
+    return extract_decls<PathDecl>(node, {"Path", "Text"}, [](const NML_Node &child) {
+        return PathDecl{child.get_attr("name")};
+    });
 }
 
 Vector<StateVariableDecl> extract_state_variables(const NML_Node &dynamics) {
-    Vector<StateVariableDecl> result;
-    for (const auto *child : find_children(dynamics, "StateVariable")) {
-        result.push_back(StateVariableDecl{get_attr(*child, "name"), get_attr(*child, "dimension"), get_attr(*child, "exposure")});
-    }
-    return result;
+    return extract_decls<StateVariableDecl>(dynamics, {"StateVariable"}, [](const NML_Node &child) {
+        return StateVariableDecl{child.get_attr("name"), child.get_attr("dimension"), child.get_attr("exposure")};
+    });
 }
 
 Vector<DerivedVariableDecl> extract_derived_variables(const NML_Node &dynamics) {
-    Vector<DerivedVariableDecl> result;
-    for (const auto *child : find_children(dynamics, "DerivedVariable")) {
-        result.push_back(DerivedVariableDecl{
-            get_attr(*child, "name"), get_attr(*child, "dimension"), get_attr(*child, "exposure"),
-            get_attr(*child, "value"), get_attr(*child, "select"), get_attr(*child, "reduce")});
-    }
-    return result;
+    return extract_decls<DerivedVariableDecl>(dynamics, {"DerivedVariable"}, [](const NML_Node &child) {
+        return DerivedVariableDecl{
+            child.get_attr("name"), child.get_attr("dimension"), child.get_attr("exposure"),
+            child.get_attr("value"), child.get_attr("select"), child.get_attr("reduce")};
+    });
 }
 
 Vector<TimeDerivativeDecl> extract_time_derivatives(const NML_Node &dynamics) {
-    Vector<TimeDerivativeDecl> result;
-    for (const auto *child : find_children(dynamics, "TimeDerivative")) {
-        result.push_back(TimeDerivativeDecl{get_attr(*child, "variable"), get_attr(*child, "value")});
-    }
-    return result;
+    return extract_decls<TimeDerivativeDecl>(dynamics, {"TimeDerivative"}, [](const NML_Node &child) {
+        return TimeDerivativeDecl{child.get_attr("variable"), child.get_attr("value")};
+    });
 }
 
 Vector<OnConditionDecl> extract_on_conditions(const NML_Node &dynamics) {
-    Vector<OnConditionDecl> result;
-    for (const auto *child : find_children(dynamics, "OnCondition")) {
-        result.push_back(OnConditionDecl{get_attr(*child, "test"), *child});
-    }
-    return result;
+    return extract_decls<OnConditionDecl>(dynamics, {"OnCondition"}, [](const NML_Node &child) {
+        return OnConditionDecl{child.get_attr("test"), child};
+    });
 }
 
 Vector<OnEventDecl> extract_on_events(const NML_Node &dynamics) {
-    Vector<OnEventDecl> result;
-    for (const auto *child : find_children(dynamics, "OnEvent")) {
-        result.push_back(OnEventDecl{get_attr(*child, "port"), *child});
-    }
-    return result;
+    return extract_decls<OnEventDecl>(dynamics, {"OnEvent"}, [](const NML_Node &child) {
+        return OnEventDecl{child.get_attr("port"), child};
+    });
 }
 
 Vector<RegimeDecl> extract_regimes(const NML_Node &dynamics) {
-    Vector<RegimeDecl> result;
-    for (const auto *child : find_children(dynamics, "Regime")) {
-        result.push_back(RegimeDecl{get_attr(*child, "name"), get_attr(*child, "initial"), *child});
-    }
-    return result;
+    return extract_decls<RegimeDecl>(dynamics, {"Regime"}, [](const NML_Node &child) {
+        return RegimeDecl{child.get_attr("name"), child.get_attr("initial"), child};
+    });
 }
 
 Vector<OnStartDecl> extract_on_starts(const NML_Node &dynamics) {
-    Vector<OnStartDecl> result;
-    for (const auto *child : find_children(dynamics, "OnStart")) {
-        result.push_back(OnStartDecl{*child});
-    }
-    return result;
+    return extract_decls<OnStartDecl>(dynamics, {"OnStart"}, [](const NML_Node &child) {
+        return OnStartDecl{child};
+    });
 }
 
 ComponentTypeBase make_base(const NML_Node &node, const String &extends) {
-    return ComponentTypeBase(get_attr(node, "name"), extends, node);
+    return ComponentTypeBase(node.get_attr("name"), extends, node);
 }
 
 CellType build_cell_type(const NML_Node &node, const String &extends) {
-    CellType result(get_attr(node, "name"), extends, node);
+    CellType result(node.get_attr("name"), extends, node);
 
     result.parameters = extract_parameters(node);
     result.exposures = extract_exposures(node);
@@ -238,7 +186,7 @@ CellType build_cell_type(const NML_Node &node, const String &extends) {
 }
 
 SynapseType build_synapse_type(const NML_Node &node, const String &extends) {
-    SynapseType result(get_attr(node, "name"), extends, node);
+    SynapseType result(node.get_attr("name"), extends, node);
 
     result.parameters = extract_parameters(node);
     result.properties = extract_properties(node);
@@ -260,7 +208,7 @@ SynapseType build_synapse_type(const NML_Node &node, const String &extends) {
 }
 
 InputsType build_inputs_type(const NML_Node &node, const String &extends) {
-    InputsType result(get_attr(node, "name"), extends, node);
+    InputsType result(node.get_attr("name"), extends, node);
 
     result.parameters = extract_parameters(node);
     result.properties = extract_properties(node);
@@ -282,7 +230,7 @@ InputsType build_inputs_type(const NML_Node &node, const String &extends) {
 }
 
 PopulationType build_population_type(const NML_Node &node, const String &extends) {
-    PopulationType result(get_attr(node, "name"), extends, node);
+    PopulationType result(node.get_attr("name"), extends, node);
 
     result.component_references = extract_component_references(node);
     result.parameters = extract_parameters(node);
@@ -292,7 +240,7 @@ PopulationType build_population_type(const NML_Node &node, const String &extends
 }
 
 ProjectType build_project_type(const NML_Node &node, const String &extends) {
-    ProjectType result(get_attr(node, "name"), extends, node);
+    ProjectType result(node.get_attr("name"), extends, node);
 
     result.component_references = extract_component_references(node);
     result.parameters = extract_parameters(node);
@@ -310,6 +258,12 @@ void NML_Node::add_attribute(String name, Any value) {
 
 void NML_Node::nest(NML_Node component) {
     body.push_back(component);
+}
+
+String NML_Node::get_attr(const String &name) const {
+    auto entry = attributes.find(name);
+    if (entry == attributes.end()) return "";
+    return std::any_cast<String>(entry->second);
 }
 
 void NML_Parser::parse(const String &nml_input_file) {
@@ -529,12 +483,14 @@ void NML_Parser::classify_all_cataloged_types() {
 // is left unclassified — the bare ComponentTypeBase identity, raw node
 // still intact.
 ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
-    // REFACTOR: These should be sets
-    static const Vector<String> cell_anchors = {"baseCell"};
-    static const Vector<String> synapse_anchors = {"baseSynapse"};
-    static const Vector<String> inputs_anchors = {"basePointCurrent", "baseSpikeSource"};
-    static const Vector<String> population_anchors = {"basePopulation", "population", "populationList"};
-    static const Vector<String> project_anchors = {
+    // Membership-only, unordered lookups -- no anchor set is ever iterated in a particular order or
+    // relied on for its declaration order, so an unordered_set (rather than a Vector<String> linearly
+    // scanned by hand) is both the right shape and gives reaches_anchor O(1) lookups instead of O(n).
+    static const unordered_set<String> cell_anchors = {"baseCell"};
+    static const unordered_set<String> synapse_anchors = {"baseSynapse"};
+    static const unordered_set<String> inputs_anchors = {"basePointCurrent", "baseSpikeSource"};
+    static const unordered_set<String> population_anchors = {"basePopulation", "population", "populationList"};
+    static const unordered_set<String> project_anchors = {
         "projection", "connection", "connectionWD", "explicitConnection",
         "synapticConnection", "synapticConnectionWD",
         "electricalConnection", "electricalConnectionInstance", "electricalConnectionInstanceW",
@@ -542,30 +498,22 @@ ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
         "continuousConnection", "continuousConnectionInstance", "continuousConnectionInstanceW",
         "continuousProjection"};
 
-    // REFACTOR: can be deleted when the vectors are switched to sets
-    auto contains = [](const Vector<String> &anchors, const String &value) {
-        for (const auto &anchor : anchors) {
-            if (anchor == value) return true;
-        }
-        return false;
-    };
-
     // Walks from `node` up through successive `extends` lookups (bounded to
     // guard against a cyclic chain), returning true the moment any name in
     // the chain (including `node` itself) matches one of `anchors`.
-    auto reaches_anchor = [this, &contains](const NML_Node &start, const Vector<String> &anchors) {
-        String current_name = get_attr(start, "name");
+    auto reaches_anchor = [this](const NML_Node &start, const unordered_set<String> &anchors) {
+        String current_name = start.get_attr("name");
         const NML_Node *current_node = &start;
 
         for (int hop = 0; hop < 64 && !current_name.empty(); ++hop) {
-            if (contains(anchors, current_name)) return true;
+            if (anchors.count(current_name) > 0) return true;
 
-            String parent_name = get_attr(*current_node, "extends");
+            String parent_name = current_node->get_attr("extends");
             if (parent_name.empty()) return false;
 
             auto parent_entry = raw_component_types.find(parent_name);
             if (parent_entry == raw_component_types.end()) {
-                return contains(anchors, parent_name);
+                return anchors.count(parent_name) > 0;
             }
 
             current_name = parent_name;
@@ -574,7 +522,7 @@ ComponentTypeEntry NML_Parser::classify_component_type(const NML_Node &node) {
         return false;
     };
 
-    String extends = get_attr(node, "extends");
+    String extends = node.get_attr("extends");
 
     if (reaches_anchor(node, cell_anchors)) return build_cell_type(node, extends);
     if (reaches_anchor(node, synapse_anchors)) return build_synapse_type(node, extends);

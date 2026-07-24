@@ -1,5 +1,6 @@
 #pragma once
 
+#include <initializer_list>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <variant>
@@ -26,7 +27,33 @@ struct NML_Node {
 
     void add_attribute(String name, Any value);
     void nest(NML_Node component);
+
+    // Returns attribute `name`'s value, or "" if this node has no such
+    // attribute (every NML/LEMS attribute is parsed as a raw string --
+    // see xml_node_to_nml_node -- so there is no other type it could be).
+    String get_attr(const String &name) const;
 };
+
+// Generic declaration-tag extractor shared by nml.cpp's extract_parameters/extract_properties/...
+// (ticket #2 [A3]) and resolve.cpp's extract_fixed_decls (ticket #49 [A4]) -- every one of those was
+// hand-written as "for each of one or more tag names, find the matching direct children and push_back
+// a DeclType built from each match's attributes," differing only in which tags and which attributes.
+// `build` receives the actual matched child (not just its attributes), so it may still branch on
+// `child.tag_name` for the rare case where the same DeclType is built differently depending on which
+// tag matched (resolve.cpp's Fixed vs Constant) -- every other caller's `build` just ignores it.
+// Iterates `tags` in the order given (not `node`'s own child order), so a caller with more than one
+// tag -- e.g. extract_parameters's Parameter-then-Constant -- keeps the same tag-major ordering it
+// always had, rather than document order.
+template <typename DeclType, typename Builder>
+Vector<DeclType> extract_decls(const NML_Node &node, std::initializer_list<const char *> tags, Builder build) {
+    Vector<DeclType> result;
+    for (const char *tag : tags) {
+        for (const auto &child : node.body) {
+            if (child.tag_name == tag) result.push_back(build(child));
+        }
+    }
+    return result;
+}
 
 // ── ComponentType categories (ticket #2 [A3]; arch doc §3) ──────────────
 //
@@ -40,15 +67,25 @@ struct NML_Node {
 // stays plain NML_Node — this classification only applies to what
 // NML_Parser catalogs into `library`.
 
-// REFACTOR: these can be consolidated
+// Several of the declaration-level tags below are structurally identical --
+// just a name plus one more field -- differing only in which LEMS tag they
+// mirror and what that tag means once resolved (§3.1). Consolidated into two
+// shared shapes (`NamedDimensionDecl`, `NamedTypeRefDecl`), with every
+// original name kept as a `using` alias -- so each declaration below is
+// still its own distinct, individually-documented identifier; only the
+// duplicated struct bodies are gone.
+
+// Shared shape for `Parameter`/`Exposure`/`Requirement` (§3.1): a name plus a
+// dimension, nothing more.
+struct NamedDimensionDecl {
+    String name;
+    String dimension;
+};
 
 // `Parameter` (§3.1): a named, time-invariant, dimensioned quantity an
 // instance carries. Whether it ends up baked or per-neuron is decided later,
 // at resolve — not readable from the declaration alone.
-struct ParameterDecl {
-    String name;
-    String dimension;
-};
+using ParameterDecl = NamedDimensionDecl;
 
 // `Property` (§3.1): like Parameter, but settable with a default — the more
 // common carrier of genuine per-instance variation (e.g. `weight`).
@@ -60,10 +97,7 @@ struct PropertyDecl {
 
 // `Exposure` (§3.1): an observable quantity recording (or a parent
 // ComponentType's `select`/`reduce`) may read.
-struct ExposureDecl {
-    String name;
-    String dimension;
-};
+using ExposureDecl = NamedDimensionDecl;
 
 // `EventPort` (§3.1): a spike port; `direction` is "in" or "out".
 struct EventPortDecl {
@@ -71,37 +105,33 @@ struct EventPortDecl {
     String direction;
 };
 
-// `Attachments` (§3.1): a synapse-attachment point on a cell.
-struct AttachmentDecl {
+// Shared shape for `Attachments`/`ComponentReference`/`Link`/`Children`/
+// `Child` (§3.1): a name plus a reference to another type's name, nothing
+// more.
+struct NamedTypeRefDecl {
     String name;
     String type;
 };
 
+// `Attachments` (§3.1): a synapse-attachment point on a cell.
+using AttachmentDecl = NamedTypeRefDecl;
+
 // `Requirement` (§3.1): a quantity this type needs bound from its enclosing
 // scope but does not own itself (near-universally postsynaptic `v`, for a
 // synapse's `g * (erev - v)`).
-struct RequirementDecl {
-    String name;
-    String dimension;
-};
+using RequirementDecl = NamedDimensionDecl;
 
 // `ComponentReference`/`Link` (§3.1) — and the closely related
 // `InstanceRequirement`/`ComponentRequirement` forms used by
 // electrical/graded synapse pairs and by projections — all "a reference to
 // another component's type," unified into one shape.
-struct ComponentReferenceDecl {
-    String name;
-    String type;
-};
+using ComponentReferenceDecl = NamedTypeRefDecl;
 
 // `Children`/`Child` (§3.1): named containment of sub-components (a
 // population's `instance` list, a projection's `connection` list, a
 // blockingPlasticSynapse's plasticity/block mechanisms, a spikeArray's
 // explicit spike-time list, ...).
-struct ChildrenDecl {
-    String name;
-    String type;
-};
+using ChildrenDecl = NamedTypeRefDecl;
 
 // `Path`/`Text` (§3.1): a structural-path or string parameter — routing
 // names like `presynapticPopulation`, `preCellId`, `destination`.
@@ -188,7 +218,24 @@ struct ComponentTypeBase {
         : name(std::move(name)), extends(std::move(extends)), raw(std::move(raw)) {}
 };
 
-// REFACTOR: These can also be consolidated, maybe even into one type that holds all of the cell type data as a matrix
+// The five categories below still hold real per-category differences (arch
+// §3.3), though a good chunk of their fields do overlap (all three Dynamics
+// categories carry parameters/state_variables/derived_variables/
+// time_derivatives/exposures/event_ports/on_starts; both Structure
+// categories carry component_references/parameters/children). They are kept
+// as five distinct C++ types in a std::variant here, rather than unified
+// into one matrix/index-addressed type, because every downstream consumer
+// narrows `ComponentTypeEntry` via std::get<T>/std::holds_alternative<T>
+// keyed on exactly these five type identities: nml.cpp's own
+// classify_component_type, resolve.cpp's merge_chain/flatten_component_type
+// (a template parameterized on one of these five types), cell_lowering.cpp/
+// synapse_lowering.cpp/inputs_lowering.cpp/output_recording.cpp/
+// model_specification.cpp downstream, and ~20 call sites across
+// nml_tests.cpp/resolve_tests.cpp/cell_lowering_tests.cpp. Re-deriving all of
+// that against one SoA/index-addressed type is a real architecture change,
+// not a mechanical rename -- left as a follow-up rather than attempted
+// alongside the same-behavior struct cleanup done in this pass (see also
+// ComponentTypeEntry below).
 
 // CellType — Dynamics/point-cell ComponentTypes (arch §3.3 D1): `iafCell`,
 // `iafRefCell`, `izhikevich2007Cell`, `adExIaFCell`, GLIF variants, etc.
@@ -278,8 +325,9 @@ using ConnectionType = ProjectType;
 // A cataloged ComponentType is exactly one of the five categories above, or
 // (for anything the arch doc's §3.3 buckets don't cover — ion channels,
 // morphology, biophysical properties, Phase 3) left as the bare identity
-// with its raw node still intact.
-// REFACTOR: This can be removed if we consolidate into one main type, every individual type instance would just be an index into the type data structure
+// with its raw node still intact. Stays a variant of five distinct types
+// rather than one unified, index-addressed type -- see the note above
+// CellType for why.
 using ComponentTypeEntry = std::variant<ComponentTypeBase, CellType, SynapseType, InputsType, PopulationType, ProjectType>;
 
 #ifndef SPIKECOREC_NML_STD_LIB_DIR

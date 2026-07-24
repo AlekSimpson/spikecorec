@@ -37,7 +37,11 @@ namespace spikecorec::nml {
 // fail resolution for every model, only real ones. See apply_fixed_pins's own doc comment for the
 // resulting warn-and-skip (rather than throw) handling this flag selects.
 //
-// REFACTOR: ANOTHER DECL STRUCT ?!
+// Not folded into the nml.h decl-struct consolidation above (NamedDimensionDecl/NamedTypeRefDecl):
+// FixedDecl's shape (a parameter name, a still-unconverted value string, and the
+// is_from_constant_declaration flag) matches none of them, and it is a resolve-time concern rather
+// than a declaration-catalog one (see the paragraph above), which is exactly why it already lives
+// here in resolve.h rather than in nml.h alongside ParameterDecl/etc.
 struct FixedDecl {
     String parameter;
     String value;

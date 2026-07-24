@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_set>
 #include <variant>
 
 #include "spikecorec/nml/resolve.h"
@@ -13,31 +14,18 @@ namespace spikecorec::nml {
 
 namespace {
 
-// ── Small local helpers (mirrors nml.cpp's own private helpers; not shared
-// across translation units since nml.cpp keeps them in its own anonymous
-// namespace) ──────────────────────────────────────────────────────────────
+// ── Small local helpers ──────────────────────────────────────────────────
+// (nml.cpp's own equivalent helpers are file-local to nml.cpp's anonymous
+// namespace, so not directly reusable here; NML_Node::get_attr -- nml.h --
+// is the one that used to be redeclared here too, now a real method instead.)
 
-// REFACTOR: These should be methods of NML_Node instead of being redeclared in every fucking file
-
-String get_attr(const NML_Node &node, const String &name) {
-    auto entry = node.attributes.find(name);
-    if (entry == node.attributes.end()) return "";
-    return std::any_cast<String>(entry->second);
-}
-
-bool contains(const Vector<String> &values, const String &target) {
-    for (const auto &value : values) {
-        if (value == target) return true;
-    }
-    return false;
-}
-
-
-// REFACTOR: These should be sets
 // Instance-level attributes that are IDrefs (arch §1.2 S7): they must
 // resolve through the symbol table to another cataloged id/name, or it is a
-// resolve error. `target` is deliberately NOT here -- see below.
-const Vector<String> IDREF_ATTRIBUTE_NAMES = {
+// resolve error. `target` is deliberately NOT here -- see below. Membership-
+// only, unordered lookups (never iterated for their declaration order), so
+// an unordered_set is the right shape rather than a Vector<String> linearly
+// scanned by hand.
+const unordered_set<String> IDREF_ATTRIBUTE_NAMES = {
     "component", "cell", "presynapticPopulation", "postsynapticPopulation",
     "synapse", "input", "ionChannel"};
 
@@ -50,7 +38,7 @@ const Vector<String> IDREF_ATTRIBUTE_NAMES = {
 // form throw a false "unresolved IDref", so it is treated as an opaque path
 // here, same as `preCellId`/`postCellId`, at the cost of not validating the
 // bare-id (`Simulation target=`) form.
-const Vector<String> OPAQUE_STRING_ATTRIBUTE_NAMES = {
+const unordered_set<String> OPAQUE_STRING_ATTRIBUTE_NAMES = {
     "name", "notes", "preCellId", "postCellId", "destination", "type", "target"};
 
 // Whether `value_text` even looks like a dimensioned literal (a leading
@@ -76,17 +64,14 @@ bool looks_like_dimensioned_literal(const String &value_text) {
 // as a separate `<Fixed parameter="X" value="V"/>` sibling. nml.cpp's own extract_parameters already
 // catalogs `X` as a ParameterDecl (so it's a legal identifier at all); this is what actually supplies
 // its baked value, reusing apply_fixed_pins/the whole existing Fixed-pin pipeline unchanged.
-// REFACTOR: Another extract function ?! should be refactored with the rest in nml.cpp
+// A thin call into the shared extract_decls (nml.h, also used by nml.cpp's own extract_parameters/
+// etc.) -- `build` branches on which of the two tags actually matched, since (unlike most
+// extract_decls callers) a Fixed and a Constant produce a differently-shaped FixedDecl.
 Vector<FixedDecl> extract_fixed_decls(const NML_Node &node) {
-    Vector<FixedDecl> result;
-    for (const auto &child : node.body) {
-        if (child.tag_name == "Fixed") {
-            result.push_back(FixedDecl{get_attr(child, "parameter"), get_attr(child, "value"), false});
-        } else if (child.tag_name == "Constant") {
-            result.push_back(FixedDecl{get_attr(child, "name"), get_attr(child, "value"), true});
-        }
-    }
-    return result;
+    return extract_decls<FixedDecl>(node, {"Fixed", "Constant"}, [](const NML_Node &child) {
+        if (child.tag_name == "Fixed") return FixedDecl{child.get_attr("parameter"), child.get_attr("value"), false};
+        return FixedDecl{child.get_attr("name"), child.get_attr("value"), true};
+    });
 }
 
 template <typename T>
@@ -342,7 +327,7 @@ ResolvedInstance resolve_instance(const NML_Node &node, const SymbolTable &symbo
             continue;
         }
 
-        if (contains(IDREF_ATTRIBUTE_NAMES, attribute_name)) {
+        if (IDREF_ATTRIBUTE_NAMES.count(attribute_name) > 0) {
             if (!symbols.contains(value_text)) {
                 log::logger().error("resolve: unresolved IDref '{}' for attribute '{}' on <{}>",
                                      value_text, attribute_name, node.tag_name);
@@ -353,7 +338,7 @@ ResolvedInstance resolve_instance(const NML_Node &node, const SymbolTable &symbo
             continue;
         }
 
-        if (contains(OPAQUE_STRING_ATTRIBUTE_NAMES, attribute_name) || !looks_like_dimensioned_literal(value_text)) {
+        if (OPAQUE_STRING_ATTRIBUTE_NAMES.count(attribute_name) > 0 || !looks_like_dimensioned_literal(value_text)) {
             result.string_attributes[attribute_name] = value_text;
             continue;
         }
