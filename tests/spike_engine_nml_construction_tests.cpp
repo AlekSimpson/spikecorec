@@ -430,3 +430,150 @@ TEST(SpikeEngineNmlMoveSafety, move_assignment_does_not_double_release_nml_resou
     // The move-assigned-to engine must still be fully functional.
     ASSERT_NO_THROW({ engine_two.step_tick(1.0f, 1, 2); });
 }
+
+// ── delay-ring fold (SpikeEngine-only) -- see the three REFACTOR comments in delay_ring.h/
+// master_kernel.h/master_kernel.cpp this generalizes. network_inputs (and the active-set enqueue
+// bookkeeping) is now ring-shaped [ring_slot_count * neuron_count] on SpikeEngine, with
+// ring_slot_count derived from WeightMatrix's own constant_delay_ticks/edge_delay_ticks at NML
+// construction time -- ring_slot_count == 1 (no real per-edge delay beyond the engine's existing
+// implicit one-tick latency) must collapse to byte-identical behavior to the pre-fold flat path;
+// ring_slot_count > 1 (a real per-edge delay configured) must deliver a scattered spike EXACTLY
+// that many ticks later, not sooner and not later.
+//
+// The ring_slot_count == 1 case below reuses SpikeEngineNmlSynapseDispatch's own two-neuron
+// conductance-synapse fixture (build_two_neuron_conductance_synapse_model/
+// run_two_neuron_conductance_synapse_network_through_spike_engine, defined above in this same
+// file) rather than a bare, synapse-free projection: engine.cpp's constructor validates every
+// ProjectionEntry's synapse_type_library_index whenever nml_ring_slot_count_ == 1 (real per-edge
+// synapse dispatch, ticket #131, is only ever force-disabled for a REAL per-edge delay, ring_slot_
+// count > 1 -- see engine.cpp's own constructor doc comment), so a projection representable with
+// ring_slot_count == 1 needs a real synapse type either way, exactly like every other existing
+// projection-bearing fixture in this file already provides. The real per-edge synapse dispatch
+// path already carries the SAME >=1-tick network_inputs latency as the plain scalar-weight path
+// (ir_spec.md §3.5) -- delivery + integrate both run within the SOURCE neuron's own firing tick,
+// so the TARGET neuron cannot observe it until its own NEXT tick's dispatch -- so this is still a
+// faithful "ring_slot_count == 1 matches the flat one-tick latency" proof.
+//
+// The ring_slot_count > 1 case below needs its OWN, separate, synapse-free fixture (real per-edge
+// synapse dispatch is force-disabled for that case, so a re-used conductance-synapse model would
+// never even exercise the delay ring at all) -- build_two_neuron_delay_ring_model, a plain
+// (no real per-edge synapse type) projection relying on the FIXED scalar propagate stage's own
+// constant_weight instead. This constructor's own delay-seeding step (engine.cpp) interprets
+// ConnectionEntry::delay DIRECTLY as a whole-tick count (SpikeEngine's NML constructor has no
+// dt_seconds available to redo delay_ring.cpp's OLD seconds->ticks conversion, and WeightMatrix's
+// own delay fields are already whole-tick-denominated) -- so the fixture below just sets `delay`
+// to the desired tick count directly. Only valid for a delay that rounds to > 1 (forcing
+// nml_ring_slot_count_ > 1, and so nml_projections_ empty, and so its own bogus
+// synapse_type_library_index never gets validated) -- NOT a general-purpose "any delay" fixture.
+
+namespace {
+
+// A minimal 2-neuron model: neuron 0 -> neuron 1 through a plain (no real per-edge synapse type)
+// projection carrying `connection_delay_ticks`. Reuses build_lif_equivalent_program/
+// build_lif_equivalent_type_entry (defined above in this same file). Parameters are engineered so
+// neuron 0 fires EXACTLY ONCE, at tick 1, from a single external boost: post-boost v=5.0 decays in
+// ONE integrate step to 5.0+1.0*(gL*(EL-5.0))/C = 5.0-2.5 = 2.5 (with gL=0.5, EL=0.0, C=1.0,
+// dt=1.0) -- still above vth=2.0, so it fires at tick 1 -- then to 2.5-1.25=1.25 the NEXT tick,
+// below vth=2.0, so it never fires again. A single, unambiguous source spike pins down this ring's
+// own delivery latency exactly (no risk of a second, later spike's own delayed arrival confusing
+// the assertion). `connection_delay_ticks` MUST round to > 1 (see this section's own header
+// comment above for why).
+ModelSpecification build_two_neuron_delay_ring_model(f64 connection_delay_ticks, vector<IrProgram> &out_programs) {
+    const f32 decay_rate = 0.5f;      // gL
+    const f32 resting_mp = 0.0f;      // EL
+    const f32 spike_threshold = 2.0f; // vth
+
+    ModelSpecification model;
+    model.total_neuron_count = 2;
+    model.type_library.push_back(build_lif_equivalent_type_entry(
+        "DelayRingCell", "delayRingInstance", 1.0f, decay_rate, resting_mp, spike_threshold));
+
+    PopulationEntry population;
+    population.id = "Pop";
+    population.type_library_index = 0;
+    population.size = 2;
+    population.neuron_index_begin = 0;
+    population.neuron_index_end = 2;
+    model.populations.push_back(population);
+
+    ProjectionEntry projection;
+    projection.id = "Proj";
+    projection.presynaptic_population_index = 0;
+    projection.postsynaptic_population_index = 0;
+    projection.connections.push_back(
+        ConnectionEntry{/*source=*/0, /*target=*/1, /*weight=*/1.0, /*delay=*/connection_delay_ticks});
+    model.projections.push_back(projection);
+
+    out_programs = {build_lif_equivalent_program("DelayRingCell", decay_rate, resting_mp, spike_threshold)};
+    return model;
+}
+
+// Drives neuron 0 over threshold with a single external boost at tick 1 (see
+// build_two_neuron_delay_ring_model's own doc comment) and returns neuron 1's own
+// membrane-potential trajectory, one sample per tick, over `tick_count` ticks.
+vector<f32> run_two_neuron_delay_ring_network_through_spike_engine(f64 connection_delay_ticks, s64 tick_count,
+                                                                    f32 constant_weight) {
+    vector<IrProgram> programs;
+    ModelSpecification model = build_two_neuron_delay_ring_model(connection_delay_ticks, programs);
+
+    SpikeEngine engine(model, programs);
+    engine.weights.set_constant_weight(constant_weight);
+
+    vector<f32> postsynaptic_trajectory;
+    postsynaptic_trajectory.reserve((usize)tick_count);
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        if (tick == 1) engine.nml_allocation_.cell_state.get_contents()[0] += 5.0f; // drives neuron 0 over threshold
+        engine.step_tick(1.0f, tick, tick + 1);
+        postsynaptic_trajectory.push_back(engine.nml_allocation_.cell_state.get_contents()[1]);
+    }
+    return postsynaptic_trajectory;
+}
+
+} // namespace
+
+TEST(SpikeEngineNmlDelayRing, ring_slot_count_one_no_configured_delay_matches_the_flat_one_tick_latency) {
+    // delay=0.0 on this fixture's one connection (build_two_neuron_conductance_synapse_model,
+    // defined above in this same file) -- the "no delay attribute given" default -- rounds to <= 1,
+    // so this engine's constructor never touches weights' delay config: nml_ring_slot_count_ stays
+    // at its own default of 1 (see this section's own header comment for why this reuses that
+    // fixture rather than build_two_neuron_delay_ring_model below).
+    vector<f32> trajectory = run_two_neuron_conductance_synapse_network_through_spike_engine(/*gbase=*/2.0f);
+
+    // Neuron 0 fires at tick 1 (driven by that fixture's own "+5.0f at tick 1" boost) -- the
+    // engine's existing implicit >=1-tick network_inputs latency (CLAUDE.md) means neuron 1 must
+    // stay at rest (EL=0.0) through tick 1 and move starting at tick 2, not before.
+    ASSERT_GT(trajectory.size(), 2u);
+    for (s64 tick = 0; tick <= 1; ++tick) {
+        EXPECT_NEAR(trajectory[(usize)tick], 0.0f, 1e-6f)
+            << "neuron 1 moved before the expected 1-tick-delayed arrival (tick " << tick << ")";
+    }
+    EXPECT_GT(std::fabs(trajectory[2]), 1e-3f)
+        << "neuron 1 never received neuron 0's spike at the expected 1-tick-delayed arrival (tick 2)";
+
+    std::cout << "[SpikeEngineNmlDelayRing] ring_slot_count==1 postsynaptic trajectory: ";
+    for (f32 voltage : trajectory) std::cout << voltage << " ";
+    std::cout << std::endl;
+}
+
+TEST(SpikeEngineNmlDelayRing, ring_shaped_path_delivers_a_spike_exactly_delay_ticks_ticks_later) {
+    const s32 delay_ticks = 5;
+    const s64 tick_count = 12;
+    vector<f32> trajectory = run_two_neuron_delay_ring_network_through_spike_engine(
+        /*connection_delay_ticks=*/(f64)delay_ticks, tick_count, /*constant_weight=*/3.0f);
+
+    // Neuron 0 fires at tick 1 -- the configured 5-tick delay means neuron 1 must stay at rest
+    // (EL=0.0) through tick 5 and move starting at tick 6 (1 + 5), not any tick before.
+    const s64 expected_arrival_tick = 1 + delay_ticks;
+    ASSERT_LT(expected_arrival_tick, tick_count);
+    for (s64 tick = 0; tick < expected_arrival_tick; ++tick) {
+        EXPECT_NEAR(trajectory[(usize)tick], 0.0f, 1e-6f)
+            << "neuron 1 moved BEFORE the configured " << delay_ticks << "-tick delay elapsed (tick " << tick << ")";
+    }
+    EXPECT_GT(std::fabs(trajectory[(usize)expected_arrival_tick]), 1e-3f)
+        << "neuron 1 never received neuron 0's spike at the expected delayed arrival tick ("
+        << expected_arrival_tick << ")";
+
+    std::cout << "[SpikeEngineNmlDelayRing] ring_slot_count==" << delay_ticks << " postsynaptic trajectory: ";
+    for (f32 voltage : trajectory) std::cout << voltage << " ";
+    std::cout << std::endl;
+}

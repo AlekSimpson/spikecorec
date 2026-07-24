@@ -257,13 +257,254 @@ private:
     vector<vector<u8>> slots_;
 };
 
+// ── delay-ring fold (SpikeEngine-only) -- ring_slot_count derivation + the one unified,
+// ring-capable drain/propagate kernel pair. See the three REFACTOR comments in delay_ring.h/
+// master_kernel.h/master_kernel.cpp this generalizes -- those files/AssembledModel are left
+// completely untouched by this fold; this is new, additive capability on SpikeEngine alone. ──────
+
+// `nml_compute_ring_slot_count_from_weight_matrix`-equivalent of delay_ring.h's own
+// compute_max_delay_ticks(model, dt_seconds): same "scan for the longest delay, floored to the
+// engine's existing implicit 1-tick minimum" shape, but reading the delay straight off `weights`
+// (constant_delay_ticks/using_constant_delay_ticks/edge_delay_ticks -- already whole-tick-
+// denominated, weight_matrix.h) instead of walking a ModelSpecification's connections through a
+// separate DelayRingAllocation (REFACTOR comment #1, delay_ring.h) -- no dt_seconds conversion is
+// needed here at all, unlike delay_ring.cpp's own (untouched) version. Padding slots beyond a
+// node's real degree are never written past their default (1), so scanning the WHOLE
+// edge_delay_ticks array (real edges and padding together) gives exactly the same answer as
+// restricting to real edges only.
+s64 nml_compute_ring_slot_count_from_weight_matrix(const WeightMatrix &weights) {
+    if (weights.using_constant_delay_ticks) {
+        return weights.constant_delay_ticks < 1 ? 1 : weights.constant_delay_ticks;
+    }
+    s64 edge_element_count = weights.node_count * weights.max_neighbor_count;
+    if (edge_element_count <= 0 || weights.edge_delay_ticks.pointer == nullptr) return 1;
+    const s32 *delay_data = weights.edge_delay_ticks.get_contents();
+    s64 max_ticks = 1;
+    for (s64 index = 0; index < edge_element_count; ++index) {
+        if (delay_data[index] > max_ticks) max_ticks = delay_data[index];
+    }
+    return max_ticks;
+}
+
+const char *const NML_UNIFIED_PROPAGATE_KERNEL_NAME = "spikecorec_engine_unified_propagate";
+
+// The delay-ring fold's ONE compiled propagate kernel (REFACTOR comment #3, master_kernel.cpp) --
+// always compiled, whether or not this model has any real per-edge delay. Adapted directly from
+// master_kernel.cpp's own build_propagate_ring_kernel_gpu_source (that file/function are left
+// untouched -- this is an independent copy, matching this file's own established "small, file-local
+// mirror" convention above): same ring-slot scatter math (a fired neuron's own weight lands in the
+// ring slot due at `tick + delay_ticks`, self-reenqueue lands at `next_tick`'s own slot), but this
+// version reads delay straight off WeightMatrix's own constant_delay_ticks/using_constant_delay_ticks/
+// edge_delay_ticks fields (REFACTOR comment #2, delay_ring.h) -- mirroring how it already reads
+// constant_weight/using_constant_weight/U/V for the weight side -- instead of a separate
+// DelayRingAllocation::edge_delay_ticks array. `ring_slot_count == 1` collapses every `% ring_slot_count`
+// to slot 0 unconditionally, reproducing today's flat single-buffer propagate exactly.
+nml::GpuSource nml_build_unified_propagate_kernel_gpu_source() {
+    nml::GpuSource source;
+
+    String msl_body =
+        "kernel void spikecorec_engine_unified_propagate(\n"
+        "    constant long        &tick                       [[ buffer(0) ]],\n"
+        "    constant long        &next_tick                  [[ buffer(1) ]],\n"
+        "    constant long        &ring_slot_count            [[ buffer(2) ]],\n"
+        "    const device float4  *U                          [[ buffer(3) ]],\n"
+        "    const device float4  *V                          [[ buffer(4) ]],\n"
+        "    constant long        &rank_float4_stride         [[ buffer(5) ]],\n"
+        "    constant float       &constant_weight            [[ buffer(6) ]],\n"
+        "    constant int         &using_constant_weight      [[ buffer(7) ]],\n"
+        "    const device uint    *internal_node_words        [[ buffer(8) ]],\n"
+        "    const device uint    *leaf_node_words             [[ buffer(9) ]],\n"
+        "    const device uint    *rank_superblock_table      [[ buffer(10) ]],\n"
+        "    const device ushort  *rank_subblock_table        [[ buffer(11) ]],\n"
+        "    constant int         &branching_factor           [[ buffer(12) ]],\n"
+        "    constant int         &superblock_size_words      [[ buffer(13) ]],\n"
+        "    constant int         &padded_node_count          [[ buffer(14) ]],\n"
+        "    constant int         &tree_height                [[ buffer(15) ]],\n"
+        "    constant int         &internal_bit_count         [[ buffer(16) ]],\n"
+        "    constant long        &neuron_count               [[ buffer(17) ]],\n"
+        "    constant long        &max_neighbor_count         [[ buffer(18) ]],\n"
+        "    constant int         &constant_delay_ticks       [[ buffer(19) ]],\n"
+        "    constant int         &using_constant_delay_ticks [[ buffer(20) ]],\n"
+        "    const device int     *edge_delay_ticks           [[ buffer(21) ]],\n"
+        "    device float         *network_inputs_ring        [[ buffer(22) ]],\n"
+        "    device long          *last_spiked                [[ buffer(23) ]],\n"
+        "    device int           *next_active_neuron_indices [[ buffer(24) ]],\n"
+        "    device int           *next_active_neuron_count   [[ buffer(25) ]],\n"
+        "    device int           *active_generation          [[ buffer(26) ]],\n"
+        "    device bool          *emit_spike                 [[ buffer(27) ]],\n"
+        "    uint thread_id [[ thread_position_in_grid ]]\n"
+        ") {\n"
+        "    long neuron_index = (long)thread_id;\n"
+        "    if (neuron_index >= neuron_count) return;\n"
+        "    if (!emit_spike[neuron_index]) return;\n"
+        "    emit_spike[neuron_index] = false;\n"
+        "\n"
+        "    last_spiked[neuron_index] = tick;\n"
+        "\n"
+        "    const device float4 *u_row = U + (long)neuron_index * rank_float4_stride;\n"
+        "\n"
+        "    for (long slot = 0; slot < max_neighbor_count; ++slot) {\n"
+        "        int child = k2t_find_nth_neighbor(\n"
+        "            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,\n"
+        "            branching_factor, superblock_size_words, (int)neuron_count, padded_node_count,\n"
+        "            tree_height, internal_bit_count, (int)neuron_index, (int)slot\n"
+        "        );\n"
+        "        if (child < 0) continue;\n"
+        "\n"
+        "        float weight = constant_weight;\n"
+        "        if (using_constant_weight == 0) {\n"
+        "            const device float4 *v_row = V + (long)child * rank_float4_stride;\n"
+        "            float dot_product = 0.0f;\n"
+        "            for (long lane = 0; lane < rank_float4_stride; ++lane) {\n"
+        "                dot_product += dot(u_row[lane], v_row[lane]);\n"
+        "            }\n"
+        "            weight = dot_product;\n"
+        "        }\n"
+        "\n"
+        "        int delay_ticks = using_constant_delay_ticks != 0\n"
+        "            ? constant_delay_ticks\n"
+        "            : edge_delay_ticks[neuron_index * max_neighbor_count + slot];\n"
+        "        long arrival_tick = tick + (long)delay_ticks;\n"
+        "        long target_slot = arrival_tick % ring_slot_count;\n"
+        "        int arrival_tick_i = (int)arrival_tick;\n"
+        "\n"
+        "        device atomic_float *input_slot =\n"
+        "            (device atomic_float *)(network_inputs_ring + target_slot * neuron_count + child);\n"
+        "        atomic_fetch_add_explicit(input_slot, weight, memory_order_relaxed);\n"
+        "\n"
+        "        device atomic_int *child_generation_slot =\n"
+        "            (device atomic_int *)(active_generation + target_slot * neuron_count + child);\n"
+        "        int previous_child_generation =\n"
+        "            atomic_exchange_explicit(child_generation_slot, arrival_tick_i, memory_order_relaxed);\n"
+        "        if (previous_child_generation != arrival_tick_i) {\n"
+        "            device atomic_int *count_slot = (device atomic_int *)(next_active_neuron_count + target_slot);\n"
+        "            int position = atomic_fetch_add_explicit(count_slot, 1, memory_order_relaxed);\n"
+        "            next_active_neuron_indices[target_slot * neuron_count + position] = child;\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    long self_slot = next_tick % ring_slot_count;\n"
+        "    int self_tag_i = (int)next_tick;\n"
+        "    device atomic_int *self_generation_slot =\n"
+        "        (device atomic_int *)(active_generation + self_slot * neuron_count + neuron_index);\n"
+        "    int previous_self_generation =\n"
+        "        atomic_exchange_explicit(self_generation_slot, self_tag_i, memory_order_relaxed);\n"
+        "    if (previous_self_generation != self_tag_i) {\n"
+        "        device atomic_int *count_slot = (device atomic_int *)(next_active_neuron_count + self_slot);\n"
+        "        int position = atomic_fetch_add_explicit(count_slot, 1, memory_order_relaxed);\n"
+        "        next_active_neuron_indices[self_slot * neuron_count + position] = (int)neuron_index;\n"
+        "    }\n"
+        "}\n";
+
+    source.msl_source =
+        "#include <metal_stdlib>\nusing namespace metal;\n" + nml::k2tree_walk_preamble_msl() + "\n" + msl_body;
+
+    String cuda_body =
+        "__global__ void spikecorec_engine_unified_propagate(\n"
+        "    long long             tick,\n"
+        "    long long             next_tick,\n"
+        "    long long             ring_slot_count,\n"
+        "    const float4          *U,\n"
+        "    const float4          *V,\n"
+        "    long long             rank_float4_stride,\n"
+        "    float                 constant_weight,\n"
+        "    int                   using_constant_weight,\n"
+        "    const unsigned int    *internal_node_words,\n"
+        "    const unsigned int    *leaf_node_words,\n"
+        "    const unsigned int    *rank_superblock_table,\n"
+        "    const unsigned short  *rank_subblock_table,\n"
+        "    int                   branching_factor,\n"
+        "    int                   superblock_size_words,\n"
+        "    int                   padded_node_count,\n"
+        "    int                   tree_height,\n"
+        "    int                   internal_bit_count,\n"
+        "    long long             neuron_count,\n"
+        "    long long             max_neighbor_count,\n"
+        "    int                   constant_delay_ticks,\n"
+        "    int                   using_constant_delay_ticks,\n"
+        "    const int             *edge_delay_ticks,\n"
+        "    float                 *network_inputs_ring,\n"
+        "    long long             *last_spiked,\n"
+        "    int                   *next_active_neuron_indices,\n"
+        "    int                   *next_active_neuron_count,\n"
+        "    int                   *active_generation,\n"
+        "    bool                  *emit_spike\n"
+        ") {\n"
+        "    long long neuron_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    if (neuron_index >= neuron_count) return;\n"
+        "    if (!emit_spike[neuron_index]) return;\n"
+        "    emit_spike[neuron_index] = false;\n"
+        "\n"
+        "    last_spiked[neuron_index] = tick;\n"
+        "\n"
+        "    const float4 *u_row = U + (long long)neuron_index * rank_float4_stride;\n"
+        "\n"
+        "    for (long long slot = 0; slot < max_neighbor_count; ++slot) {\n"
+        "        int child = k2t_find_nth_neighbor(\n"
+        "            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,\n"
+        "            branching_factor, superblock_size_words, (int)neuron_count, padded_node_count,\n"
+        "            tree_height, internal_bit_count, (int)neuron_index, (int)slot\n"
+        "        );\n"
+        "        if (child < 0) continue;\n"
+        "\n"
+        "        float weight = constant_weight;\n"
+        "        if (using_constant_weight == 0) {\n"
+        "            const float4 *v_row = V + (long long)child * rank_float4_stride;\n"
+        "            float dot_product = 0.0f;\n"
+        "            for (long long lane = 0; lane < rank_float4_stride; ++lane) {\n"
+        "                float4 u4 = u_row[lane];\n"
+        "                float4 v4 = v_row[lane];\n"
+        "                dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;\n"
+        "            }\n"
+        "            weight = dot_product;\n"
+        "        }\n"
+        "\n"
+        "        int delay_ticks = using_constant_delay_ticks != 0\n"
+        "            ? constant_delay_ticks\n"
+        "            : edge_delay_ticks[neuron_index * max_neighbor_count + slot];\n"
+        "        long long arrival_tick = tick + (long long)delay_ticks;\n"
+        "        long long target_slot = arrival_tick % ring_slot_count;\n"
+        "        int arrival_tick_i = (int)arrival_tick;\n"
+        "\n"
+        "        atomicAdd(&network_inputs_ring[target_slot * neuron_count + child], weight);\n"
+        "\n"
+        "        int previous_child_generation =\n"
+        "            atomicExch(&active_generation[target_slot * neuron_count + child], arrival_tick_i);\n"
+        "        if (previous_child_generation != arrival_tick_i) {\n"
+        "            int position = atomicAdd(&next_active_neuron_count[target_slot], 1);\n"
+        "            next_active_neuron_indices[target_slot * neuron_count + position] = child;\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    long long self_slot = next_tick % ring_slot_count;\n"
+        "    int self_tag_i = (int)next_tick;\n"
+        "    int previous_self_generation =\n"
+        "        atomicExch(&active_generation[self_slot * neuron_count + neuron_index], self_tag_i);\n"
+        "    if (previous_self_generation != self_tag_i) {\n"
+        "        int position = atomicAdd(&next_active_neuron_count[self_slot], 1);\n"
+        "        next_active_neuron_indices[self_slot * neuron_count + position] = (int)neuron_index;\n"
+        "    }\n"
+        "}\n";
+
+    source.cuda_source = "#include <vector_types.h>\n" + nml::k2tree_walk_preamble_cuda() + "\n" + cuda_body;
+
+    source.functions = {nml::GpuFunctionSignature{
+        NML_UNIFIED_PROPAGATE_KERNEL_NAME,
+        {"tick", "next_tick", "ring_slot_count", "U", "V", "rank_float4_stride", "constant_weight",
+         "using_constant_weight", "internal_node_words", "leaf_node_words", "rank_superblock_table",
+         "rank_subblock_table", "branching_factor", "superblock_size_words", "padded_node_count",
+         "tree_height", "internal_bit_count", "neuron_count", "max_neighbor_count", "constant_delay_ticks",
+         "using_constant_delay_ticks", "edge_delay_ticks", "network_inputs_ring", "last_spiked",
+         "next_active_neuron_indices", "next_active_neuron_count", "active_generation", "emit_spike"}}};
+    return source;
+}
+
 } // namespace
 
 SpikeEngine::NmlResolvedArgument SpikeEngine::resolve_nml_cell_tick_argument(
     const String &parameter_name, const nml::IrProgram &program, s32 type_library_index,
     s32 neuron_index_begin, s64 cell_state_chunk_base_offset, s32 population_size,
-    f32 *network_inputs_base, u32 *rng_state_base,
-    const UnorderedMap<String, GpuPointer<bool>> &emit_port_flags
+    u32 *rng_state_base, const UnorderedMap<String, GpuPointer<bool>> &emit_port_flags
 ) const {
     NmlResolvedArgument argument;
 
@@ -276,8 +517,11 @@ SpikeEngine::NmlResolvedArgument SpikeEngine::resolve_nml_cell_tick_argument(
         return argument;
     }
     if (parameter_name == "network_inputs") {
-        argument.kind = NmlResolvedArgument::Kind::FixedPointer;
-        argument.fixed_pointer = network_inputs_base + neuron_index_begin;
+        // delay-ring fold: network_inputs is now ring-shaped -- which slot this population reads
+        // from rotates every tick (tick % nml_ring_slot_count_), so only neuron_index_begin is
+        // cached here; step_tick recomputes the real pointer against the CURRENT ring slot.
+        argument.kind = NmlResolvedArgument::Kind::NetworkInputsRingOffset;
+        argument.neuron_index_begin = neuron_index_begin;
         return argument;
     }
     if (parameter_name == "rng_state") {
@@ -409,9 +653,41 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
 
     block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
 
+    // ── delay-ring fold (SpikeEngine-only) -- seed `weights`' own per-edge delay from
+    // model.projections' ConnectionEntry::delay, then determine nml_ring_slot_count_ from
+    // `weights` (REFACTOR comment #1, delay_ring.h: delay lives in WeightMatrix now, not a
+    // separate DelayRingAllocation). WeightMatrix::constant_delay_ticks/edge_delay_ticks are
+    // already whole-tick-denominated (weight_matrix.h), and this constructor has no dt_seconds
+    // available to redo delay_ring.cpp's OLD seconds->ticks conversion (compute_max_delay_ticks/
+    // allocate_delay_ring, used only by the separate, untouched AssembledModel/DelayRingAllocation
+    // system) -- so ConnectionEntry::delay is interpreted DIRECTLY as a whole-tick count here. A
+    // connection whose delay rounds to <= 1 (including the "no delay attribute given" default of
+    // 0.0) leaves its edge at weights' own already-established 1-tick baseline, so an ordinary
+    // model (no caller-configured delay) sees nml_ring_slot_count_ == 1 -- exactly today's flat,
+    // single-buffer behavior.
+    {
+        bool any_non_default_edge_delay = false;
+        for (const nml::ProjectionEntry &projection : model.projections) {
+            for (const nml::ConnectionEntry &connection : projection.connections) {
+                s64 rounded_delay_ticks = (s64)std::llround(connection.delay);
+                if (rounded_delay_ticks <= 1) continue;
+                if (!any_non_default_edge_delay) {
+                    weights.using_constant_delay_ticks = false;
+                    any_non_default_edge_delay = true;
+                }
+                weights.set_edge_delay_ticks(connection.source_neuron_index, connection.target_neuron_index,
+                                              (s32)rounded_delay_ticks);
+            }
+        }
+    }
+    nml_ring_slot_count_ = nml_compute_ring_slot_count_from_weight_matrix(weights);
+
     usize neuron_f32_byte_size = (usize) neuron_count * sizeof(f32);
     usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
     usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
+    usize ring_f32_byte_size = (usize) nml_ring_slot_count_ * neuron_f32_byte_size;
+    usize ring_s32_byte_size = (usize) nml_ring_slot_count_ * neuron_s32_byte_size;
+    usize ring_slot_count_s32_byte_size = (usize) nml_ring_slot_count_ * sizeof(s32);
 
     // ── the 5 engine-owned buffers an NML-derived model actually needs (matches
     // examples/nml_pipeline_support.h's own make_live_model_buffers seeding convention, NOT the
@@ -419,40 +695,57 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
     // not 0, since an NML `_tick` kernel checks last_spiked differently than the hardcoded LIF
     // kernel does). membrane_potentials/last_tick_updated/active_neuron_indices/active_neuron_count/
     // input_staging/override_staging are hardcoded-LIF-only buffers, left unallocated -- the NML
-    // step_tick path below never reads them. ──
-    network_inputs = allocate<f32>(neuron_f32_byte_size);
-    memset(network_inputs.get_contents(), 0, neuron_f32_byte_size);
+    // step_tick path below never reads them.
+    //
+    // network_inputs/next_active_neuron_indices/active_generation are ring-shaped
+    // [nml_ring_slot_count_ * neuron_count] (next_active_neuron_count is [nml_ring_slot_count_])
+    // -- the delay-ring fold (see nml_ring_slot_count_'s own doc comment, engine.h). Every slot
+    // starts zeroed/reset exactly like the old single flat buffer did, so ring_slot_count == 1
+    // reproduces that flat buffer's own initial state byte for byte. ──
+    network_inputs = allocate<f32>(ring_f32_byte_size);
+    memset(network_inputs.get_contents(), 0, ring_f32_byte_size);
 
     last_spiked = allocate<s64>(neuron_s64_byte_size);
     std::fill(last_spiked.get_contents(), last_spiked.get_contents() + neuron_count, (s64)-1);
 
-    next_active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
+    next_active_neuron_indices = allocate<s32>(ring_s32_byte_size);
 
-    next_active_neuron_count = allocate<s32>(sizeof(s32));
-    next_active_neuron_count.get_contents()[0] = 0;
+    next_active_neuron_count = allocate<s32>(ring_slot_count_s32_byte_size);
+    memset(next_active_neuron_count.get_contents(), 0, ring_slot_count_s32_byte_size);
 
-    active_generation = allocate<s32>(neuron_s32_byte_size);
-    std::fill(active_generation.get_contents(), active_generation.get_contents() + neuron_count, (s32)-1);
+    active_generation = allocate<s32>(ring_s32_byte_size);
+    std::fill(active_generation.get_contents(),
+              active_generation.get_contents() + nml_ring_slot_count_ * neuron_count, (s32)-1);
 
-    prefetch_to_gpu(network_inputs, neuron_f32_byte_size);
+    prefetch_to_gpu(network_inputs, ring_f32_byte_size);
     prefetch_to_gpu(last_spiked, neuron_s64_byte_size);
-    prefetch_to_gpu(next_active_neuron_indices, neuron_s32_byte_size);
-    prefetch_to_gpu(next_active_neuron_count, sizeof(s32));
-    prefetch_to_gpu(active_generation, neuron_s32_byte_size);
+    prefetch_to_gpu(next_active_neuron_indices, ring_s32_byte_size);
+    prefetch_to_gpu(next_active_neuron_count, ring_slot_count_s32_byte_size);
+    prefetch_to_gpu(active_generation, ring_s32_byte_size);
 
     // ── assemble + compile the master kernel (ticket #6's own assembly, ported from
-    // nml::AssembledModel's constructor -- see master_kernel.cpp) ──
+    // nml::AssembledModel's constructor -- see master_kernel.cpp). Only population_gpu_sources is
+    // used below -- the flat drain_network_inputs_source/propagate_source this also builds are
+    // unused (this fold always compiles its OWN unified, ring-capable drain/propagate kernels
+    // instead, see below and this file's own "delay-ring fold" helpers above), matching REFACTOR
+    // comment #3 (master_kernel.cpp): one drain kernel and one propagate kernel, always, whether
+    // or not this model has any real per-edge delay. ──
     nml::AssembledMasterKernelSource assembled = nml::assemble_master_kernel_source(model, type_library_ir_programs);
 
+    // build_drain_ring_kernel_gpu_source (master_kernel.h, unmodified) is already exactly the
+    // unified drain kernel this fold needs: it zeroes network_inputs_ring[current_slot], which for
+    // ring_slot_count == 1 is always slot 0 -- precisely today's flat drain.
+    nml::GpuSource unified_drain_source = nml::build_drain_ring_kernel_gpu_source();
     nml_drain_kernel_ = nml::compile_kernel_or_throw_with_source(
-        nml_source_text_for_this_backend(assembled.drain_network_inputs_source),
-        assembled.drain_network_inputs_source.functions.at(0).function_name,
-        "the engine-fixed deliver-drain kernel", "");
+        nml_source_text_for_this_backend(unified_drain_source),
+        unified_drain_source.functions.at(0).function_name,
+        "the engine-fixed unified (delay-ring-capable) deliver-drain kernel", "");
 
+    nml::GpuSource unified_propagate_source = nml_build_unified_propagate_kernel_gpu_source();
     nml_propagate_kernel_ = nml::compile_kernel_or_throw_with_source(
-        nml_source_text_for_this_backend(assembled.propagate_source),
-        assembled.propagate_source.functions.at(0).function_name,
-        "the engine-fixed propagate kernel", "");
+        nml_source_text_for_this_backend(unified_propagate_source),
+        unified_propagate_source.functions.at(0).function_name,
+        "the engine-fixed unified (delay-ring-capable) propagate kernel", "");
 
     nml_emit_port_names_ = nml::collect_emit_port_names(model, type_library_ir_programs);
     for (const String &port_name : nml_emit_port_names_) {
@@ -491,7 +784,6 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
     // master_kernel.h's own "the compiled IR should just be a list of instructions" REFACTOR note
     // above class AssembledModel). ──
     const s64 *chunk_base_offsets = nml_allocation_.cell_type_boundaries.get_contents();
-    f32 *network_inputs_base = network_inputs.get_contents();
 
     for (usize population_index = 0; population_index < model.populations.size(); ++population_index) {
         const nml::PopulationEntry &population = model.populations[population_index];
@@ -517,7 +809,7 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
         for (const String &parameter_name : source.functions[0].parameter_names_in_order) {
             plan.arguments.push_back(resolve_nml_cell_tick_argument(
                 parameter_name, program, population.type_library_index, population.neuron_index_begin,
-                chunk_base_offsets[population_index], population.size, network_inputs_base, rng_state_base,
+                chunk_base_offsets[population_index], population.size, rng_state_base,
                 nml_emit_port_flags_));
         }
         nml_population_dispatch_plans_.push_back(std::move(plan));
@@ -527,8 +819,17 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
     // synapse type's edge-parallel functions once here; topology/matrix-index registration + the
     // per-projection dispatch-argument precomputation is deferred to the first step_tick call (see
     // ensure_nml_synapse_dispatch_topology_built), since it needs `weights`'s own real k^2-tree,
-    // ported from nml::AssembledModel's own constructor (master_kernel.cpp) ──────────────────────────
-    nml_projections_ = model.projections;
+    // ported from nml::AssembledModel's own constructor (master_kernel.cpp). Deliberately NOT
+    // activated when nml_ring_slot_count_ > 1 (real per-edge delay configured) -- mirrors
+    // nml::AssembledModel's own established enable_delay_ring precedent (master_kernel.cpp's
+    // constructor: "ticket #64's delay ring and this ticket's synapse dispatch have not been
+    // integrated with each other") exactly, since this Stage 2 dispatch's own resolved
+    // "network_inputs" argument (resolve_nml_synapse_edge_argument) is a single FIXED pointer
+    // baked once at topology-build time, not ring-slot-aware -- untested/unsafe for a model with
+    // real ring rotation. `projections_` is simply left empty in that case, so step_tick's own
+    // `!nml_projections_.empty()` gate leaves this fold's own ring-mode behavior exactly what
+    // nml::AssembledModel's ring mode already established. ──────────────────────────────────────
+    nml_projections_ = (nml_ring_slot_count_ > 1) ? Vector<nml::ProjectionEntry>{} : model.projections;
     nml_projection_edge_topology_.resize(nml_projections_.size());
 
     for (const nml::ProjectionEntry &projection : nml_projections_) {
@@ -599,6 +900,13 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
         ensure_nml_synapse_dispatch_topology_built();
     }
 
+    // ── delay-ring fold: which ring slot this tick's population dispatch reads its own
+    // network_inputs from -- current_ring_slot is always 0 when nml_ring_slot_count_ == 1 (the
+    // ordinary "no delay configured" case), collapsing to exactly today's flat single-buffer
+    // behavior (see engine.h's own doc comment on nml_ring_slot_count_).
+    s64 current_ring_slot = tick % nml_ring_slot_count_;
+    f32 *network_inputs_ring_base = network_inputs.get_contents();
+
     // stages 2-5: one dispatch per population with a per-neuron kernel, over its own full neuron
     // range (arch §4.1's cell-type-boundary dispatch) -- mirrors
     // nml::AssembledModel::step_tick's own population dispatch loop (master_kernel.cpp), reading
@@ -619,25 +927,34 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
                 case NmlResolvedArgument::Kind::FixedPointer:
                     builder.add_pointer(argument.fixed_pointer);
                     break;
+                case NmlResolvedArgument::Kind::NetworkInputsRingOffset:
+                    builder.add_pointer(network_inputs_ring_base + current_ring_slot * neuron_count +
+                                         argument.neuron_index_begin);
+                    break;
             }
         }
         builder.dispatch(plan.kernel_handle, nml_launch_config_for(plan.population_size));
     }
 
-    // fixed deliver-drain: network_inputs has now been read by every population's own `_tick`
-    // kernel this tick -- zero it so the propagate stage below writes THIS tick's fresh
-    // contributions, not an accumulation on top of what was already consumed (ir_spec.md §3.5's
-    // >=1-tick latency).
+    // fixed deliver-drain: this tick's own ring slot has now been read by every population's own
+    // `_tick` kernel this tick -- zero just that slot so the propagate stage below writes THIS
+    // tick's fresh contributions, not an accumulation on top of what was already consumed
+    // (ir_spec.md §3.5's >=1-tick latency). ring_slot_count == 1 always targets slot 0, exactly
+    // today's flat drain.
     {
         NmlDispatchArgumentBuilder builder;
         builder.add_pointer(network_inputs.get_contents());
         builder.add_s64(neuron_count);
+        builder.add_s64(current_ring_slot);
         builder.dispatch(nml_drain_kernel_, nml_launch_config_for(neuron_count));
     }
 
-    // Reset the active-set enqueue counter to 0 before this tick's propagate dispatches run --
-    // matches nml::AssembledModel::step_tick's own per-tick reset.
-    next_active_neuron_count.get_contents()[0] = 0;
+    // Reset this tick's own ring slot's active-set enqueue counter to 0 before this tick's
+    // propagate dispatches run -- matches nml::AssembledModel::step_tick's own per-tick reset,
+    // ring-generalized (delay is always >= 1, so this tick's own propagate dispatch below can
+    // never target this SAME slot -- see nml::DelayRingAllocation's own ring-mode step_tick for the
+    // identical reasoning, master_kernel.cpp).
+    next_active_neuron_count.get_contents()[current_ring_slot] = 0;
 
     // ── Stage 2 (ticket #131): real per-edge synapse dispatch -- delivery-event construction +
     // `_deliver_<port>` dispatch (bumps Sk for this tick's fresh spikes), immediately followed by
@@ -646,7 +963,9 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
     // already reflects this tick's synaptic contribution, matching the fixed scalar propagate stage's
     // own observable timing. Must run BEFORE the fixed scalar propagate dispatch below, which
     // reads+clears nml_emit_port_flags_ for its own last_spiked/active-set bookkeeping (this dispatch
-    // reads, but does not clear, the SAME flags). ──
+    // reads, but does not clear, the SAME flags). Never runs when nml_ring_slot_count_ > 1 --
+    // nml_projections_ is forced empty at construction time for that case (see this file's own
+    // constructor doc comment on this exact restriction). ──
     if (!nml_projections_.empty()) {
         dispatch_nml_synapse_delivery_events(dt, tick);
         dispatch_nml_synapse_integrate_edges(dt, tick);
@@ -660,6 +979,12 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
     f32 constant_weight_for_this_dispatch = nml_projections_.empty() ? weights.constant_weight : 0.0f;
     s32 using_constant_weight_for_this_dispatch =
         nml_projections_.empty() ? (weights.using_constant_weight ? 1 : 0) : 1;
+    // delay-ring fold: read straight off `weights`' own delay configuration (REFACTOR comment #2,
+    // delay_ring.h) -- edge_delay_ticks may be a null GpuPointer for an edge-free WeightMatrix
+    // (node_count * max_neighbor_count == 0), so guard the get_contents() call (never dereferenced
+    // by the kernel either way when max_neighbor_count <= 0).
+    const s32 *edge_delay_ticks_pointer =
+        weights.edge_delay_ticks.pointer != nullptr ? weights.edge_delay_ticks.get_contents() : nullptr;
     for (const String &port_name : nml_emit_port_names_) {
         auto found = nml_emit_port_flags_.find(port_name);
         if (found == nml_emit_port_flags_.end()) {
@@ -670,6 +995,7 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
         NmlDispatchArgumentBuilder builder;
         builder.add_s64(tick);
         builder.add_s64(next_tick);
+        builder.add_s64(nml_ring_slot_count_);
         builder.add_pointer(weights.U_matrix.get_contents());
         builder.add_pointer(weights.V_matrix.get_contents());
         builder.add_s64(weights.rank_float4_stride);
@@ -686,6 +1012,9 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
         builder.add_s32(weights.k2tree.internal_bit_count);
         builder.add_s64(neuron_count);
         builder.add_s64(weights.max_neighbor_count);
+        builder.add_s32(weights.constant_delay_ticks);
+        builder.add_s32(weights.using_constant_delay_ticks ? 1 : 0);
+        builder.add_pointer(edge_delay_ticks_pointer);
         builder.add_pointer(network_inputs.get_contents());
         builder.add_pointer(last_spiked.get_contents());
         builder.add_pointer(next_active_neuron_indices.get_contents());
@@ -1130,6 +1459,7 @@ SpikeEngine::SpikeEngine(SpikeEngine &&other) noexcept
     , alive(other.alive)
     , active_set_optimization_enabled(other.active_set_optimization_enabled)
     , nml_mode_enabled_(other.nml_mode_enabled_)
+    , nml_ring_slot_count_(other.nml_ring_slot_count_)
     , nml_population_dispatch_plans_(std::move(other.nml_population_dispatch_plans_))
     , nml_emit_port_flags_(std::move(other.nml_emit_port_flags_))
     , nml_emit_port_names_(std::move(other.nml_emit_port_names_))
@@ -1219,6 +1549,7 @@ SpikeEngine &SpikeEngine::operator=(SpikeEngine &&other) noexcept {
     active_set_optimization_enabled = other.active_set_optimization_enabled;
 
     nml_mode_enabled_ = other.nml_mode_enabled_;
+    nml_ring_slot_count_ = other.nml_ring_slot_count_;
     nml_population_dispatch_plans_ = std::move(other.nml_population_dispatch_plans_);
     nml_emit_port_flags_ = std::move(other.nml_emit_port_flags_);
     nml_emit_port_names_ = std::move(other.nml_emit_port_names_);

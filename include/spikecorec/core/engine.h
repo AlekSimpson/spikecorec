@@ -188,14 +188,19 @@ namespace spikecorec {
         // fully complete.
 
         // One resolved dispatch argument for a population's per-neuron `_tick` kernel -- either a
-        // per-call scalar substituted at dispatch time (Dt/Tick/PopulationSize) or a fixed pointer
-        // computed once at construction (every other parameter kind -- network_inputs/emit-port/
-        // state/accum/param:dyn/regime/expose/rng_state buffers never move for the engine's
-        // lifetime, so their resolved address can be cached instead of re-derived every tick).
+        // per-call scalar substituted at dispatch time (Dt/Tick/PopulationSize), a fixed pointer
+        // computed once at construction (every parameter kind that never moves for the engine's
+        // lifetime -- emit-port/state/accum/param:dyn/regime/expose/rng_state buffers), or
+        // NetworkInputsRingOffset (the delay-ring fold: `network_inputs` is now ring-shaped
+        // `[nml_ring_slot_count_ * neuron_count]`, so which slot a population's own `_tick` kernel
+        // reads from rotates every tick -- `tick % nml_ring_slot_count_` -- and so cannot be baked
+        // as a single fixed pointer the way it could when network_inputs was always flat; only
+        // `neuron_index_begin` is cached here, and step_tick recomputes the real pointer each call).
         struct NmlResolvedArgument {
-            enum class Kind { Dt, Tick, PopulationSize, FixedPointer };
+            enum class Kind { Dt, Tick, PopulationSize, FixedPointer, NetworkInputsRingOffset };
             Kind kind = Kind::FixedPointer;
             const void *fixed_pointer = nullptr;
+            s32 neuron_index_begin = 0; // only meaningful for Kind::NetworkInputsRingOffset
         };
 
         // One population's precomputed dispatch: its compiled per-neuron kernel, the neuron count
@@ -207,6 +212,19 @@ namespace spikecorec {
         };
 
         bool nml_mode_enabled_ = false;
+
+        // ── delay-ring fold (SpikeEngine-only; see the three REFACTOR comments in delay_ring.h/
+        // master_kernel.h/master_kernel.cpp this generalizes) -- network_inputs/
+        // next_active_neuron_indices/next_active_neuron_count/active_generation above are all
+        // ring-shaped `[nml_ring_slot_count_ * neuron_count]` (next_active_neuron_count is
+        // `[nml_ring_slot_count_]`), determined once from `weights`' own delay configuration
+        // (constant_delay_ticks/edge_delay_ticks) at NML construction time. `1` is the ordinary
+        // "no real per-edge delay beyond the engine's existing implicit one-tick latency" case --
+        // every dispatch then always reads/writes slot 0, collapsing to exactly the pre-fold flat
+        // behavior. There is only ever ONE compiled drain kernel and ONE compiled propagate kernel
+        // (nml_drain_kernel_/nml_propagate_kernel_ below), parameterized by ring_slot_count/
+        // current_slot at dispatch time, regardless of this value.
+        s64 nml_ring_slot_count_ = 1;
 
         Vector<NmlPopulationDispatchPlan> nml_population_dispatch_plans_;
 
@@ -315,11 +333,14 @@ namespace spikecorec {
         // directly reusable) append_cell_tick_argument performs (src/nml/master_kernel.cpp), just
         // run ONCE here at construction instead of every tick. Throws on a `require`/bare-`param`/
         // k^2-tree-walk parameter kind, matching that function's own established scope boundary.
+        // Takes no network_inputs pointer (unlike append_cell_tick_argument) -- the delay-ring fold
+        // means "network_inputs" now resolves to Kind::NetworkInputsRingOffset (just
+        // neuron_index_begin cached), recomputed against the CURRENT ring slot every tick in
+        // step_tick, not baked here.
         NmlResolvedArgument resolve_nml_cell_tick_argument(
             const String &parameter_name, const nml::IrProgram &program, s32 type_library_index,
             s32 neuron_index_begin, s64 cell_state_chunk_base_offset, s32 population_size,
-            f32 *network_inputs_base, u32 *rng_state_base,
-            const UnorderedMap<String, GpuPointer<bool>> &emit_port_flags) const;
+            u32 *rng_state_base, const UnorderedMap<String, GpuPointer<bool>> &emit_port_flags) const;
 
         // Builds nml_projection_edge_topology_ (from this->weights's real k^2-tree) and registers
         // every used synapse type's peredge variables as real WeightMatrix matrix_index(es), then
