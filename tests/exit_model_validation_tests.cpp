@@ -119,6 +119,28 @@ using namespace spikecorec::nml;
 //    `population/index/exposureName` form does (see glif_ei_network.nml's
 //    own header comment) -- the GLIF3 single-cell fixture's plain population
 //    has no such issue and isn't affected.
+//    UPDATE (direct user instruction, 2026-07-23): ticket #131 has since built exactly the "spike-
+//    scatter batch construction" subsystem this item originally flagged as unbuilt (AssembledModel::
+//    dispatch_synapse_delivery_events/dispatch_synapse_integrate_edges, master_kernel.h's own "ticket
+//    #131" section) -- a model with model.projections non-empty (every network fixture in this file
+//    except the ring-mode delayed-coupling network, see below) now dispatches its real per-edge
+//    synapse ComponentType automatically, making this item's own set_constant_weight(0.0f)
+//    placeholder calls fully inert rather than load-bearing (left in place, not deleted, purely as a
+//    "state the placeholder was here" marker -- see each driver's own updated comment for specifics).
+//    Real propagation is therefore now genuinely exercised for the GLIF E/I network (ExcPop[0] ->
+//    InhPop[0] via a real expOneSynapse, see ExitModelGlifEiNetwork's own tests below) and the
+//    izhikevich network (DrivenPop's own real spike was always unaffected either way; TargetPop still
+//    never spikes -- NOT because of this item's own zero-weight forcing anymore, but because
+//    izhikevich_network.nml's own "izhCurrSynapse" is actually an `alphaCurrentSynapse` instance,
+//    whose coupled `I`/`J` TimeDerivative is a real, separate, pre-existing Phase-1 scope gap
+//    (synapse_lowering.cpp's own "general per-edge forward-Euler integration for an arbitrary
+//    right-hand side is out of Phase-1 scope" limitation) -- the SAME gap this item's own
+//    ExcPop[2]/alphaCurrentSynapse leg already documents for the GLIF E/I network, not a new one).
+//    The delayed-coupling network's own ring-mode dispatch (`enable_delay_ring=true`) is UNCHANGED by
+//    ticket #131 (master_kernel.h's own explicit "not solved here": ring mode never reads
+//    model.projections at all), so its own nonzero placeholder weight (0.6f) remains the sole,
+//    genuinely load-bearing propagation mechanism there -- see run_delayed_coupling_network's own
+//    comment below.
 
 namespace {
 
@@ -845,9 +867,19 @@ TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_prop
 // delayed_coupling_network,poisson_population}/ is REAL output from running each fixture through
 // pyneuroml/jNeuroML (commands documented in each fixture's own LEMS_*.xml header comment) -- not an
 // analytic stand-in. Everything in this section EXCEPT the DISABLED_-prefixed numeric-comparison
-// tests at the bottom runs and passes normally; those comparison tests are intentionally disabled
-// (do not need to pass in this ticket's PR) per that same scope clarification -- the user will
-// manually enable them later and verify against this same checked-in reference data.
+// tests at the bottom originally ran and passed normally; those comparison tests were intentionally
+// disabled (did not need to pass in this ticket's PR) per that same scope clarification, pending the
+// user manually enabling them later against this same checked-in reference data.
+//
+// UPDATE (direct user instruction, 2026-07-23): three of the four DISABLED_ comparison tests below are
+// now re-enabled (izhikevich DrivenPop, delayed-coupling SourcePop, delayed-coupling delay-ring
+// arrival), rewritten to this file's own established ticket-#125 relaxed comparison philosophy
+// (expect_spike_train_roughly_matches_reference, defined earlier in this file) for consistency with
+// every other re-enabled comparison in this file. The izhikevich network's own TargetPop comparison
+// stays DISABLED_ for a real, evidenced, orthogonal reason (see its own updated comment below, and
+// item 2 below) -- not loosened to force a pass. The Poisson population's own comparison also stays
+// DISABLED_, for the separate, legitimate, statistical reason its own comment (item 4 below)
+// documents, unrelated to synapse dispatch.
 //
 // ── Known limitations a reviewer should look at closely (Phase-2 section) ────────────────────────
 // 1. Both network fixtures use `<inputList>`/`<input>` for their own pulseGenerator stimulus (NOT
@@ -857,21 +889,23 @@ TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_prop
 //    does not recognize `inputList` either, so `model.stimuli` is empty for both, and each fixture's
 //    own driver below reconstructs the identical stimulus window by hand from the .nml's own literal
 //    `pulseGenerator` attributes, exactly mirroring `run_glif_ei_network`'s own established pattern.
-// 2. AssembledModel's fixed propagate stage still does not invoke a real per-edge synapse
-//    ComponentType's own dynamics (this file's own header comment #3, carried over unchanged from
-//    ticket #61 -- no ticket in CLAUDE.md's own epic ticket graph has built the "spike-scatter batch
-//    construction" subsystem gpu_source.h's own header comment flags as needed for that yet). Both
-//    network fixtures' own drivers below force the WeightMatrix's scattered value to either exactly
-//    zero (izhikevich network -- a magnitude comparison would be meaningless without real synapse
-//    dynamics, matching glif_ei_network's own precedent) or an arbitrary nonzero placeholder
-//    (delayed-coupling network -- this exit model's own validation target is delivery TIMING, which
-//    the delay ring derives purely from the connection's own `delay` attribute independent of
-//    whatever value gets scattered, so no magnitude comparison is attempted there at all).
-// 3. The delayed-coupling network's own DISABLED_ comparison test compares spikecorec's own delay-ring
-//    delivery tick against a tick DERIVED from the real captured jLEMS reference trace (the first
-//    tick TargetPop's own voltage departs from its resting potential) -- not literally re-deriving
-//    the expected tick from the connection's own `delay` attribute a second time (which would be
-//    circular and would not actually exercise cross-simulator agreement at all).
+// 2. UPDATE (direct user instruction, 2026-07-23): ticket #131 has since built the "spike-scatter
+//    batch construction" subsystem this item originally flagged as unbuilt -- see this file's own
+//    header comment (#3) above for the full update. For the izhikevich network specifically: its own
+//    zero-weight placeholder is now fully inert (real per-edge izhCurrSynapse dispatch runs
+//    regardless), so DrivenPop's own spike train is now genuinely end-to-end comparable; TargetPop
+//    still does not spike, but for a DIFFERENT, real, orthogonal reason -- izhikevich_network.nml's
+//    own "izhCurrSynapse" is actually an `alphaCurrentSynapse` instance, whose coupled TimeDerivative
+//    is a separate, documented Phase-1 scope gap (see this file's own
+//    DISABLED_izhikevich_network_target_neuron_... test below for the full evidence). The
+//    delayed-coupling network's own ring-mode dispatch is untouched by ticket #131 (its nonzero
+//    placeholder weight remains the sole real propagation mechanism there, exactly as this item
+//    originally described) -- no magnitude comparison is attempted for it either, same as before.
+// 3. The delayed-coupling network's own now re-enabled comparison test compares spikecorec's own
+//    delay-ring delivery tick against a tick DERIVED from the real captured jLEMS reference trace (the
+//    first tick TargetPop's own voltage departs from its resting potential) -- not literally
+//    re-deriving the expected tick from the connection's own `delay` attribute a second time (which
+//    would be circular and would not actually exercise cross-simulator agreement at all).
 // 4. The Poisson population's own comparison is explicitly a STATISTICAL one (aggregate spike count
 //    over the recorded window), not spike-for-spike -- see poisson_population.nml's own header
 //    comment for why an exact comparison is not meaningful even in principle for this exit model
@@ -914,9 +948,17 @@ IzhikevichNetworkRunResult run_izhikevich_network(s64 tick_count, f32 dt_seconds
     ModelAllocation allocation = allocate_model(model, programs);
     seed_izhikevich_initial_state(allocation, model);
     WeightMatrix weights = build_weight_matrix(model);
-    // See this file's own header comment (Phase-2 section, #2): forced to exactly zero, matching
-    // glif_ei_network's own established precedent -- the driven_simulation... test below only
-    // asserts on DrivenPop, never TargetPop, for the same documented reason.
+    // ticket #131: AssembledModel now dispatches this model's real izhCurrSynapse (actually an
+    // `alphaCurrentSynapse` instance, see izhikevich_network.nml's own header comment) per-edge
+    // dynamics automatically (model.projections is non-empty here), forcing this constant-weight
+    // placeholder's own scattered contribution to zero regardless (see master_kernel.h) -- left set
+    // anyway as an explicit, harmless no-op rather than deleting the call, matching
+    // run_glif_ei_network's own established convention above. This does NOT make TargetPop spike,
+    // though: alphaCurrentSynapse's own coupled `I`/`J` TimeDerivative isn't a recognized linear-decay
+    // shape (synapse_lowering.cpp's own documented, separate limitation -- the SAME gap
+    // run_glif_ei_network's own ExcPop[2] leg hits), so `I` never integrates and TargetPop never
+    // receives a nonzero current -- see this file's own header comment (Phase-2 section, #2) and the
+    // DISABLED_izhikevich_network_target_neuron_... test below.
     weights.set_constant_weight(0.0f);
 
     AssembledModel assembled_model(model, programs);
@@ -1328,13 +1370,28 @@ TEST(ExitModelReferenceDataLoader, loads_poisson_population_spike_raster) {
     EXPECT_EQ(spike_count_by_selection.size(), 100u); // every one of the 100 neurons fired at least once
 }
 
-// ── DISABLED_: spikecorec vs. real pyneuroml/jLEMS reference (per ticket #67's clarified scope,
-// mirroring ticket #61's own -- these do NOT need to pass in this ticket's PR) ─────────────────────
+// ── spikecorec vs. real pyneuroml/jLEMS reference (originally ALL DISABLED_ per ticket #67's
+// clarified scope, mirroring ticket #61's own) ────────────────────────────────────────────────────
+//
+// UPDATE (direct user instruction, 2026-07-23): three of the four below are now re-enabled
+// (izhikevich DrivenPop, delayed-coupling SourcePop, delayed-coupling delay-ring arrival), rewritten
+// to this file's own established ticket-#125 relaxed comparison philosophy
+// (expect_spike_train_roughly_matches_reference, defined earlier in this file) now that ticket #131's
+// real per-edge synapse dispatch makes them genuinely comparable. The izhikevich network's own
+// TargetPop comparison stays DISABLED_ -- a real, evidenced, orthogonal gap (alphaCurrentSynapse's
+// coupled TimeDerivative, not this ticket's own scope), see its own comment below. The Poisson
+// population's own comparison also stays DISABLED_, for the separate, legitimate, statistical reason
+// its own comment documents (unrelated to synapse dispatch). ─────────────────────────────────────
 
-TEST(ExitModelValidation, DISABLED_izhikevich_network_driven_neuron_matches_pyneuroml_reference) {
+TEST(ExitModelValidation, izhikevich_network_driven_neuron_matches_pyneuroml_reference) {
+    // Re-enabled (UPDATE, direct user instruction, 2026-07-23): DrivenPop's own spike train never
+    // depended on synapse dispatch at all (it is the directly-stimulated population, unaffected by
+    // either the pre-#131 zero-weight placeholder or ticket #131's real izhCurrSynapse dispatch) --
+    // rewritten to this file's own established ticket-#125 relaxed comparison philosophy
+    // (expect_spike_train_roughly_matches_reference) for consistency with every other re-enabled
+    // comparison in this file, rather than the original strict per-spike-index tolerance.
     const s64 tick_count = 2300;
     const f32 dt_seconds = 1e-4f;
-    const f64 spike_time_tolerance_seconds = 1e-3; // matches ExitModelGlif3SingleCell's own tolerance
 
     IzhikevichNetworkRunResult own_result = run_izhikevich_network(tick_count, dt_seconds);
     Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
@@ -1345,25 +1402,30 @@ TEST(ExitModelValidation, DISABLED_izhikevich_network_driven_neuron_matches_pyne
         if (spike.selection_id == "sel_driven") reference_driven_spike_times.push_back(spike.time_seconds);
     }
 
-    ASSERT_EQ(own_result.driven_spike_ticks.size(), reference_driven_spike_times.size());
-    for (usize index = 0; index < reference_driven_spike_times.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.driven_spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_driven_spike_times[index], spike_time_tolerance_seconds)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.driven_spike_ticks, reference_driven_spike_times,
+                                                  (f64)dt_seconds, "izhikevich_network DrivenPop");
 }
 
 TEST(ExitModelValidation, DISABLED_izhikevich_network_target_neuron_does_not_yet_match_pyneuroml_reference) {
-    // See izhikevich_network.nml's own header comment / this file's own header comment (Phase-2
-    // section, #2): AssembledModel's fixed propagate stage does not yet invoke izhCurrSynapse's own
-    // real per-edge dynamics -- with the scattered weight forced to exactly zero, TargetPop in
-    // spikecorec's own simulation never receives any input at all and so never spikes, regardless of
-    // tolerance, unlike the real jLEMS reference (which genuinely propagates through izhCurrSynapse
-    // and shows 5 TargetPop spikes). Left DISABLED_ (not merely skipped) so re-enabling it is a
-    // deliberate, visible step once that subsystem exists -- mirrors ticket #61's own original
-    // glif_ei_network precedent for this exact same class of gap (that GLIF1 test itself has since
-    // been re-enabled in a PARTIAL form -- see ExitModelGlifEiNetwork's own comparison test -- but
-    // this izhikevich/Phase-2 gap is untouched by that ticket #125 change and stays DISABLED_ here).
+    // STILL DISABLED_ (investigated, direct user instruction, 2026-07-23) -- NOT because of the
+    // original "zero-weight forcing sidesteps synapse dispatch" reason this comment used to give.
+    // Ticket #131 has since built real per-edge synapse dispatch, and it DOES run automatically for
+    // this model (model.projections is non-empty, see run_izhikevich_network's own updated comment
+    // above) -- but TargetPop still never spikes, for a real, separate, orthogonal reason: despite its
+    // id="izhCurrSynapse", this fixture's synapse is actually an `alphaCurrentSynapse` instance
+    // (izhikevich_network.nml's own <alphaCurrentSynapse id="izhCurrSynapse" .../>), and
+    // alphaCurrentSynapse's own coupled `I`/`J` TimeDerivative is not a recognized linear-decay shape
+    // (synapse_lowering.cpp's own documented, separate limitation: "general per-edge forward-Euler
+    // integration for an arbitrary right-hand side is out of Phase-1 scope" -- confirmed at test time
+    // by that exact warning, logged once per run) -- so `I` never integrates and TargetPop never
+    // receives a nonzero current: own_result.target_spike_ticks is empty (0) against the reference's
+    // own 5 spikes, even forcibly run (--gtest_also_run_disabled_tests). This is the SAME gap
+    // ExitModelGlifEiNetwork.driven_simulation_spikes_via_real_per_edge_synapse_propagation's own
+    // ExcPop[2]/alphaCurrentSynapse leg already documents and stays silent for -- not a new one, and
+    // not something the ticket-#125 relaxed comparison philosophy is meant to paper over (a
+    // structurally wrong firing-rate bug is exactly the class that philosophy still catches -- see
+    // this file's own tolerance doc comment). Left DISABLED_ (not loosened, not silently re-disabled)
+    // until alphaCurrentSynapse's coupled TimeDerivative gets its own general forward-Euler lowering.
     const s64 tick_count = 2300;
     const f32 dt_seconds = 1e-4f;
 
@@ -1376,48 +1438,47 @@ TEST(ExitModelValidation, DISABLED_izhikevich_network_target_neuron_does_not_yet
         if (spike.selection_id == "sel_target") reference_target_spike_times.push_back(spike.time_seconds);
     }
 
-    ASSERT_EQ(own_result.target_spike_ticks.size(), reference_target_spike_times.size());
-    for (usize index = 0; index < reference_target_spike_times.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.target_spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_target_spike_times[index], 1e-3)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.target_spike_ticks, reference_target_spike_times,
+                                                  (f64)dt_seconds, "izhikevich_network TargetPop");
 }
 
-TEST(ExitModelValidation, DISABLED_delayed_coupling_network_source_spike_matches_pyneuroml_reference) {
+TEST(ExitModelValidation, delayed_coupling_network_source_spike_matches_pyneuroml_reference) {
+    // Re-enabled (UPDATE, direct user instruction, 2026-07-23) -- SourcePop's own spike train never
+    // depended on synapse dispatch (delaySynapse's own dynamics/the delay ring only affect TargetPop's
+    // own delivery, not SourcePop's own firing under its direct stimulus), rewritten to this file's own
+    // established ticket-#125 relaxed comparison philosophy for the same consistency reason as the
+    // izhikevich network's own re-enabled DrivenPop test above.
     const s64 tick_count = 600;
     const f32 dt_seconds = 1e-4f;
-    const f64 spike_time_tolerance_seconds = 1e-3;
 
     DelayedCouplingRunResult own_result = run_delayed_coupling_network(tick_count, dt_seconds);
     Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
         fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_spikes.dat"));
 
-    ASSERT_EQ(own_result.source_spike_ticks.size(), reference_spikes.size());
-    for (usize index = 0; index < reference_spikes.size(); ++index) {
-        f64 own_spike_time_seconds = (f64)own_result.source_spike_ticks[index] * dt_seconds;
-        EXPECT_NEAR(own_spike_time_seconds, reference_spikes[index].time_seconds, spike_time_tolerance_seconds)
-            << "spike index " << index;
-    }
+    expect_spike_train_roughly_matches_reference(own_result.source_spike_ticks, extract_spike_time_seconds(reference_spikes),
+                                                  (f64)dt_seconds, "delayed_coupling_network SourcePop");
 }
 
-TEST(ExitModelValidation, DISABLED_delayed_coupling_network_delay_ring_matches_pyneuroml_observed_arrival) {
-    // The ticket #64/#67 core proof: spikecorec's own delay ring (allocate_delay_ring,
-    // AssembledModel's enable_delay_ring=true path) delivers at the SAME tick jLEMS's own real,
-    // independently-simulated connection delay does -- NOT re-derived from the connection's own
-    // `delay` attribute in this test (that would be circular), but read directly off the real
-    // captured jLEMS reference trace: the first tick TargetPop's own membrane potential departs from
-    // its resting value EL (delayed_coupling_network.nml's own header comment: TargetPop receives NO
-    // stimulus of its own, so any departure is attributable exclusively to the one delayed
-    // connection).
+TEST(ExitModelValidation, delayed_coupling_network_delay_ring_matches_pyneuroml_observed_arrival) {
+    // Re-enabled (UPDATE, direct user instruction, 2026-07-23). The ticket #64/#67 core proof:
+    // spikecorec's own delay ring (allocate_delay_ring, AssembledModel's enable_delay_ring=true path)
+    // delivers at roughly the SAME tick jLEMS's own real, independently-simulated connection delay
+    // does -- NOT re-derived from the connection's own `delay` attribute in this test (that would be
+    // circular), but read directly off the real captured jLEMS reference trace: the first tick
+    // TargetPop's own membrane potential departs from its resting value EL
+    // (delayed_coupling_network.nml's own header comment: TargetPop receives NO stimulus of its own,
+    // so any departure is attributable exclusively to the one delayed connection). This exit model's
+    // own delivery TIMING target is unaffected by ticket #131's real per-edge synapse dispatch either
+    // way -- ring mode (enable_delay_ring=true) never dispatches a synapse ComponentType's own
+    // dynamics at all (master_kernel.h's own explicit "not solved here"), so this comparison's own
+    // pass/fail was never gated on that subsystem existing.
     const s64 tick_count = 600;
     const f32 dt_seconds = 1e-4f;
     // jLEMS's own discrete-event bookkeeping does not line up tick-for-tick with a naive
     // forward-Euler comparison (a real, small few-tick offset was observed while capturing this
-    // fixture's own reference data -- see this ticket's own final report) -- this is a tolerance
-    // band, not exact-tick matching, matching this file's own established 1ms spike-time-tolerance
-    // convention above.
-    const f64 delivery_time_tolerance_seconds = 1e-3;
+    // fixture's own reference data) -- this is a tolerance band, not exact-tick matching, reusing this
+    // file's own established SPIKE_EDGE_TIME_TOLERANCE_SECONDS constant (ticket #125's relaxed
+    // philosophy) rather than a separately hand-rolled tolerance value.
 
     DelayedCouplingRunResult own_result = run_delayed_coupling_network(tick_count, dt_seconds);
     ASSERT_FALSE(own_result.target_delivery_ticks.empty());
@@ -1439,7 +1500,7 @@ TEST(ExitModelValidation, DISABLED_delayed_coupling_network_delay_ring_matches_p
     f64 reference_arrival_time_seconds = (f64)(reference_arrival_row - 1) * (f64)dt_seconds;
 
     f64 own_first_delivery_time_seconds = (f64)own_result.target_delivery_ticks[0] * dt_seconds;
-    EXPECT_NEAR(own_first_delivery_time_seconds, reference_arrival_time_seconds, delivery_time_tolerance_seconds);
+    EXPECT_NEAR(own_first_delivery_time_seconds, reference_arrival_time_seconds, SPIKE_EDGE_TIME_TOLERANCE_SECONDS);
 }
 
 TEST(ExitModelValidation, DISABLED_poisson_population_aggregate_spike_count_matches_pyneuroml_reference) {
