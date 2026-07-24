@@ -20,30 +20,26 @@
 // four of `tauPlus`/`tauMinus`/`aPlus`/`aMinus` counts as having an STDP spec. That matches the
 // community naming convention and keeps the codegen generic — no hand-written per-type special case.
 //
-// Two real limitations of the TARGET KERNEL, which this wiring layer maps onto rather than hides:
+// The TARGET KERNEL implements real bidirectional STDP (ticket #66 follow-up): a minus-side
+// (depression) dial fed from `aMinus` and an independent plus-side (potentiation) dial fed from
+// `aPlus`, both using the same recency shape (`pow(tick_delta, -3)`) baked into the kernel source.
+// A causal (pre-before-post) pairing measurably potentiates the edge; an anti-causal pairing
+// measurably depresses it — the two-sided window textbook STDP describes, not a depression-only
+// approximation. `tauPlus`/`tauMinus` are still used only for STDP-spec presence detection (the
+// kernel's own recency shape is fixed, not derived from either time constant).
 //
-//   1. The stage-7 kernel has exactly one externally-supplied dial, `learning_rate`. Its recency
-//      shape (`pow(tick_delta, -3)`) is baked into the kernel source. So only ONE of the four spec
-//      values can reach it: `aMinus` is used, because —
-//   2. The kernel's update is always a DEPRESSION. `decay_delta` is `-learning_rate * pow(...)`,
-//      which is non-positive on every path; there is no branch anywhere that makes it positive. So
-//      this is not the two-sided potentiate/depress window textbook STDP describes.
-//      `tauPlus`/`tauMinus`/`aPlus` are required for presence detection but cannot influence the
-//      math.
-//
-// ── Two wiring targets: SpikeEngine's hardcoded-LIF path, and its NML mode (ticket #132) ─────────
-// `apply_stdp_wiring` is overloaded on two simulation objects (SpikeEngine, and the older
-// AssembledModel this ticket's own migration is retiring call sites of). Sections 1-4 below exercise
-// the `SpikeEngine&` overload against the original hardcoded-LIF path (Phase-1's own SC-11 API).
-// Section 5 exercises the SAME `SpikeEngine&` overload again, but against a SpikeEngine built via
-// the NML `ModelSpecification` constructor instead — enable_plasticity/disable_plasticity are
-// unified across both construction paths, so no separate overload is needed. See that section's own
-// comment for why it needs a SEPARATE two-neuron model (a per-edge-delay ring, not the plain
-// one-tick-latency connection sections 1-4 use) to actually call `enable_plasticity` without
-// throwing: ticket #131's real per-edge synapse dispatch and ticket #132's STDP both write the
-// shared U/V basis, and `SpikeEngine::enable_plasticity` refuses to run alongside the former
-// (engine.cpp's own documented guard) unless the model's real per-edge delay forces the delay ring
-// (ring_slot_count > 1), which switches off #131's dispatch entirely.
+// ── Two wiring targets, both against SpikeEngine (ticket #132) ──────────────────────────────────
+// The NML codegen path was folded directly into `SpikeEngine` — there is no separate engine class
+// for it anymore. Sections 1-4 below exercise `apply_stdp_wiring(model, engine)` against the
+// original hardcoded-LIF path (Phase-1's own SC-11 API). Section 5 exercises the SAME overload
+// again, but against a SpikeEngine built via the NML `ModelSpecification` constructor instead —
+// enable_plasticity/disable_plasticity are unified across both construction paths, so no separate
+// overload is needed. See that section's own comment for why it needs a SEPARATE two-neuron model
+// (a per-edge-delay ring, not the plain one-tick-latency connection sections 1-4 use) to actually
+// call `enable_plasticity` without throwing: ticket #131's real per-edge synapse dispatch and
+// ticket #132's STDP both write the shared U/V basis, and `SpikeEngine::enable_plasticity` refuses
+// to run alongside the former (engine.cpp's own documented guard) unless the model's real per-edge
+// delay forces the delay ring (ring_slot_count > 1), which switches off #131's dispatch entirely.
 //
 // Also note `enable_plasticity` is a no-op on an engine/model that already has plasticity enabled —
 // it will not overwrite an existing learning rate. Hence the explicit `disable_plasticity()` calls

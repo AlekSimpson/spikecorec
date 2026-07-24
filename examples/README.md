@@ -56,12 +56,13 @@ it is handed, and raw LEMS ComponentType declarations do not validate against th
 ### Real synaptic propagation, not a placeholder (ticket #131)
 
 Earlier revisions of this suite scattered spikes through the k²-tree/`WeightMatrix` path with an
-explicit **placeholder** current (`--weight`), because `AssembledModel`'s propagate stage did not yet
-invoke a projection's synapse ComponentType's own dynamics. That subsystem now exists: whenever a
-model declares a real projection, `AssembledModel` dispatches that projection's actual synapse type
-automatically — no opt-in needed, and a `WeightMatrix::set_constant_weight` call has no effect on
-such a model (its contribution is forced to zero, since the real per-edge dispatch already supplies
-it). Concretely:
+explicit **placeholder** current (`--weight`), because the NML-codegen propagate stage did not yet
+invoke a projection's synapse ComponentType's own dynamics. That subsystem now exists, folded
+directly into `SpikeEngine` (`include/spikecorec/core/engine.h`/`src/core/engine.cpp` — the NML
+codegen path no longer runs through a separate engine class at all): whenever a model declares a
+real projection, `SpikeEngine` dispatches that projection's actual synapse type automatically — no
+opt-in needed, and a `WeightMatrix::set_constant_weight` call has no effect on such a model (its
+contribution is forced to zero, since the real per-edge dispatch already supplies it). Concretely:
 
 - the torus examples (`glif1_torus_network_example`, `glif2_torus_network_example`,
   `glif3_torus_network_example`, `glif4_torus_network_example`, `glif5_torus_network_example`,
@@ -296,22 +297,27 @@ The only example that writes its own NeuroML rather than loading a fixture, beca
 it doubles as the example for **bringing hand-authored LEMS dynamics into the engine**.
 
 STDP detection is structural — any Synapse ComponentType baking all four of
-`tauPlus`/`tauMinus`/`aPlus`/`aMinus` counts — which keeps codegen generic. The file documents two
-real limitations of the target kernel that the wiring maps onto rather than hides: the kernel has
-exactly one dial (`learning_rate`, fed from `aMinus`), and its update is always a depression, not the
-two-sided window textbook STDP describes.
+`tauPlus`/`tauMinus`/`aPlus`/`aMinus` counts — which keeps codegen generic. The wiring now maps onto
+real bidirectional STDP: a minus-side (depression) rate from `aMinus` and a plus-side (potentiation)
+rate from `aPlus`, both independently gated — causal (pre-before-post) pairings measurably
+potentiate an edge, anti-causal pairings measurably depress it, on both the legacy hardcoded-LIF
+kernel and the NML codegen path.
 
-Two wiring targets are exercised: the original `SpikeEngine` overload (Phase-1's own SC-11 API), and
-`AssembledModel`'s own overload (ticket #132). The latter demonstrates `AssembledModel::
-enable_plasticity`'s documented incompatibility guard directly — it throws when called on a model
-with real per-edge synapse dispatch active (ticket #131), and succeeds once the SAME structural
-model is instead built with a real per-edge delay and `enable_delay_ring=true` (which disables that
-dispatch). See `tests/assembled_model_plasticity_tests.cpp` for a full run that actually steps this
-combination and measures a weight depress.
+Two wiring targets are exercised, both against `SpikeEngine` — the NML codegen path was folded into
+`SpikeEngine` directly (there is no longer a separate engine class for it): the original
+`SpikeEngine` overload against the legacy hardcoded-LIF path (Phase-1's own SC-11 API), and the same
+overload again against a `SpikeEngine` built via the NML `ModelSpecification` constructor instead.
+The latter demonstrates `SpikeEngine::enable_plasticity`'s documented incompatibility guard
+directly — it throws when called on a model with real per-edge synapse dispatch active (ticket
+#131), and succeeds once the SAME structural model is instead built with a real per-edge delay and
+ring mode enabled (which disables that dispatch). See
+`tests/spike_engine_nml_construction_tests.cpp`'s `SpikeEngineNmlPlasticity` suite — specifically
+`stdp_measurably_depresses_the_weight_over_a_real_glif_run_with_a_non_trivial_delay_ring` — for a
+full run that actually steps this combination and measures a weight change.
 
 ### `glif_stdp_plasticity_example.cpp` — STDP on a real GLIF network (ticket #129)
 
-`stdp_plasticity_example.cpp`'s own `AssembledModel` section uses a deliberately minimal, 2-neuron
+`stdp_plasticity_example.cpp`'s own NML-mode `SpikeEngine` section uses a deliberately minimal, 2-neuron
 GLIF1/LIF-equivalent fixture — adaptation-free by construction, so it never shows a real GLIF cell's
 own after-spike-current state interacting with a weight-changing plasticity rule. This is the GLIF
 counterpart: the SAME 8×8 GLIF3 torus every other torus example uses, but wired with a real per-edge
@@ -347,7 +353,7 @@ Four things worth knowing before writing your own driver:
 
 - **`GpuContextScope` must be the first local in `main`.** `release_gpu_resources()` frees every
   buffer the backend handed out, so it has to run *after* the last object owning one
-  (`ModelAllocation`, `WeightMatrix`, `AssembledModel`, …). Locals destruct in reverse declaration
+  (`ModelAllocation`, `WeightMatrix`, `SpikeEngine`, …). Locals destruct in reverse declaration
   order, so declaring the guard first makes it destruct last. Calling `release_gpu_resources()` by
   hand at the end of `main` instead frees those buffers while their owners are still alive, and the
   destructors then double-free — a segfault at exit, after a run that otherwise looked fine.
@@ -361,9 +367,10 @@ Four things worth knowing before writing your own driver:
   `NS::String`, which collides with the engine's `String` alias if `Metal.hpp` is pulled in later
   through a transitive include.
 - **A real projection means real synapse dispatch, unconditionally.** `WeightMatrix::
-  set_constant_weight` no longer has any effect once `AssembledModel` is built from a model with
-  `model.projections` non-empty (ticket #131) — see "Real synaptic propagation" above before
-  copying a `set_constant_weight` call into a new example and expecting it to do anything.
+  set_constant_weight` no longer has any effect once `SpikeEngine` is built (via its NML
+  `ModelSpecification` constructor) from a model with `model.projections` non-empty (ticket #131) —
+  see "Real synaptic propagation" above before copying a `set_constant_weight` call into a new
+  example and expecting it to do anything.
 
 ## Python
 
