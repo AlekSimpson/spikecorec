@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/master_kernel.h"
@@ -37,16 +38,14 @@ using namespace spikecorec::nml;
 // This file's own AssembledModel-stateful behavioral-equivalence tests (the assembled master kernel
 // reproducing the current hardcoded LIF cell as a special case, real per-edge synapse dispatch, real
 // STDP + delay ring, the active-set x nonlinear-dynamics rule, ...) have been ported to SpikeEngine
-// as part of folding nml::AssembledModel into SpikeEngine (see master_kernel.h's own "REFACTOR"
-// comments above class AssembledModel) -- see tests/spike_engine_nml_construction_tests.cpp's own
+// as part of folding nml::AssembledModel into SpikeEngine -- see
+// tests/spike_engine_nml_construction_tests.cpp's own
 // SpikeEngineNmlPropagateDispatch/SpikeEngineNmlActiveSetNonlinearRule/SpikeEngineNmlSynapseDispatch/
-// SpikeEngineNmlPlasticity/SpikeEngineNmlDelayRing suites. What remains here are the STATELESS free
-// functions (compile_kernel_or_throw_with_source/assemble_master_kernel_source/collect_emit_port_
+// SpikeEngineNmlPlasticity/SpikeEngineNmlDelayRing suites. `nml::AssembledModel` itself has since been
+// deleted entirely (master_kernel.h/.cpp). What remains here are the STATELESS free functions
+// (compile_kernel_or_throw_with_source/assemble_master_kernel_source/collect_emit_port_
 // names/build_drain_ring_kernel_gpu_source/build_propagate_ring_kernel_gpu_source/allocate_delay_
-// ring) that are staying in master_kernel.h/.cpp/delay_ring.h/.cpp untouched, plus one AssembledModel-
-// specific behavior (step_tick_throws_on_a_delay_ring_enablement_mismatch) that has no SpikeEngine
-// analogue at all (SpikeEngine's own always-ring-shaped design has no separate enablement flag to
-// mismatch).
+// ring) that are staying in master_kernel.h/.cpp/delay_ring.h/.cpp untouched.
 
 namespace {
 
@@ -220,13 +219,10 @@ TEST(MasterKernel, assembles_a_two_population_two_cell_type_model_and_compiles_e
         assembled.propagate_source.cuda_source.find(String("__global__ void ") + MASTER_KERNEL_PROPAGATE_NAME + "("),
         String::npos);
 
-    // compile + cache: constructing an AssembledModel actually calls compile_kernel for every
+    // compile + cache: constructing a SpikeEngine actually calls compile_kernel for every
     // kernel (Metal newLibrary, on this build) without throwing -- the "compile once" half of the
     // ticket, exercised for real, not just assembled as text.
-    EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs);
-        (void)assembled_model;
-    });
+    EXPECT_NO_THROW({ SpikeEngine engine(model, programs); });
 }
 
 TEST(MasterKernel, a_population_whose_cell_type_has_no_per_neuron_tick_content_is_skipped_not_fatal) {
@@ -256,10 +252,7 @@ TEST(MasterKernel, a_population_whose_cell_type_has_no_per_neuron_tick_content_i
     ASSERT_EQ(assembled.population_gpu_sources.size(), 1u);
     EXPECT_TRUE(assembled.population_gpu_sources[0].functions.empty());
 
-    EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs);
-        (void)assembled_model;
-    });
+    EXPECT_NO_THROW({ SpikeEngine engine(model, programs); });
 }
 
 TEST(MasterKernel, collect_emit_port_names_returns_the_union_across_populations_in_first_seen_order) {
@@ -301,8 +294,8 @@ TEST(MasterKernel, collect_emit_port_names_returns_the_union_across_populations_
 // hold here (delivers_exactly_delay_ticks_later_and_wakes_the_active_set_at_the_right_tick) has been
 // ported to SpikeEngineNmlDelayRing.ring_shaped_path_delivers_a_spike_exactly_delay_ticks_ticks_later
 // (tests/spike_engine_nml_construction_tests.cpp) as part of folding nml::AssembledModel into
-// SpikeEngine (see master_kernel.h's own "REFACTOR" comments above class AssembledModel) -- the two
-// tests were already equivalent in intent/assertions. What remains here is genuinely free-function
+// SpikeEngine (AssembledModel itself has since been deleted entirely -- master_kernel.h/.cpp) -- the
+// two tests were already equivalent in intent/assertions. What remains here is genuinely free-function
 // coverage (build_drain_ring_kernel_gpu_source/build_propagate_ring_kernel_gpu_source compile as real
 // MSL) that has no dependency on AssembledModel at all, so it stays.
 
@@ -379,65 +372,16 @@ TEST(MasterKernelDelayRing, ring_size_scales_with_the_longest_delay_actually_pre
 // since SpikeEngine's own always-ring-shaped design collapses the old "flat AssembledModel" vs
 // "ring-mode AssembledModel with a trivial delay" distinction into one unified mechanism.
 
-// A caller must not mix delay-ring mode between construction and step_tick -- both mismatches throw
-// rather than silently reading/writing whichever buffer happens to be set. This concept does NOT
+// step_tick_throws_on_a_delay_ring_enablement_mismatch used to live here: AssembledModel required a
+// caller not to mix delay-ring mode between construction and step_tick (both mismatches threw,
+// rather than silently reading/writing whichever buffer happened to be set). This concept does NOT
 // apply to SpikeEngine's own design (confirmed by reading engine.h/engine.cpp): there is no separate
 // enable flag or two divergent code paths -- SpikeEngine's step_tick always operates on its own
 // internally-owned, always ring-shaped (ring_slot_count >= 1) buffers, with no external "buffers"
 // parameter to mismatch against a construction-time flag at all. A genuine simplification, not a
-// gap -- this test stays here as AssembledModel's own still-valid, still-relevant coverage.
-TEST(MasterKernelDelayRing, step_tick_throws_on_a_delay_ring_enablement_mismatch) {
-    ModelSpecification model;
-    model.total_neuron_count = 1;
-    model.type_library.push_back(build_lif_equivalent_type_entry("Cell", "instance", 1.0f, 0.1f, 0.0f, 1.0f));
-
-    PopulationEntry population;
-    population.id = "Pop";
-    population.type_library_index = 0;
-    population.size = 1;
-    population.neuron_index_begin = 0;
-    population.neuron_index_end = 1;
-    model.populations.push_back(population);
-
-    spikecorec::Vector<IrProgram> programs = {build_lif_equivalent_program("Cell", 0.1f, 0.0f, 1.0f)};
-
-    ModelAllocation allocation = allocate_model(model, programs);
-    vector<vector<s32>> adjacency = {{}};
-    WeightMatrix weights(adjacency, /*rank=*/1);
-
-    GpuPointer<f32> network_inputs = allocate<f32>(sizeof(f32));
-    memset(network_inputs.get_contents(), 0, sizeof(f32));
-    GpuPointer<s64> last_spiked = allocate<s64>(sizeof(s64));
-    memset(last_spiked.get_contents(), 0, sizeof(s64));
-    GpuPointer<s32> next_active_indices = allocate<s32>(sizeof(s32));
-    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
-    next_active_count.get_contents()[0] = 0;
-    GpuPointer<s32> active_generation = allocate<s32>(sizeof(s32));
-    active_generation.get_contents()[0] = -1;
-    GpuPointer<bool> emit_spike = allocate<bool>(sizeof(bool));
-    memset(emit_spike.get_contents(), 0, sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-
-    // Constructed WITHOUT enable_delay_ring, but buffers.delay_ring is left non-null below.
-    AssembledModel assembled_model_flat(model, programs, /*enable_delay_ring=*/false);
-    DelayRingAllocation ring = allocate_delay_ring(model, weights, /*dt_seconds=*/1.0f);
-    buffers.delay_ring = &ring;
-    EXPECT_THROW(assembled_model_flat.step_tick(buffers, 1.0f, 0, 1), std::runtime_error);
-
-    // Constructed WITH enable_delay_ring, but buffers.delay_ring is null below.
-    AssembledModel assembled_model_ring(model, programs, /*enable_delay_ring=*/true);
-    buffers.delay_ring = nullptr;
-    EXPECT_THROW(assembled_model_ring.step_tick(buffers, 1.0f, 0, 1), std::runtime_error);
-}
+// gap -- so, unlike this file's other retired AssembledModel-stateful tests, there is no SpikeEngine
+// analogue to port this one to; the behavior it guarded against is categorically impossible in
+// SpikeEngine's design, not an uncovered case.
 
 // ── ticket #131: spike-scatter batch-construction subsystem -- real per-edge synapse dynamics ────
 //

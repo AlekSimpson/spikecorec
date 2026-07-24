@@ -79,38 +79,4 @@ void apply_stdp_wiring(const ModelSpecification &model, SpikeEngine &engine) {
     }
 }
 
-// ── ticket #132: the same wiring, targeting AssembledModel (see plasticity_wiring.h's own doc
-// comment) -- identical scan/mapping logic to apply_stdp_wiring(SpikeEngine&) above, duplicated
-// rather than shared, matching this codebase's own established preference for small, explicit
-// per-target functions over a speculative shared abstraction for two concrete call sites.
-void apply_stdp_wiring(const ModelSpecification &model, AssembledModel &assembled_model) {
-    std::optional<f32> mapped_learning_rate;
-    String winning_synapse_id;
-
-    for (const auto &entry : model.type_library) {
-        std::optional<StdpSpec> spec = find_stdp_spec(entry);
-        if (!spec) continue;
-
-        f32 rate = map_stdp_spec_to_learning_rate(*spec);
-        if (!mapped_learning_rate) {
-            mapped_learning_rate = rate;
-            winning_synapse_id = entry.bound_instance_id;
-            continue;
-        }
-        if (std::fabs(*mapped_learning_rate - rate) > 1e-9f) {
-            log::logger().warn(
-                "apply_stdp_wiring: model has multiple STDP-shaped synapses mapping to different "
-                "learning rates ({} vs {}) -- AssembledModel has one global stdp_learning_rate_ "
-                "scalar, so the first one found ('{}') wins, ignoring '{}'",
-                *mapped_learning_rate, rate, winning_synapse_id, entry.bound_instance_id);
-        }
-    }
-
-    if (mapped_learning_rate) {
-        assembled_model.enable_plasticity(*mapped_learning_rate);
-    } else {
-        assembled_model.disable_plasticity();
-    }
-}
-
 } // namespace spikecorec::nml

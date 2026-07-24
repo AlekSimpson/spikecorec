@@ -19,7 +19,6 @@
 #include "spikecorec/nml/cell_lowering.h"
 #include "spikecorec/nml/inputs_lowering.h"
 #include "spikecorec/nml/ir.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
@@ -60,7 +59,7 @@ namespace spikecorec::examples {
 //
 // Declare this as the FIRST local in main(). Destruction order matters: release_gpu_resources()
 // frees every buffer the backend handed out, so it must run AFTER the last object that owns one
-// (ModelAllocation, WeightMatrix, AssembledModel, LiveModelBuffers…). Locals are destroyed in
+// (ModelAllocation, WeightMatrix, SpikeEngine…). Locals are destroyed in
 // reverse declaration order, so declaring the guard first makes it destruct last, which is exactly
 // the required order. Calling release_gpu_resources() by hand at the end of main() instead would
 // free those buffers while the owners are still alive, and their destructors would then double-free.
@@ -152,70 +151,6 @@ inline WeightMatrix build_weight_matrix(const nml::ModelSpecification &model) {
         }
     }
     return WeightMatrix(adjacency, /*rank=*/1);
-}
-
-// ── Runtime buffers ─────────────────────────────────────────────────────────────────────────────
-
-// The engine-owned per-neuron buffers a caller must supply to AssembledModel::step_tick, bundled
-// so an example's driving loop threads one struct through instead of nine.
-struct LiveModelBuffers {
-    GpuPointer<f32> network_inputs;
-    GpuPointer<s64> last_spiked;
-    GpuPointer<s32> next_active_neuron_indices;
-    GpuPointer<s32> next_active_neuron_count;
-    GpuPointer<s32> active_generation;
-    GpuPointer<bool> emit_spike_flags;
-    GpuPointer<u32> rng_state;
-    nml::ModelRuntimeBuffers buffers;
-};
-
-// Allocates and initializes every buffer above. `seed_rng_state` allocates the per-neuron xorshift32
-// state on-device generators need (`rand`/`randn` in a generated kernel); leave it false for a model
-// with no on-device generator.
-//
-// `last_spiked` is seeded to -1 ("never fired") rather than 0, so tick 0 is not misread as a spike.
-inline LiveModelBuffers make_live_model_buffers(
-    nml::ModelAllocation &allocation, WeightMatrix &weights, s64 total_neuron_count, bool seed_rng_state = false
-) {
-    const usize neuron_count = (usize)total_neuron_count;
-    LiveModelBuffers live;
-
-    live.network_inputs = allocate<f32>(neuron_count * sizeof(f32));
-    std::memset(live.network_inputs.get_contents(), 0, neuron_count * sizeof(f32));
-
-    live.last_spiked = allocate<s64>(neuron_count * sizeof(s64));
-    std::fill(live.last_spiked.get_contents(), live.last_spiked.get_contents() + total_neuron_count, (s64)-1);
-
-    live.next_active_neuron_indices = allocate<s32>(neuron_count * sizeof(s32));
-    live.next_active_neuron_count = allocate<s32>(sizeof(s32));
-    live.next_active_neuron_count.get_contents()[0] = 0;
-
-    live.active_generation = allocate<s32>(neuron_count * sizeof(s32));
-    std::fill(live.active_generation.get_contents(), live.active_generation.get_contents() + total_neuron_count, -1);
-
-    live.emit_spike_flags = allocate<bool>(neuron_count * sizeof(bool));
-    std::memset(live.emit_spike_flags.get_contents(), 0, neuron_count * sizeof(bool));
-
-    live.buffers.allocation = &allocation;
-    live.buffers.weights = &weights;
-    live.buffers.network_inputs = live.network_inputs.get_contents();
-    live.buffers.last_spiked = live.last_spiked.get_contents();
-    live.buffers.next_active_neuron_indices = live.next_active_neuron_indices.get_contents();
-    live.buffers.next_active_neuron_count = live.next_active_neuron_count.get_contents();
-    live.buffers.active_generation = live.active_generation.get_contents();
-    live.buffers.emit_port_flags["spike"] = live.emit_spike_flags.get_contents();
-
-    if (seed_rng_state) {
-        live.rng_state = allocate<u32>(neuron_count * sizeof(u32));
-        // xorshift32 is stuck at zero forever once it reaches zero — every seed must be nonzero and
-        // per-neuron distinct.
-        for (s64 neuron_index = 0; neuron_index < total_neuron_count; ++neuron_index) {
-            live.rng_state.get_contents()[neuron_index] = (u32)((neuron_index + 1) * 2654435761u) | 1u;
-        }
-        live.buffers.rng_state = live.rng_state.get_contents();
-    }
-
-    return live;
 }
 
 // ── Cell-state addressing ───────────────────────────────────────────────────────────────────────
