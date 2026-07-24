@@ -5,7 +5,6 @@
 #endif
 
 #include <cmath>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -13,15 +12,13 @@
 
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/backend.h"
-#include "spikecorec/core/weight_matrix.h"
+#include "spikecorec/core/engine.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/cell_lowering.h"
 #include "spikecorec/nml/synapse_lowering.h"
 #include "spikecorec/nml/allocator.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/stimulus_schedule.h"
 #include "spikecorec/nml/discrete_spike_input.h"
 
@@ -43,7 +40,7 @@ using namespace spikecorec::nml::network_generation;
 //  2. allocator.cpp fills the resulting per-neuron array from those exact values, at the right
 //     offset within the model-wide `dynamic_parameter_arrays` buffer.
 //  3. The acceptance criterion: a population of otherwise-identical LIF cells with per-neuron `vth`
-//     values, driven by IDENTICAL stimulus through a real AssembledModel, spikes at genuinely
+//     values, driven by IDENTICAL stimulus through a real SpikeEngine, spikes at genuinely
 //     different times -- each neuron's own `vth` value, not just "doesn't crash".
 //
 // Real NML syntax for genuine population-level heterogeneity (per-instance distinct bound
@@ -185,7 +182,7 @@ TEST(HeterogeneousParameters, allocator_throws_when_heterogeneous_value_count_mi
 // with strictly increasing vth), not the exact analytic tick.
 TEST(HeterogeneousParameters, population_with_heterogeneous_vth_spikes_at_genuinely_different_times) {
     const s32 population_size = 4;
-    const Vector<f64> vth_values = {1.0, 2.0, 3.0, 4.0};
+    const spikecorec::Vector<f64> vth_values = {1.0, 2.0, 3.0, 4.0};
     const f32 injected_current = 0.5f;
     const f32 dt = 1.0f;
     const s64 tick_count = 40;
@@ -196,53 +193,22 @@ TEST(HeterogeneousParameters, population_with_heterogeneous_vth_spikes_at_genuin
     IrProgram program = lower_cell_to_ir(model.type_library[0]);
     spikecorec::Vector<IrProgram> programs{program};
 
-    ModelAllocation allocation = allocate_model(model, programs);
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally. This model has no real
+    // projections, so its own auto-built weight matrix has zero edges -- an explicit, harmless no-op
+    // stating the same "this test injects its own constant current directly into network_inputs every
+    // tick and does not depend on propagation between neurons" intent the old manually-built ring
+    // adjacency (see inputs_lowering_tests.cpp's own Poisson acceptance test for the identical
+    // precedent) used to document.
+    SpikeEngine engine(model, programs, dt);
+    engine.weights.set_constant_weight(0.0f);
 
-    // Trivial ring adjacency (K2Tree rejects self-loops, so neuron i -> neuron (i+1)%N instead),
-    // purely so WeightMatrix accepts a non-empty network (see inputs_lowering_tests.cpp's own
-    // Poisson acceptance test for the identical precedent) -- this test injects its own constant
-    // current directly into network_inputs every tick and does not depend on propagation between
-    // neurons.
-    vector<vector<s32>> adjacency((usize)population_size);
-    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        adjacency[(usize)neuron_index] = {(neuron_index + 1) % population_size};
-    }
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-
-    GpuPointer<f32> network_inputs = allocate<f32>((usize)population_size * sizeof(f32));
-    // Sentinel -1 ("never fired"), NOT 0 -- `last_spiked[n] == tick` at tick 0 would otherwise be
-    // indistinguishable from a genuine first spike at tick 0 (matches active_generation's own -1
-    // convention below).
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)population_size * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + population_size, (s64)-1);
-    GpuPointer<s32> next_active_indices = allocate<s32>((usize)population_size * sizeof(s32));
-    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
-    next_active_count.get_contents()[0] = 0;
-    GpuPointer<s32> active_generation = allocate<s32>((usize)population_size * sizeof(s32));
-    std::fill(active_generation.get_contents(), active_generation.get_contents() + population_size, -1);
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)population_size * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)population_size * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-
-    Vector<s64> first_spike_tick((usize)population_size, -1);
+    spikecorec::Vector<s64> first_spike_tick((usize)population_size, -1);
     for (s64 tick = 0; tick < tick_count; ++tick) {
         for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-            network_inputs.get_contents()[neuron_index] = injected_current; // identical stimulus, every tick
+            engine.network_inputs.get_contents()[neuron_index] = injected_current; // identical stimulus, every tick
         }
-        assembled_model.step_tick(buffers, dt, tick, tick + 1);
-        const s64 *last_spiked_contents = last_spiked.get_contents();
+        engine.step_tick(dt, tick, tick + 1);
+        const s64 *last_spiked_contents = engine.last_spiked.get_contents();
         for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
             if (first_spike_tick[(usize)neuron_index] < 0 && last_spiked_contents[neuron_index] == tick) {
                 first_spike_tick[(usize)neuron_index] = tick;
@@ -340,59 +306,6 @@ spikecorec::Vector<IrProgram> build_heterogeneous_ring_type_library_ir_programs(
     return programs;
 }
 
-WeightMatrix build_heterogeneous_ring_weight_matrix(const ModelSpecification &model) {
-    vector<vector<s32>> adjacency((usize)model.total_neuron_count);
-    for (const auto &projection : model.projections) {
-        for (const auto &connection : projection.connections) {
-            adjacency[(usize)connection.source_neuron_index].push_back(connection.target_neuron_index);
-        }
-    }
-    return WeightMatrix(adjacency, /*rank=*/1);
-}
-
-// One assembled model's live (non-delay-ring) runtime buffers -- mirrors
-// tests/end_to_end_network_tests.cpp's own LiveModelBuffers/make_live_model_buffers exactly.
-struct HeterogeneousRingLiveBuffers {
-    GpuPointer<f32> network_inputs;
-    GpuPointer<s64> last_spiked;
-    GpuPointer<s32> next_active_indices;
-    GpuPointer<s32> next_active_count;
-    GpuPointer<s32> active_generation;
-    GpuPointer<bool> emit_spike;
-    ModelRuntimeBuffers buffers;
-};
-
-HeterogeneousRingLiveBuffers make_heterogeneous_ring_live_buffers(ModelAllocation &allocation, WeightMatrix &weights,
-                                                     s64 total_neuron_count) {
-    HeterogeneousRingLiveBuffers live;
-    live.network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
-    memset(live.network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
-
-    live.last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
-    std::fill(live.last_spiked.get_contents(), live.last_spiked.get_contents() + total_neuron_count, (s64)-1);
-
-    live.next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
-    live.next_active_count = allocate<s32>(sizeof(s32));
-    live.next_active_count.get_contents()[0] = 0;
-
-    live.active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
-    std::fill(live.active_generation.get_contents(), live.active_generation.get_contents() + total_neuron_count, -1);
-
-    live.emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
-    memset(live.emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
-
-    live.buffers.allocation = &allocation;
-    live.buffers.weights = &weights;
-    live.buffers.network_inputs = live.network_inputs.get_contents();
-    live.buffers.last_spiked = live.last_spiked.get_contents();
-    live.buffers.next_active_neuron_indices = live.next_active_indices.get_contents();
-    live.buffers.next_active_neuron_count = live.next_active_count.get_contents();
-    live.buffers.active_generation = live.active_generation.get_contents();
-    live.buffers.emit_port_flags["spike"] = live.emit_spike.get_contents();
-
-    return live;
-}
-
 s32 heterogeneous_ring_population_index(const ModelSpecification &model) {
     for (s32 population_index = 0; population_index < (s32)model.populations.size(); ++population_index) {
         if (model.populations[(usize)population_index].id == "Pop") return population_index;
@@ -434,10 +347,9 @@ bool heterogeneous_ring_all_finite(const ModelAllocation &allocation) {
 struct HeterogeneousGlifRingFixture {
     ModelSpecification model;
     spikecorec::Vector<IrProgram> programs;
-    ModelAllocation allocation;
-    WeightMatrix weights;
-    Vector<f64> theta_inf_values;
-    Vector<f64> asc_add1_values;
+    SpikeEngine engine;
+    spikecorec::Vector<f64> theta_inf_values;
+    spikecorec::Vector<f64> asc_add1_values;
 };
 
 // Builds the shared GLIF5 ring fixture described in this section's own header comment above.
@@ -446,8 +358,8 @@ struct HeterogeneousGlifRingFixture {
 // own established convention), one pulseGenerator/explicitInput targeting Pop[0] for the
 // continuous-current-injection test.
 HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixture_id,
-                                                             const Vector<GeneratedStimulus> &stimuli) {
-    Vector<f64> theta_inf_values((usize)HETEROGENEOUS_RING_SIZE), asc_add1_values((usize)HETEROGENEOUS_RING_SIZE);
+                                                             const spikecorec::Vector<GeneratedStimulus> &stimuli) {
+    spikecorec::Vector<f64> theta_inf_values((usize)HETEROGENEOUS_RING_SIZE), asc_add1_values((usize)HETEROGENEOUS_RING_SIZE);
     for (s32 local_index = 0; local_index < HETEROGENEOUS_RING_SIZE; ++local_index) {
         // -52mV .. -43.6mV across the ring (thetaInf), -80pA .. -192pA across the ring (ascAdd1) --
         // spaced widely enough apart (0.6mV / 8pA per neuron) that neither float32 rounding nor the
@@ -502,15 +414,19 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     model.type_library[(usize)cell_type_index].heterogeneous_parameter_values["ascAdd1"] = asc_add1_values;
 
     spikecorec::Vector<IrProgram> programs = build_heterogeneous_ring_type_library_ir_programs(model);
-    ModelAllocation allocation = allocate_model(model, programs);
 
-    // allocate_model zero-initializes cell_state without applying OnStart (this tree's own
-    // established convention, tests/end_to_end_network_tests.cpp's own seed_glif_initial_state) --
-    // seed v to EL (uniform) and theta to EACH neuron's own heterogeneous thetaInf (NOT the uniform
-    // baked placeholder above -- reading that here instead would silently defeat the entire point of
-    // this fixture: a first spike's own post-reset theta would no longer trace back to that neuron's
-    // OWN configured value). asc1/asc2 legitimately stay at their own zero-initialized default,
-    // matching GLIF5's own OnStart `asc1=0`/`asc2=0`.
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally -- the latter from
+    // model.projections, the exact same adjacency this file's own former (now-removed)
+    // build_heterogeneous_ring_weight_matrix helper built by hand.
+    SpikeEngine engine(model, programs);
+
+    // allocate_model (called internally by SpikeEngine's constructor) zero-initializes cell_state
+    // without applying OnStart (this tree's own established convention, tests/end_to_end_network_
+    // tests.cpp's own seed_glif_initial_state) -- seed v to EL (uniform) and theta to EACH neuron's
+    // own heterogeneous thetaInf (NOT the uniform baked placeholder above -- reading that here instead
+    // would silently defeat the entire point of this fixture: a first spike's own post-reset theta
+    // would no longer trace back to that neuron's OWN configured value). asc1/asc2 legitimately stay
+    // at their own zero-initialized default, matching GLIF5's own OnStart `asc1=0`/`asc2=0`.
     {
         s32 population_index = heterogeneous_ring_population_index(model);
         const PopulationEntry &population_entry = model.populations[(usize)population_index];
@@ -519,16 +435,16 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
         s32 v_slot = glif_state_variable_slot(GlifVariant::Glif5, "v");
         s32 theta_slot = glif_state_variable_slot(GlifVariant::Glif5, "theta");
         for (s32 local_index = 0; local_index < population_entry.size; ++local_index) {
-            allocation.cell_state.get_contents()[heterogeneous_ring_state_value_index(
-                allocation, population_index, v_slot, local_index, population_entry.size)] = (f32)resting_potential;
-            allocation.cell_state.get_contents()[heterogeneous_ring_state_value_index(
-                allocation, population_index, theta_slot, local_index, population_entry.size)] =
+            engine.nml_allocation_.cell_state.get_contents()[heterogeneous_ring_state_value_index(
+                engine.nml_allocation_, population_index, v_slot, local_index, population_entry.size)] =
+                (f32)resting_potential;
+            engine.nml_allocation_.cell_state.get_contents()[heterogeneous_ring_state_value_index(
+                engine.nml_allocation_, population_index, theta_slot, local_index, population_entry.size)] =
                 (f32)theta_inf_values[(usize)local_index];
         }
     }
 
-    WeightMatrix weights = build_heterogeneous_ring_weight_matrix(model);
-    // ticket #131: AssembledModel now dispatches HETEROGENEOUS_RING_SYNAPSE_XML's own real
+    // ticket #131: SpikeEngine now dispatches HETEROGENEOUS_RING_SYNAPSE_XML's own real
     // expOneSynapse per-edge dynamics for this model (it has real projections), so this
     // constant-weight placeholder is inert (its own scalar propagate contribution is forced to zero
     // whenever real per-edge synapse dispatch is active -- see master_kernel.h) -- left set anyway
@@ -540,27 +456,26 @@ HeterogeneousGlifRingFixture build_heterogeneous_glif5_ring(const String &fixtur
     // heterogeneity claim in both tests below never depends on the propagated current's own
     // magnitude or the wave's own timing, only on each neuron's own post-first-spike state (see this
     // section's own header comment).
-    weights.set_constant_weight(3.0e-8f);
+    engine.weights.set_constant_weight(3.0e-8f);
 
-    return {std::move(model), std::move(programs), std::move(allocation), std::move(weights),
+    return {std::move(model), std::move(programs), std::move(engine),
             std::move(theta_inf_values), std::move(asc_add1_values)};
 }
 
-// Runs `tick_count` ticks of `assembled_model` over `fixture`/`live`, invoking `apply_stimulus_for_tick`
+// Runs `tick_count` ticks of `fixture.engine`, invoking `apply_stimulus_for_tick`
 // once per tick immediately before step_tick (the caller's own driving mechanism -- continuous
 // injection or a discrete spike array), and returns each of the ring's own neurons' first-spike tick
 // plus its `theta`/`asc1` state captured AT THE MOMENT of that first spike (NOT at the end of the run
 // -- theta/asc1 both continue evolving after a neuron's first spike, so reading them only once the
 // whole run is done would no longer reflect that neuron's own first-spike-time value).
 struct HeterogeneousRingRunResult {
-    Vector<s64> first_spike_tick;
-    Vector<f32> theta_after_first_spike;
-    Vector<f32> asc1_after_first_spike;
+    spikecorec::Vector<s64> first_spike_tick;
+    spikecorec::Vector<f32> theta_after_first_spike;
+    spikecorec::Vector<f32> asc1_after_first_spike;
 };
 
-HeterogeneousRingRunResult run_heterogeneous_ring(HeterogeneousGlifRingFixture &fixture, AssembledModel &assembled_model,
-                                     HeterogeneousRingLiveBuffers &live, s64 tick_count, f32 dt_seconds,
-                                     const std::function<void(s64)> &apply_stimulus_for_tick) {
+HeterogeneousRingRunResult run_heterogeneous_ring(HeterogeneousGlifRingFixture &fixture, s64 tick_count,
+                                     f32 dt_seconds, const std::function<void(s64)> &apply_stimulus_for_tick) {
     HeterogeneousRingRunResult result;
     result.first_spike_tick.assign((usize)HETEROGENEOUS_RING_SIZE, -1);
     result.theta_after_first_spike.assign((usize)HETEROGENEOUS_RING_SIZE, 0.0f);
@@ -568,17 +483,18 @@ HeterogeneousRingRunResult run_heterogeneous_ring(HeterogeneousGlifRingFixture &
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
         apply_stimulus_for_tick(tick);
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
-        EXPECT_TRUE(heterogeneous_ring_all_finite(fixture.allocation)) << "tick=" << tick;
+        fixture.engine.step_tick(dt_seconds, tick, tick + 1);
+        EXPECT_TRUE(heterogeneous_ring_all_finite(fixture.engine.nml_allocation_)) << "tick=" << tick;
 
         for (s32 local_index = 0; local_index < HETEROGENEOUS_RING_SIZE; ++local_index) {
             s32 global_index = heterogeneous_ring_global_neuron_index(fixture.model, local_index);
-            if (result.first_spike_tick[(usize)local_index] < 0 && live.buffers.last_spiked[global_index] == tick) {
+            if (result.first_spike_tick[(usize)local_index] < 0 &&
+                fixture.engine.last_spiked.get_contents()[global_index] == tick) {
                 result.first_spike_tick[(usize)local_index] = tick;
                 result.theta_after_first_spike[(usize)local_index] =
-                    read_heterogeneous_ring_glif5_state(fixture.allocation, fixture.model, "theta", local_index);
+                    read_heterogeneous_ring_glif5_state(fixture.engine.nml_allocation_, fixture.model, "theta", local_index);
                 result.asc1_after_first_spike[(usize)local_index] =
-                    read_heterogeneous_ring_glif5_state(fixture.allocation, fixture.model, "asc1", local_index);
+                    read_heterogeneous_ring_glif5_state(fixture.engine.nml_allocation_, fixture.model, "asc1", local_index);
             }
         }
     }
@@ -594,7 +510,7 @@ void assert_heterogeneous_ring_multi_hop_heterogeneity(const HeterogeneousGlifRi
                                                  const String &driving_mechanism_label) {
     ASSERT_GE(result.first_spike_tick[0], 0) << "the directly-driven neuron (Pop[0]) never spiked at all";
 
-    const Vector<s32> hop_distances_to_check = {4, 8, 12, 15};
+    const spikecorec::Vector<s32> hop_distances_to_check = {4, 8, 12, 15};
     for (s32 hop_distance : hop_distances_to_check) {
         std::cout << "[HeterogeneousGlifNetworkParameters/" << driving_mechanism_label
                   << "] hop_distance=" << hop_distance
@@ -649,16 +565,13 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_continuous_current_i
     HeterogeneousGlifRingFixture fixture =
         build_heterogeneous_glif5_ring("heterogeneous_glif5_ring_continuous", {stimulus});
 
-    AssembledModel assembled_model(fixture.model, fixture.programs);
-    HeterogeneousRingLiveBuffers live =
-        make_heterogeneous_ring_live_buffers(fixture.allocation, fixture.weights, fixture.model.total_neuron_count);
-
     StimulusSchedule schedule = build_stimulus_schedule(fixture.model, (f64)dt_seconds);
     s32 driven_neuron_index = heterogeneous_ring_global_neuron_index(fixture.model, 0);
 
-    HeterogeneousRingRunResult result = run_heterogeneous_ring(fixture, assembled_model, live, tick_count, dt_seconds,
+    HeterogeneousRingRunResult result = run_heterogeneous_ring(fixture, tick_count, dt_seconds,
         [&](s64 tick) {
-            live.buffers.network_inputs[driven_neuron_index] += (f32)schedule.current_at(driven_neuron_index, tick);
+            fixture.engine.network_inputs.get_contents()[driven_neuron_index] +=
+                (f32)schedule.current_at(driven_neuron_index, tick);
         });
 
     assert_heterogeneous_ring_multi_hop_heterogeneity(fixture, result, tick_count, "continuous_current_injection");
@@ -670,10 +583,6 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_discrete_spike_array
 
     HeterogeneousGlifRingFixture fixture = build_heterogeneous_glif5_ring("heterogeneous_glif5_ring_discrete", {});
 
-    AssembledModel assembled_model(fixture.model, fixture.programs);
-    HeterogeneousRingLiveBuffers live =
-        make_heterogeneous_ring_live_buffers(fixture.allocation, fixture.weights, fixture.model.total_neuron_count);
-
     s32 driven_neuron_index = heterogeneous_ring_global_neuron_index(fixture.model, 0);
 
     // A literal, host-provided 0/1 array -- one value per tick -- held on for the whole run, driving
@@ -684,8 +593,10 @@ TEST(HeterogeneousGlifNetworkParameters, glif5_ring_network_discrete_spike_array
     discrete_schedule.current_amplitude_amperes = 3.0e-9f; // 3nA
     discrete_schedule.spike_bits.assign((usize)tick_count, spikecorec::Vector<u8>{1});
 
-    HeterogeneousRingRunResult result = run_heterogeneous_ring(fixture, assembled_model, live, tick_count, dt_seconds,
-        [&](s64 tick) { discrete_schedule.apply_to_network_inputs(live.buffers.network_inputs, tick); });
+    HeterogeneousRingRunResult result = run_heterogeneous_ring(fixture, tick_count, dt_seconds,
+        [&](s64 tick) {
+            discrete_schedule.apply_to_network_inputs(fixture.engine.network_inputs.get_contents(), tick);
+        });
 
     assert_heterogeneous_ring_multi_hop_heterogeneity(fixture, result, tick_count, "discrete_spike_array");
 }

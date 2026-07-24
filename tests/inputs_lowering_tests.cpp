@@ -5,21 +5,18 @@
 #endif
 
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <type_traits>
 
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/backend.h"
-#include "spikecorec/core/weight_matrix.h"
+#include "spikecorec/core/engine.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/inputs_lowering.h"
 #include "spikecorec/nml/gpu_source.h"
-#include "spikecorec/nml/master_kernel.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -36,7 +33,7 @@ using namespace spikecorec::nml;
 //     named error (the documented scope boundary -- see inputs_lowering.h).
 //  2. The acceptance criterion's Poisson piece: a real population of `SpikeSourcePoisson` instances
 //     (parsed from real NML text through the whole front end, exactly like cell_lowering_tests.cpp's
-//     own pattern), driven for several thousand ticks through a real `AssembledModel` (ticket #6),
+//     own pattern), driven for several thousand ticks through a real `SpikeEngine` (ticket #6),
 //     with its spike-count statistics checked against the expected Poisson rate.
 
 namespace {
@@ -223,7 +220,7 @@ TEST(InputsLowering, spike_source_poisson_lowers_to_a_rand_driven_spike_source_a
     EXPECT_TRUE(rng_state_is_a_parameter);
 }
 
-// ── acceptance criterion: an on-device Poisson population run through AssembledModel ──────────────
+// ── acceptance criterion: an on-device Poisson population run through SpikeEngine ──────────────────
 //
 // 50 independent SpikeSourcePoisson neurons at rate=20Hz, driven for 5000 ticks at dt=1ms (5
 // simulated seconds) -- expected total spike count = 50 * 20 * 5 = 5000. Tolerance: this is a
@@ -258,54 +255,18 @@ TEST(InputsLowering, poisson_population_spike_count_matches_expected_rate_over_s
     IrProgram program = lower_inputs_to_ir(model.type_library[0]);
     spikecorec::Vector<IrProgram> programs{program};
 
-    ModelAllocation allocation = allocate_model(model, programs);
-
-    // Trivial ring adjacency (K2Tree rejects self-loops, so neuron i -> neuron (i+1)%N instead),
-    // purely so WeightMatrix accepts a non-empty network (it rejects an edge-free one) -- this test
-    // only cares about spike TIMING (last_spiked), never network_inputs/propagation, so the edge's
-    // own weight is irrelevant.
-    vector<vector<s32>> adjacency((usize)population_size);
-    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        adjacency[(usize)neuron_index] = {(neuron_index + 1) % population_size};
-    }
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-
-    GpuPointer<f32> network_inputs = allocate<f32>((usize)population_size * sizeof(f32));
-    memset(network_inputs.get_contents(), 0, (usize)population_size * sizeof(f32));
-    // Sentinel -1 ("never fired"), NOT 0 -- `last_spiked[n] == tick` at tick 0 would otherwise be
-    // indistinguishable from a genuine first spike at tick 0.
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)population_size * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + population_size, (s64)-1);
-    GpuPointer<s32> next_active_indices = allocate<s32>((usize)population_size * sizeof(s32));
-    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
-    next_active_count.get_contents()[0] = 0;
-    GpuPointer<s32> active_generation = allocate<s32>((usize)population_size * sizeof(s32));
-    std::fill(active_generation.get_contents(), active_generation.get_contents() + population_size, -1);
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)population_size * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)population_size * sizeof(bool));
-    GpuPointer<u32> rng_state = allocate<u32>((usize)population_size * sizeof(u32));
-    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        rng_state.get_contents()[neuron_index] = (u32)((neuron_index + 1) * 2654435761u) | 1u; // nonzero seed
-    }
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    buffers.rng_state = rng_state.get_contents();
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally. This model has no real
+    // projections, so its own auto-built weight matrix has zero edges -- this test only cares about
+    // spike TIMING (last_spiked), never network_inputs/propagation, so that is irrelevant. rng_state
+    // is seeded by SpikeEngine's own constructor with the exact same nonzero-seed scheme (neuron_index
+    // + 1) * 2654435761u) | 1u this test used to seed by hand, since SpikeSourcePoisson's own
+    // generated `_tick` kernel references rand.
+    SpikeEngine engine(model, programs, dt);
 
     s64 total_spike_count = 0;
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        assembled_model.step_tick(buffers, dt, tick, tick + 1);
-        const s64 *last_spiked_contents = last_spiked.get_contents();
+        engine.step_tick(dt, tick, tick + 1);
+        const s64 *last_spiked_contents = engine.last_spiked.get_contents();
         for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
             if (last_spiked_contents[neuron_index] == tick) ++total_spike_count;
         }
@@ -320,7 +281,7 @@ TEST(InputsLowering, poisson_population_spike_count_matches_expected_rate_over_s
     // trivially "pass" a count-only check for the wrong reason).
     s32 neurons_that_fired = 0;
     for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        if (last_spiked.get_contents()[neuron_index] != -1) ++neurons_that_fired;
+        if (engine.last_spiked.get_contents()[neuron_index] != -1) ++neurons_that_fired;
     }
     EXPECT_GT(neurons_that_fired, population_size / 2);
 }

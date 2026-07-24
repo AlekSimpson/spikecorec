@@ -5,21 +5,18 @@
 #endif
 
 #include <cmath>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <vector>
 #include <gtest/gtest.h>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/cell_lowering.h"
-#include "spikecorec/nml/allocator.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/stimulus_schedule.h"
-#include "spikecorec/core/weight_matrix.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -30,7 +27,7 @@ using namespace spikecorec::nml;
 // Lowers the real vendored `izhikevich2007Cell`/`adExIaFCell`/`fitzHughNagumoCell`/
 // `hindmarshRose1984Cell` ComponentTypes (third_party/neuroml2/std_lib/Cells.xml -- read directly,
 // not reproduced/simplified here) through the SAME pipeline cell_lowering_tests.cpp's GLIF fixtures
-// already exercise, and additionally drives each one through a real AssembledModel (ticket #6) with
+// already exercise, and additionally drives each one through a real SpikeEngine (ticket #6) with
 // a pulseGenerator current step (ticket #58's stimulus_schedule.h), verifying it reproduces that
 // cell's own well-known textbook firing pattern.
 //
@@ -123,8 +120,8 @@ ModelSpecification build_real_cell_model(
 // pulseGenerator's own Inputs-category entry gets an empty placeholder (allocator.h's own documented
 // convention: "an empty `.alloc` correctly contributes nothing" -- Phase-1 stimulus is host-precomputed
 // via ticket #58's stimulus_schedule.h, not IR-lowered at all).
-Vector<IrProgram> build_ir_programs_for_model(const ModelSpecification &model) {
-    Vector<IrProgram> programs;
+spikecorec::Vector<IrProgram> build_ir_programs_for_model(const ModelSpecification &model) {
+    spikecorec::Vector<IrProgram> programs;
     for (const auto &entry : model.type_library) {
         if (entry.category == TypeLibraryCategory::Cell) {
             programs.push_back(lower_cell_to_ir(entry));
@@ -135,63 +132,25 @@ Vector<IrProgram> build_ir_programs_for_model(const ModelSpecification &model) {
     return programs;
 }
 
-// ── AssembledModel harness shared by every acceptance test below ────────────────────────────────
+// ── SpikeEngine harness shared by every acceptance test below ───────────────────────────────────
 //
-// A single-neuron, single-population, no-edges AssembledModel run, mirroring
-// master_kernel_tests.cpp's own established fixture-construction pattern exactly (ModelAllocation +
-// WeightMatrix-with-no-edges + the fixed set of ModelRuntimeBuffers GpuPointers), generalized to
-// whichever `IrProgram program` this ticket's own lower_cell_to_ir produced for a real cell instead
-// of that file's own hand-built GLIF1-equivalent IrProgram.
+// A single-neuron, single-population, no-edges SpikeEngine, mirroring
+// master_kernel_tests.cpp's own established fixture-construction pattern (ModelAllocation +
+// WeightMatrix-with-no-edges + the fixed set of ModelRuntimeBuffers GpuPointers) but through
+// SpikeEngine's own unified ModelSpecification constructor, which now owns all of that internally --
+// generalized to whichever `IrProgram program` this ticket's own lower_cell_to_ir produced for a
+// real cell instead of that file's own hand-built GLIF1-equivalent IrProgram.
 struct SingleNeuronHarness {
     // `model` is NOT owned/copied here (ModelSpecification isn't copyable -- it holds a WeightMatrix
     // inside `adjacency`) -- callers keep their own local ModelSpecification alive for at least this
     // harness's own lifetime (every test below does) and may keep using it afterward (e.g. to build a
     // StimulusSchedule from the same model).
-    Vector<IrProgram> programs;
-    ModelAllocation allocation;
-    WeightMatrix weights;
-    std::unique_ptr<AssembledModel> assembled_model;
-
-    GpuPointer<f32> network_inputs;
-    GpuPointer<s64> last_spiked;
-    GpuPointer<s32> next_active_indices;
-    GpuPointer<s32> next_active_count;
-    GpuPointer<s32> active_generation;
-    GpuPointer<bool> emit_spike;
-    ModelRuntimeBuffers buffers;
+    SpikeEngine engine;
 
     explicit SingleNeuronHarness(ModelSpecification &model)
-        : programs(build_ir_programs_for_model(model)),
-          allocation(allocate_model(model, programs)),
-          weights(vector<vector<s32>>{{}}, /*rank=*/1) {
-        assembled_model = std::make_unique<AssembledModel>(model, programs);
+        : engine(model, build_ir_programs_for_model(model)) {}
 
-        network_inputs = allocate<f32>(sizeof(f32));
-        memset(network_inputs.get_contents(), 0, sizeof(f32));
-        last_spiked = allocate<s64>(sizeof(s64));
-        // -1, not 0: every acceptance test below detects "did tick T spike" via
-        // `last_spiked[0] == T`, starting from T=0 -- a zero-initialized last_spiked would collide
-        // with a genuine check at tick 0 even when no spike happened yet.
-        last_spiked.get_contents()[0] = -1;
-        next_active_indices = allocate<s32>(sizeof(s32));
-        next_active_count = allocate<s32>(sizeof(s32));
-        next_active_count.get_contents()[0] = 0;
-        active_generation = allocate<s32>(sizeof(s32));
-        active_generation.get_contents()[0] = -1;
-        emit_spike = allocate<bool>(sizeof(bool));
-        memset(emit_spike.get_contents(), 0, sizeof(bool));
-
-        buffers.allocation = &allocation;
-        buffers.weights = &weights;
-        buffers.network_inputs = network_inputs.get_contents();
-        buffers.last_spiked = last_spiked.get_contents();
-        buffers.next_active_neuron_indices = next_active_indices.get_contents();
-        buffers.next_active_neuron_count = next_active_count.get_contents();
-        buffers.active_generation = active_generation.get_contents();
-        buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    }
-
-    f32 &state(s32 offset) { return allocation.cell_state.get_contents()[offset]; }
+    f32 &state(s32 offset) { return engine.nml_allocation_.cell_state.get_contents()[offset]; }
 
     // ModelAllocation::cell_state is always zero-initialized (allocate_model's own
     // allocate_zeroed_f32) -- the allocator does not (yet) interpret a StateDirective's own
@@ -257,8 +216,8 @@ TEST(NonlinearCellAcceptance, izhikevich2007Cell_regular_spiking_pattern_under_c
     harness.seed_state({-0.06f, 0.0f}); // OnStart: v=v0=-60mV, u=0 (allocate_model doesn't seed OnStart yet)
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt);
 
-    Vector<f32> voltage_trace((usize)tick_count);
-    Vector<s64> spike_ticks;
+    spikecorec::Vector<f32> voltage_trace((usize)tick_count);
+    spikecorec::Vector<s64> spike_ticks;
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
         // ticket #58 machinery: this cell's own `iSyn` DerivedVariable (select/reduce="add" over
@@ -269,8 +228,8 @@ TEST(NonlinearCellAcceptance, izhikevich2007Cell_regular_spiking_pattern_under_c
         // deliberate: this single-neuron model has no edges at all, and this is the same "host
         // supplies the per-tick value directly" contract stimulus_schedule.h's own header comment
         // documents for the not-yet-wired (ticket #61) splice into a generated master kernel.
-        harness.buffers.network_inputs[0] = (f32)schedule.current_at(0, tick);
-        harness.assembled_model->step_tick(harness.buffers, dt, tick, tick + 1);
+        harness.engine.network_inputs.get_contents()[0] = (f32)schedule.current_at(0, tick);
+        harness.engine.step_tick(dt, tick, tick + 1);
 
         voltage_trace[(usize)tick] = harness.state(0); // state offset 0 == "v" (first declared StateVariable)
         // ticket #6's own documented contract (master_kernel.h): the fixed propagate stage this same
@@ -278,7 +237,7 @@ TEST(NonlinearCellAcceptance, izhikevich2007Cell_regular_spiking_pattern_under_c
         // checking it here would always see false -- last_spiked[neuron_index]==tick (set by that
         // same propagate stage) is the correct post-step_tick spike signal, matching
         // master_kernel_tests.cpp's own established LIF-equivalence test precedent.
-        if (harness.buffers.last_spiked[0] == tick) spike_ticks.push_back(tick);
+        if (harness.engine.last_spiked.get_contents()[0] == tick) spike_ticks.push_back(tick);
     }
 
     ASSERT_GE(spike_ticks.size(), 3u) << "expected several spikes during the current step (regular spiking)";
@@ -353,21 +312,21 @@ TEST(NonlinearCellAcceptance, adExIaFCell_spike_frequency_adaptation_under_curre
     harness.seed_state({-0.0706f, 0.0f, 0.0f}); // OnStart: v=EL=-70.6mV, w=0 (lastSpikeTime defaults to 0)
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt);
 
-    Vector<s64> spike_ticks;
+    spikecorec::Vector<s64> spike_ticks;
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        harness.buffers.network_inputs[0] = (f32)schedule.current_at(0, tick);
-        harness.assembled_model->step_tick(harness.buffers, dt, tick, tick + 1);
+        harness.engine.network_inputs.get_contents()[0] = (f32)schedule.current_at(0, tick);
+        harness.engine.step_tick(dt, tick, tick + 1);
         // ticket #6's own documented contract (master_kernel.h): the fixed propagate stage this same
         // step_tick call already ran reads-then-CLEARS emit_port_flags["spike"] before returning, so
         // checking it here would always see false -- last_spiked[neuron_index]==tick (set by that
         // same propagate stage) is the correct post-step_tick spike signal, matching
         // master_kernel_tests.cpp's own established LIF-equivalence test precedent.
-        if (harness.buffers.last_spiked[0] == tick) spike_ticks.push_back(tick);
+        if (harness.engine.last_spiked.get_contents()[0] == tick) spike_ticks.push_back(tick);
     }
 
     ASSERT_GE(spike_ticks.size(), 4u) << "expected several spikes during the current step (adapting regular spiking)";
 
-    Vector<s64> inter_spike_intervals;
+    spikecorec::Vector<s64> inter_spike_intervals;
     for (usize index = 1; index < spike_ticks.size(); ++index) {
         inter_spike_intervals.push_back(spike_ticks[index] - spike_ticks[index - 1]);
     }
@@ -442,9 +401,9 @@ TEST(NonlinearCellAcceptance, fitzHughNagumoCell_sustained_oscillation_under_cur
     SingleNeuronHarness harness(model);
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt);
 
-    Vector<f32> voltage_trace((usize)tick_count);
+    spikecorec::Vector<f32> voltage_trace((usize)tick_count);
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        harness.assembled_model->step_tick(harness.buffers, dt, tick, tick + 1);
+        harness.engine.step_tick(dt, tick, tick + 1);
 
         // Direct-state stimulus injection (see this file's own header comment above): this cell has
         // no network_inputs/iSyn channel at all, so the current step is added directly to `V`
@@ -539,21 +498,21 @@ TEST(NonlinearCellAcceptance, hindmarshRose1984Cell_bursting_pattern_under_curre
     harness.seed_state({-0.032f, -11.8f, 0.0f, 0.0f});
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt);
 
-    Vector<s64> spike_ticks;
+    spikecorec::Vector<s64> spike_ticks;
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        harness.buffers.network_inputs[0] = (f32)schedule.current_at(0, tick);
-        harness.assembled_model->step_tick(harness.buffers, dt, tick, tick + 1);
+        harness.engine.network_inputs.get_contents()[0] = (f32)schedule.current_at(0, tick);
+        harness.engine.step_tick(dt, tick, tick + 1);
         // ticket #6's own documented contract (master_kernel.h): the fixed propagate stage this same
         // step_tick call already ran reads-then-CLEARS emit_port_flags["spike"] before returning, so
         // checking it here would always see false -- last_spiked[neuron_index]==tick (set by that
         // same propagate stage) is the correct post-step_tick spike signal, matching
         // master_kernel_tests.cpp's own established LIF-equivalence test precedent.
-        if (harness.buffers.last_spiked[0] == tick) spike_ticks.push_back(tick);
+        if (harness.engine.last_spiked.get_contents()[0] == tick) spike_ticks.push_back(tick);
     }
 
     ASSERT_GE(spike_ticks.size(), 20u) << "expected many spikes across the current step (a sustained bursting rhythm)";
 
-    Vector<s64> inter_spike_intervals;
+    spikecorec::Vector<s64> inter_spike_intervals;
     for (usize index = 1; index < spike_ticks.size(); ++index) {
         inter_spike_intervals.push_back(spike_ticks[index] - spike_ticks[index - 1]);
     }
