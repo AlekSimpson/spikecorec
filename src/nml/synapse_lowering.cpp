@@ -196,24 +196,55 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     //
     // A state variable whose `TimeDerivative` matches the recognized
     // linear-decay shape (`detect_linear_decay_shape`, shared with
-    // cell_lowering.cpp's direct-mutation case via expression_lowering.h) IS
-    // now lowered -- per-edge storage is accumulate-only (arch §4.3:
-    // `accedge` is `Sk[edge]+=value`, there is no direct "set" op), so decay
-    // is expressed as read-decay-writeback-delta: `loadedge` the current
-    // value, `expdecay` (or the 3-instruction non-zero-target form) it to
-    // what it should decay to, `accedge` the DIFFERENCE back so the next
-    // tick's `loadedge` reconstructs the decayed value. The decayed result is
-    // written into the same `edge_<name>` register `peredge_aliases` already
-    // points every later reference of this variable at, so it decays BEFORE
-    // the DerivedVariable computations below read it (mirroring how the old
-    // aggregatable path decayed `g` before contributing it). A
-    // `TimeDerivative` that does NOT match the recognized shape is still
-    // silently dropped from `.tick` (unlike every other unsupported shape in
-    // this file, which throws) -- general per-edge forward-Euler integration
-    // for an arbitrary right-hand side is out of this ticket's scope -- but a
-    // silent drop is still worth a diagnostic so a future synapse with
-    // genuine non-decay dynamics doesn't lose it without at least a
-    // build-time signal.
+    // cell_lowering.cpp's direct-mutation case via expression_lowering.h) is
+    // lowered via a closed-form decay -- per-edge storage is accumulate-only
+    // (arch §4.3: `accedge` is `Sk[edge]+=value`, there is no direct "set"
+    // op), so decay is expressed as read-decay-writeback-delta: `loadedge`
+    // the current value, `expdecay` (or the 3-instruction non-zero-target
+    // form) it to what it should decay to, `accedge` the DIFFERENCE back so
+    // the next tick's `loadedge` reconstructs the decayed value. The decayed
+    // result is written into the same `edge_<name>` register
+    // `peredge_aliases` already points every later reference of this
+    // variable at, so it decays BEFORE the DerivedVariable computations below
+    // read it (mirroring how the old aggregatable path decayed `g` before
+    // contributing it).
+    //
+    // A `TimeDerivative` that does NOT match the recognized shape (e.g.
+    // alphaCurrentSynapse's own `I`, whose right-hand side `(e*J - I)/tau`
+    // has a compound, not bare-leaf, "target" half) now gets a general
+    // forward-Euler fallback instead of being dropped: the same
+    // accumulate-only `accedge` the closed-form case's writeback above relies
+    // on is equally suited to a forward-Euler DELTA (`dt * rhs`, exactly what
+    // forward Euler always computes) -- `emit_expression` (the same shared
+    // machinery cell_lowering.cpp's own direct-mutation forward-Euler
+    // fallback, `lower_time_derivative`, uses) evaluates the whole RHS into a
+    // fresh temporary, scaled by `dt`, then `accedge`'d as the delta.
+    // `edge_<name>` is also updated in-register immediately afterward (not
+    // just Sk, whose delta only the NEXT tick's `loadedge` folds in) so this
+    // tick's own DerivedVariable computations below see the
+    // freshly-integrated value, matching the decay-shape branch's own
+    // convention of leaving `edge_<name>` holding the post-update value.
+    //
+    // The RHS may reference OTHER per-edge state variables (alphaCurrentSynapse's
+    // own `I` reads `J`) -- those need their own `loadedge` first so
+    // `emit_expression` resolves them, via `peredge_aliases`, to a register
+    // that has actually been populated. Read/write ordering matters here:
+    // `accedge` (peredge case) writes straight to the underlying
+    // `sparse_delta_<var>` device buffer with no double-buffering
+    // (`emit_accedge_body`/`emit_loadedge`, gpu_source.cpp), so a `loadedge`
+    // of a variable would see any `accedge` already emitted earlier THIS
+    // forall body immediately -- not deferred to next tick's `loadedge` the
+    // way it might be assumed. Reading a per-edge variable whose own
+    // TimeDerivative was already integrated EARLIER in this same
+    // state-variable loop (i.e. it precedes this one in Dynamics) would
+    // therefore silently observe its post-update, not tick-start, value,
+    // which is wrong (LEMS's TimeDerivatives all read the simultaneous
+    // tick-start state). `already_processed_state_variable_names` tracks
+    // whose own turn has already completed so that case throws instead of
+    // silently miscomputing; referencing a variable whose turn hasn't
+    // happened yet (alphaCurrentSynapse's actual declaration order, `I`
+    // before `J`) is always safe -- nothing has written to its storage yet
+    // this tick -- and is handled by a fresh `loadedge` right here.
     UnorderedMap<String, String> time_derivative_rhs_of_variable;
     for (const auto &time_derivative : synapse.time_derivatives) {
         time_derivative_rhs_of_variable[time_derivative.variable] = time_derivative.value;
@@ -226,27 +257,60 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     }
     LoweringContext forall_context(known_names, peredge_aliases);
 
+    std::unordered_set<String> already_processed_state_variable_names;
     for (const auto &state_variable : synapse.state_variables) {
         String edge_local_name = "edge_" + state_variable.name;
 
         auto time_derivative_entry = time_derivative_rhs_of_variable.find(state_variable.name);
+        ExpressionNodePointer right_hand_side;
         std::optional<LinearDecayShape> decay_shape;
         if (time_derivative_entry != time_derivative_rhs_of_variable.end()) {
-            ExpressionNodePointer right_hand_side = parse_arithmetic_text(
+            right_hand_side = parse_arithmetic_text(
                 time_derivative_entry->second, "TimeDerivative '" + state_variable.name + "'");
             decay_shape = detect_linear_decay_shape(*right_hand_side, state_variable.name);
         }
 
         if (!decay_shape) {
             forall_body.push_back(LoadEdgeInstruction{edge_local_name, state_variable.name, EdgeSetReference::CurrentEdge});
-            if (time_derivative_entry != time_derivative_rhs_of_variable.end()) {
-                log::logger().warn(
-                    "synapse_lowering: '{}' declares a TimeDerivative for '{}' that isn't a recognized "
-                    "linear-decay shape ('(target-state)/tau' or '-state/tau') -- its decay is NOT lowered "
-                    "into '.tick' (general per-edge forward-Euler integration for an arbitrary right-hand "
-                    "side is out of Phase-1 scope)",
-                    synapse_entry.component_type_name, state_variable.name);
+
+            if (time_derivative_entry == time_derivative_rhs_of_variable.end()) {
+                already_processed_state_variable_names.insert(state_variable.name);
+                continue;
             }
+
+            for (const auto &other_state_variable : synapse.state_variables) {
+                if (other_state_variable.name == state_variable.name) continue;
+                if (!references_identifier(*right_hand_side, other_state_variable.name)) continue;
+
+                bool other_already_integrated_this_tick =
+                    already_processed_state_variable_names.count(other_state_variable.name) > 0 &&
+                    time_derivative_rhs_of_variable.count(other_state_variable.name) > 0;
+                if (other_already_integrated_this_tick) {
+                    log::throw_runtime_error(log::logger(),
+                        "synapse_lowering: '" + synapse_entry.component_type_name + "'s TimeDerivative '" +
+                        state_variable.name + "' references '" + other_state_variable.name + "', whose own "
+                        "TimeDerivative was already integrated earlier this tick (it is declared before '" +
+                        state_variable.name + "' in Dynamics) -- reading its already-updated value in the "
+                        "same tick is not supported (only a forward reference to a not-yet-integrated "
+                        "per-edge state variable is)");
+                }
+
+                forall_body.push_back(LoadEdgeInstruction{
+                    "edge_" + other_state_variable.name, other_state_variable.name, EdgeSetReference::CurrentEdge});
+            }
+
+            // General forward-Euler fallback (see this loop's header comment): evaluate the whole
+            // right-hand side into a fresh temporary, scale by dt, accedge the delta -- the same
+            // shape cell_lowering.cpp's own lower_time_derivative forward-Euler fallback uses,
+            // adapted to per-edge storage's accumulate-only accedge instead of a direct mutation.
+            forall_context.reset_temporary_counter();
+            String delta_name = forall_context.fresh_temporary();
+            forall_context.emit_expression(*right_hand_side, forall_body, delta_name);
+            forall_body.push_back(BinaryInstruction{BinaryOpcode::Mul, delta_name, delta_name, "dt"});
+            forall_body.push_back(AccumulateEdgeInstruction{state_variable.name, EdgeSetReference::CurrentEdge, delta_name});
+            forall_body.push_back(BinaryInstruction{BinaryOpcode::Add, edge_local_name, edge_local_name, delta_name});
+
+            already_processed_state_variable_names.insert(state_variable.name);
             continue;
         }
 
@@ -262,6 +326,7 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
         String delta_name = edge_local_name + "_delta";
         forall_body.push_back(BinaryInstruction{BinaryOpcode::Sub, delta_name, edge_local_name, old_value_name});
         forall_body.push_back(AccumulateEdgeInstruction{state_variable.name, EdgeSetReference::CurrentEdge, delta_name});
+        already_processed_state_variable_names.insert(state_variable.name);
     }
 
     lower_all_derived_variables(synapse, forall_body, forall_context);

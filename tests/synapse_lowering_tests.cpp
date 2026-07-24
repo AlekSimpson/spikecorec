@@ -5,17 +5,21 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <gtest/gtest.h>
-#include <spdlog/sinks/ostream_sink.h>
 
+#include "spikecorec/core/backend.h"
+#include "spikecorec/core/weight_matrix.h"
+#include "spikecorec/nml/allocator.h"
+#include "spikecorec/nml/cell_lowering.h"
+#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/synapse_lowering.h"
-#include "spikecorec/core/log.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -85,29 +89,6 @@ const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specifi
     }
     throw std::runtime_error("no type library entry for '" + bound_instance_id + "'");
 }
-
-// Temporarily attaches an in-memory sink to the shared `log::logger()` so a
-// test can assert on a specific warning firing (review follow-up on ticket
-// #51: the per-edge-synapse-declares-a-TimeDerivative diagnostic). Removes
-// itself in the destructor -- the sink holds a reference to `captured_text_`,
-// a member of THIS object, so it must not outlive it.
-class ScopedLogCapture {
-public:
-    ScopedLogCapture() : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(captured_text_)) {
-        log::logger().sinks().push_back(sink_);
-    }
-
-    ~ScopedLogCapture() {
-        auto &sinks = log::logger().sinks();
-        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
-    }
-
-    String text() const { return captured_text_.str(); }
-
-private:
-    std::ostringstream captured_text_;
-    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
-};
 
 const String DUMMY_CELL_COMPONENT_TYPE =
     "  <ComponentType name=\"DummyCell\" extends=\"baseCell\">"
@@ -198,8 +179,9 @@ const String TEST_EXP_TWO_SYNAPSE_COMPONENT_TYPE =
 // A per-edge synapse whose `TimeDerivative` is declared but does NOT match
 // the recognized linear-decay shape (`1 / tau`, a constant charging rate --
 // no `-state` numerator, so `detect_linear_decay_shape` returns nullopt) --
-// exercises the warn-and-skip path the decay-shaped fixtures above no longer
-// take now that they're actually lowered.
+// exercises the general forward-Euler fallback (this synapse's own RHS
+// references no OTHER per-edge state variable, unlike alphaCurrentSynapse's
+// own `I`/`J`, so this is the fallback's simplest possible shape).
 const String TEST_NON_DECAYING_SYNAPSE_COMPONENT_TYPE =
     "  <ComponentType name=\"TestNonDecayingSynapse\" extends=\"baseConductanceBasedSynapse\">"
     "    <Property name=\"weight\" dimension=\"none\" defaultValue=\"1\"/>"
@@ -234,6 +216,86 @@ const String TEST_NMDA_SYNAPSE_COMPONENT_TYPE =
     "      </OnEvent>"
     "    </Dynamics>"
     "  </ComponentType>";
+
+// Builds a small, real 2-neuron network (node 0 -> node 1, the same
+// `DummyCell` self-loop-avoiding wiring `build_synapse_type_library_entry`
+// itself uses) through a real, vendored `alphaCurrentSynapse` instance, and
+// returns the FULL ModelSpecification (not just the synapse's own
+// TypeLibraryEntry) so a caller can build IR programs and run an
+// AssembledModel end to end -- the numeric acceptance test below needs both
+// the cell AND synapse type-library entries, unlike every other fixture in
+// this file.
+ModelSpecification build_alpha_current_synapse_network_specification(
+    const String &tau_attribute, const String &ibase_attribute, const String &weight_attribute
+) {
+    write_temp_file("spikecorec_synapse_lowering_alpha_acceptance_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"SynapseLoweringAlphaAcceptanceContent\">"
+        + DUMMY_CELL_COMPONENT_TYPE +
+        "  <DummyCell id=\"dummyCellInstance\" C=\"1.0e-10\"/>"
+        "  <alphaCurrentSynapse id=\"alphaSynapseInstance\" tau=\"" + tau_attribute + "\" ibase=\"" +
+        ibase_attribute + "\" weight=\"" + weight_attribute + "\"/>"
+        "  <network id=\"Net\">"
+        "    <population id=\"Pop\" component=\"dummyCellInstance\" size=\"2\"/>"
+        "    <projection id=\"Proj\" presynapticPopulation=\"Pop\" postsynapticPopulation=\"Pop\" synapse=\"alphaSynapseInstance\">"
+        "      <connection id=\"0\" preCellId=\"Pop/0/dummyCellInstance\" postCellId=\"Pop/1/dummyCellInstance\"/>"
+        "    </projection>"
+        "  </network>"
+        "</neuroml>");
+
+    String top_path = write_temp_file("spikecorec_synapse_lowering_alpha_acceptance_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"SynapseLoweringAlphaAcceptanceTop\">"
+        "  <include href=\"spikecorec_synapse_lowering_alpha_acceptance_content.nml\"/>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(top_path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+    return build_model_specification(resolved);
+}
+
+// Hand-forward-Euler-integrates the SAME two coupled ODEs alphaCurrentSynapse's own real Dynamics
+// declare (`dJ/dt = -J/tau`, `dI/dt = (e*J - I)/tau`, `OnStart`: I=J=0, `OnEvent`: `J += weight *
+// ibase`), matching -- statement for statement -- the exact discretization synapse_lowering.cpp's
+// own lowering now produces (verified by reading gpu_source.cpp's emit_loadedge/emit_accedge_body
+// and master_kernel.cpp's own step_tick dispatch order, see this test file's own header comment on
+// the acceptance test below for the full derivation):
+//   - a presynaptic spike's `OnEvent` bump to `J` is applied BEFORE this SAME tick's own I/J
+//     integration reads it (dispatch_synapse_delivery_events always runs immediately before
+//     dispatch_synapse_integrate_edges, same tick, master_kernel.cpp's own step_tick) --
+//     accumulate the bump into `state_j` first, every tick, unconditionally (a no-op except on
+//     `spike_tick`).
+//   - `I`'s own general forward-Euler fallback reads `J`'s CURRENT (just-bumped-if-applicable,
+//     not-yet-decayed-this-tick) value and `I`'s own CURRENT (not-yet-updated) value, computes
+//     `dt * rhs`, and the resulting NEW `I` is what synapse_lowering.cpp's own DerivedVariable
+//     `i = I` exposes -- i.e. THIS tick's `network_inputs` contribution is the just-integrated
+//     (not the stale, pre-tick) `I`.
+//   - `J`'s own recognized closed-form decay shape then decays the SAME (just-bumped) `J` value
+//     via the exact exponential `J *= exp(-dt/tau)` (`expdecay`, not a linear forward-Euler
+//     approximation) -- this becomes the tick-start `J` the NEXT tick's own integration reads.
+struct AlphaCurrentSynapseForwardEulerResult {
+    Vector<f64> exposed_current; // one value per tick -- the network_inputs contribution that tick
+};
+
+AlphaCurrentSynapseForwardEulerResult run_alpha_current_synapse_forward_euler(
+    f64 tau_seconds, f64 ibase_amperes, f64 weight, f64 dt_seconds, s64 tick_count, s64 spike_tick
+) {
+    AlphaCurrentSynapseForwardEulerResult result;
+    result.exposed_current.reserve((usize)tick_count);
+
+    const f64 euler_constant = 2.7182818284590451; // the real ComponentType's own literal (Synapses.xml)
+    f64 state_i = 0.0; // OnStart: I = 0
+    f64 state_j = 0.0; // OnStart: J = 0
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        if (tick == spike_tick) state_j += weight * ibase_amperes; // OnEvent, delivered before this tick's own integrate
+        f64 delta_i = dt_seconds * (euler_constant * state_j - state_i) / tau_seconds;
+        f64 new_state_i = state_i + delta_i;
+        result.exposed_current.push_back(new_state_i); // DerivedVariable i = I, read AFTER I's own update
+        state_j *= std::exp(-dt_seconds / tau_seconds);  // J's own closed-form decay over this dt
+        state_i = new_state_i;
+    }
+    return result;
+}
 
 } // namespace
 
@@ -460,17 +522,17 @@ TEST(SynapseLoweringPerEdge, lowers_nmda_style_synapse) {
 // ── TestNonDecayingSynapse (custom, non-decay-shaped TimeDerivative) ─────
 
 // A per-edge synapse whose `TimeDerivative` (`1 / tau`, a constant charging
-// rate) does NOT match the recognized linear-decay shape -- unlike every
-// fixture above, this one's decay is still NOT lowered into `.tick` (general
-// per-edge forward-Euler integration for an arbitrary right-hand side is out
-// of this ticket's scope). Every OTHER unsupported shape in
-// synapse_lowering.cpp throws; this one silent drop instead logs a warning
-// (review follow-up on ticket #51) so a future real per-edge synapse with
-// genuine non-decay-shaped dynamics is at least observable, not silently
-// lost. Asserts both halves: the warning fires, AND the resulting `.tick` is
-// the same (no-decay) shape the per-edge fixtures used to all produce before
-// this ticket's fix.
-TEST(SynapseLoweringPerEdge, warns_and_skips_when_per_edge_time_derivative_is_not_decay_shaped) {
+// rate) does NOT match the recognized linear-decay shape -- exercises the
+// general forward-Euler fallback in its simplest possible shape (the RHS
+// references no OTHER per-edge state variable, unlike alphaCurrentSynapse's
+// own `I`/`J` -- see the dedicated alphaCurrentSynapse tests below for that
+// cross-reference case). `g`'s TimeDerivative used to be silently dropped
+// here (only a warning, no `.tick` lowering at all); it is now actually
+// integrated: `loadedge` the current value, evaluate `1/tau` into a fresh
+// temporary, scale by `dt`, `accedge` the delta, and update the `edge_g`
+// register in place so the DerivedVariable `i` below reads the
+// freshly-integrated value.
+TEST(SynapseLoweringPerEdge, forward_euler_lowers_a_per_edge_time_derivative_that_is_not_decay_shaped) {
     TypeLibraryEntry entry = build_synapse_type_library_entry(
         "non_decaying", TEST_NON_DECAYING_SYNAPSE_COMPONENT_TYPE, "TestNonDecayingSynapse",
         "gbase=\"1nS\" erev=\"0mV\" tau=\"50ms\" weight=\"1\"");
@@ -479,27 +541,8 @@ TEST(SynapseLoweringPerEdge, warns_and_skips_when_per_edge_time_derivative_is_no
     ASSERT_EQ(synapse.time_derivatives.size(), 1u);
     ASSERT_EQ(synapse.time_derivatives[0].variable, "g");
 
-    ScopedLogCapture log_capture;
     IrProgram program = lower_synapse_to_ir(entry);
-    String captured_log_text = log_capture.text();
-
-    EXPECT_NE(captured_log_text.find("TestNonDecayingSynapse"), String::npos);
-    EXPECT_NE(captured_log_text.find("'g'"), String::npos);
-    EXPECT_NE(captured_log_text.find("TimeDerivative"), String::npos);
-
-    // The TimeDerivative is correctly omitted (no `expdecay`/`accedge`
-    // writeback for `g`'s decay, and `tau` is declared in `.alloc` but never
-    // read in `.tick`) -- the same no-decay shape every per-edge fixture used
-    // to produce before this ticket's fix.
     String rendered_program = print_ir_program(program);
-    EXPECT_NE(rendered_program.find("peredge g"), String::npos);
-    EXPECT_NE(rendered_program.find("param tau"), String::npos);
-    EXPECT_EQ(rendered_program.find("expdecay"), String::npos);
-
-    usize tick_section_start = rendered_program.find(".tick");
-    ASSERT_NE(tick_section_start, String::npos);
-    String tick_section = rendered_program.substr(tick_section_start);
-    EXPECT_EQ(tick_section.find("tau"), String::npos);
 
     String expected =
         ".alloc\n"
@@ -519,6 +562,10 @@ TEST(SynapseLoweringPerEdge, warns_and_skips_when_per_edge_time_derivative_is_no
         "  @integrate\n"
         "    forall neuron_in {\n"
         "      loadedge edge_g, g@edge\n"
+        "      div t0, 1, tau\n"
+        "      mul t0, t0, dt\n"
+        "      accedge g@edge, t0\n"
+        "      add edge_g, edge_g, t0\n"
         "      sub i, erev, v\n"
         "      mul i, edge_g, i\n"
         "      add network_inputs, network_inputs, i\n"
@@ -579,4 +626,204 @@ TEST(SynapseLoweringErrors, lower_all_synapse_types_skips_non_synapse_type_libra
     Vector<IrProgram> programs = lower_all_synapse_types_to_ir(specification);
     ASSERT_EQ(programs.size(), 1u);
     EXPECT_EQ(programs[0].component_type_name, "expOneSynapse");
+}
+
+// ── alphaCurrentSynapse (real, current-based, coupled I/J TimeDerivative) ─
+//
+// The exact gap a full skeptical ticket audit flagged: `I`'s own TimeDerivative
+// (`(2.7182818284590451*J - I)/tau`) does not match the recognized closed-form
+// linear-decay shape (its "target" half, `2.7182818284590451*J`, is a compound
+// Binary node, not a bare leaf -- detect_linear_decay_shape's own documented
+// scope), so it used to be silently dropped, leaving `I` pinned at 0 forever.
+// synapse_lowering.cpp's own general forward-Euler fallback now lowers it.
+
+TEST(SynapseLoweringPerEdge, lowers_real_alpha_current_synapse_couples_I_and_J) {
+    TypeLibraryEntry entry = build_synapse_type_library_entry(
+        "alpha_current", "", "alphaCurrentSynapse", "tau=\"10ms\" ibase=\"1nA\" weight=\"2\"");
+
+    ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
+    ASSERT_FALSE(entry.is_conductance_based);
+    ASSERT_TRUE(std::holds_alternative<SynapseType>(entry.dynamics.flattened));
+    const SynapseType &synapse = std::get<SynapseType>(entry.dynamics.flattened);
+    ASSERT_EQ(synapse.state_variables.size(), 2u);
+    EXPECT_EQ(synapse.state_variables[0].name, "I");
+    EXPECT_EQ(synapse.state_variables[1].name, "J");
+    ASSERT_EQ(synapse.time_derivatives.size(), 2u);
+
+    IrProgram program = lower_synapse_to_ir(entry);
+    String rendered_program = print_ir_program(program);
+
+    String expected =
+        ".alloc\n"
+        "  peredge I\n"
+        "  peredge J\n"
+        "  param tau = 0.01\n"
+        "  param ibase = 1.0000000000000001e-09\n"
+        "  param weight = 2\n"
+        "  expose i\n"
+        ".tick\n"
+        "  @deliver\n"
+        "    onevent in {\n"
+        "      mul t0, weight, ibase\n"
+        "      accedge J@edge, t0\n"
+        "    }\n"
+        "  @integrate\n"
+        "    forall neuron_in {\n"
+        "      loadedge edge_I, I@edge\n"
+        "      loadedge edge_J, J@edge\n"
+        "      mul t0, 2.7182818284590451, edge_J\n"
+        "      sub t0, t0, edge_I\n"
+        "      div t0, t0, tau\n"
+        "      mul t0, t0, dt\n"
+        "      accedge I@edge, t0\n"
+        "      add edge_I, edge_I, t0\n"
+        "      loadedge edge_J_old, J@edge\n"
+        "      expdecay edge_J, edge_J_old, tau\n"
+        "      sub edge_J_delta, edge_J, edge_J_old\n"
+        "      accedge J@edge, edge_J_delta\n"
+        "      mov i, edge_I\n"
+        "      add network_inputs, network_inputs, i\n"
+        "    }\n";
+
+    // Neither state variable was dropped: `J`'s own `-J/tau` matches the recognized closed-form
+    // decay shape (the same read-decay-writeback-delta sequence every other decaying fixture in
+    // this file produces); `I`'s own RHS does NOT match that shape (its "target" half is a compound
+    // `2.7182818284590451*J`, not a bare leaf) but is now lowered via the general forward-Euler
+    // fallback instead of being silently dropped -- `J` (referenced by `I`'s own RHS, not yet
+    // touched this tick since `J` is declared after `I`) is loaded fresh into `edge_J`, the whole
+    // RHS is evaluated into a temporary, scaled by `dt`, `accedge`'d as `I`'s own delta, and
+    // `edge_I` updated in place so the finished-current identity `i = I` below reads the
+    // just-integrated value, not a permanently-stale one.
+    EXPECT_EQ(rendered_program, expected);
+}
+
+// ── alphaCurrentSynapse acceptance: real, numeric, end-to-end alpha-shaped current ───────────────
+//
+// Drives a real 2-neuron network through AssembledModel (ticket #131's real per-edge synapse
+// dispatch machinery -- the SAME machinery master_kernel_tests.cpp's own
+// MasterKernelSynapseDispatch tests and exit_model_validation_tests.cpp's own GLIF E/I network use)
+// for enough ticks that a single presynaptic spike produces a measurable, non-zero, alpha-shaped
+// postsynaptic current: starts at/near 0, rises, peaks around t=tau after the spike (the classical
+// alpha-function kernel's own analytic peak time, not just "eventually nonzero"), then decays back
+// down. Compared, tick for tick, against run_alpha_current_synapse_forward_euler's own
+// hand-integrated reference (same discretization synapse_lowering.cpp's own fix produces, see that
+// function's header comment for the exact derivation).
+//
+// The postsynaptic neuron's own current is read directly via `network_inputs[target]` right after
+// each `step_tick` call, rather than through the postsynaptic cell's own (irrelevant) `v` --
+// master_kernel.cpp's own step_tick sequence drains network_inputs to exactly 0 before this tick's
+// fresh synaptic dispatch writes into it (see master_kernel.cpp's own "fixed deliver-drain" comment),
+// and alphaCurrentSynapse's `i = I` identity is the ONLY edge feeding this neuron, so
+// `network_inputs[target]` right after `step_tick` returns is EXACTLY this tick's `I` value -- no
+// separate per-edge read-back machinery (e.g. WeightMatrix::get_for_matrix) is needed. The scalar
+// k^2-tree weight-matrix path is left at DEFAULT_MATRIX_INDEX's own all-ones coefficients but
+// `set_constant_weight(0.0f)`'d anyway as an explicit, harmless no-op (ticket #131 already forces
+// this dispatch's own weight contribution to 0 whenever `model.projections` is non-empty -- see
+// master_kernel.h's own "ticket #131" doc comment -- matching exit_model_validation_tests.cpp's own
+// established convention of stating the placeholder explicitly rather than deleting the call).
+TEST(SynapseLoweringAlphaCurrentAcceptance, real_alpha_current_synapse_produces_alpha_shaped_current) {
+    const String tau_attribute = "10ms";
+    const String ibase_attribute = "1nA";
+    const String weight_attribute = "2";
+    const f64 tau_seconds = 0.01;
+    const f64 ibase_amperes = 1e-9;
+    const f64 weight = 2.0;
+    const f32 dt_seconds = 1e-4f;
+    const s64 tick_count = 400;
+    const s64 spike_tick = 2;
+
+    ModelSpecification model =
+        build_alpha_current_synapse_network_specification(tau_attribute, ibase_attribute, weight_attribute);
+    ASSERT_EQ(model.total_neuron_count, 2);
+    ASSERT_EQ(model.type_library.size(), 2u); // DummyCell + alphaCurrentSynapse
+    ASSERT_EQ(model.projections.size(), 1u);
+
+    Vector<IrProgram> programs;
+    programs.reserve(model.type_library.size());
+    for (const auto &entry : model.type_library) {
+        if (entry.category == TypeLibraryCategory::Cell) {
+            programs.push_back(lower_cell_to_ir(entry));
+        } else {
+            ASSERT_EQ(entry.category, TypeLibraryCategory::Synapse);
+            programs.push_back(lower_synapse_to_ir(entry));
+        }
+    }
+
+    ModelAllocation allocation = allocate_model(model, programs);
+
+    vector<vector<s32>> adjacency = {{1}, {}};
+    WeightMatrix weights(adjacency, /*rank=*/1);
+    weights.set_constant_weight(0.0f); // explicit no-op -- see this test's own header comment
+
+    AssembledModel assembled_model(model, programs);
+
+    GpuPointer<f32> network_inputs = allocate<f32>(2 * sizeof(f32));
+    memset(network_inputs.get_contents(), 0, 2 * sizeof(f32));
+    GpuPointer<s64> last_spiked = allocate<s64>(2 * sizeof(s64));
+    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + 2, (s64)-1);
+    GpuPointer<s32> next_active_indices = allocate<s32>(2 * sizeof(s32));
+    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
+    next_active_count.get_contents()[0] = 0;
+    GpuPointer<s32> active_generation = allocate<s32>(2 * sizeof(s32));
+    std::fill(active_generation.get_contents(), active_generation.get_contents() + 2, -1);
+    GpuPointer<bool> emit_spike = allocate<bool>(2 * sizeof(bool));
+    memset(emit_spike.get_contents(), 0, 2 * sizeof(bool));
+
+    ModelRuntimeBuffers buffers;
+    buffers.allocation = &allocation;
+    buffers.weights = &weights;
+    buffers.network_inputs = network_inputs.get_contents();
+    buffers.last_spiked = last_spiked.get_contents();
+    buffers.next_active_neuron_indices = next_active_indices.get_contents();
+    buffers.next_active_neuron_count = next_active_count.get_contents();
+    buffers.active_generation = active_generation.get_contents();
+    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
+
+    Vector<f32> observed_current;
+    observed_current.reserve((usize)tick_count);
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        emit_spike.get_contents()[0] = (tick == spike_tick); // one presynaptic spike, exactly this tick
+        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        emit_spike.get_contents()[0] = false;
+        observed_current.push_back(network_inputs.get_contents()[1]);
+    }
+
+    deallocate(std::move(network_inputs));
+    deallocate(std::move(last_spiked));
+    deallocate(std::move(next_active_indices));
+    deallocate(std::move(next_active_count));
+    deallocate(std::move(active_generation));
+    deallocate(std::move(emit_spike));
+
+    AlphaCurrentSynapseForwardEulerResult reference = run_alpha_current_synapse_forward_euler(
+        tau_seconds, ibase_amperes, weight, (f64)dt_seconds, tick_count, spike_tick);
+    ASSERT_EQ(observed_current.size(), reference.exposed_current.size());
+
+    // Tight, tick-for-tick numeric match against the hand-computed reference -- both use the exact
+    // same discretization; the only expected divergence is float32 (engine) vs. float64 (reference)
+    // rounding, not a magnitude- or shape-class difference.
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        f64 reference_value = reference.exposed_current[(usize)tick];
+        f64 tolerance = std::fabs(reference_value) * 1e-3 + 1e-13;
+        EXPECT_NEAR((f64)observed_current[(usize)tick], reference_value, tolerance) << "tick=" << tick;
+    }
+
+    // Qualitative alpha shape: near zero before the spike, rises, peaks, decays back down -- not
+    // just "is nonzero at some point".
+    for (s64 tick = 0; tick < spike_tick; ++tick) {
+        EXPECT_NEAR(observed_current[(usize)tick], 0.0f, 1e-15f) << "tick=" << tick;
+    }
+
+    usize peak_tick_index = 0;
+    for (usize tick_index = 0; tick_index < observed_current.size(); ++tick_index) {
+        if (observed_current[tick_index] > observed_current[peak_tick_index]) peak_tick_index = tick_index;
+    }
+    EXPECT_GT(peak_tick_index, (usize)spike_tick)
+        << "current should rise after the spike, not peak immediately";
+    EXPECT_LT(peak_tick_index, (usize)tick_count - 1)
+        << "current should decay back down before the horizon ends, not still be rising";
+    EXPECT_GT(observed_current[peak_tick_index], 1e-10f)
+        << "peak current should be a real, measurable magnitude, not near-zero noise";
+    EXPECT_LT(observed_current[(usize)tick_count - 1], observed_current[peak_tick_index] * 0.5f)
+        << "current should have decayed back down substantially by the end of the horizon";
 }

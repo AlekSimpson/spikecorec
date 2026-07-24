@@ -37,22 +37,25 @@ namespace spikecorec::nml {
 // ticket's scope). A `DerivedVariable` using `select`/`reduce`
 // (Children-based sub-mechanism composition, e.g. `blockingPlasticSynapse`'s
 // real `plasticityFactor`/`blockFactor`) throws -- out of Phase-1 scope, per
-// the IR spec's own NMDA example eliding the Mg-block. A `peredge` state
-// variable's own `TimeDerivative` IS lowered -- but only when its
-// right-hand side matches the recognized linear-decay shape
-// (`detect_linear_decay_shape`, shared with cell_lowering.cpp's own
-// direct-mutation case). Per-edge storage is accumulate-only (arch §4.3:
-// `accedge` is `Sk[edge]+=value`; there is no direct "set" op), so a decay
-// can't be applied in place the way cell-side lowering does -- instead it's
-// expressed as read-decay-writeback-delta: `loadedge` the current value,
-// compute what it decays to, `accedge` the DIFFERENCE back so the
-// reconstructed read reflects the decayed value next tick (see
-// synapse_lowering.cpp). A `TimeDerivative` that does NOT match the
-// recognized decay shape still gets a build-time warning (not a throw --
-// the emitted IR is still spec-conformant) and is silently dropped from
-// `.tick`, matching the old behavior -- a general per-edge forward-Euler
-// integration for an arbitrary right-hand side is out of this ticket's
-// scope.
+// the IR spec's own NMDA example eliding the Mg-block. Every `peredge` state
+// variable's own `TimeDerivative` IS lowered: one matching the recognized
+// linear-decay shape (`detect_linear_decay_shape`, shared with
+// cell_lowering.cpp's own direct-mutation case) uses the closed-form
+// `expdecay` path; one that doesn't (e.g. `alphaCurrentSynapse`'s own `I`,
+// whose coupled right-hand side references another per-edge state variable,
+// `J`) falls back to a general per-edge forward-Euler integration instead.
+// Per-edge storage is accumulate-only (arch §4.3: `accedge` is
+// `Sk[edge]+=value`; there is no direct "set" op), so neither path can
+// mutate a peredge variable in place the way cell-side lowering does --
+// both instead read the current value via `loadedge` and `accedge` back
+// only the DELTA (the closed-form path's decayed-value-minus-old-value; the
+// forward-Euler path's own `dt * rhs`) so the reconstructed read reflects
+// the updated value next tick (see synapse_lowering.cpp). A per-edge
+// TimeDerivative referencing another per-edge state variable whose OWN
+// TimeDerivative was already integrated earlier the same tick (i.e. it
+// precedes this one in the type's declared Dynamics) throws rather than
+// silently reading its already-updated value -- see synapse_lowering.cpp's
+// own header comment on the per-variable integration loop.
 
 // Lowers one Synapse-category `TypeLibraryEntry` to its `IrProgram`. Throws
 // std::runtime_error if `synapse_entry.category != TypeLibraryCategory::Synapse`,

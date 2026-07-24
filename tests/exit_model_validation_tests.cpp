@@ -672,14 +672,11 @@ TEST(ExitModelGlifEiNetwork, driven_simulation_spikes_via_real_per_edge_synapse_
     // alphaCurrentSynapse/NMDA per-edge dynamics (run_glif_ei_network's own constant-weight
     // placeholder is now inert -- see master_kernel.h), so real propagation happens exactly as the
     // checked-in jLEMS reference (glif_ei_network_spikes.dat) shows: ExcPop[0] -> InhPop[0] via a
-    // real expOneSynapse. ExcPop[0] -> ExcPop[2] (via alphaCurrentSynapse) and the ExcPop[2] ->
-    // InhPop[0] NMDA leg do NOT yet reproduce the reference -- alphaCurrentSynapse's own two-
-    // state-variable coupled TimeDerivative (`I`/`J`) isn't a recognized linear-decay shape
-    // (synapse_lowering.cpp's own documented, separate limitation: "general per-edge forward-Euler
-    // integration for an arbitrary right-hand side is out of Phase-1 scope"), so `I` never
-    // integrates and ExcPop[2] never receives a nonzero current -- a real, pre-existing, orthogonal
-    // gap this ticket does not fix (see ExitModelGlifEiNetwork's own re-enabled reference-comparison
-    // test below, which compares only the populations this gap doesn't block).
+    // real expOneSynapse, AND ExcPop[0] -> ExcPop[2] via a real alphaCurrentSynapse (its own
+    // coupled I/J TimeDerivative now lowers via synapse_lowering.cpp's general forward-Euler
+    // fallback for per-edge state, not just the closed-form decay shape -- see that file's own
+    // doc comment). The ExcPop[2] -> InhPop[0] NMDA leg's own numeric agreement with the reference
+    // is checked separately below (roughly_matches_pyneuroml_reference_where_real_propagation_is_implemented).
     const s64 tick_count = 2500;
     const f32 dt_seconds = 1e-4f;
 
@@ -698,10 +695,10 @@ TEST(ExitModelGlifEiNetwork, driven_simulation_spikes_via_real_per_edge_synapse_
     EXPECT_TRUE(result.spike_ticks[1].empty()) << "ExcPop[1] is unconnected and should never spike";
     EXPECT_TRUE(result.spike_ticks[4].empty()) << "InhPop[1] is unconnected and should never spike";
 
-    // ExcPop[2]: still silent -- see this test's own header comment above (alphaCurrentSynapse's
-    // coupled-ODE gap, not a "zero propagated weight" placeholder anymore).
-    EXPECT_TRUE(result.spike_ticks[2].empty())
-        << "ExcPop[2] should stay silent until alphaCurrentSynapse's coupled TimeDerivative is lowered";
+    // ExcPop[2]: now genuinely spikes via alphaCurrentSynapse's real per-edge current (the gap this
+    // test used to document is closed -- see the header comment above).
+    EXPECT_GE(result.spike_ticks[2].size(), 1u)
+        << "ExcPop[2] should spike via alphaCurrentSynapse's real per-edge current from ExcPop[0]'s spikes";
 
     // InhPop[0]: the ticket #131 acceptance criterion, exercised directly -- ExcPop[0]'s own spike
     // reaches InhPop[0] through expOneSynapse's real, gbase/tauDecay/erev-derived per-edge current
@@ -795,23 +792,21 @@ TEST(ExitModelGlif3SingleCell, matches_pyneuroml_reference) {
 }
 
 TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_propagation_is_implemented) {
-    // Re-enabled (was DISABLED_glif_ei_network_matches_pyneuroml_reference). UNLIKE GLIF3's own
-    // re-enabled comparison above, this one is necessarily PARTIAL, for a reason the relaxed timing
-    // philosophy cannot fix: AssembledModel's propagate stage (ticket #131) now dispatches real
-    // expOneSynapse per-edge dynamics (ExcPop[0] -> InhPop[0]), but NOT alphaCurrentSynapse's own
-    // coupled TimeDerivative (ExcPop[0] -> ExcPop[2]) or the ExcPop[2] -> InhPop[0] NMDA leg that
-    // depends on it (synapse_lowering.cpp's own documented, separate limitation -- see
-    // ExitModelGlifEiNetwork.driven_simulation_spikes_via_real_per_edge_synapse_propagation's own
-    // header comment above). So ExcPop[2] never spikes in spikecorec's own simulation regardless of
-    // tolerance, and InhPop[0]'s own spike count structurally undershoots the reference's own full
-    // count (the reference's own InhPop[0] receives BOTH the expOneSynapse leg AND the NMDA leg
-    // spikecorec's own AssembledModel can't yet reproduce). This is a real, pre-existing, orthogonal
-    // gap -- not a timing artifact this ticket's relaxation is meant to address -- so only ExcPop[0]
-    // (the one population with a full, real, end-to-end propagation path matching the reference) is
-    // numerically compared against the reference below; the other four keep the SAME plain
-    // silent/non-silent assertions driven_simulation_spikes_via_real_per_edge_synapse_propagation
-    // above already establishes, rather than a numeric comparison this gap makes structurally
-    // impossible to pass.
+    // Re-enabled (was DISABLED_glif_ei_network_matches_pyneuroml_reference). alphaCurrentSynapse's
+    // coupled I/J TimeDerivative now lowers (synapse_lowering.cpp's general forward-Euler fallback
+    // for per-edge state), so ExcPop[0] -> ExcPop[2] via alphaCurrentSynapse is real too, not just
+    // the ExcPop[0] -> InhPop[0] expOneSynapse leg. Neither ExcPop[2] nor InhPop[0] is numerically
+    // compared against the reference below, though, verified directly rather than assumed: ExcPop[2]
+    // spikes 69 times against the reference's 56 (a 23% difference, just outside this file's own
+    // SPIKE_COUNT_RELATIVE_TOLERANCE of 20%) -- real propagation through a real synapse, but not yet
+    // a tight numeric match (forward-Euler discretization of alphaCurrentSynapse's coupled ODE at
+    // this dt vs. jLEMS's own solver is the likely source of the residual gap, not investigated
+    // further here). InhPop[0]'s own count similarly still undershoots the reference (it receives
+    // BOTH the expOneSynapse leg AND the ExcPop[2]->InhPop[0] NMDA leg; both are real now, but the
+    // combined count doesn't land within tolerance either). Both keep the plain "does it spike"
+    // sanity check driven_simulation_spikes_via_real_per_edge_synapse_propagation above already
+    // establishes, rather than a numeric comparison that would fail outside the tolerance this file
+    // uses everywhere else -- an honest gap to close later, not forced to pass here.
     const s64 tick_count = 2500;
     const f32 dt_seconds = 1e-4f;
 
@@ -836,15 +831,17 @@ TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_prop
     EXPECT_TRUE(own_result.spike_ticks[1].empty()) << "ExcPop[1] is unconnected and should never spike";
     EXPECT_TRUE(own_result.spike_ticks[4].empty()) << "InhPop[1] is unconnected and should never spike";
 
-    // ExcPop[2]: still silent -- see this test's own header comment above (alphaCurrentSynapse's
-    // coupled-ODE gap, a separate, pre-existing, orthogonal limitation).
-    EXPECT_TRUE(own_result.spike_ticks[2].empty())
-        << "ExcPop[2] should stay silent until alphaCurrentSynapse's coupled TimeDerivative is lowered";
+    // ExcPop[2]: now genuinely propagates via alphaCurrentSynapse, but its own spike count (69)
+    // still doesn't land within SPIKE_COUNT_RELATIVE_TOLERANCE of the reference's own count (56, a
+    // 23% difference) -- see this test's own header comment above -- so it keeps the plain "it does
+    // spike at all" check rather than a numeric comparison that would fail.
+    EXPECT_GE(own_result.spike_ticks[2].size(), 1u)
+        << "ExcPop[2] should spike via alphaCurrentSynapse's real per-edge current from ExcPop[0]'s spikes";
 
-    // InhPop[0]: spikes via the real expOneSynapse leg (ticket #131), but its own spike count
-    // structurally undershoots the reference's own full count (see this test's own header comment
-    // above) -- a plain "it does spike at all" check, not a numeric comparison against the reference,
-    // until the NMDA leg's own alphaCurrentSynapse dependency is lowered.
+    // InhPop[0]: spikes via both the real expOneSynapse leg and the real NMDA leg (ticket #131), but
+    // the combined count still doesn't land within tolerance of the reference's own full count (see
+    // this test's own header comment above) -- a plain "it does spike at all" check, not a numeric
+    // comparison against the reference.
     EXPECT_GE(own_result.spike_ticks[3].size(), 1u)
         << "InhPop[0] should spike via expOneSynapse's real per-edge conductance from ExcPop[0]'s spikes";
 }
@@ -953,12 +950,10 @@ IzhikevichNetworkRunResult run_izhikevich_network(s64 tick_count, f32 dt_seconds
     // dynamics automatically (model.projections is non-empty here), forcing this constant-weight
     // placeholder's own scattered contribution to zero regardless (see master_kernel.h) -- left set
     // anyway as an explicit, harmless no-op rather than deleting the call, matching
-    // run_glif_ei_network's own established convention above. This does NOT make TargetPop spike,
-    // though: alphaCurrentSynapse's own coupled `I`/`J` TimeDerivative isn't a recognized linear-decay
-    // shape (synapse_lowering.cpp's own documented, separate limitation -- the SAME gap
-    // run_glif_ei_network's own ExcPop[2] leg hits), so `I` never integrates and TargetPop never
-    // receives a nonzero current -- see this file's own header comment (Phase-2 section, #2) and the
-    // DISABLED_izhikevich_network_target_neuron_... test below.
+    // run_glif_ei_network's own established convention above. TargetPop genuinely spikes now:
+    // alphaCurrentSynapse's own coupled `I`/`J` TimeDerivative lowers via synapse_lowering.cpp's
+    // general forward-Euler fallback for per-edge state (see that file's own doc comment) -- see
+    // izhikevich_network_target_neuron_matches_pyneuroml_reference below.
     weights.set_constant_weight(0.0f);
 
     AssembledModel assembled_model(model, programs);
@@ -1406,26 +1401,16 @@ TEST(ExitModelValidation, izhikevich_network_driven_neuron_matches_pyneuroml_ref
                                                   (f64)dt_seconds, "izhikevich_network DrivenPop");
 }
 
-TEST(ExitModelValidation, DISABLED_izhikevich_network_target_neuron_does_not_yet_match_pyneuroml_reference) {
-    // STILL DISABLED_ (investigated, direct user instruction, 2026-07-23) -- NOT because of the
-    // original "zero-weight forcing sidesteps synapse dispatch" reason this comment used to give.
-    // Ticket #131 has since built real per-edge synapse dispatch, and it DOES run automatically for
-    // this model (model.projections is non-empty, see run_izhikevich_network's own updated comment
-    // above) -- but TargetPop still never spikes, for a real, separate, orthogonal reason: despite its
-    // id="izhCurrSynapse", this fixture's synapse is actually an `alphaCurrentSynapse` instance
-    // (izhikevich_network.nml's own <alphaCurrentSynapse id="izhCurrSynapse" .../>), and
-    // alphaCurrentSynapse's own coupled `I`/`J` TimeDerivative is not a recognized linear-decay shape
-    // (synapse_lowering.cpp's own documented, separate limitation: "general per-edge forward-Euler
-    // integration for an arbitrary right-hand side is out of Phase-1 scope" -- confirmed at test time
-    // by that exact warning, logged once per run) -- so `I` never integrates and TargetPop never
-    // receives a nonzero current: own_result.target_spike_ticks is empty (0) against the reference's
-    // own 5 spikes, even forcibly run (--gtest_also_run_disabled_tests). This is the SAME gap
-    // ExitModelGlifEiNetwork.driven_simulation_spikes_via_real_per_edge_synapse_propagation's own
-    // ExcPop[2]/alphaCurrentSynapse leg already documents and stays silent for -- not a new one, and
-    // not something the ticket-#125 relaxed comparison philosophy is meant to paper over (a
-    // structurally wrong firing-rate bug is exactly the class that philosophy still catches -- see
-    // this file's own tolerance doc comment). Left DISABLED_ (not loosened, not silently re-disabled)
-    // until alphaCurrentSynapse's coupled TimeDerivative gets its own general forward-Euler lowering.
+TEST(ExitModelValidation, izhikevich_network_target_neuron_matches_pyneuroml_reference) {
+    // Re-enabled. Was DISABLED_ because, despite its id="izhCurrSynapse", this fixture's synapse is
+    // actually an `alphaCurrentSynapse` instance (izhikevich_network.nml's own
+    // <alphaCurrentSynapse id="izhCurrSynapse" .../>), and alphaCurrentSynapse's own coupled `I`/`J`
+    // TimeDerivative wasn't a recognized linear-decay shape, so `I` never integrated and TargetPop
+    // never received a nonzero current. synapse_lowering.cpp now has a general forward-Euler
+    // fallback for per-edge state when the closed-form decay shape isn't recognized (see that file's
+    // own doc comment) -- alphaCurrentSynapse's real dynamics run now, TargetPop genuinely spikes,
+    // and this test's own ticket-#125 relaxed comparison philosophy applies like every other
+    // re-enabled test in this file.
     const s64 tick_count = 2300;
     const f32 dt_seconds = 1e-4f;
 
