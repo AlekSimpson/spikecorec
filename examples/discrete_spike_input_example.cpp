@@ -68,6 +68,7 @@
 
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/nml/discrete_spike_input.h"
 
 #include "glif_torus_network.h"
@@ -76,6 +77,14 @@ using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
 
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a file-scope
+// `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template -- ambiguous
+// with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates of the
+// same name from two using-directives at the same scope, regardless of expanding to the identical
+// type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_tests.cpp/
+// examples/stdp_plasticity_example.cpp already do for the same reason.
+
 namespace {
 
 // One named input stream: a bit pattern, a slot width, and the neuron it drives.
@@ -83,14 +92,14 @@ struct InputStream {
     String name;
     s32 target_neuron_index = 0;
     s64 slot_ticks = 100;      // ticks each pattern element occupies
-    Vector<u8> pattern_bits;   // the caller's array, tiled across the run
-    Vector<u8> expanded_bits;  // per-tick: 1 only on the first tick of a set element's slot
+    spikecorec::Vector<u8> pattern_bits;   // the caller's array, tiled across the run
+    spikecorec::Vector<u8> expanded_bits;  // per-tick: 1 only on the first tick of a set element's slot
 };
 
 // Parses a bit string like "0001001010". Commas, spaces and brackets are ignored, so
 // "[0,0,0,1,0,0,1,0,1,0]" parses identically.
-Vector<u8> parse_bit_pattern(const String &text) {
-    Vector<u8> bits;
+spikecorec::Vector<u8> parse_bit_pattern(const String &text) {
+    spikecorec::Vector<u8> bits;
     for (char character : text) {
         if (character == '0') bits.push_back(0);
         else if (character == '1') bits.push_back(1);
@@ -104,8 +113,8 @@ Vector<u8> parse_bit_pattern(const String &text) {
 // Expands `pattern_bits` across `tick_count`: element `k` owns ticks [k*slot, (k+1)*slot), and a set
 // element injects on the FIRST tick of its slot only — one impulse per set bit, not a held current.
 // The pattern tiles once it runs out.
-Vector<u8> expand_pattern(const Vector<u8> &pattern_bits, s64 slot_ticks, s64 tick_count) {
-    Vector<u8> expanded((usize)tick_count, 0);
+spikecorec::Vector<u8> expand_pattern(const spikecorec::Vector<u8> &pattern_bits, s64 slot_ticks, s64 tick_count) {
+    spikecorec::Vector<u8> expanded((usize)tick_count, 0);
     for (s64 tick = 0; tick < tick_count; ++tick) {
         if (tick % slot_ticks != 0) continue;
         const s64 element_index = (tick / slot_ticks) % (s64)pattern_bits.size();
@@ -116,10 +125,10 @@ Vector<u8> expand_pattern(const Vector<u8> &pattern_bits, s64 slot_ticks, s64 ti
 
 // Renders a per-tick bit array as a raster row. One column covers several ticks; a column shows '|'
 // if any tick in its window is set, so a sparse pattern never vanishes.
-void print_tick_raster(const String &label, const Vector<u8> &bits_by_tick, s64 tick_count,
+void print_tick_raster(const String &label, const spikecorec::Vector<u8> &bits_by_tick, s64 tick_count,
                        s32 column_count = 86) {
     const s32 columns = (s32)std::min<s64>(column_count, std::max<s64>(tick_count, 1));
-    Vector<char> row((usize)columns, ' ');
+    spikecorec::Vector<char> row((usize)columns, ' ');
     for (s64 tick = 0; tick < (s64)bits_by_tick.size() && tick < tick_count; ++tick) {
         if (bits_by_tick[(usize)tick] == 0) continue;
         row[(usize)std::min<s64>(tick * columns / std::max<s64>(tick_count, 1), columns - 1)] = '|';
@@ -130,9 +139,9 @@ void print_tick_raster(const String &label, const Vector<u8> &bits_by_tick, s64 
 }
 
 // Same shape, from a list of spike ticks, so input and output rasters line up column for column.
-void print_spike_raster_row(const String &label, const Vector<s64> &spike_ticks, s64 tick_count,
+void print_spike_raster_row(const String &label, const spikecorec::Vector<s64> &spike_ticks, s64 tick_count,
                             s32 column_count = 86) {
-    Vector<u8> bits_by_tick((usize)tick_count, 0);
+    spikecorec::Vector<u8> bits_by_tick((usize)tick_count, 0);
     for (s64 spike_tick : spike_ticks) {
         if (spike_tick >= 0 && spike_tick < tick_count) bits_by_tick[(usize)spike_tick] = 1;
     }
@@ -151,7 +160,7 @@ struct BitOutcomeTally {
 // spike if one appears within `delivery_window_ticks` of it (the engine's own >=1-tick latency means
 // the spike need not land on the exact same tick).
 BitOutcomeTally classify_bit_outcomes(
-    const Vector<u8> &expanded_bits, const Vector<s64> &spike_ticks, s64 refractory_ticks,
+    const spikecorec::Vector<u8> &expanded_bits, const spikecorec::Vector<s64> &spike_ticks, s64 refractory_ticks,
     s64 delivery_window_ticks = 2
 ) {
     BitOutcomeTally tally;
@@ -174,20 +183,6 @@ BitOutcomeTally classify_bit_outcomes(
     return tally;
 }
 
-// A trivial, deterministic ring (neuron n → n+1) purely to satisfy WeightMatrix's constructor for a
-// model with NO real projections — mirrors poisson_population_example's own established precedent
-// for the same "no projections at all" case. `set_constant_weight(0.0f)` keeps it inert: only spike
-// timing matters when lateral coupling is off, nothing here is ever propagated.
-WeightMatrix build_unconnected_placeholder_weight_matrix(s64 neuron_count) {
-    Vector<Vector<s32>> adjacency((usize)neuron_count);
-    for (s32 neuron_index = 0; neuron_index < (s32)neuron_count; ++neuron_index) {
-        adjacency[(usize)neuron_index] = {(neuron_index + 1) % (s32)neuron_count};
-    }
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(0.0f);
-    return weights;
-}
-
 } // namespace
 
 int main(int argument_count, char **argument_values) {
@@ -207,7 +202,7 @@ int main(int argument_count, char **argument_values) {
         else if (argument == "--bit-ticks") slow_slot_ticks = std::strtoll(argument_values[argument_index + 1], nullptr, 10);
         else if (argument == "--amplitude") bit_amplitude_amperes = std::strtof(argument_values[argument_index + 1], nullptr);
     }
-    const Vector<u8> pattern_bits = parse_bit_pattern(pattern_text);
+    const spikecorec::Vector<u8> pattern_bits = parse_bit_pattern(pattern_text);
     // Deliberately shorter than the 5ms (50-tick) refractory period, so bits get swallowed.
     const s64 fast_slot_ticks = 20;
 
@@ -228,31 +223,28 @@ int main(int argument_count, char **argument_values) {
     ModelSpecification model =
         load_generated_model("discrete_input_torus", generate_glif_torus_network_nml(network_options));
 
-    Vector<IrProgram> programs = lower_type_library_to_ir(model);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model);
     print_model_summary(model, programs);
     if (options.base.print_ir) print_ir_programs(model, programs);
 
     std::cout << "\n  Note `stimuli : 0` above — this model declares no pulseGenerator and no\n"
               << "  explicitInput. All drive comes from the host-provided bit arrays below.\n";
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_glif_initial_state(allocation, model, GlifVariant::Glif3);
-
-    // With lateral coupling off (the default), this model has NO projections at all, so a trivial
-    // placeholder adjacency stands in purely to satisfy WeightMatrix's constructor (nothing is ever
-    // propagated). With `--couple`, this is the SAME real torus/expOneSynapse wiring the GLIF3/GLIF5
-    // torus examples use — AssembledModel dispatches its real per-edge conductance automatically.
-    WeightMatrix weights = lateral_coupling_enabled
-                                ? build_weight_matrix(model)
-                                : build_unconnected_placeholder_weight_matrix(model.total_neuron_count);
-
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally, then every `.tick`
+    // section → one master kernel, compiled once. With lateral coupling off (the default), this
+    // model has NO projections at all — SpikeEngine's own WeightMatrix construction handles an
+    // edge-free adjacency directly, no placeholder ring needed. With `--couple`, this is the SAME
+    // real torus/expOneSynapse wiring the GLIF3/GLIF5 torus examples use — SpikeEngine dispatches
+    // its real per-edge conductance automatically. set_constant_weight(0.0f) is documentation either
+    // way (see glif_ei_network_example's own identical comment).
+    SpikeEngine engine(model, programs, options.base.dt_seconds);
+    seed_glif_initial_state(engine.nml_allocation_, model, GlifVariant::Glif3);
+    engine.weights.set_constant_weight(0.0f);
 
     // ── 2. The same pattern at two rates ────────────────────────────────────────────────────────
     const s64 tick_count = options.base.tick_count;
 
-    Vector<InputStream> streams;
+    spikecorec::Vector<InputStream> streams;
     {
         InputStream slow;
         slow.name = "slow";
@@ -281,7 +273,7 @@ int main(int argument_count, char **argument_values) {
 
     discrete_schedule.spike_bits.resize((usize)tick_count);
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        Vector<u8> bits_this_tick;
+        spikecorec::Vector<u8> bits_this_tick;
         bits_this_tick.reserve(streams.size());
         for (const InputStream &stream : streams) bits_this_tick.push_back(stream.expanded_bits[(usize)tick]);
         discrete_schedule.spike_bits[(usize)tick] = std::move(bits_this_tick);
@@ -313,16 +305,16 @@ int main(int argument_count, char **argument_values) {
     std::cout << "  " << tick_count << " ticks × " << options.base.dt_seconds * 1000.0f << "ms = "
               << format_seconds((f64)tick_count * options.base.dt_seconds) << "\n";
 
-    Vector<Vector<s64>> spike_ticks_by_neuron((usize)model.total_neuron_count);
-    Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
+    spikecorec::Vector<spikecorec::Vector<s64>> spike_ticks_by_neuron((usize)model.total_neuron_count);
+    spikecorec::Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        discrete_schedule.apply_to_network_inputs(live.buffers.network_inputs, tick);
+        discrete_schedule.apply_to_network_inputs(engine.network_inputs.get_contents(), tick);
 
-        assembled_model.step_tick(live.buffers, options.base.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.base.dt_seconds, tick, tick + 1);
 
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            if (live.buffers.last_spiked[neuron_index] != tick) continue;
+            if (engine.last_spiked.get_contents()[neuron_index] != tick) continue;
             spike_ticks_by_neuron[(usize)neuron_index].push_back(tick);
             ++spike_count_by_neuron[(usize)neuron_index];
         }
@@ -334,7 +326,7 @@ int main(int argument_count, char **argument_values) {
     const s64 refractory_ticks = (s64)std::llround(0.005 / (f64)options.base.dt_seconds); // t_ref = 5ms
 
     for (const InputStream &stream : streams) {
-        const Vector<s64> &output_spike_ticks = spike_ticks_by_neuron[(usize)stream.target_neuron_index];
+        const spikecorec::Vector<s64> &output_spike_ticks = spike_ticks_by_neuron[(usize)stream.target_neuron_index];
         const BitOutcomeTally tally = classify_bit_outcomes(stream.expanded_bits, output_spike_ticks, refractory_ticks);
 
         std::cout << "\n  \033[1m" << stream.name << "\033[0m — neuron " << stream.target_neuron_index

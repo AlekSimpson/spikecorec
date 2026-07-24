@@ -31,17 +31,19 @@
 //      `tauPlus`/`tauMinus`/`aPlus` are required for presence detection but cannot influence the
 //      math.
 //
-// ── Two wiring targets: the legacy SpikeEngine, and AssembledModel (ticket #132) ─────────────────
-// `apply_stdp_wiring` is overloaded on TWO simulation objects. Sections 1-4 below exercise the
-// original `SpikeEngine` overload (Phase-1's own SC-11 API — the hardcoded LIF path). Section 5
-// exercises the newer `AssembledModel` overload ticket #132 added, which drives the SAME
-// stage-7 depression update against a real NML/GLIF-family `AssembledModel` tick loop instead —
-// see that section's own comment for why it needs a SEPARATE two-neuron model (a per-edge-delay
-// ring, not the plain one-tick-latency connection sections 1-4 use) to actually call
-// `enable_plasticity` without throwing: ticket #131's real per-edge synapse dispatch and ticket
-// #132's STDP both write the shared U/V basis, and `AssembledModel::enable_plasticity` refuses to
-// run alongside the former (master_kernel.h's own documented guard) unless the model was built
-// with `enable_delay_ring=true`, which switches off #131's dispatch entirely.
+// ── Two wiring targets: SpikeEngine's hardcoded-LIF path, and its NML mode (ticket #132) ─────────
+// `apply_stdp_wiring` is overloaded on two simulation objects (SpikeEngine, and the older
+// AssembledModel this ticket's own migration is retiring call sites of). Sections 1-4 below exercise
+// the `SpikeEngine&` overload against the original hardcoded-LIF path (Phase-1's own SC-11 API).
+// Section 5 exercises the SAME `SpikeEngine&` overload again, but against a SpikeEngine built via
+// the NML `ModelSpecification` constructor instead — enable_plasticity/disable_plasticity are
+// unified across both construction paths, so no separate overload is needed. See that section's own
+// comment for why it needs a SEPARATE two-neuron model (a per-edge-delay ring, not the plain
+// one-tick-latency connection sections 1-4 use) to actually call `enable_plasticity` without
+// throwing: ticket #131's real per-edge synapse dispatch and ticket #132's STDP both write the
+// shared U/V basis, and `SpikeEngine::enable_plasticity` refuses to run alongside the former
+// (engine.cpp's own documented guard) unless the model's real per-edge delay forces the delay ring
+// (ring_slot_count > 1), which switches off #131's dispatch entirely.
 //
 // Also note `enable_plasticity` is a no-op on an engine/model that already has plasticity enabled —
 // it will not overwrite an existing learning rate. Hence the explicit `disable_plasticity()` calls
@@ -54,7 +56,6 @@
 #include <iostream>
 
 #include "spikecorec/core/engine.h"
-#include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/plasticity_wiring.h"
 
 #include "nml_pipeline_support.h"
@@ -223,49 +224,41 @@ int main(int argument_count, char **argument_values) {
               << "one synapse type cannot represent all of them at once — the first is used and a\n"
               << "warning is logged (run with --verbose to see it). That is a documented Phase-1 limit.\n";
 
-    // ── 5. Applying the wiring to AssembledModel (ticket #132) ──────────────────────────────────
-    print_heading("AssembledModel wiring (ticket #132)");
+    // ── 5. Applying the wiring to SpikeEngine's NML mode (ticket #132) ─────────────────────────
+    print_heading("SpikeEngine (NML mode) wiring (ticket #132)");
 
     // `stdp_model` above has a real per-edge projection (ticket #131 dispatches its DemoStdpSynapse
     // automatically, the same way every torus/GLIF-E/I example's own expOneSynapse gets dispatched)
-    // and was NOT built with `enable_delay_ring=true` — exactly the combination
-    // AssembledModel::enable_plasticity documents as unsafe (both would write the shared U/V basis
+    // and has no real per-edge delay configured (ring_slot_count == 1) — exactly the combination
+    // SpikeEngine::enable_plasticity documents as unsafe (both would write the shared U/V basis
     // uncoordinated) and refuses. Demonstrated directly rather than silently worked around:
-    ModelAllocation stdp_model_allocation = allocate_model(stdp_model, stdp_programs);
-    AssembledModel stdp_assembled_model_flat(stdp_model, stdp_programs); // enable_delay_ring=false (default)
-    std::cout << "  flat-mode AssembledModel (real per-edge dispatch active, ticket #131):\n";
+    SpikeEngine stdp_engine_flat(stdp_model, stdp_programs, options.dt_seconds);
+    std::cout << "  flat-mode SpikeEngine (real per-edge dispatch active, ticket #131):\n";
     try {
-        apply_stdp_wiring(stdp_model, stdp_assembled_model_flat);
+        apply_stdp_wiring(stdp_model, stdp_engine_flat);
         std::cout << "    apply_stdp_wiring did NOT throw — unexpected, see this file's header comment\n";
     } catch (const std::exception &enable_plasticity_error) {
         std::cout << "    apply_stdp_wiring threw, as documented: " << enable_plasticity_error.what() << "\n";
     }
 
     // The SAME structural model, but wired through a REAL per-edge delay (`<connectionWD delay=...>`)
-    // and constructed with `enable_delay_ring=true` — ticket #64's ring mode disables #131's synapse
-    // dispatch entirely (master_kernel.h), so `enable_plasticity` is safe here.
+    // — a real per-edge delay forces the delay ring (ring_slot_count > 1, engine.cpp), which disables
+    // #131's synapse dispatch entirely, so `enable_plasticity` is safe here.
     ModelSpecification stdp_ring_model = build_two_neuron_model(
         "ring", STDP_SYNAPSE_COMPONENT_TYPE, "DemoStdpSynapse",
         "gbase=\"1nS\" erev=\"0mV\" tau=\"5ms\" tauPlus=\"20ms\" tauMinus=\"20ms\" aPlus=\"0.01\" aMinus=\"0.012\"",
         "<connectionWD id=\"0\" preCellId=\"Pop/0/demoCellInstance\" postCellId=\"Pop/1/demoCellInstance\" "
         "weight=\"1\" delay=\"5ms\"/>");
     spikecorec::Vector<IrProgram> stdp_ring_programs = lower_type_library_to_ir(stdp_ring_model);
-    ModelAllocation stdp_ring_allocation = allocate_model(stdp_ring_model, stdp_ring_programs);
-    WeightMatrix stdp_ring_weights = build_weight_matrix(stdp_ring_model);
-    DelayRingAllocation stdp_delay_ring = allocate_delay_ring(stdp_ring_model, stdp_ring_weights, options.dt_seconds);
 
-    AssembledModel stdp_assembled_model_ring(stdp_ring_model, stdp_ring_programs, /*enable_delay_ring=*/true);
-    std::cout << "\n  ring-mode AssembledModel (real per-edge delay, #131's dispatch disabled):\n";
-    apply_stdp_wiring(stdp_ring_model, stdp_assembled_model_ring);
-    std::cout << "    plasticity_enabled=" << stdp_assembled_model_ring.plasticity_enabled()
+    SpikeEngine stdp_engine_ring(stdp_ring_model, stdp_ring_programs, options.dt_seconds);
+    std::cout << "\n  ring-mode SpikeEngine (real per-edge delay, #131's dispatch disabled):\n";
+    apply_stdp_wiring(stdp_ring_model, stdp_engine_ring);
+    std::cout << "    plasticity_enabled=" << stdp_engine_ring.plasticity_enabled()
               << "  (mapped from this model's own aMinus=0.012 via apply_stdp_wiring)\n";
 
-    (void)stdp_model_allocation;
-    (void)stdp_ring_allocation;
-    (void)stdp_delay_ring;
-
     std::cout << "\nThe integration mechanism itself — real cell dynamics, a non-trivial per-edge\n"
-              << "delay, and active STDP together in one AssembledModel tick loop — is ticket #132's\n"
+              << "delay, and active STDP together in one SpikeEngine tick loop — is ticket #132's\n"
               << "own deliverable; see tests/assembled_model_plasticity_tests.cpp for a full run that\n"
               << "steps this exact combination and measures the weight actually depress.\n";
 

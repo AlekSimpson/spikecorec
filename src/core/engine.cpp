@@ -1643,7 +1643,7 @@ void SpikeEngine::enable_plasticity(f32 _learning_rate) {
     // both hardcoded-LIF constructors above, which never set nml_mode_enabled_/nml_projections_.
     if (nml_mode_enabled_ && !nml_projections_.empty()) {
         log::throw_runtime_error(*logger,
-            "enable_plasticity: this AssembledModel has real per-edge synapse dispatch active "
+            "enable_plasticity: this SpikeEngine has real per-edge synapse dispatch active "
             "(ticket #131 projections) -- STDP's rank-1 nudge of the shared U/V basis is not yet "
             "compensated against a peredge synapse's own Ck reconstruction sharing that basis, so "
             "combining the two is not supported (see master_kernel.h's own 'ticket #132' doc "

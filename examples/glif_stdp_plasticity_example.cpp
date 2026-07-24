@@ -8,15 +8,16 @@
 // uses (glif_torus_network.h), but built with a real per-edge delay and driven with active STDP.
 //
 // ── Why delay-ring mode, not the torus examples' own real per-edge synapse dispatch ──────────────
-// `AssembledModel::enable_plasticity` throws if real per-edge synapse dispatch (ticket #131) is
+// `SpikeEngine::enable_plasticity` throws if real per-edge synapse dispatch (ticket #131) is
 // active -- STDP's rank-1 nudge of the shared U/V basis is not yet compensated against a peredge
-// synapse's own Ck reconstruction sharing that same basis (see master_kernel.h's own "ticket #132"
-// doc comment). The one combination `enable_plasticity` already accepts is `enable_delay_ring=true`,
-// which forces #131's dispatch off entirely -- so this network is wired with a real, non-trivial
-// per-edge delay (`connection_delay`, ticket #64) rather than the torus examples' usual
-// `expOneSynapse` conductance. `--gbase` (inherited from the shared torus option parser) therefore has
-// NO effect here, the same documented exception `delayed_coupling_example`/`poisson_population_example`
-// already are (see examples/README.md's own "Real synaptic propagation" section).
+// synapse's own Ck reconstruction sharing that same basis (see engine.h's own "ticket #132" doc
+// comment). The one combination `enable_plasticity` already accepts is a real per-edge delay forcing
+// the delay ring (ring_slot_count > 1, engine.cpp), which forces #131's dispatch off entirely -- so
+// this network is wired with a real, non-trivial per-edge delay (`connection_delay`, ticket #64)
+// rather than the torus examples' usual `expOneSynapse` conductance. `--gbase` (inherited from the
+// shared torus option parser) therefore has NO effect here, the same documented exception
+// `delayed_coupling_example`/`poisson_population_example` already are (see examples/README.md's own
+// "Real synaptic propagation" section).
 //
 // ── Why the scattered weight is a real, fixed magnitude, decoupled from what STDP measures ───────
 // `weights.set_constant_weight(...)` does two things: it fixes `constant_weight`/`using_constant_weight`
@@ -46,6 +47,7 @@
 #include <cstring>
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/topologies.h"
 #include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/stimulus_schedule.h"
@@ -55,6 +57,14 @@
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
+
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a file-scope
+// `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template -- ambiguous
+// with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates of the
+// same name from two using-directives at the same scope, regardless of expanding to the identical
+// type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_tests.cpp/
+// examples/stdp_plasticity_example.cpp already do for the same reason.
 
 int main(int argument_count, char **argument_values) {
     TorusExampleOptions options = parse_torus_example_options(
@@ -76,7 +86,7 @@ int main(int argument_count, char **argument_values) {
         load_generated_model("glif_stdp_torus", generate_glif_torus_network_nml(network_options));
 
     // ── 2. Lowering ─────────────────────────────────────────────────────────────────────────────
-    Vector<IrProgram> programs = lower_type_library_to_ir(model);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model);
     print_model_summary(model, programs);
     if (options.base.print_ir) print_ir_programs(model, programs);
 
@@ -89,58 +99,54 @@ int main(int argument_count, char **argument_values) {
               << "  connection delay: " << network_options.connection_delay
               << "   (real per-edge delay, ticket #64 -- required for STDP, see this file's own header comment)\n";
 
-    // ── 3. Allocation + initial state ──────────────────────────────────────────────────────────
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_glif_initial_state(allocation, model, GlifVariant::Glif3);
+    // ── 3-5. SpikeEngine builds its own ModelAllocation + WeightMatrix internally, converting this
+    // model's real per-connection delay to whole ticks and folding `network_inputs` into a ring
+    // accordingly, then every `.tick` section → one master kernel, compiled once (see this file's
+    // own header comment and delayed_coupling_example.cpp's identical fold). ─────────────────────
+    SpikeEngine engine(model, programs, options.base.dt_seconds);
+    seed_glif_initial_state(engine.nml_allocation_, model, GlifVariant::Glif3);
 
-    // ── 4. Weight matrix + delay ring ──────────────────────────────────────────────────────────
-    WeightMatrix weights = build_weight_matrix(model);
     // A real, fixed scattered magnitude -- see this file's own header comment for why STDP's own
     // updates below never feed back into it (using_constant_weight stays true for the whole run).
     const f32 scattered_weight = 0.5f;
-    weights.set_constant_weight(scattered_weight);
+    engine.weights.set_constant_weight(scattered_weight);
 
-    DelayRingAllocation ring = allocate_delay_ring(model, weights, options.base.dt_seconds);
+    // Exactly one real per-connection delay value in this torus, so the uniform-delay path applies
+    // (SpikeEngine's constructor, engine.cpp): weights.set_constant_delay_ticks(...), not the
+    // per-edge array -- so `weights.constant_delay_ticks` is this model's own real ring_slot_count.
+    const s64 ring_slot_count = engine.weights.constant_delay_ticks;
+
+    // compute_max_delay_ticks is the same free, standalone seconds->ticks scan SpikeEngine's own
+    // constructor uses upstream of the ring fold (delay_ring.h) -- reported here purely as
+    // information about the model's own declared delay, independent of the engine's internal ring
+    // representation.
     print_heading("Delay ring");
-    std::cout << "  ring slots      : " << ring.ring_slot_count << "   (max delay in ticks + 1)\n"
+    std::cout << "  ring slots      : " << compute_max_delay_ticks(model, options.base.dt_seconds) + 1
+              << "   (max delay in ticks + 1)\n"
               << "  scattered weight: " << scattered_weight << "   (fixed for the whole run, see above)\n";
 
-    // ── 5. Assembly + STDP (ticket #132) ───────────────────────────────────────────────────────
-    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
+    // ── 6. STDP (ticket #132) ───────────────────────────────────────────────────────────────────
     const f32 stdp_learning_rate = 0.2f;
-    assembled_model.enable_plasticity(stdp_learning_rate);
+    engine.enable_plasticity(stdp_learning_rate);
 
     print_heading("Plasticity (ticket #132)");
-    std::cout << "  plasticity_enabled : " << std::boolalpha << assembled_model.plasticity_enabled() << "\n"
+    std::cout << "  plasticity_enabled : " << std::boolalpha << engine.plasticity_enabled() << "\n"
               << "  learning_rate      : " << stdp_learning_rate << "\n"
               << "  every neuron that fires walks its own real k^2-tree neighbours and nudges their\n"
               << "  stored weight down (WeightMatrix::update, stage 7) -- see the summary at the end.\n";
-
-    // ── 6. Runtime buffers -- ring mode needs none of the flat network_inputs/active-set arrays
-    //      (superseded by the ring's own equivalents, see delay_ring.h) ───────────────────────────
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)model.total_neuron_count * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + model.total_neuron_count, (s64)-1);
-    GpuPointer<bool> emit_spike_flags = allocate<bool>((usize)model.total_neuron_count * sizeof(bool));
-    std::memset(emit_spike_flags.get_contents(), 0, (usize)model.total_neuron_count * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike_flags.get_contents();
-    buffers.delay_ring = &ring;
 
     // ── 7. Stimulus schedule -- injected into the ring's CURRENT slot every tick, ring mode's own
     //      equivalent of the flat network_inputs accumulation the other torus examples use ─────────
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)options.base.dt_seconds);
 
     // ── 8. STDP's own real k^2-tree edges out of the driven corner, sampled before the run ────────
-    Vector<Vector<s32>> torus_adjacency = square_torus(options.side_length);
+    spikecorec::Vector<spikecorec::Vector<s32>> torus_adjacency = square_torus(options.side_length);
     const s32 sampled_source_neuron_index = 0;
-    Vector<s32> sampled_targets = torus_adjacency[(usize)sampled_source_neuron_index];
-    Vector<f32> sampled_weight_before(sampled_targets.size());
+    spikecorec::Vector<s32> sampled_targets = torus_adjacency[(usize)sampled_source_neuron_index];
+    spikecorec::Vector<f32> sampled_weight_before(sampled_targets.size());
     for (usize sample_index = 0; sample_index < sampled_targets.size(); ++sample_index) {
-        sampled_weight_before[sample_index] = weights.get(sampled_source_neuron_index, sampled_targets[sample_index]);
+        sampled_weight_before[sample_index] =
+            engine.weights.get(sampled_source_neuron_index, sampled_targets[sample_index]);
     }
 
     // ── 9. Recording (ticket #138) ─────────────────────────────────────────────────────────────
@@ -158,24 +164,26 @@ int main(int argument_count, char **argument_values) {
     std::cout << "  " << options.base.tick_count << " ticks × " << options.base.dt_seconds * 1000.0f << "ms = "
               << format_seconds((f64)options.base.tick_count * options.base.dt_seconds) << "\n";
 
-    Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
-    Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
-    Vector<s64> stimulated_spike_ticks;
+    spikecorec::Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
+    spikecorec::Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
+    spikecorec::Vector<s64> stimulated_spike_ticks;
 
     for (s64 tick = 0; tick < options.base.tick_count; ++tick) {
-        s64 current_slot = tick % ring.ring_slot_count;
+        s64 current_slot = tick % ring_slot_count;
         s64 current_slot_base = current_slot * model.total_neuron_count;
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
             f64 current = schedule.current_at(neuron_index, tick);
-            if (current != 0.0) ring.input_ring.get_contents()[current_slot_base + neuron_index] += (f32)current;
+            if (current != 0.0) {
+                engine.network_inputs.get_contents()[current_slot_base + neuron_index] += (f32)current;
+            }
         }
 
-        assembled_model.step_tick(buffers, options.base.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.base.dt_seconds, tick, tick + 1);
 
-        if (recorder) recorder->record_tick(allocation, model, buffers.last_spiked, tick);
+        if (recorder) recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
 
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            if (buffers.last_spiked[neuron_index] != tick) continue;
+            if (engine.last_spiked.get_contents()[neuron_index] != tick) continue;
             ++spike_count_by_neuron[(usize)neuron_index];
             if (first_spike_tick_by_neuron[(usize)neuron_index] == -1) {
                 first_spike_tick_by_neuron[(usize)neuron_index] = tick;
@@ -214,7 +222,7 @@ int main(int argument_count, char **argument_values) {
     // ── 12. STDP's measured effect on the driven corner's own 4 real edges ────────────────────────
     print_heading("Plasticity effect (ticket #132)");
     for (usize sample_index = 0; sample_index < sampled_targets.size(); ++sample_index) {
-        f32 weight_after = weights.get(sampled_source_neuron_index, sampled_targets[sample_index]);
+        f32 weight_after = engine.weights.get(sampled_source_neuron_index, sampled_targets[sample_index]);
         std::cout << "  neuron " << sampled_source_neuron_index << " → neuron " << sampled_targets[sample_index]
                   << "   before=" << sampled_weight_before[sample_index] << "  after=" << weight_after
                   << "  change=" << (weight_after - sampled_weight_before[sample_index]) << "\n";

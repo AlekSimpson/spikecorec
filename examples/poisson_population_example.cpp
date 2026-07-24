@@ -19,8 +19,8 @@
 //      comparison that is meaningful for a PRNG-driven source.
 //
 // This model declares no projections at all, so ticket #131's real per-edge synapse dispatch never
-// applies here (there is nothing for it to dispatch) — the trivial ring adjacency below exists
-// purely to satisfy WeightMatrix's constructor, exactly as it did before that ticket.
+// applies here (there is nothing for it to dispatch) — SpikeEngine's own WeightMatrix construction
+// handles that edge-free adjacency directly, no placeholder ring needed.
 //
 // ── A known caveat, so the numbers below are not misread ────────────────────────────────────────
 // The real SpikeSourcePoisson ComponentType seeds its next-spike time at OnStart as
@@ -35,11 +35,20 @@
 #include <cmath>
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "nml_pipeline_support.h"
 
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
+
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a file-scope
+// `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template -- ambiguous
+// with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates of the
+// same name from two using-directives at the same scope, regardless of expanding to the identical
+// type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_tests.cpp/
+// examples/stdp_plasticity_example.cpp already do for the same reason.
 
 int main(int argument_count, char **argument_values) {
     ExampleOptions options = parse_example_options(argument_count, argument_values, ExampleOptions{4000, 1e-4f});
@@ -50,31 +59,21 @@ int main(int argument_count, char **argument_values) {
     // ── 1. The on-device stimulus path ──────────────────────────────────────────────────────────
     // Note the second argument. With it false (the default everywhere else in these examples), an
     // Inputs entry would get an empty placeholder and this population would have no kernel at all.
-    Vector<IrProgram> programs = lower_type_library_to_ir(model, /*lower_inputs_on_device=*/true);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model, /*lower_inputs_on_device=*/true);
     print_model_summary(model, programs);
     if (options.print_ir) print_ir_programs(model, programs);
 
     const s32 population_size = model.total_neuron_count;
 
-    ModelAllocation allocation = allocate_model(model, programs);
-
-    // WeightMatrix rejects an edge-free adjacency, and this model declares no projections — so a
-    // trivial ring (neuron n → n+1, since self-loops are rejected too) exists purely to satisfy the
-    // constructor. Only spike timing matters here; nothing is ever propagated.
-    Vector<Vector<s32>> adjacency((usize)population_size);
-    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        adjacency[(usize)neuron_index] = {(neuron_index + 1) % population_size};
-    }
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-
-    // ── 2. rng_state ────────────────────────────────────────────────────────────────────────────
-    // make_live_model_buffers seeds each neuron with (index + 1) * 2654435761u | 1u — distinct and
-    // guaranteed nonzero. step_tick only ever advances this state; it never re-seeds it.
-    LiveModelBuffers live =
-        make_live_model_buffers(allocation, weights, model.total_neuron_count, /*seed_rng_state=*/true);
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally, then every `.tick`
+    // section → one master kernel, compiled once. This model declares no projections at all, so
+    // SpikeEngine's own WeightMatrix construction handles that edge-free adjacency directly (see
+    // this file's own header comment) — no placeholder ring needed. set_constant_weight(0.0f) is
+    // documentation, not the mechanism: only spike timing matters here, nothing is ever propagated.
+    // rng_state is seeded automatically by the constructor, the same
+    // (index + 1) * 2654435761u | 1u scheme as before -- distinct and guaranteed nonzero.
+    SpikeEngine engine(model, programs, options.dt_seconds);
+    engine.weights.set_constant_weight(0.0f);
 
     print_heading("On-device generator");
     std::cout << "  population size : " << population_size << "\n"
@@ -94,12 +93,12 @@ int main(int argument_count, char **argument_values) {
               << format_seconds((f64)options.tick_count * options.dt_seconds) << "\n";
 
     s64 total_spike_count = 0;
-    Vector<Vector<s64>> spike_ticks_by_neuron((usize)population_size);
+    spikecorec::Vector<spikecorec::Vector<s64>> spike_ticks_by_neuron((usize)population_size);
 
     for (s64 tick = 0; tick < options.tick_count; ++tick) {
-        assembled_model.step_tick(live.buffers, options.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.dt_seconds, tick, tick + 1);
         for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-            if (live.buffers.last_spiked[neuron_index] == tick) {
+            if (engine.last_spiked.get_contents()[neuron_index] == tick) {
                 ++total_spike_count;
                 spike_ticks_by_neuron[(usize)neuron_index].push_back(tick);
             }
@@ -144,7 +143,7 @@ int main(int argument_count, char **argument_values) {
     }
 
     print_heading("Spike raster (first 16 neurons)");
-    Vector<Vector<s64>> raster_subset(
+    spikecorec::Vector<spikecorec::Vector<s64>> raster_subset(
         spike_ticks_by_neuron.begin(),
         spike_ticks_by_neuron.begin() + (long)std::min<usize>(spike_ticks_by_neuron.size(), 16));
     print_spike_raster(raster_subset, options.tick_count);

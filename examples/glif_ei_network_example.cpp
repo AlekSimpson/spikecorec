@@ -46,11 +46,20 @@
 #include <cmath>
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "nml_pipeline_support.h"
 
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
+
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a file-scope
+// `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template -- ambiguous
+// with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates of the
+// same name from two using-directives at the same scope, regardless of expanding to the identical
+// type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_tests.cpp/
+// examples/stdp_plasticity_example.cpp already do for the same reason.
 
 int main(int argument_count, char **argument_values) {
     ExampleOptions options = parse_example_options(argument_count, argument_values, ExampleOptions{5000, 1e-4f});
@@ -58,7 +67,7 @@ int main(int argument_count, char **argument_values) {
 
     // ── 1-2. Front-end and lowering ─────────────────────────────────────────────────────────────
     ModelSpecification model = load_model_specification("glif_ei_network");
-    Vector<IrProgram> programs = lower_type_library_to_ir(model);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model);
     print_model_summary(model, programs);
     if (options.print_ir) print_ir_programs(model, programs);
 
@@ -72,20 +81,15 @@ int main(int argument_count, char **argument_values) {
                   << "  connections = " << projection.connections.size() << "\n";
     }
 
-    // ── 3. Allocation and initial state ─────────────────────────────────────────────────────────
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_membrane_potentials_from_resting_parameter(allocation, model);
-
-    // ── 4. Adjacency → WeightMatrix ─────────────────────────────────────────────────────────────
-    // set_constant_weight(0.0f) is left in place as documentation, not because it changes anything:
-    // this model has real projections, so AssembledModel now dispatches expOneSynapse/
-    // alphaCurrentSynapse/the NMDA synapse's own real dynamics and forces this WeightMatrix's own
-    // scattered contribution to zero regardless (see this file's own header comment).
-    WeightMatrix weights = build_weight_matrix(model);
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    // ── 3-4. SpikeEngine builds its own ModelAllocation + WeightMatrix internally, then every
+    // `.tick` section → one master kernel, compiled once. set_constant_weight(0.0f) is left in place
+    // as documentation, not because it changes anything: this model has real projections, so
+    // SpikeEngine now dispatches expOneSynapse/alphaCurrentSynapse/the NMDA synapse's own real
+    // dynamics and forces this WeightMatrix's own scattered contribution to zero regardless (see
+    // this file's own header comment). ──────────────────────────────────────────────────────────
+    SpikeEngine engine(model, programs, options.dt_seconds);
+    seed_membrane_potentials_from_resting_parameter(engine.nml_allocation_, model);
+    engine.weights.set_constant_weight(0.0f);
 
     // ── 5. Stimulus ─────────────────────────────────────────────────────────────────────────────
     // This model drives its pulseGenerator through `<inputList>`/`<input>` rather than
@@ -110,23 +114,23 @@ int main(int argument_count, char **argument_values) {
     std::cout << "  " << options.tick_count << " ticks × " << options.dt_seconds * 1000.0f << "ms = "
               << format_seconds((f64)options.tick_count * options.dt_seconds) << "\n";
 
-    Vector<Vector<f32>> membrane_traces((usize)model.total_neuron_count);
-    Vector<Vector<s64>> spike_ticks_by_neuron((usize)model.total_neuron_count);
+    spikecorec::Vector<spikecorec::Vector<f32>> membrane_traces((usize)model.total_neuron_count);
+    spikecorec::Vector<spikecorec::Vector<s64>> spike_ticks_by_neuron((usize)model.total_neuron_count);
 
     for (s64 tick = 0; tick < options.tick_count; ++tick) {
         if (tick >= stimulus_delay_ticks && tick < stimulus_delay_ticks + stimulus_duration_ticks) {
-            live.buffers.network_inputs[stimulus_target_neuron_index] += stimulus_amplitude_amperes;
+            engine.network_inputs.get_contents()[stimulus_target_neuron_index] += stimulus_amplitude_amperes;
         }
 
-        assembled_model.step_tick(live.buffers, options.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.dt_seconds, tick, tick + 1);
 
         for (s32 population_index = 0; population_index < (s32)model.populations.size(); ++population_index) {
             const PopulationEntry &population = model.populations[(usize)population_index];
             for (s32 local_index = 0; local_index < population.size; ++local_index) {
                 s32 neuron_index = population.neuron_index_begin + local_index;
                 membrane_traces[(usize)neuron_index].push_back(
-                    read_membrane_potential(allocation, model, population_index, local_index));
-                if (live.buffers.last_spiked[neuron_index] == tick) {
+                    read_membrane_potential(engine.nml_allocation_, model, population_index, local_index));
+                if (engine.last_spiked.get_contents()[neuron_index] == tick) {
                     spike_ticks_by_neuron[(usize)neuron_index].push_back(tick);
                 }
             }
