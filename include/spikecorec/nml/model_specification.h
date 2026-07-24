@@ -203,4 +203,13 @@ struct ModelSpecification {
 // have already guaranteed exists (a malformed ResolvedModel).
 ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 weight_matrix_rank = -1);
 
+// Builds the exact-edge-set WeightMatrix (arch §0.3) from every projection's connections -- the
+// SAME construction `examples/nml_pipeline_support.h`'s own `build_weight_matrix()` performs, given
+// a proper home in this module (used by `SpikeEngine`'s new NML-model constructor,
+// include/spikecorec/core/engine.h) instead of every caller duplicating it inline. `rank` is fixed
+// at 1, matching every existing NML-pipeline caller of this construction. Unlike `model.adjacency`
+// (unset for a model with no connections), this is unconditionally constructed -- sized to
+// `model.total_neuron_count` regardless of how many (if any) projections/connections exist.
+WeightMatrix build_weight_matrix_from_projections(const ModelSpecification &model);
+
 } // namespace spikecorec::nml

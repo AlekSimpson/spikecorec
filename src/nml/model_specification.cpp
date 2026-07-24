@@ -476,4 +476,14 @@ ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 
     return specification;
 }
 
+WeightMatrix build_weight_matrix_from_projections(const ModelSpecification &model) {
+    Vector<Vector<s32>> adjacency((usize)model.total_neuron_count);
+    for (const auto &projection : model.projections) {
+        for (const auto &connection : projection.connections) {
+            adjacency[(usize)connection.source_neuron_index].push_back(connection.target_neuron_index);
+        }
+    }
+    return WeightMatrix(adjacency, /*rank=*/1);
+}
+
 } // namespace spikecorec::nml
