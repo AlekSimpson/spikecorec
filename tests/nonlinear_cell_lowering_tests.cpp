@@ -73,6 +73,15 @@ const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specifi
     throw std::runtime_error("no type library entry for '" + bound_instance_id + "'");
 }
 
+// Recomputes the active-set x nonlinear-dynamics classification (ticket #62 [F1]) directly via
+// cell_dynamics_are_closed_form_advanceable/gather_regime_info (cell_lowering.h), the SAME classifier
+// lower_cell_to_ir itself calls internally -- IrProgram no longer carries a stored
+// closed_form_advanceable tag (this cleanup).
+bool is_closed_form_advanceable(const TypeLibraryEntry &entry) {
+    const CellType &cell = std::get<CellType>(entry.dynamics.flattened);
+    return cell_dynamics_are_closed_form_advanceable(cell, gather_regime_info(cell));
+}
+
 // Builds a single-neuron model around one REAL vendored Cells.xml ComponentType (included directly
 // via NML_Parser::STANDARD_LIBRARY_PATH -- nml_tests.cpp's own
 // `does_not_schema_gate_included_files` precedent for pulling in the real std-lib bundle), optionally
@@ -223,7 +232,7 @@ TEST(NonlinearCellLowering, izhikevich2007Cell_lowers_and_is_classified_nonlinea
     // ticket #62 [F1]: the nonlinear `k*(v-vr)*(v-vt)` product hides behind `iMemb`'s own
     // DerivedVariable indirection -- must still be tagged nonlinear (ticket #63's own transitive
     // DerivedVariable-inlining extension to the classifier).
-    EXPECT_FALSE(program.closed_form_advanceable);
+    EXPECT_FALSE(is_closed_form_advanceable(entry));
 
     String printed = print_ir_program(program);
     EXPECT_NE(printed.find("mul"), String::npos);
@@ -317,7 +326,7 @@ TEST(NonlinearCellLowering, adExIaFCell_lowers_and_is_classified_nonlinear) {
 
     // ticket #62 [F1]: the `exp((v-VT)/delT)` term hides behind `iMemb`'s own DerivedVariable
     // indirection, and is only reachable via `emit_expression`'s new function-call support.
-    EXPECT_FALSE(program.closed_form_advanceable);
+    EXPECT_FALSE(is_closed_form_advanceable(entry));
 
     String printed = print_ir_program(program);
     EXPECT_NE(printed.find("exp "), String::npos) << printed;
@@ -411,7 +420,7 @@ TEST(NonlinearCellLowering, fitzHughNagumoCell_lowers_and_is_classified_nonlinea
 
     // ticket #62 [F1]: `V^3` is a directly-embedded nonlinear term (no DerivedVariable indirection
     // needed here) -- only reachable via ticket #63's own `^` parser support.
-    EXPECT_FALSE(program.closed_form_advanceable);
+    EXPECT_FALSE(is_closed_form_advanceable(entry));
 
     String printed = print_ir_program(program);
     EXPECT_NE(printed.find("pow"), String::npos) << printed;
@@ -502,7 +511,7 @@ TEST(NonlinearCellLowering, hindmarshRose1984Cell_lowers_and_is_classified_nonli
     // ticket #62 [F1]: the `x^2`/`x^3` terms hide three DerivedVariable levels deep (`iMemb` reads
     // `phi`/`z`; `phi` reads `x`; `x` reads `v`) -- exactly the transitive-inlining gap this ticket
     // closes in cell_lowering.cpp's classifier.
-    EXPECT_FALSE(program.closed_form_advanceable);
+    EXPECT_FALSE(is_closed_form_advanceable(entry));
 
     String printed = print_ir_program(program);
     EXPECT_NE(printed.find("pow"), String::npos) << printed;

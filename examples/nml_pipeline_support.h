@@ -392,9 +392,6 @@ inline void print_model_summary(const nml::ModelSpecification &model, const Vect
                   << " state_variables=" << entry.state_variable_count
                   << " alloc=" << program.alloc.size()
                   << " tick=" << count_tick_instructions(program.tick)
-                  << (entry.category == nml::TypeLibraryCategory::Cell
-                          ? (program.closed_form_advanceable ? "  [closed-form advanceable]" : "  [nonlinear]")
-                          : "")
                   << "\n"
                   << "      stages: " << format_tick_stage_breakdown(program.tick) << "\n";
     }
@@ -408,6 +405,17 @@ inline void print_model_summary(const nml::ModelSpecification &model, const Vect
                   << " type=" << model.type_library[(usize)population.type_library_index].component_type_name << "\n";
     }
     std::cout << std::right;
+}
+
+// Whether `model.populations[population_index]`'s cell type is closed-form advanceable (ticket #62
+// [F1]) -- recomputed directly via cell_dynamics_are_closed_form_advanceable/gather_regime_info
+// (cell_lowering.h), since AssembledModel no longer exposes this as its own accessor (removed --
+// nothing in step_tick's own dispatch ever consulted it; see master_kernel.h's own doc comment).
+inline bool population_is_closed_form_advanceable(const nml::ModelSpecification &model, usize population_index) {
+    const nml::TypeLibraryEntry &entry = model.type_library[(usize)model.populations[population_index].type_library_index];
+    if (entry.category != nml::TypeLibraryCategory::Cell) return false;
+    const nml::CellType &cell = std::get<nml::CellType>(entry.dynamics.flattened);
+    return nml::cell_dynamics_are_closed_form_advanceable(cell, nml::gather_regime_info(cell));
 }
 
 inline String format_seconds(f64 seconds) {

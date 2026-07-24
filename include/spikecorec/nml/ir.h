@@ -275,19 +275,6 @@ struct IrProgram {
     String component_type_name;
     Vector<AllocDirective> alloc;
     TickProgram tick;
-
-    // REFACTOR: THIS FLAG IS NOT NEEDED, IT SHOULD JUST BE AN INITIALIZATION / PROCESSING CONDITIONAL THAT CRASHES IF IT DETECTS INVALID SETUP / UNSUPPORTED MODEL
-    // Active-set x nonlinear-dynamics tag (ticket #62 [F1]; arch §0.5): whether this program's
-    // Dynamics are safe for the engine's active-set closed-form multi-tick lazy decay -- true
-    // ("closed_form_advanceable") iff every TimeDerivative is affine in the type's own state
-    // variables (all of GLIF); false ("nonlinear") means the type must integrate exactly one dt per
-    // active tick, never skipped/fast-forwarded (arch §5 Phase 2's Active-set x nonlinear rule).
-    // Computed by lower_cell_to_ir (ticket #50, cell_lowering.cpp) for a Cell-category program; a
-    // Synapse/Inputs program leaves this at its default (false, not applicable -- the active-set
-    // skip is a per-neuron/cell concept, arch §4.1). Pure metadata alongside the `.alloc`/`.tick`
-    // sections, like component_type_name above -- NOT part of the printed IR text
-    // (print_ir_program), since it isn't part of the locked v1.0 `.alloc`/`.tick` surface.
-    bool closed_form_advanceable = false;
 };
 
 // Renders `program` back to the IR text form shown in the locked spec's §4

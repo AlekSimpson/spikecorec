@@ -9,10 +9,10 @@
 //   1. The active-set × nonlinear rule. The engine's active-set optimization can skip a quiet neuron
 //      for many ticks and then catch it up with one closed-form `apply_decay`. That is only valid
 //      for analytically-integrable (linear) dynamics — all of GLIF. A nonlinear cell must integrate
-//      exactly one dt per active tick and can never be fast-forwarded. Lowering tags each cell type
-//      with `closed_form_advanceable`, and the model summary below prints that tag: GLIF prints
-//      [closed-form advanceable], izhikevich2007Cell prints [nonlinear]. That single bit is what
-//      keeps a skip-dispatch fast path from silently corrupting nonlinear cells.
+//      exactly one dt per active tick and can never be fast-forwarded. Lowering classifies each cell
+//      type via cell_dynamics_are_closed_form_advanceable, and this example prints that tag below:
+//      GLIF prints closed-form advanceable, izhikevich2007Cell prints nonlinear. That single bit is
+//      what keeps a skip-dispatch fast path from silently corrupting nonlinear cells.
 //
 //   2. Two state variables instead of one. izhikevich2007Cell carries a recovery variable `u`
 //      alongside `v`, and its OnStart sets `v = v0`. allocate_model zero-initializes cell_state and
@@ -89,7 +89,7 @@ int main(int argument_count, char **argument_values) {
               << "  in one step. A nonlinear population must integrate exactly one dt per tick.\n\n";
     for (usize population_index = 0; population_index < model.populations.size(); ++population_index) {
         std::cout << "    " << std::left << std::setw(16) << model.populations[population_index].id << std::right
-                  << (assembled_model.population_is_closed_form_advanceable(population_index)
+                  << (population_is_closed_form_advanceable(model, population_index)
                           ? "closed-form advanceable  (skipping permitted)"
                           : "nonlinear                (must never be fast-forwarded)")
                   << "\n";

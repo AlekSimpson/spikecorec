@@ -88,6 +88,15 @@ const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specifi
     throw std::runtime_error("no type library entry for '" + bound_instance_id + "'");
 }
 
+// Recomputes the active-set x nonlinear-dynamics classification (ticket #62 [F1]) directly via
+// cell_dynamics_are_closed_form_advanceable/gather_regime_info (cell_lowering.h), the SAME classifier
+// lower_cell_to_ir itself calls internally -- IrProgram no longer carries a stored
+// closed_form_advanceable tag (this cleanup).
+bool is_closed_form_advanceable(const TypeLibraryEntry &entry) {
+    const CellType &cell = std::get<CellType>(entry.dynamics.flattened);
+    return cell_dynamics_are_closed_form_advanceable(cell, gather_regime_info(cell));
+}
+
 // Temporarily attaches an in-memory sink to the shared `log::logger()` so a
 // test can assert on a specific warning firing -- same helper as
 // synapse_lowering_tests.cpp's own (ticket #60 [X1]'s cell_lowering.cpp
@@ -437,7 +446,7 @@ TEST(CellLoweringGlifFamily, lowers_glif1_leaky_integrate_and_fire_with_refracto
     // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): GLIF1's `v`
     // dynamics is affine in its own state variables (v, refractoryTimeElapsed), so it must be
     // tagged closed_form_advanceable -- "all of GLIF" keeps the engine's closed-form lazy advance.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // ── GLIF2: LIF + a reset rule that depends on the pre-spike voltage ──────
@@ -534,7 +543,7 @@ TEST(CellLoweringGlifFamily, lowers_glif2_voltage_dependent_reset_rule) {
     // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): the
     // voltage-dependent reset rule only affects @reset, not the `v`/`refractoryTimeElapsed`
     // TimeDerivatives themselves, so GLIF2 is still affine and must stay closed_form_advanceable.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // ── GLIF3: LIF + two after-spike currents ────────────────────────────────
@@ -621,7 +630,7 @@ TEST(CellLoweringGlifFamily, lowers_glif3_after_spike_currents) {
     // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): `v`'s coupled
     // `ascSum` term and the ASCs' own `-asc_k/tauAsc_k` decays are all affine in
     // {v, asc1, asc2, refractoryTimeElapsed}, so GLIF3 stays closed_form_advanceable.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // ── GLIF4: LIF + an adaptive (state-variable) threshold ──────────────────
@@ -707,7 +716,7 @@ TEST(CellLoweringGlifFamily, lowers_glif4_adaptive_threshold) {
     // decay is affine in {v, theta, refractoryTimeElapsed} (theta appears in `detect`'s comparison,
     // not inside a TimeDerivative right-hand side, so it doesn't affect this classification), so
     // GLIF4 stays closed_form_advanceable.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // ── GLIF5: GLIF3 + GLIF4 combined ────────────────────────────────────────
@@ -803,7 +812,7 @@ TEST(CellLoweringGlifFamily, lowers_glif5_after_spike_currents_and_adaptive_thre
     // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): GLIF5 combines
     // GLIF3's ASCs and GLIF4's adaptive threshold, all still affine in the cell's own state
     // variables, so it stays closed_form_advanceable too.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // ── Fidelity check: a Regime-less LIF cell reproduces the locked IR spec's
@@ -878,7 +887,7 @@ TEST(CellLoweringGlifFamily, lowers_regime_less_lif_cell_matching_locked_ir_spec
 
     // Active-set x nonlinear-dynamics classification (ticket #62 [F1], arch §0.5): the regime-less
     // pure-LIF `v` dynamics is affine in `v`, so it stays closed_form_advanceable.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // ── Error handling ────────────────────────────────────────────────────────
@@ -1146,7 +1155,7 @@ TEST(CellLoweringActiveSetNonlinearRule, quadratic_self_product_time_derivative_
 
     IrProgram program = lower_cell_to_ir(entry);
 
-    EXPECT_FALSE(program.closed_form_advanceable)
+    EXPECT_FALSE(is_closed_form_advanceable(entry))
         << "a v*v self-product TimeDerivative must NOT be tagged closed_form_advanceable -- it has "
            "no analytically closed-form multi-tick advance, so the engine's active-set optimization "
            "must integrate it exactly one dt per active tick (arch §0.5)";
@@ -1184,7 +1193,7 @@ TEST(CellLoweringActiveSetNonlinearRule, same_fixture_without_the_quadratic_term
 
     IrProgram program = lower_cell_to_ir(entry);
 
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(entry));
 }
 
 // A same-identifier, both-leaf self-reference (`asc1 <- asc1 + ascAdd1`,

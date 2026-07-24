@@ -204,6 +204,15 @@ const TypeLibraryEntry &type_library_entry_for(const ModelSpecification &specifi
     throw std::runtime_error("no type library entry for '" + bound_instance_id + "'");
 }
 
+// Recomputes the active-set x nonlinear-dynamics classification (ticket #62 [F1]) directly via
+// cell_dynamics_are_closed_form_advanceable/gather_regime_info (cell_lowering.h), the SAME classifier
+// lower_cell_to_ir itself calls internally -- IrProgram no longer carries a stored
+// closed_form_advanceable tag (this cleanup).
+bool is_closed_form_advanceable(const TypeLibraryEntry &entry) {
+    const CellType &cell = std::get<CellType>(entry.dynamics.flattened);
+    return cell_dynamics_are_closed_form_advanceable(cell, gather_regime_info(cell));
+}
+
 // ── the hand-authored ComponentTypes (this ticket's own deliverable) ────────────────────────────────
 
 const String SIMPLE_ACCUMULATOR_CELL_COMPONENT_TYPE =
@@ -503,7 +512,7 @@ TEST(SimpleAccumulatorCellIsolation, ir_lowering_shows_the_dt_cancelling_network
 
     // `network_inputs / dt` does not reference `v` at all, so it is (trivially) affine in `v` --
     // cell_lowering.cpp's own classifier (ticket #62) correctly tags this closed_form_advanceable.
-    EXPECT_TRUE(program.closed_form_advanceable);
+    EXPECT_TRUE(is_closed_form_advanceable(cell_entry));
 }
 
 TEST(SimpleAccumulatorCellIsolation, accumulate_threshold_reset_cycle_matches_hand_computed_trajectory) {

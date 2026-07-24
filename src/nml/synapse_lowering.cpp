@@ -273,8 +273,6 @@ IrProgram lower_synapse_to_ir(const TypeLibraryEntry &synapse_entry) {
     program.component_type_name = synapse_entry.component_type_name;
     program.alloc = std::move(alloc_directives);
     program.tick = std::move(tick);
-    // closed_form_advanceable (ticket #62 [F1]) stays at its default (false) -- the active-set
-    // multi-tick skip is a per-neuron/cell concept (arch §4.1), not applicable to a per-edge synapse.
     return program;
 }
 

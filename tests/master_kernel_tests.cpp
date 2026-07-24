@@ -120,15 +120,13 @@ TypeLibraryEntry build_lif_equivalent_type_entry(const String &type_name, const 
 // build_lif_equivalent_program above, extended with one `v * v` self-product term in its own
 // `@integrate` (a state variable multiplied by itself -- the same shape a real nonlinear cell's
 // quadratic term would take, see cell_lowering_tests.cpp's own
-// NONLINEAR_TEST_ONLY_COMPONENT_TYPE), with `closed_form_advanceable` explicitly set false (this
-// file builds IrPrograms by hand rather than through lower_cell_to_ir, so nothing computes this
-// tag automatically the way cell_lowering.cpp's own classification does for a real lowered type --
-// see this file's own doc comment above for why hand-built IrProgram fixtures are this file's
-// established pattern).
+// NONLINEAR_TEST_ONLY_COMPONENT_TYPE) -- this file builds IrPrograms by hand rather than through
+// lower_cell_to_ir, so nothing computes cell_dynamics_are_closed_form_advanceable's classification
+// automatically the way cell_lowering.cpp does for a real lowered type (see this file's own doc
+// comment above for why hand-built IrProgram fixtures are this file's established pattern).
 IrProgram build_nonlinear_test_only_program(const String &type_name, f32 gL, f32 EL, f32 vth) {
     IrProgram program;
     program.component_type_name = type_name;
-    program.closed_form_advanceable = false;
     program.alloc = {
         StateDirective{"v", "f32", nullopt},
         ParamConstantDirective{"C", String("1.0")},
@@ -804,40 +802,6 @@ TEST(MasterKernel, a_genuine_zero_constant_weight_propagates_exactly_zero_not_th
 // `active_set_skip_then_revisit_matches_per_tick_decay_equivalence`, not here (this file has no
 // notion of a hardcoded LIF's active-set skip at all -- see this ticket's own report for why).
 
-TEST(MasterKernelActiveSetNonlinearRule, population_is_closed_form_advanceable_reflects_each_type_tag) {
-    ModelSpecification model;
-    model.total_neuron_count = 2;
-    model.type_library.push_back(build_lif_equivalent_type_entry("LinearCell", "linearInstance", 1.0f, 0.1f, 0.0f, 1.0f));
-    model.type_library.push_back(build_lif_equivalent_type_entry("NonlinearCell", "nonlinearInstance", 1.0f, 0.1f, 0.0f, 1.0f));
-
-    PopulationEntry linear_population;
-    linear_population.id = "LinearPop";
-    linear_population.type_library_index = 0;
-    linear_population.size = 1;
-    linear_population.neuron_index_begin = 0;
-    linear_population.neuron_index_end = 1;
-    model.populations.push_back(linear_population);
-
-    PopulationEntry nonlinear_population;
-    nonlinear_population.id = "NonlinearPop";
-    nonlinear_population.type_library_index = 1;
-    nonlinear_population.size = 1;
-    nonlinear_population.neuron_index_begin = 1;
-    nonlinear_population.neuron_index_end = 2;
-    model.populations.push_back(nonlinear_population);
-
-    IrProgram linear_program = build_lif_equivalent_program("LinearCell", 0.1f, 0.0f, 1.0f);
-    linear_program.closed_form_advanceable = true; // matches what lower_cell_to_ir would tag a real GLIF-shaped cell
-    spikecorec::Vector<IrProgram> programs = {
-        linear_program,
-        build_nonlinear_test_only_program("NonlinearCell", 0.1f, 0.0f, 1.0f),
-    };
-
-    AssembledModel assembled_model(model, programs);
-    EXPECT_TRUE(assembled_model.population_is_closed_form_advanceable(0));
-    EXPECT_FALSE(assembled_model.population_is_closed_form_advanceable(1));
-}
-
 TEST(MasterKernelActiveSetNonlinearRule, nonlinear_population_never_receives_a_closed_form_multi_tick_jump) {
     const f32 gL = 0.1f;
     const f32 EL = 0.0f;
@@ -868,7 +832,6 @@ TEST(MasterKernelActiveSetNonlinearRule, nonlinear_population_never_receives_a_c
     WeightMatrix weights(adjacency, /*rank=*/1);
 
     AssembledModel assembled_model(model, programs);
-    ASSERT_FALSE(assembled_model.population_is_closed_form_advanceable(0));
 
     GpuPointer<f32> network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
     memset(network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));

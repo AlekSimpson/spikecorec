@@ -97,8 +97,7 @@ int main(int argument_count, char **argument_values) {
     LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
 
     std::cout << "  population tagged   : "
-              << (assembled_model.population_is_closed_form_advanceable(0) ? "closed-form advanceable"
-                                                                          : "nonlinear")
+              << (population_is_closed_form_advanceable(model, 0) ? "closed-form advanceable" : "nonlinear")
               << "   (GLIF is linear in its own state variables)\n";
 
     // ── 3. Stimulus ─────────────────────────────────────────────────────────────────────────────

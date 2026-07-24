@@ -39,28 +39,16 @@ void lower_state_assignment_into(const NML_Node &state_assignment_node, Vector<T
     context.emit_expression(*value_expression, output, assigned_variable_name);
 }
 
+} // namespace
+
 // ── Regime body parsing (arch §3.2 Regime/Transition/OnEntry; IR spec §4's
 // refractory-regime example) -- `RegimeDecl::body` is the raw `<Regime>`
 // node, walked the same way `<Dynamics>` itself is walked by nml.cpp's
 // (private, not reused here) extractors. ─────────────────────────────────
-
-struct RegimeTimeDerivative {
-    String variable_name;
-    String value_text;
-};
-
-struct RegimeOnCondition {
-    String test_text;
-    const NML_Node *body_node = nullptr; // the raw <OnCondition> node
-};
-
-struct RegimeInfo {
-    String name;
-    s32 index = 0;
-    Vector<RegimeTimeDerivative> time_derivatives;
-    Vector<RegimeOnCondition> on_conditions;
-    Vector<const NML_Node *> on_entry_state_assignments; // flattened <StateAssignment> children of every <OnEntry>
-};
+//
+// RegimeTimeDerivative/RegimeOnCondition/RegimeInfo and gather_regime_info now live in
+// cell_lowering.h (this cleanup) -- gather_regime_info is real, directly-callable public API rather
+// than a private helper only this file's own lower_cell_to_ir could reach.
 
 // The `initial="true"` regime becomes index 0; every other regime keeps its
 // declaration order after it (if none is marked initial, declaration order
@@ -95,6 +83,8 @@ Vector<RegimeInfo> gather_regime_info(const CellType &cell) {
     }
     return regimes;
 }
+
+namespace {
 
 const String REGIME_VARIABLE_NAME = "r";
 
@@ -318,9 +308,13 @@ bool expression_is_affine_in_state_variables(const ExpressionNode &node, AffineC
     return false;
 }
 
-// `regimes` is `lower_cell_to_ir`'s own already-gathered regime metadata (RegimeInfo, defined
-// above) -- passed in rather than recomputed so this stays a pure structural check over data the
-// caller already has.
+} // namespace
+
+// cell_dynamics_are_closed_form_advanceable now lives in cell_lowering.h (this cleanup) -- real,
+// directly-callable public API instead of only reachable by reading a stored tag back off a
+// constructed IrProgram. `regimes` is `lower_cell_to_ir`'s own already-gathered regime metadata
+// (gather_regime_info, also declared there) -- passed in rather than recomputed so this stays a pure
+// structural check over data the caller already has.
 bool cell_dynamics_are_closed_form_advanceable(const CellType &cell, const Vector<RegimeInfo> &regimes) {
     std::unordered_set<String> state_variable_names;
     for (const auto &state_variable : cell.state_variables) state_variable_names.insert(state_variable.name);
@@ -351,6 +345,8 @@ bool cell_dynamics_are_closed_form_advanceable(const CellType &cell, const Vecto
     }
     return true;
 }
+
+namespace {
 
 // Gathers every `OnStart`'s `StateAssignment`s (arch §3.2: seeds state at
 // INIT) into a variable-name -> raw-value-text map. `CellType::on_starts`
@@ -562,7 +558,6 @@ IrProgram lower_cell_to_ir(const TypeLibraryEntry &cell_entry) {
     program.component_type_name = cell_entry.component_type_name;
     program.alloc = std::move(alloc_directives);
     program.tick = std::move(tick);
-    program.closed_form_advanceable = cell_dynamics_are_closed_form_advanceable(cell, regimes);
     return program;
 }
 
