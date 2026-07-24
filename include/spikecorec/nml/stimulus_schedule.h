@@ -51,10 +51,9 @@ constexpr f64 DEFAULT_PULSE_GENERATOR_WEIGHT = 1.0;
 // dense `[neuron_count x tick_count]` array (Phase-1 stimulus counts are
 // tiny, so a dense per-tick buffer would waste memory for no benefit;
 // `to_dense_input_spikes` below renders exactly the dense slice an engine
-// call actually needs, on demand) or a `Vector` of small heap-boxed window
-// structs (this avoids one heap allocation per window; `window_count` is
-// known up front from `model.stimuli.size()`, so the arrays are sized once
-// at construction and never resized).
+// call actually needs, on demand). `window_count` is known up front from
+// `model.stimuli.size()`, so the arrays are sized once at construction and
+// never resized.
 struct StimulusSchedule {
     // neuron_index -> every schedule slot targeting it. Almost always exactly
     // one entry, but current_at() sums however many are present -- e.g. two

@@ -921,8 +921,9 @@ AssembledModel::AssembledModel(const ModelSpecification &model, const Vector<IrP
 
     // ── ticket #64 [F3]: ring-based deliver-drain/propagate, only when opted into ─────────────────
     //
-    // REFACTOR: WHY THE FUCK ARE WE HAVING A WHOLE SEPARATE KERNEL COMPILED FOR MODELS THAT USE DELAYED INPUT SCHEME?????? 
-    //           ALL MODEL SETTINGS SHOULD IDEALLY CONVERGE INTO A SINGLE SET OF KERNELS / KERNEL FUNCTIONS THAT COVERS ALL NETWORK/MODEL FEATURES
+    // REFACTOR: Why do we compile a whole separate kernel for models that use the delayed input scheme?
+    //           All model settings should ideally converge into a single set of kernels/kernel functions
+    //           that covers all network/model features.
     //
     delay_ring_enabled_ = enable_delay_ring;
     if (delay_ring_enabled_) {
