@@ -298,6 +298,12 @@ namespace spikecorec {
         // neighbors written. Resolved via a k^2-tree row-walk — see K2Tree::get_neighbors.
         [[nodiscard]] s64 get_neighbors(s64 node_index, s32 *output_buffer) const;
 
+        // writes up to max_neighbor_count PREDECESSOR indices of node_index into output_buffer
+        // (caller-allocated, at least max_neighbor_count elements) — every node `u` with an edge
+        // u -> node_index; returns the number written. The exact mirror of get_neighbors, resolved
+        // via a k^2-tree column-walk — see K2Tree::get_predecessors.
+        [[nodiscard]] s64 get_predecessors(s64 node_index, s32 *output_buffer) const;
+
         void set_constant_weight(f32 value);
 
         // Sets constant_delay_ticks to `ticks` and using_constant_delay_ticks to

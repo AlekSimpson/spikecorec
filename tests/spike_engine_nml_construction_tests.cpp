@@ -1391,6 +1391,66 @@ TEST(SpikeEngineNmlPlasticity,
     EXPECT_LT(weight_after, weight_before);
 }
 
+// ── Real bidirectional STDP on SpikeEngine's own NML host-side path (apply_nml_stdp_plasticity) ─────
+//
+// The two-sided counterpart of stdp_measurably_depresses_... above, on the same real GLIF delay-ring
+// fixture. With BOTH a minus-side (depression) and a plus-side (potentiation) rate enabled, the same
+// engine, driven with two different spike orderings, must move the 0 -> 1 edge in OPPOSITE directions:
+//   - CAUSAL (neuron 0/pre fires at tick 2, neuron 1/post at tick 3): apply_nml_stdp_plasticity walks
+//     neuron 1's PREDECESSORS (the new WeightMatrix::get_predecessors), finds neuron 0 fired one tick
+//     earlier, and POTENTIATES 0 -> 1 -> the weight goes UP.
+//   - ANTI-CAUSAL (neuron 1/post fires at tick 2, neuron 0/pre at tick 3): it walks neuron 0's forward
+//     neighbors, finds neuron 1 fired one tick earlier, and DEPRESSES 0 -> 1 (the still-working
+//     depression path) -> the weight goes DOWN.
+// Every fire tick is real GLIF cell dynamics (a single external pulse over threshold), not a hand-set
+// spike time — asserted via last_spiked below.
+TEST(SpikeEngineNmlPlasticity,
+     bidirectional_stdp_potentiates_causal_and_depresses_anti_causal_over_a_real_glif_delay_ring_run) {
+    const s64 delay_ticks = 5; // > 1 -> ring mode -> nml_projections_ empty -> enable_plasticity allowed
+    const f32 delivered_constant_weight = 0.1f; // well below vth=2.0 -- a delivered spike never re-fires
+    const f32 external_pulse = 5.0f;
+    const s64 tick_count = 8;
+    const f32 stdp_learning_rate = 0.02f;      // minus / depression
+    const f32 stdp_learning_rate_plus = 0.02f; // plus / potentiation
+
+    // Runs one two-neuron pairing at the given fire ticks; returns the 0 -> 1 weight before and after.
+    auto run_pairing = [&](s64 neuron0_pulse_tick, s64 neuron1_pulse_tick) -> std::pair<f32, f32> {
+        vector<IrProgram> programs;
+        ModelSpecification model = build_two_neuron_delay_ring_model((f64)delay_ticks, programs);
+
+        SpikeEngine engine(model, programs, /*dt_seconds=*/1.0f);
+        engine.weights.set_constant_weight(delivered_constant_weight);
+        engine.enable_plasticity(stdp_learning_rate, stdp_learning_rate_plus);
+        EXPECT_TRUE(engine.plasticity_enabled());
+
+        f32 before = engine.weights.get(0, 1);
+        for (s64 tick = 0; tick < tick_count; ++tick) {
+            if (tick == neuron0_pulse_tick) engine.nml_allocation_.cell_state.get_contents()[0] += external_pulse;
+            if (tick == neuron1_pulse_tick) engine.nml_allocation_.cell_state.get_contents()[1] += external_pulse;
+            engine.step_tick(1.0f, tick, tick + 1);
+        }
+
+        // Sanity: real GLIF dynamics fired each neuron exactly once, at its intended tick.
+        EXPECT_EQ(engine.last_spiked.get_contents()[0], neuron0_pulse_tick);
+        EXPECT_EQ(engine.last_spiked.get_contents()[1], neuron1_pulse_tick);
+
+        f32 after = engine.weights.get(0, 1);
+        return {before, after};
+    };
+
+    // Causal pre-before-post: neuron 0 at tick 2, neuron 1 at tick 3 -> POTENTIATION.
+    auto [causal_before, causal_after] = run_pairing(/*neuron0=*/2, /*neuron1=*/3);
+    std::cout << "[SpikeEngineNmlPlasticity bidirectional causal] weight(0->1) before=" << causal_before
+              << " after=" << causal_after << " delta=" << (causal_after - causal_before) << "\n";
+    EXPECT_GT(causal_after, causal_before);
+
+    // Anti-causal post-before-pre: neuron 1 at tick 2, neuron 0 at tick 3 -> DEPRESSION (still working).
+    auto [anti_before, anti_after] = run_pairing(/*neuron0=*/3, /*neuron1=*/2);
+    std::cout << "[SpikeEngineNmlPlasticity bidirectional anti-causal] weight(0->1) before=" << anti_before
+              << " after=" << anti_after << " delta=" << (anti_after - anti_before) << "\n";
+    EXPECT_LT(anti_after, anti_before);
+}
+
 // ── Retired from tests/delay_ring_tests.cpp (its own DelayRing suite tested compute_max_delay_ticks/
 // allocate_delay_ring, pure host-side functions with NO AssembledModel/GPU dispatch at all). Spike
 // Engine's own delay-ring fold (engine.cpp's nml_delay_seconds_to_ticks/nml_compute_ring_slot_count_

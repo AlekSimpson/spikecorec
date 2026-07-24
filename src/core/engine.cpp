@@ -34,6 +34,7 @@ SpikeEngine::SpikeEngine()
     , resting_membrane_potential(0.1f)
     , decay_rate(0.01f)
     , learning_rate(0.0f) // plasticity off by default
+    , learning_rate_plus(0.0f) // potentiation off by default
     , spike_period(1)
     , spike_threshold(1.0f)
     , alive(true)
@@ -115,6 +116,7 @@ SpikeEngine::SpikeEngine(
     , resting_membrane_potential(resting_mp)
     , decay_rate(decay_rate)
     , learning_rate(learning_rate)
+    , learning_rate_plus(0.0f) // potentiation off by default; opt in via enable_plasticity(minus, plus)
     , spike_period(1)
     , spike_threshold(1.0f)
     , alive(true)
@@ -661,6 +663,7 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
     , resting_membrane_potential(0.0f)
     , decay_rate(0.0f)
     , learning_rate(0.0f)
+    , learning_rate_plus(0.0f)
     , spike_period(1)
     , spike_threshold(1.0f)
     , alive(true)
@@ -1454,7 +1457,10 @@ void SpikeEngine::dispatch_nml_synapse_delivery_events(f32 dt, s64 tick) {
 // nml_-prefixed one (see engine.h's own doc comment on apply_nml_stdp_plasticity). ──────────────────
 
 void SpikeEngine::apply_nml_stdp_plasticity(s64 tick) {
-    if (learning_rate == 0.0f) return;
+    // Bidirectional STDP: depression is gated on learning_rate, potentiation on learning_rate_plus,
+    // each independently -- the whole method is a no-op only when both are zero. See engine.h's own
+    // doc comment on this method for the full two-sided rule.
+    if (learning_rate == 0.0f && learning_rate_plus == 0.0f) return;
 
     s64 max_neighbor_count = weights.max_neighbor_count;
     if (max_neighbor_count <= 0) return;
@@ -1463,20 +1469,43 @@ void SpikeEngine::apply_nml_stdp_plasticity(s64 tick) {
     for (s64 source_node = 0; source_node < neuron_count; ++source_node) {
         if (last_spiked.get_contents()[source_node] != tick) continue; // did not fire this tick
 
-        s64 neighbor_count = weights.get_neighbors(source_node, neighbor_scratch.data());
-        for (s64 slot = 0; slot < neighbor_count; ++slot) {
-            s32 child = neighbor_scratch[(usize)slot];
-            s64 child_last_spiked = last_spiked.get_contents()[child];
-            // "never fired" is < 0 here (this engine's own -1 seed convention for NML mode) -- see
-            // engine.h's own doc comment on this method for why this differs from the ported
-            // original's `== 0` check.
-            if (child_last_spiked < 0 || child_last_spiked == tick) continue;
+        // ── DEPRESSION (anti-causal): the firing neuron is presynaptic; walk its forward neighbors,
+        // and for each child that already fired at a strictly earlier tick, nudge source->child DOWN.
+        if (learning_rate != 0.0f) {
+            s64 neighbor_count = weights.get_neighbors(source_node, neighbor_scratch.data());
+            for (s64 slot = 0; slot < neighbor_count; ++slot) {
+                s32 child = neighbor_scratch[(usize)slot];
+                s64 child_last_spiked = last_spiked.get_contents()[child];
+                // "never fired" is < 0 here (this engine's own -1 seed convention for NML mode) -- see
+                // engine.h's own doc comment on this method for why this differs from the ported
+                // original's `== 0` check.
+                if (child_last_spiked < 0 || child_last_spiked == tick) continue;
 
-            s64 signed_tick_delta = tick - child_last_spiked;
-            f32 tick_delta = (f32)(signed_tick_delta < 0 ? -signed_tick_delta : signed_tick_delta);
-            f32 decay_delta = -learning_rate * std::pow(tick_delta, -3.0f);
-            weights.update((s32)source_node, child, decay_delta, /*learning_rate=*/0.5f,
-                           /*l2_regularization=*/1.0f, /*iterations=*/1);
+                s64 signed_tick_delta = tick - child_last_spiked;
+                f32 tick_delta = (f32)(signed_tick_delta < 0 ? -signed_tick_delta : signed_tick_delta);
+                f32 decay_delta = -learning_rate * std::pow(tick_delta, -3.0f);
+                weights.update((s32)source_node, child, decay_delta, /*learning_rate=*/0.5f,
+                               /*l2_regularization=*/1.0f, /*iterations=*/1);
+            }
+        }
+
+        // ── POTENTIATION (causal): the firing neuron is postsynaptic; walk its PREDECESSORS, and for
+        // each predecessor that fired at a strictly earlier tick (pre-before-post), nudge
+        // predecessor->source UP. Same "< 0 = never fired" / "== tick = same tick" exclusion the
+        // depression side uses, and the same pow(tick_delta, -3) recency shape, just positive.
+        if (learning_rate_plus != 0.0f) {
+            s64 predecessor_count = weights.get_predecessors(source_node, neighbor_scratch.data());
+            for (s64 slot = 0; slot < predecessor_count; ++slot) {
+                s32 parent = neighbor_scratch[(usize)slot];
+                s64 parent_last_spiked = last_spiked.get_contents()[parent];
+                if (parent_last_spiked < 0 || parent_last_spiked == tick) continue;
+
+                s64 signed_tick_delta = tick - parent_last_spiked;
+                f32 tick_delta = (f32)(signed_tick_delta < 0 ? -signed_tick_delta : signed_tick_delta);
+                f32 potentiate_delta = learning_rate_plus * std::pow(tick_delta, -3.0f);
+                weights.update(parent, (s32)source_node, potentiate_delta, /*learning_rate=*/0.5f,
+                               /*l2_regularization=*/1.0f, /*iterations=*/1);
+            }
         }
     }
 }
@@ -1517,6 +1546,7 @@ SpikeEngine::SpikeEngine(SpikeEngine &&other) noexcept
     , resting_membrane_potential(other.resting_membrane_potential)
     , decay_rate(other.decay_rate)
     , learning_rate(other.learning_rate)
+    , learning_rate_plus(other.learning_rate_plus)
     , spike_period(other.spike_period)
     , spike_threshold(other.spike_threshold)
     , use_constant_weight(other.use_constant_weight)
@@ -1606,6 +1636,7 @@ SpikeEngine &SpikeEngine::operator=(SpikeEngine &&other) noexcept {
     resting_membrane_potential = other.resting_membrane_potential;
     decay_rate = other.decay_rate;
     learning_rate = other.learning_rate;
+    learning_rate_plus = other.learning_rate_plus;
     spike_period = other.spike_period;
     spike_threshold = other.spike_threshold;
     use_constant_weight = other.use_constant_weight;
@@ -1655,7 +1686,7 @@ bool SpikeEngine::plasticity_enabled() {
     return learning_rate > 0.0f;
 }
 
-void SpikeEngine::enable_plasticity(f32 _learning_rate) {
+void SpikeEngine::enable_plasticity(f32 _learning_rate, f32 _learning_rate_plus) {
     if (plasticity_enabled()) return;
 
     // ── ticket #132: coordinating with ticket #131's real per-edge synapse dispatch -- STDP's rank-1
@@ -1673,12 +1704,14 @@ void SpikeEngine::enable_plasticity(f32 _learning_rate) {
     }
 
     learning_rate = _learning_rate;
+    learning_rate_plus = _learning_rate_plus;
 }
 
 void SpikeEngine::disable_plasticity() {
     if (!plasticity_enabled()) return;
 
     learning_rate = 0.0f;
+    learning_rate_plus = 0.0f;
 }
 
 void SpikeEngine::setup_lifetime(int lifetime_, bool allocate_logs, s64 max_log_bytes) {
@@ -1795,6 +1828,7 @@ void SpikeEngine::step_simulation(
         spike_period,
         spike_threshold,
         learning_rate,
+        learning_rate_plus,
         decay_rate,
         resting_membrane_potential,
         weights.U_matrix.get_contents(),

@@ -305,6 +305,7 @@ namespace spikecorec {
         s32           spike_period,
         f32           spike_threshold,
         f32           learning_rate,
+        f32           learning_rate_plus,
         f32           decay_rate,
         f32           resting_mp,
         const float4 *U,

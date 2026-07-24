@@ -94,12 +94,23 @@ struct StdpSpec {
 // `synapse_entry` isn't a Synapse-category entry, or if any of the four names is absent.
 std::optional<StdpSpec> find_stdp_spec(const TypeLibraryEntry &synapse_entry);
 
-// Maps `spec` onto the single scalar the real stage-7 kernel path consumes (see this header's own
-// doc comment for the derivation): `spec.a_minus`, unchanged.
+// Maps `spec` onto the minus-side (depression) scalar the real stage-7 kernel path consumes (see
+// this header's own doc comment for the derivation): `spec.a_minus`, unchanged.
 f32 map_stdp_spec_to_learning_rate(const StdpSpec &spec);
 
+// Maps `spec` onto the plus-side (potentiation) scalar the real bidirectional-STDP path consumes:
+// `spec.a_plus`, the standard STDP potentiation-amplitude parameter. This is the LTP counterpart of
+// map_stdp_spec_to_learning_rate above — it drives the causal (pre-before-post) predecessor-edge
+// potentiation both stage-7 call sites now apply (the legacy GPU `step`/`step_no_active_optimization`
+// kernels and SpikeEngine::apply_nml_stdp_plasticity), scaled by the same pow(tick_delta, -3) recency
+// shape the depression side uses, just positive. Throws if a_plus is negative (a potentiation
+// amplitude is always >= 0, matching map_stdp_spec_to_learning_rate's own aMinus guard).
+f32 map_stdp_spec_to_learning_rate_plus(const StdpSpec &spec);
+
 // Scans every Synapse-category entry in `model.type_library` for an StdpSpec (`find_stdp_spec`).
-// Presence -> `engine.enable_plasticity(map_stdp_spec_to_learning_rate(spec))`; absence ->
+// Presence -> `engine.enable_plasticity(map_stdp_spec_to_learning_rate(spec),
+// map_stdp_spec_to_learning_rate_plus(spec))` (both the minus-side depression rate and the plus-side
+// potentiation rate now reach the engine, for real bidirectional STDP); absence ->
 // `engine.disable_plasticity()` -- exactly the presence/absence rule the ticket specifies, reusing
 // SC-11's already-toggleable engine API rather than building a new one. If more than one
 // Synapse-category entry has an STDP spec and they map to different learning rates, the first

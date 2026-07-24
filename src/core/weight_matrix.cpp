@@ -241,6 +241,15 @@ s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
     return k2tree.get_neighbors((s32)node_index, output_buffer, max_neighbor_count);
 }
 
+s64 WeightMatrix::get_predecessors(s64 node_index, s32 *output_buffer) const {
+    if (!can_safely_cast_s64_to_s32(node_index) ||
+        !check_index_inbounds((s32)node_index)) {
+        return 0;
+    }
+
+    return k2tree.get_predecessors((s32)node_index, output_buffer, max_neighbor_count);
+}
+
 void WeightMatrix::set_constant_weight(f32 value) {
     log::logger().debug("set_constant_weight: value={}", value);
     // U and V are filled across every rank_float4_stride*4 lane below, and

@@ -49,8 +49,24 @@ f32 map_stdp_spec_to_learning_rate(const StdpSpec &spec) {
     return spec.a_minus;
 }
 
+f32 map_stdp_spec_to_learning_rate_plus(const StdpSpec &spec) {
+    // `aPlus` is a potentiation AMPLITUDE (NeuroML convention, always >= 0) feeding the causal
+    // (pre-before-post) predecessor-edge potentiation both stage-7 call sites now apply: a positive
+    // potentiate_delta = +learning_rate_plus * pow(tick_delta, -3), the LTP mirror of the depression
+    // side's own always-negative decay_delta. Rejected explicitly if negative, matching
+    // map_stdp_spec_to_learning_rate's own aMinus guard rather than silently mapping a nonsensical
+    // negative amplitude through.
+    if (spec.a_plus < 0.0f) {
+        log::throw_invalid_argument(log::logger(),
+            "map_stdp_spec_to_learning_rate_plus: aPlus must be >= 0 (a potentiation amplitude), got " +
+            std::to_string(spec.a_plus));
+    }
+    return spec.a_plus;
+}
+
 void apply_stdp_wiring(const ModelSpecification &model, SpikeEngine &engine) {
     std::optional<f32> mapped_learning_rate;
+    f32 mapped_learning_rate_plus = 0.0f; // plus-side rate of whichever spec wins below
     String winning_synapse_id;
 
     for (const auto &entry : model.type_library) {
@@ -58,8 +74,10 @@ void apply_stdp_wiring(const ModelSpecification &model, SpikeEngine &engine) {
         if (!spec) continue;
 
         f32 rate = map_stdp_spec_to_learning_rate(*spec);
+        f32 rate_plus = map_stdp_spec_to_learning_rate_plus(*spec);
         if (!mapped_learning_rate) {
             mapped_learning_rate = rate;
+            mapped_learning_rate_plus = rate_plus;
             winning_synapse_id = entry.bound_instance_id;
             continue;
         }
@@ -73,7 +91,7 @@ void apply_stdp_wiring(const ModelSpecification &model, SpikeEngine &engine) {
     }
 
     if (mapped_learning_rate) {
-        engine.enable_plasticity(*mapped_learning_rate);
+        engine.enable_plasticity(*mapped_learning_rate, mapped_learning_rate_plus);
     } else {
         engine.disable_plasticity();
     }

@@ -914,6 +914,7 @@ void gpu_step(
    s32           spike_period,
    f32           spike_threshold,
    f32           learning_rate,
+   f32           learning_rate_plus,
    f32           decay_rate,
    f32           resting_mp,
    const float4 *U,
@@ -954,7 +955,7 @@ void gpu_step(
 
     if (active_set_optimization_enabled) {
         cuda::step_kernel<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
-            tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
+            tick, next_tick, spike_period, spike_threshold, learning_rate, learning_rate_plus, decay_rate, resting_mp,
             U, V, rank_float4_stride, constant_weight,
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
             branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
@@ -964,7 +965,7 @@ void gpu_step(
         );
     }else {
         cuda::step_kernel_no_active_optimization<<<static_cast<unsigned>(block_count), static_cast<unsigned>(thread_count_per_block), 0, stream>>>(
-            tick, next_tick, spike_period, spike_threshold, learning_rate, decay_rate, resting_mp,
+            tick, next_tick, spike_period, spike_threshold, learning_rate, learning_rate_plus, decay_rate, resting_mp,
             U, V, rank_float4_stride, constant_weight,
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
             branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
@@ -984,6 +985,10 @@ void gpu_step(
             threads_per_block
         };
 
+        // learning_rate_plus is bound at buffer(30), reusing the slot the previously-passed-but-unused
+        // thread_count_per_block held (Metal caps this kernel at 31 buffers, indices 0-30, and it was
+        // already at that limit — see the `step` kernel's own note). block_count stays unbound (it is
+        // args index 31, past arg_count=31). thread_count_per_block is no longer passed to this kernel.
         const void *args[] = {
            &tick, &next_tick, &spike_period, &spike_threshold,
            &learning_rate, &decay_rate, &resting_mp, &U, &V,
@@ -993,7 +998,7 @@ void gpu_step(
            &internal_bit_count, &neuron_count, &network_inputs, &membrane_potentials,
            &last_spiked, &last_tick_updated, &active_neuron_indices, &active_neuron_count,
            &next_active_neuron_indices, &next_active_neuron_count,
-           &active_generation, &thread_count_per_block, &block_count
+           &active_generation, &learning_rate_plus, &block_count
         };
         const usize arg_sizes[] = {
             sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),
@@ -1001,7 +1006,7 @@ void gpu_step(
             sizeof(const u16 *), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s64),
             sizeof(f32 *), sizeof(f32 *), sizeof(s64 *), sizeof(s64 *), sizeof(const s32 *), sizeof(const s32 *),
             sizeof(s32 *), sizeof(s32 *), sizeof(s32 *),
-            sizeof(s32), sizeof(s32)
+            sizeof(f32), sizeof(s32)
         };
 
 
@@ -1014,6 +1019,9 @@ void gpu_step(
             threads_per_block
         };
 
+        // learning_rate_plus is bound at buffer(25), reusing the slot the previously-passed-but-unused
+        // thread_count_per_block held (kept symmetric with the `step` kernel above). block_count stays
+        // unbound (args index 26, past arg_count=26). thread_count_per_block is no longer passed here.
         const void *args[] = {
            &tick, &next_tick, &spike_period, &spike_threshold,
            &learning_rate, &decay_rate, &resting_mp, &U, &V,
@@ -1021,14 +1029,14 @@ void gpu_step(
            &rank_superblock_table, &rank_subblock_table, &branching_factor,
            &superblock_size_words, &padded_node_count, &tree_height,
            &internal_bit_count, &neuron_count, &network_inputs, &membrane_potentials,
-           &last_spiked, &last_tick_updated, &thread_count_per_block, &block_count
+           &last_spiked, &last_tick_updated, &learning_rate_plus, &block_count
         };
         const usize arg_sizes[] = {
             sizeof(s64), sizeof(s64), sizeof(s32), sizeof(f32), sizeof(f32), sizeof(f32), sizeof(f32),
             sizeof(float4 *), sizeof(float4 *), sizeof(s64), sizeof(f32), sizeof(const u32 *), sizeof(const u32 *), sizeof(const u32 *),
             sizeof(const u16 *), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s64),
             sizeof(f32 *), sizeof(f32 *), sizeof(s64 *), sizeof(s64 *),
-            sizeof(s32), sizeof(s32)
+            sizeof(f32), sizeof(s32)
         };
 
         metal_dispatch(kernel_handle, config, args, arg_sizes, 26, batch);

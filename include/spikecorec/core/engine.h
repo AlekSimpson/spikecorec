@@ -72,7 +72,9 @@ namespace spikecorec {
 
         f32 resting_membrane_potential;
         f32 decay_rate;
-        f32 learning_rate;
+        f32 learning_rate;      // minus-side (depression) STDP rate — 0 disables the depression path
+        f32 learning_rate_plus; // plus-side (potentiation) STDP rate — 0 disables the potentiation
+                                // path; the two are independent so a run can enable either or both
         s32 spike_period;
         f32 spike_threshold;
 
@@ -176,7 +178,11 @@ namespace spikecorec {
         [[nodiscard]] pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
 
         bool plasticity_enabled();
-        void enable_plasticity(f32 _learning_rate = 0.00222f);
+        // Enables STDP with a minus-side (depression) rate and an optional plus-side (potentiation)
+        // rate. The plus-side default is 0.0f so every existing single-argument caller keeps exactly
+        // its prior pure-depression behavior (bidirectional potentiation is opt-in). Unchanged
+        // no-op-if-already-enabled semantics (guards on `learning_rate > 0.0f`) — see engine.cpp.
+        void enable_plasticity(f32 _learning_rate = 0.00222f, f32 _learning_rate_plus = 0.0f);
         void disable_plasticity();
 
         void get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 voltage_scale, GpuPointer<f32> output_buffer);
@@ -396,11 +402,18 @@ namespace spikecorec {
 
         // Stage 7 (arch §2): for every neuron whose last_spiked == tick (fired THIS tick -- the fixed
         // propagate dispatch(es) above have already set this for every emit port by the time this
-        // runs), walks its real k^2-tree neighbors and applies the same rank-1 Hebbian nudge
-        // AssembledModel::apply_stdp_plasticity does, via WeightMatrix::update() (ticket #132; see
-        // master_kernel.h's own "ticket #132" doc comment for the full derivation). Reuses
-        // SpikeEngine's OWN existing `learning_rate` field / enable_plasticity() / disable_plasticity()
-        // rather than a second nml_-prefixed learning-rate field -- no-op when learning_rate == 0.0f.
+        // runs), applies real bidirectional STDP via WeightMatrix::update() (ticket #132; see
+        // master_kernel.h's own "ticket #132" doc comment for the full derivation), the host-side
+        // mirror of the legacy GPU `step`/`step_no_active_optimization` kernels' own two-sided rule:
+        //   - DEPRESSION (anti-causal): walk the firing neuron's forward k^2-tree neighbors
+        //     (get_neighbors); for each already-fired child, nudge the source->child edge DOWN by
+        //     -learning_rate * pow(tick_delta, -3).
+        //   - POTENTIATION (causal): walk the firing neuron's PREDECESSORS (get_predecessors); for each
+        //     predecessor that fired strictly before this tick, nudge the predecessor->source edge UP
+        //     by +learning_rate_plus * pow(tick_delta, -3).
+        // Reuses SpikeEngine's OWN `learning_rate`/`learning_rate_plus` fields / enable_plasticity() /
+        // disable_plasticity() -- each direction is independently gated (depression on learning_rate,
+        // potentiation on learning_rate_plus), and the whole method is a no-op when both are 0.
         // "Never fired" is checked as `last_spiked < 0` here (this engine's own -1 seed convention for
         // NML mode, see the ModelSpecification constructor -- unlike AssembledModel's ModelRuntimeBuffers
         // callers, which seed last_spiked to 0 and check against that instead).

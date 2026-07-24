@@ -64,6 +64,49 @@ TEST(K2Tree, adjacent_and_neighbors) {
     }
 }
 
+TEST(K2Tree, adjacent_and_predecessors) {
+    auto adjacency = k2_reference_adjacency();
+    const s32 node_count = 8;
+    K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
+
+    // Ground-truth predecessor lists = the TRANSPOSE of the reference adjacency: node u is a
+    // predecessor of node v iff the edge u -> v exists in the forward adjacency.
+    vector<vector<s32>> predecessors((usize)node_count);
+    for (s32 source = 0; source < node_count; ++source)
+        for (s32 target : adjacency[(usize)source])
+            predecessors[(usize)target].push_back(source);
+
+    vector<s32> buffer(node_count);
+    for (s32 target = 0; target < node_count; ++target) {
+        s64 count = tree.get_predecessors(target, buffer.data(), node_count);
+        vector<s32> found(buffer.begin(), buffer.begin() + count);
+        std::sort(found.begin(), found.end());
+        vector<s32> expected = predecessors[(usize)target];
+        std::sort(expected.begin(), expected.end());
+        EXPECT_EQ(found, expected) << "target=" << target;
+    }
+}
+
+TEST(K2Tree, predecessors_bounds_and_degenerate) {
+    // Out-of-range / degenerate queries return 0 written, mirroring get_neighbors' own bounds checks.
+    K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
+    vector<s32> buffer(8);
+    EXPECT_EQ(tree.get_predecessors(-1, buffer.data(), 8), 0);
+    EXPECT_EQ(tree.get_predecessors(8, buffer.data(), 8), 0);
+    EXPECT_EQ(tree.get_predecessors(0, buffer.data(), 0), 0);
+
+    vector<vector<s32>> single_isolated = {{}};
+    K2Tree isolated = *K2Tree::from_adjacency_list(single_isolated, 1);
+    EXPECT_EQ(isolated.get_predecessors(0, buffer.data(), 8), 0);
+
+    // max_neighbor_count truncation: node 3 has two predecessors (2 and 7); asking for at most 1
+    // must write exactly 1 (and only a real predecessor).
+    unordered_set<s32> node3_predecessors = {2, 7};
+    s64 truncated = tree.get_predecessors(3, buffer.data(), 1);
+    EXPECT_EQ(truncated, 1);
+    EXPECT_TRUE(node3_predecessors.count(buffer[0])) << "wrote a non-predecessor: " << buffer[0];
+}
+
 TEST(K2Tree, adjacent_batch) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;

@@ -188,6 +188,77 @@ __device__ __forceinline__ s32 k2t_next_neighbor(
     return -1;
 }
 
+// Resumes a DFS over a COLUMN's predecessors from the caller's stack state — the exact mirror of
+// k2t_next_neighbor (identical to src/metal/kernels.metal's own k2t_next_predecessor), returning the
+// next predecessor index `u` (a node with edge u -> v) each call, or -1 when exhausted. Reads the SAME
+// stored bits k2t_next_neighbor does: fixes the column offset (from the query node `v`) at each level
+// and iterates every ROW branch, instead of fixing the row and iterating every column branch. Stack
+// arrays must be allocated by the caller (size MAX_K2TREE_HEIGHT each) and initialized once identically
+// to k2t_next_neighbor's:
+//   stack_row_base[0]=0, stack_col_base[0]=0, stack_block_size[0]=padded_node_count,
+//   stack_bit_offset[0]=0, stack_next_row[0]=0, stack_top=0 (or -1 to short-circuit).
+__device__ __forceinline__ s32 k2t_next_predecessor(
+    const u32 *internal_node_words,
+    const u32 *leaf_node_words,
+    const u32 *rank_superblock_table,
+    const u16 *rank_subblock_table,
+    s32 branching_factor,
+    s32 superblock_size_words,
+    s32 node_count,
+    s32 tree_height,
+    s32 internal_bit_count,
+    s32 v,
+    s32 *stack_row_base,
+    s32 *stack_col_base,
+    s32 *stack_block_size,
+    s32 *stack_bit_offset,
+    s32 *stack_next_row,
+    s32 &stack_top
+) {
+    s32 branching_factor_squared = branching_factor * branching_factor;
+
+    while (stack_top >= 0) {
+        s32 level      = stack_top;
+        s32 row_offset = stack_next_row[level];
+        if (row_offset >= branching_factor) {
+            stack_top--;
+            continue;
+        }
+        stack_next_row[level] = row_offset + 1;
+
+        s32 row_base         = stack_row_base[level];
+        s32 col_base         = stack_col_base[level];
+        s32 block_size       = stack_block_size[level];
+        s32 level_bit_offset = stack_bit_offset[level];
+
+        s32 child_block_size = block_size / branching_factor;
+        s32 col_offset       = (v - col_base) / child_block_size;
+        s32 child_flat_index = row_offset * branching_factor + col_offset;
+        s32 bit_position     = level_bit_offset + child_flat_index;
+
+        if (level == tree_height - 1) {
+            if (k2t_get_bit(leaf_node_words, bit_position)) {
+                s32 u = row_base + row_offset;
+                if (u < node_count) return u;
+            }
+        } else if (k2t_get_bit(internal_node_words, bit_position)) {
+            s32 rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
+                                                      rank_subblock_table, bit_position, superblock_size_words) + 1;
+            s32 child_level = stack_top + 1;
+            s32 raw_offset  = branching_factor_squared * rank_inclusive;
+            stack_row_base[child_level]   = row_base + row_offset * child_block_size;
+            stack_col_base[child_level]   = col_base + col_offset * child_block_size;
+            stack_block_size[child_level] = child_block_size;
+            stack_bit_offset[child_level] = (child_level == tree_height - 1)
+                ? (raw_offset - internal_bit_count)
+                : raw_offset;
+            stack_next_row[child_level] = 0;
+            stack_top = child_level;
+        }
+    }
+    return -1;
+}
+
 // ── neighbor_weights ──────────────────────────────────────────────────────────
 // One thread per (source_node, neighbor_slot) pair; each thread walks its source
 // node's row in the k^2-tree (descending only into populated subtrees) to discover
@@ -655,6 +726,122 @@ __device__ __forceinline__ void step_apply_hebbian_update(
     }
 }
 
+// ── step_apply_hebbian_update_atomic_uv ───────────────────────────────────────
+// Fully-atomic U+V variant of step_apply_hebbian_update — the exact mirror of
+// src/metal/kernels.metal's own step_apply_hebbian_update_atomic_uv (see there for the full
+// race-safety rationale). Used for the causal potentiation direction, where the nudged U row belongs
+// to a PREDECESSOR this thread does not own (and which other firing neurons' threads may nudge
+// concurrently), so U[source_node] is read via atomicAdd(&slot, 0.0f) and written via atomicAdd,
+// exactly the way the plain variant already treats V[target_node] — now on both sides.
+__device__ __forceinline__ void step_apply_hebbian_update_atomic_uv(
+    float4 *U,
+    float4 *V,
+    s64     rank_float4_stride,
+    s32     source_node,
+    s32     target_node,
+    f32     delta,
+    f32     learning_rate,
+    f32     l2_regularization
+) {
+    float4 anchor_u[MAX_RANK_FLOAT4_STRIDE];
+    float4 anchor_v[MAX_RANK_FLOAT4_STRIDE];
+
+    float4 *u_row = U + (s64)source_node * rank_float4_stride;
+    float4 *v_row = V + (s64)target_node * rank_float4_stride;
+
+    f32 sum_u = l2_regularization;
+    f32 sum_v = l2_regularization;
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        float4 *u_slot = u_row + lane;
+        float4 *v_slot = v_row + lane;
+        float4 u4, v4;
+        u4.x = atomicAdd(&u_slot->x, 0.0f);
+        u4.y = atomicAdd(&u_slot->y, 0.0f);
+        u4.z = atomicAdd(&u_slot->z, 0.0f);
+        u4.w = atomicAdd(&u_slot->w, 0.0f);
+        v4.x = atomicAdd(&v_slot->x, 0.0f);
+        v4.y = atomicAdd(&v_slot->y, 0.0f);
+        v4.z = atomicAdd(&v_slot->z, 0.0f);
+        v4.w = atomicAdd(&v_slot->w, 0.0f);
+        anchor_u[lane] = u4;
+        anchor_v[lane] = v4;
+        sum_u += u4.x * u4.x + u4.y * u4.y + u4.z * u4.z + u4.w * u4.w;
+        sum_v += v4.x * v4.x + v4.y * v4.y + v4.z * v4.z + v4.w * v4.w;
+    }
+    f32 inv_den_u = 1.0f / sum_u;
+    f32 inv_den_v = 1.0f / sum_v;
+
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        f32 scale_u = learning_rate * delta * inv_den_v;
+        f32 scale_v = learning_rate * delta * inv_den_u;
+        float4 av = anchor_v[lane];
+        float4 au = anchor_u[lane];
+
+        float4 *u_slot = u_row + lane;
+        atomicAdd(&u_slot->x, av.x * scale_u);
+        atomicAdd(&u_slot->y, av.y * scale_u);
+        atomicAdd(&u_slot->z, av.z * scale_u);
+        atomicAdd(&u_slot->w, av.w * scale_u);
+
+        float4 *v_slot = v_row + lane;
+        atomicAdd(&v_slot->x, au.x * scale_v);
+        atomicAdd(&v_slot->y, au.y * scale_v);
+        atomicAdd(&v_slot->z, au.z * scale_v);
+        atomicAdd(&v_slot->w, au.w * scale_v);
+    }
+}
+
+// ── owned-U-row staging (bidirectional-STDP race safety) ──────────────────────
+// Exact mirror of src/metal/kernels.metal's stage_owned_u_row/flush_owned_u_row (see there for the
+// full race-safety rationale). When potentiation is active (learning_rate_plus != 0), a firing
+// successor's potentiation walk can atomic-write this neuron's own U row concurrently with this
+// thread's flush, so the owned row is staged via atomic loads (atomicAdd(&slot, 0.0f), the same
+// atomic-read idiom step_apply_hebbian_update uses for V) and flushed as an atomic ADD of this thread's
+// net change (final - initial) rather than a plain overwrite. When potentiation is off, no thread ever
+// writes another neuron's U row, so the single-owner plain path is kept (bit-for-bit unchanged).
+__device__ __forceinline__ void stage_owned_u_row(
+    float4 *u_row_global,
+    float4 *u_row_accumulator,
+    float4 *u_row_initial,
+    s64 rank_float4_stride,
+    bool atomic_u_updates
+) {
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        if (atomic_u_updates) {
+            float4 *slot = u_row_global + lane;
+            float4 staged;
+            staged.x = atomicAdd(&slot->x, 0.0f);
+            staged.y = atomicAdd(&slot->y, 0.0f);
+            staged.z = atomicAdd(&slot->z, 0.0f);
+            staged.w = atomicAdd(&slot->w, 0.0f);
+            u_row_accumulator[lane] = staged;
+            u_row_initial[lane] = staged;
+        } else {
+            u_row_accumulator[lane] = u_row_global[lane];
+        }
+    }
+}
+
+__device__ __forceinline__ void flush_owned_u_row(
+    float4 *u_row_global,
+    float4 *u_row_accumulator,
+    float4 *u_row_initial,
+    s64 rank_float4_stride,
+    bool atomic_u_updates
+) {
+    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+        if (atomic_u_updates) {
+            float4 *slot = u_row_global + lane;
+            atomicAdd(&slot->x, u_row_accumulator[lane].x - u_row_initial[lane].x);
+            atomicAdd(&slot->y, u_row_accumulator[lane].y - u_row_initial[lane].y);
+            atomicAdd(&slot->z, u_row_accumulator[lane].z - u_row_initial[lane].z);
+            atomicAdd(&slot->w, u_row_accumulator[lane].w - u_row_initial[lane].w);
+        } else {
+            u_row_global[lane] = u_row_accumulator[lane];
+        }
+    }
+}
+
 // ── step ──────────────────────────────────────────────────────────────────────
 // Uncompiled mirror of the Metal `step` kernel (src/metal/kernels.metal:488-614,
 // finalized 2026-06-06) — pending verification on CUDA hardware (this machine has
@@ -669,6 +856,7 @@ __global__ void step_kernel(
     s32           spike_period,
     f32           spike_threshold,
     f32           learning_rate,
+    f32           learning_rate_plus,
     f32           decay_rate,
     f32           resting_mp,
     float4       *U,
@@ -734,16 +922,17 @@ __global__ void step_kernel(
         last_spiked[neuron_thread_id] = tick;
     }
 
-    // U[neuron_thread_id] is exclusively owned by this thread for the whole tick
-    // (active_neuron_indices has no duplicates), so it's staged into registers
-    // once, accumulated across every outgoing edge below with plain (non-atomic)
-    // math, and flushed back to global memory a single time — instead of routing
-    // each edge's Hebbian update through 4 atomicAdds per rank lane.
+    // U[neuron_thread_id] is staged into registers once, accumulated across every outgoing depression
+    // edge below, and flushed back a single time — instead of 4 atomicAdds per rank lane per edge. That
+    // single-owner plain path is valid only when NO other thread can write this U row; when potentiation
+    // is active (learning_rate_plus != 0) a firing successor's potentiation walk CAN atomic-write this
+    // row concurrently, so the stage/flush switch to atomic snapshot + atomic net-delta add (see
+    // stage_owned_u_row/flush_owned_u_row for the full race-safety rationale).
+    bool atomic_u_updates = (learning_rate_plus != 0.0f);
     float4 u_row_accumulator[MAX_RANK_FLOAT4_STRIDE];
+    float4 u_row_initial[MAX_RANK_FLOAT4_STRIDE];
     float4 *u_row_global = U + (s64)neuron_thread_id * rank_float4_stride;
-    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-        u_row_accumulator[lane] = u_row_global[lane];
-    }
+    stage_owned_u_row(u_row_global, u_row_accumulator, u_row_initial, rank_float4_stride, atomic_u_updates);
 
     // Single DFS walk over the row — O(D·H) instead of O(D²·H).
     s32 walk_stack_row_base[MAX_K2TREE_HEIGHT];
@@ -801,8 +990,43 @@ __global__ void step_kernel(
         }
     }
 
-    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-        u_row_global[lane] = u_row_accumulator[lane];
+    flush_owned_u_row(u_row_global, u_row_accumulator, u_row_initial, rank_float4_stride, atomic_u_updates);
+
+    // ── causal potentiation (real bidirectional STDP) — mirror of src/metal/kernels.metal's own
+    // predecessor walk (see there for the full race-safety rationale): this neuron just fired, so walk
+    // its predecessors and potentiate each predecessor->this edge for predecessors that fired at a
+    // strictly earlier tick, via the fully-atomic step_apply_hebbian_update_atomic_uv.
+    if (learning_rate_plus != 0.0f) {
+        s32 pred_stack_row_base[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_col_base[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_block_size[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_bit_offset[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_next_row[MAX_K2TREE_HEIGHT];
+        pred_stack_row_base[0]   = 0;
+        pred_stack_col_base[0]   = 0;
+        pred_stack_block_size[0] = padded_node_count;
+        pred_stack_bit_offset[0] = 0;
+        pred_stack_next_row[0]   = 0;
+        s32 pred_stack_top = (tree_height > 0 && neuron_thread_id >= 0 &&
+                              neuron_thread_id < (s32)neuron_count) ? 0 : -1;
+
+        s32 parent;
+        while ((parent = k2t_next_predecessor(
+            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+            branching_factor, superblock_size_words, (s32)neuron_count,
+            tree_height, internal_bit_count, neuron_thread_id,
+            pred_stack_row_base, pred_stack_col_base, pred_stack_block_size,
+            pred_stack_bit_offset, pred_stack_next_row, pred_stack_top
+        )) >= 0) {
+            s64 parent_last_spiked = last_spiked[parent];
+            if (!(parent_last_spiked == 0 || parent_last_spiked == tick)) {
+                s64 delta_ticks = tick - parent_last_spiked;
+                f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
+                f32 potentiate_delta = learning_rate_plus * powf(tick_delta, -3.0f);
+                step_apply_hebbian_update_atomic_uv(U, V, rank_float4_stride, parent, neuron_thread_id,
+                                                    potentiate_delta, 0.5f, 1.0f);
+            }
+        }
     }
 
     // re-enqueue the spiking neuron itself for next tick (it may decay/spike again)
@@ -822,6 +1046,7 @@ __global__ void step_kernel_no_active_optimization(
     s32           spike_period,
     f32           spike_threshold,
     f32           learning_rate,
+    f32           learning_rate_plus,
     f32           decay_rate,
     f32           resting_mp,
     float4       *U,
@@ -879,16 +1104,17 @@ __global__ void step_kernel_no_active_optimization(
         last_spiked[neuron_thread_id] = tick;
     }
 
-    // U[neuron_thread_id] is exclusively owned by this thread for the whole tick
-    // (active_neuron_indices has no duplicates), so it's staged into registers
-    // once, accumulated across every outgoing edge below with plain (non-atomic)
-    // math, and flushed back to global memory a single time — instead of routing
-    // each edge's Hebbian update through 4 atomicAdds per rank lane.
+    // U[neuron_thread_id] is staged into registers once, accumulated across every outgoing depression
+    // edge below, and flushed back a single time — instead of 4 atomicAdds per rank lane per edge. That
+    // single-owner plain path is valid only when NO other thread can write this U row; when potentiation
+    // is active (learning_rate_plus != 0) a firing successor's potentiation walk CAN atomic-write this
+    // row concurrently, so the stage/flush switch to atomic snapshot + atomic net-delta add (see
+    // stage_owned_u_row/flush_owned_u_row for the full race-safety rationale).
+    bool atomic_u_updates = (learning_rate_plus != 0.0f);
     float4 u_row_accumulator[MAX_RANK_FLOAT4_STRIDE];
+    float4 u_row_initial[MAX_RANK_FLOAT4_STRIDE];
     float4 *u_row_global = U + (s64)neuron_thread_id * rank_float4_stride;
-    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-        u_row_accumulator[lane] = u_row_global[lane];
-    }
+    stage_owned_u_row(u_row_global, u_row_accumulator, u_row_initial, rank_float4_stride, atomic_u_updates);
 
     // Single DFS walk over the row — O(D·H) instead of O(D²·H).
     s32 walk_stack_row_base[MAX_K2TREE_HEIGHT];
@@ -939,8 +1165,43 @@ __global__ void step_kernel_no_active_optimization(
         atomicAdd(&network_inputs[child], weight);
     }
 
-    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-        u_row_global[lane] = u_row_accumulator[lane];
+    flush_owned_u_row(u_row_global, u_row_accumulator, u_row_initial, rank_float4_stride, atomic_u_updates);
+
+    // ── causal potentiation (real bidirectional STDP) — identical to step_kernel's own predecessor
+    // walk (see src/metal/kernels.metal for the full race-safety rationale): this neuron just fired, so
+    // walk its predecessors and potentiate each predecessor->this edge for predecessors that fired at a
+    // strictly earlier tick, via the fully-atomic step_apply_hebbian_update_atomic_uv.
+    if (learning_rate_plus != 0.0f) {
+        s32 pred_stack_row_base[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_col_base[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_block_size[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_bit_offset[MAX_K2TREE_HEIGHT];
+        s32 pred_stack_next_row[MAX_K2TREE_HEIGHT];
+        pred_stack_row_base[0]   = 0;
+        pred_stack_col_base[0]   = 0;
+        pred_stack_block_size[0] = padded_node_count;
+        pred_stack_bit_offset[0] = 0;
+        pred_stack_next_row[0]   = 0;
+        s32 pred_stack_top = (tree_height > 0 && neuron_thread_id >= 0 &&
+                              neuron_thread_id < (s32)neuron_count) ? 0 : -1;
+
+        s32 parent;
+        while ((parent = k2t_next_predecessor(
+            internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
+            branching_factor, superblock_size_words, (s32)neuron_count,
+            tree_height, internal_bit_count, neuron_thread_id,
+            pred_stack_row_base, pred_stack_col_base, pred_stack_block_size,
+            pred_stack_bit_offset, pred_stack_next_row, pred_stack_top
+        )) >= 0) {
+            s64 parent_last_spiked = last_spiked[parent];
+            if (!(parent_last_spiked == 0 || parent_last_spiked == tick)) {
+                s64 delta_ticks = tick - parent_last_spiked;
+                f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
+                f32 potentiate_delta = learning_rate_plus * powf(tick_delta, -3.0f);
+                step_apply_hebbian_update_atomic_uv(U, V, rank_float4_stride, parent, neuron_thread_id,
+                                                    potentiate_delta, 0.5f, 1.0f);
+            }
+        }
     }
 
     membrane_potentials[neuron_thread_id] = membrane_potential;

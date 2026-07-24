@@ -109,6 +109,58 @@ static void collect_row_neighbors(
     }
 }
 
+// Recursive column-walk: the exact mirror of collect_row_neighbors, collecting up to
+// max_neighbor_count PREDECESSOR indices of column `v` into output_buffer (every `u` with
+// edge u -> v). Descends only into subtrees that intersect v's column and have at least one
+// bit set. Same bit-position bookkeeping as collect_row_neighbors, but fixes the column
+// offset (derived from the query node `v`) at each level and explores every ROW branch,
+// instead of fixing the row and exploring every column branch.
+static void collect_column_predecessors(
+    const u32 *internal_words, const u32 *leaf_words,
+    const u32 *superblock_data, const u16 *subblock_data,
+    s32 branching_factor, s32 superblock_size_words,
+    s32 node_count, s32 tree_height, s32 internal_bit_count,
+    s32 level, s32 row_base, s32 column_base, s32 block_size, s32 level_bit_offset,
+    s32 v, s32 *output_buffer, s64 max_neighbor_count, s64 &predecessors_found
+) {
+    if (predecessors_found >= max_neighbor_count) return;
+
+    s32 branching_factor_squared = branching_factor * branching_factor;
+    s32 child_block_size = block_size / branching_factor;
+    s32 column_offset = (v - column_base) / child_block_size;
+
+    for (s32 row_offset = 0; row_offset < branching_factor; row_offset++) {
+        if (predecessors_found >= max_neighbor_count) return;
+
+        s32 child_flat_index = row_offset * branching_factor + column_offset;
+        s32 bit_position = level_bit_offset + child_flat_index;
+
+        if (level == tree_height - 1) {
+            if (get_bit(leaf_words, bit_position)) {
+                s32 u = row_base + row_offset;
+                if (u < node_count)
+                    output_buffer[predecessors_found++] = u;
+            }
+        } else if (get_bit(internal_words, bit_position)) {
+            s32 rank_inclusive = rank1_exclusive(internal_words, superblock_data, subblock_data,
+                                                  bit_position, superblock_size_words) + 1;
+            s32 raw_offset = branching_factor_squared * rank_inclusive;
+            s32 child_level_bit_offset = (level + 1 == tree_height - 1)
+                ? (raw_offset - internal_bit_count)
+                : raw_offset;
+            collect_column_predecessors(
+                internal_words, leaf_words, superblock_data, subblock_data,
+                branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
+                level + 1,
+                row_base + row_offset * child_block_size,
+                column_base + column_offset * child_block_size,
+                child_block_size, child_level_bit_offset,
+                v, output_buffer, max_neighbor_count, predecessors_found
+            );
+        }
+    }
+}
+
 static vector<u32> pack_bits_to_words(const vector<s32> &bits) {
     usize word_count = (bits.size() + 31) / 32;
     vector<u32> words(word_count, 0);
@@ -546,6 +598,25 @@ s64 K2Tree::get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_c
         node_index, output_buffer, max_neighbor_count, neighbors_found
     );
     return neighbors_found;
+}
+
+s64 K2Tree::get_predecessors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const {
+    if (max_neighbor_count <= 0) return 0;
+    if (node_index < 0 || node_index >= node_count || tree_height == 0) return 0;
+
+    const u32 *internal_words = internal_node_words.get_contents();
+    const u32 *leaf_words = leaf_node_words.get_contents();
+    const u32 *superblock_data = rank_superblock_table.get_contents();
+    const u16 *subblock_data = rank_subblock_table.get_contents();
+
+    s64 predecessors_found = 0;
+    collect_column_predecessors(
+        internal_words, leaf_words, superblock_data, subblock_data,
+        branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
+        0, 0, 0, padded_node_count, 0,
+        node_index, output_buffer, max_neighbor_count, predecessors_found
+    );
+    return predecessors_found;
 }
 
 void K2Tree::adjacent_batch(

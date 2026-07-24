@@ -253,3 +253,212 @@ TEST(PlasticityWiringDirection, stdp_direction_matches_kernel_sign_convention) {
                                                           /*presynaptic_spike_tick=*/3);
     EXPECT_TRUE(approx(frozen_before, frozen_after, 1e-6f));
 }
+
+// ── Real bidirectional STDP on the LEGACY engine's GPU kernel path ────────────────────────────────
+//
+// A genuinely driven simulation (no hand-computed weight deltas — every weight change comes from the
+// real step_no_active_optimization GPU kernel) of a 2-neuron network 0 -> 1, run over many repeated
+// spike-pair trials with a controlled phase relationship:
+//   - CAUSAL (neuron 0 fires one tick BEFORE neuron 1, repeatedly): when neuron 1 fires it walks its
+//     PREDECESSORS (the new k2t_next_predecessor traversal), finds neuron 0 fired one tick earlier,
+//     and POTENTIATES the 0 -> 1 edge (+learning_rate_plus * pow(1, -3) per pairing). A large
+//     inter-trial gap makes the cross-trial anti-causal depression (pow(gap-1, -3), tiny) negligible,
+//     so the 0 -> 1 edge must show NET POTENTIATION over the run.
+//   - ANTI-CAUSAL (neuron 1 fires one tick before neuron 0, repeatedly): when neuron 0 fires it walks
+//     its forward neighbors, finds neuron 1 fired one tick earlier, and DEPRESSES the 0 -> 1 edge
+//     (-learning_rate * pow(1, -3) per pairing) — the SAME depression path that shipped before this
+//     change, run here with learning_rate_plus = 0 so it is byte-for-byte the pre-change behavior.
+//
+// Active-set optimization is disabled so every neuron is processed every tick (the
+// step_no_active_optimization kernel), which makes firing a clean, deterministic function of the
+// injected current and removes active-set carryover from the picture. A small constant scatter weight
+// (0.01, well below threshold) means a propagated spike never spuriously fires a neuron — every fire
+// is driven by the explicit external pulse, at exactly the intended tick.
+namespace {
+struct BidirectionalRunResult {
+    f32 weight_before = 0.0f;
+    f32 weight_after = 0.0f;
+    s64 neuron0_fire_count = 0;
+    s64 neuron1_fire_count = 0;
+};
+
+// Runs the repeated spike-pair protocol described above and returns the 0 -> 1 edge weight before and
+// after. `causal == true` fires neuron 0 then neuron 1 each trial; `false` fires neuron 1 then neuron 0.
+BidirectionalRunResult run_legacy_bidirectional_pairing(bool causal, f32 learning_rate, f32 learning_rate_plus,
+                                                        s32 trial_count, s64 trial_period) {
+    vector<vector<s32>> network = {{1}, {}}; // edge 0 -> 1
+    SpikeEngine engine(&network, {2, 1}, /*rank=*/8, /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                       /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                       /*active_set_optimization_enabled=*/false);
+    engine.learning_rate = learning_rate;
+    engine.learning_rate_plus = learning_rate_plus;
+    engine.use_constant_weight = true;
+    engine.weights.set_constant_weight(0.01f); // tiny scatter — never spuriously fires a neuron
+    engine.set_input_neurons({0, 1});
+    engine.reset_state(/*last_spiked_value=*/0, /*active_gen_value=*/-1); // 0 = legacy "never fired"
+
+    const f32 firing_pulse = 5.0f;
+    const s64 base_tick = 2; // avoid tick 1, where a last_spiked==0 neuron hits the spike-period reset
+
+    BidirectionalRunResult result;
+    result.weight_before = engine.weights.get(0, 1);
+
+    s64 last_tick = base_tick + (s64)(trial_count - 1) * trial_period + 1;
+    for (s64 tick = 0; tick <= last_tick; ++tick) {
+        // Which neuron (if any) is driven to fire this tick, for the current phase relationship.
+        s32 fire_neuron = -1;
+        for (s32 trial = 0; trial < trial_count; ++trial) {
+            s64 first_tick = base_tick + (s64)trial * trial_period;
+            if (tick == first_tick) fire_neuron = causal ? 0 : 1;
+            else if (tick == first_tick + 1) fire_neuron = causal ? 1 : 0;
+        }
+
+        vector<f32> input = {0.0f, 0.0f};
+        if (fire_neuron == 0) input[0] = firing_pulse;
+        else if (fire_neuron == 1) input[1] = firing_pulse;
+
+        engine.step_simulation(input, tick);
+
+        // tick > 0 guard: last_spiked is seeded to 0 (the legacy kernel's "never fired" sentinel),
+        // which coincides with tick 0 — so a bare `last_spiked == tick` would false-positive there.
+        // No neuron is ever driven to fire at tick 0/1, so real fires are all at tick >= 2.
+        if (tick > 0 && engine.last_spiked.get_contents()[0] == tick) ++result.neuron0_fire_count;
+        if (tick > 0 && engine.last_spiked.get_contents()[1] == tick) ++result.neuron1_fire_count;
+    }
+
+    result.weight_after = engine.weights.get(0, 1);
+    engine.shutdown();
+    return result;
+}
+} // namespace
+
+TEST(BidirectionalStdpLegacyKernel, causal_pairing_net_potentiates_the_edge_over_a_real_driven_run) {
+    const f32 learning_rate = 0.02f;      // minus/depression side
+    const f32 learning_rate_plus = 0.02f; // plus/potentiation side
+    const s32 trial_count = 12;
+    const s64 trial_period = 8; // large gap so cross-trial depression (pow(7,-3)) is negligible
+
+    BidirectionalRunResult causal =
+        run_legacy_bidirectional_pairing(/*causal=*/true, learning_rate, learning_rate_plus, trial_count, trial_period);
+
+    // Sanity: this is a REAL driven run — both neurons actually fired, once per trial.
+    EXPECT_EQ(causal.neuron0_fire_count, trial_count);
+    EXPECT_EQ(causal.neuron1_fire_count, trial_count);
+
+    std::cout << "[BidirectionalStdpLegacyKernel causal] weight(0->1) before=" << causal.weight_before
+              << " after=" << causal.weight_after
+              << " delta=" << (causal.weight_after - causal.weight_before) << "\n";
+
+    // The causal (pre-before-post) pairing must NET POTENTIATE the 0 -> 1 edge — the whole point of the
+    // new predecessor-side potentiation path. A margin well above float noise (the per-pairing
+    // potentiation is ~learning_rate_plus, applied trial_count times).
+    EXPECT_GT(causal.weight_after, causal.weight_before + 1e-3f);
+}
+
+TEST(BidirectionalStdpLegacyKernel, anti_causal_pairing_still_depresses_unchanged_from_before) {
+    const f32 learning_rate = 0.02f;
+    const s32 trial_count = 12;
+    const s64 trial_period = 8;
+
+    // learning_rate_plus = 0 → the potentiation path is fully gated off, so this run is byte-for-byte
+    // the depression-only behavior that shipped before this change (a real regression check).
+    BidirectionalRunResult anti_causal =
+        run_legacy_bidirectional_pairing(/*causal=*/false, learning_rate, /*learning_rate_plus=*/0.0f, trial_count,
+                                         trial_period);
+
+    EXPECT_EQ(anti_causal.neuron0_fire_count, trial_count);
+    EXPECT_EQ(anti_causal.neuron1_fire_count, trial_count);
+
+    std::cout << "[BidirectionalStdpLegacyKernel anti-causal] weight(0->1) before=" << anti_causal.weight_before
+              << " after=" << anti_causal.weight_after
+              << " delta=" << (anti_causal.weight_after - anti_causal.weight_before) << "\n";
+
+    // Post-before-pre pairing depresses the 0 -> 1 edge, exactly as the shipped depression path always did.
+    EXPECT_LT(anti_causal.weight_after, anti_causal.weight_before - 1e-3f);
+}
+
+// The bidirectional-STDP U-row race fix (stage_owned_u_row/flush_owned_u_row) switches a firing
+// neuron's OWN U-row stage+flush from a plain register copy/overwrite to an atomic snapshot + atomic
+// net-delta ADD whenever potentiation is active (learning_rate_plus != 0). This test pins down that
+// the atomic path is NUMERICALLY EQUIVALENT to the plain path for a pure-depression pairing: a SINGLE
+// anti-causal pairing (neuron 1 fires at tick 2 when neuron 0 has never fired -> no potentiation lands;
+// neuron 0 fires at tick 3 -> depresses 0 -> 1). The ONLY thing that differs between the two runs below
+// is whether neuron 0's flush of U[0] at tick 3 goes through the atomic-delta path or the plain path;
+// no other thread touches U[0], so the two must agree to well within float noise. (This validates the
+// delta-add flush arithmetic deterministically, complementing the genuinely-concurrent hub test below,
+// whose exact racing interleaving cannot be forced deterministically.)
+TEST(BidirectionalStdpLegacyKernel, atomic_owned_u_row_flush_matches_the_plain_flush_for_pure_depression) {
+    BidirectionalRunResult plain_flush =
+        run_legacy_bidirectional_pairing(/*causal=*/false, /*learning_rate=*/0.02f, /*learning_rate_plus=*/0.0f,
+                                         /*trial_count=*/1, /*trial_period=*/8);
+    BidirectionalRunResult atomic_flush =
+        run_legacy_bidirectional_pairing(/*causal=*/false, /*learning_rate=*/0.02f, /*learning_rate_plus=*/0.02f,
+                                         /*trial_count=*/1, /*trial_period=*/8);
+
+    // Both runs applied exactly one depression to 0 -> 1 and zero potentiations.
+    EXPECT_LT(plain_flush.weight_after, plain_flush.weight_before - 1e-4f);
+    std::cout << "[BidirectionalStdpLegacyKernel flush-equivalence] plain=" << plain_flush.weight_after
+              << " atomic=" << atomic_flush.weight_after << "\n";
+    EXPECT_TRUE(approx(atomic_flush.weight_after, plain_flush.weight_after, 1e-6f));
+}
+
+// Genuinely-concurrent stress test of the U-row race fix: a hub predecessor (neuron 0) with many
+// successors, where every successor fires the SAME tick and simultaneously potentiates its own
+// 0 -> successor edge — so U[0] takes `successor_count` concurrent atomic adds per potentiation tick,
+// interleaved with neuron 0's own atomic-delta flush on its fire ticks. This is exactly the kind of
+// heavy concurrent traffic on one shared U row that the fix has to keep correct; the run must stay
+// finite and every edge must net-potentiate. (Note: the precise atomic-vs-plain interleaving the fix
+// closes — a predecessor flushing its own U row while a successor potentiates it the SAME tick — is
+// only reachable through the nondeterministic last_spiked read-window, since the same-tick exclusion
+// otherwise skips it, so no test can force that exact interleaving; this maximizes concurrent U[0]
+// atomic contention instead and verifies the outcome is correct/finite under the fix.)
+TEST(BidirectionalStdpLegacyKernel, concurrent_potentiation_of_a_shared_hub_predecessor_stays_finite) {
+    const s32 successor_count = 12;
+    const s32 neuron_count = successor_count + 1; // neuron 0 = hub, 1..successor_count = successors
+    vector<vector<s32>> network((usize)neuron_count);
+    for (s32 successor = 1; successor <= successor_count; ++successor) network[0].push_back(successor);
+
+    SpikeEngine engine(&network, {neuron_count, 1}, /*rank=*/8, /*resting_mp=*/0.1f, /*decay_rate=*/0.01f,
+                       /*learning_rate=*/0.0f, /*plasticity_enabled=*/true,
+                       /*active_set_optimization_enabled=*/false);
+    engine.learning_rate = 0.02f;
+    engine.learning_rate_plus = 0.02f;
+    engine.use_constant_weight = true;
+    engine.weights.set_constant_weight(0.01f);
+    vector<s32> all_neurons;
+    for (s32 neuron = 0; neuron < neuron_count; ++neuron) all_neurons.push_back(neuron);
+    engine.set_input_neurons(all_neurons);
+    engine.reset_state(/*last_spiked_value=*/0, /*active_gen_value=*/-1);
+
+    vector<f32> weight_before((usize)successor_count);
+    for (s32 successor = 1; successor <= successor_count; ++successor)
+        weight_before[(usize)(successor - 1)] = engine.weights.get(0, successor);
+
+    const f32 firing_pulse = 5.0f;
+    const s64 base_tick = 2;
+    const s64 trial_period = 8;
+    const s32 trial_count = 10;
+    s64 last_tick = base_tick + (s64)(trial_count - 1) * trial_period + 1;
+
+    for (s64 tick = 0; tick <= last_tick; ++tick) {
+        vector<f32> input((usize)neuron_count, 0.0f);
+        for (s32 trial = 0; trial < trial_count; ++trial) {
+            s64 first_tick = base_tick + (s64)trial * trial_period;
+            if (tick == first_tick) {
+                input[0] = firing_pulse; // hub fires
+            } else if (tick == first_tick + 1) {
+                for (s32 successor = 1; successor <= successor_count; ++successor)
+                    input[(usize)successor] = firing_pulse; // every successor fires this same tick
+            }
+        }
+        engine.step_simulation(input, tick);
+    }
+
+    for (s32 successor = 1; successor <= successor_count; ++successor) {
+        f32 after = engine.weights.get(0, successor);
+        EXPECT_TRUE(std::isfinite(after)) << "edge 0->" << successor << " went non-finite under contention";
+        EXPECT_GT(after, weight_before[(usize)(successor - 1)] + 1e-3f)
+            << "edge 0->" << successor << " did not net-potentiate under concurrent U[0] traffic";
+    }
+    engine.shutdown();
+}
