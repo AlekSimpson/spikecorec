@@ -147,6 +147,19 @@ namespace spikecorec {
         // otherwise.
         void step_tick(f32 dt, s64 tick, s64 next_tick);
 
+        // Sets a single neuron's emit-port flag directly, ahead of calling step_tick for that same
+        // tick -- a real, minimal way to host-drive a synthetic/external spike into the fixed
+        // propagate stage (stage 6), which reads+clears every nml_emit_port_flags_ entry
+        // unconditionally each tick regardless of who set it true. A flag forced true here is
+        // therefore dispatched through the exact same k^2-tree scatter/last_spiked/active-set/
+        // delay-ring machinery as a spike a population's own `.tick` kernel would have set. Only
+        // valid on a SpikeEngine constructed via the ModelSpecification constructor above (throws
+        // otherwise), and only for a `port_name` that is one of this model's own known emit ports
+        // (nml_emit_port_names_, throws otherwise) and an in-range `neuron_index` (throws
+        // otherwise). Deliberately scoped to this single setter rather than exposing
+        // nml_emit_port_flags_ itself.
+        void force_emit(const String &port_name, s64 neuron_index);
+
         void start_static_record(
             const vector<vector<f32>> &input_spikes,
             s64 lifetime,

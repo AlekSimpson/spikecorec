@@ -4,18 +4,15 @@
 #include <Metal/Metal.hpp>
 #endif
 
-#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/backend.h"
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
-#include "spikecorec/nml/allocator.h"
 #include "spikecorec/nml/cell_lowering.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
 #include "spikecorec/nml/model_specification.h"
@@ -24,6 +21,15 @@
 using namespace std;
 using namespace spikecorec;
 using namespace spikecorec::nml;
+
+// core/engine.h (needed below for SpikeEngine, the alphaCurrentSynapse acceptance test's own
+// migration off AssembledModel) has its own file-scope `using namespace spikecorec::log;`, which
+// makes the ALIAS TEMPLATE `spikecorec::log::Vector` ambiguous with `spikecorec::Vector` for a plain
+// unqualified `Vector<...>` (two distinct `using namespace` directives at the same scope, each making
+// a same-named alias TEMPLATE visible) -- exactly the clash tests/simple_lif_stdp_network_tests.cpp's
+// own header comment already documents. So this file spells out `spikecorec::Vector<...>` at its
+// (few) own bare-`Vector<...>` call sites below, rather than the bare `Vector<...>` this file used
+// before engine.h was pulled in.
 
 // ── Synapse dynamics -> IR lowering tests (ticket #51 [B3]) ──────────────
 //
@@ -217,21 +223,57 @@ const String TEST_NMDA_SYNAPSE_COMPONENT_TYPE =
     "    </Dynamics>"
     "  </ComponentType>";
 
+// SpikeEngine migration note (real, newly-surfaced gap -- see this test's own header comment further
+// below for the full detail): plain `DummyCell` (used everywhere else in this file) declares no
+// `EventOut` at all, so `collect_emit_port_names`/SpikeEngine's own `nml_emit_port_flags_` register
+// ZERO emit ports for a model built from it -- there is then no real per-neuron flag buffer for
+// `SpikeEngine::force_emit("spike", ...)` to target (it correctly throws "not a known emit port" in
+// that case, exactly per its own scoped-setter contract). The OLD `AssembledModel`/`ModelRuntimeBuffers`
+// path never needed a real declared port here because `AssembledModel::dispatch_synapse_delivery_events`
+// (ticket #131) unions over WHATEVER keys are present in the caller-supplied `emit_port_flags` map
+// directly (master_kernel.cpp), independent of the model's own declared ports -- a looser, ad hoc
+// mechanism `ModelRuntimeBuffers` allowed but `SpikeEngine::force_emit` deliberately does not
+// (force_emit is scoped to real, model-declared emit ports on purpose). This dedicated
+// `DummyCellWithSpikePort` ComponentType (used ONLY by this one acceptance test, not by any other
+// fixture in this file) is the minimal, honest fix: it gives neuron 0 a REAL, structurally-declared
+// `spike` EventOut so SpikeEngine allocates a real flag buffer for `force_emit` to target, gated by an
+// `OnCondition` that is provably never satisfied on its own (neuron 0 has no incoming connection in
+// this 2-neuron 0->1 network, so its own `v` never leaves its initial 0 -- `v .gt. spikeThreshold`
+// with any positive `spikeThreshold` can therefore never fire from the cell's own dynamics; the ONLY
+// way "spike" ever becomes true is the explicit `force_emit` call below). This changes nothing about
+// the test's own OBSERVABLE behavior (neuron 0's own accumulate/threshold cycle was never exercised
+// or asserted on either before or after this change) -- it only makes the model structurally support
+// the same "designated neuron can be forced to spike externally" capability the pre-migration test
+// already relied on, through the correctly-scoped mechanism `force_emit` actually provides.
+const String DUMMY_CELL_WITH_SPIKE_PORT_COMPONENT_TYPE =
+    "  <ComponentType name=\"DummyCellWithSpikePort\" extends=\"baseCell\">"
+    "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+    "    <Parameter name=\"spikeThreshold\" dimension=\"voltage\"/>"
+    "    <Dynamics>"
+    "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+    "      <TimeDerivative variable=\"v\" value=\"network_inputs / C\"/>"
+    "      <OnCondition test=\"v .gt. spikeThreshold\">"
+    "        <EventOut port=\"spike\"/>"
+    "      </OnCondition>"
+    "    </Dynamics>"
+    "  </ComponentType>";
+
 // Builds a small, real 2-neuron network (node 0 -> node 1, the same
-// `DummyCell` self-loop-avoiding wiring `build_synapse_type_library_entry`
+// self-loop-avoiding wiring `build_synapse_type_library_entry`
 // itself uses) through a real, vendored `alphaCurrentSynapse` instance, and
 // returns the FULL ModelSpecification (not just the synapse's own
-// TypeLibraryEntry) so a caller can build IR programs and run an
-// AssembledModel end to end -- the numeric acceptance test below needs both
+// TypeLibraryEntry) so a caller can build IR programs and run a SpikeEngine
+// end to end -- the numeric acceptance test below needs both
 // the cell AND synapse type-library entries, unlike every other fixture in
-// this file.
+// this file. Uses `DummyCellWithSpikePort` (see its own doc comment just above), not plain
+// `DummyCell`, so `force_emit("spike", 0)` has a real emit port to target.
 ModelSpecification build_alpha_current_synapse_network_specification(
     const String &tau_attribute, const String &ibase_attribute, const String &weight_attribute
 ) {
     write_temp_file("spikecorec_synapse_lowering_alpha_acceptance_content.nml",
         "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"SynapseLoweringAlphaAcceptanceContent\">"
-        + DUMMY_CELL_COMPONENT_TYPE +
-        "  <DummyCell id=\"dummyCellInstance\" C=\"1.0e-10\"/>"
+        + DUMMY_CELL_WITH_SPIKE_PORT_COMPONENT_TYPE +
+        "  <DummyCellWithSpikePort id=\"dummyCellInstance\" C=\"1.0e-10\" spikeThreshold=\"1V\"/>"
         "  <alphaCurrentSynapse id=\"alphaSynapseInstance\" tau=\"" + tau_attribute + "\" ibase=\"" +
         ibase_attribute + "\" weight=\"" + weight_attribute + "\"/>"
         "  <network id=\"Net\">"
@@ -273,7 +315,7 @@ ModelSpecification build_alpha_current_synapse_network_specification(
 //     via the exact exponential `J *= exp(-dt/tau)` (`expdecay`, not a linear forward-Euler
 //     approximation) -- this becomes the tick-start `J` the NEXT tick's own integration reads.
 struct AlphaCurrentSynapseForwardEulerResult {
-    Vector<f64> exposed_current; // one value per tick -- the network_inputs contribution that tick
+    spikecorec::Vector<f64> exposed_current; // one value per tick -- the network_inputs contribution that tick
 };
 
 AlphaCurrentSynapseForwardEulerResult run_alpha_current_synapse_forward_euler(
@@ -623,7 +665,7 @@ TEST(SynapseLoweringErrors, lower_all_synapse_types_skips_non_synapse_type_libra
     ModelSpecification specification = build_model_specification(resolved);
     ASSERT_EQ(specification.type_library.size(), 2u); // one cell, one synapse
 
-    Vector<IrProgram> programs = lower_all_synapse_types_to_ir(specification);
+    spikecorec::Vector<IrProgram> programs = lower_all_synapse_types_to_ir(specification);
     ASSERT_EQ(programs.size(), 1u);
     EXPECT_EQ(programs[0].component_type_name, "expOneSynapse");
 }
@@ -699,9 +741,10 @@ TEST(SynapseLoweringPerEdge, lowers_real_alpha_current_synapse_couples_I_and_J) 
 
 // ── alphaCurrentSynapse acceptance: real, numeric, end-to-end alpha-shaped current ───────────────
 //
-// Drives a real 2-neuron network through AssembledModel (ticket #131's real per-edge synapse
-// dispatch machinery -- the SAME machinery master_kernel_tests.cpp's own
-// MasterKernelSynapseDispatch tests and exit_model_validation_tests.cpp's own GLIF E/I network use)
+// Drives a real 2-neuron network through SpikeEngine's own NML-model constructor (ticket #131's real
+// per-edge synapse dispatch machinery -- the SAME machinery master_kernel_tests.cpp's own
+// MasterKernelSynapseDispatch tests and exit_model_validation_tests.cpp's own GLIF E/I network use,
+// now folded into SpikeEngine itself)
 // for enough ticks that a single presynaptic spike produces a measurable, non-zero, alpha-shaped
 // postsynaptic current: starts at/near 0, rises, peaks around t=tau after the spike (the classical
 // alpha-function kernel's own analytic peak time, not just "eventually nonzero"), then decays back
@@ -711,15 +754,24 @@ TEST(SynapseLoweringPerEdge, lowers_real_alpha_current_synapse_couples_I_and_J) 
 //
 // The postsynaptic neuron's own current is read directly via `network_inputs[target]` right after
 // each `step_tick` call, rather than through the postsynaptic cell's own (irrelevant) `v` --
-// master_kernel.cpp's own step_tick sequence drains network_inputs to exactly 0 before this tick's
-// fresh synaptic dispatch writes into it (see master_kernel.cpp's own "fixed deliver-drain" comment),
-// and alphaCurrentSynapse's `i = I` identity is the ONLY edge feeding this neuron, so
-// `network_inputs[target]` right after `step_tick` returns is EXACTLY this tick's `I` value -- no
-// separate per-edge read-back machinery (e.g. WeightMatrix::get_for_matrix) is needed. The scalar
-// k^2-tree weight-matrix path is left at DEFAULT_MATRIX_INDEX's own all-ones coefficients but
-// `set_constant_weight(0.0f)`'d anyway as an explicit, harmless no-op (ticket #131 already forces
+// SpikeEngine's own step_tick sequence (engine.cpp, ported as-is from master_kernel.cpp) drains
+// network_inputs to exactly 0 before this tick's fresh synaptic dispatch writes into it (see
+// engine.cpp's own "fixed deliver-drain" comment), and alphaCurrentSynapse's `i = I` identity is the
+// ONLY edge feeding this neuron, so `network_inputs[target]` right after `step_tick` returns is
+// EXACTLY this tick's `I` value -- no separate per-edge read-back machinery (e.g.
+// WeightMatrix::get_for_matrix) is needed. The presynaptic spike itself is forced directly via
+// `SpikeEngine::force_emit("spike", 0)`, exactly on `spike_tick` -- the same real, minimal capability
+// `ModelRuntimeBuffers::emit_port_flags` used to provide before SpikeEngine folded AssembledModel in.
+// This is why the network below is built on `DummyCellWithSpikePort`, not plain `DummyCell` --
+// see that ComponentType's own doc comment (just above build_alpha_current_synapse_network_
+// specification) for a real, newly-surfaced gap this migration discovered: `force_emit` is correctly
+// scoped to a model's own REAL, declared emit ports, unlike the old `ModelRuntimeBuffers::
+// emit_port_flags` map, which `AssembledModel`'s synapse-delivery dispatch read as an arbitrary,
+// caller-supplied bag of flags independent of any cell's own declared ports.
+// The scalar k^2-tree weight-matrix path is left at DEFAULT_MATRIX_INDEX's own all-ones coefficients
+// but `set_constant_weight(0.0f)`'d anyway as an explicit, harmless no-op (ticket #131 already forces
 // this dispatch's own weight contribution to 0 whenever `model.projections` is non-empty -- see
-// master_kernel.h's own "ticket #131" doc comment -- matching exit_model_validation_tests.cpp's own
+// engine.h's own "ticket #131" doc comment -- matching exit_model_validation_tests.cpp's own
 // established convention of stating the placeholder explicitly rather than deleting the call).
 TEST(SynapseLoweringAlphaCurrentAcceptance, real_alpha_current_synapse_produces_alpha_shaped_current) {
     const String tau_attribute = "10ms";
@@ -735,10 +787,10 @@ TEST(SynapseLoweringAlphaCurrentAcceptance, real_alpha_current_synapse_produces_
     ModelSpecification model =
         build_alpha_current_synapse_network_specification(tau_attribute, ibase_attribute, weight_attribute);
     ASSERT_EQ(model.total_neuron_count, 2);
-    ASSERT_EQ(model.type_library.size(), 2u); // DummyCell + alphaCurrentSynapse
+    ASSERT_EQ(model.type_library.size(), 2u); // DummyCellWithSpikePort + alphaCurrentSynapse
     ASSERT_EQ(model.projections.size(), 1u);
 
-    Vector<IrProgram> programs;
+    spikecorec::Vector<IrProgram> programs;
     programs.reserve(model.type_library.size());
     for (const auto &entry : model.type_library) {
         if (entry.category == TypeLibraryCategory::Cell) {
@@ -749,51 +801,21 @@ TEST(SynapseLoweringAlphaCurrentAcceptance, real_alpha_current_synapse_produces_
         }
     }
 
-    ModelAllocation allocation = allocate_model(model, programs);
+    // SpikeEngine's own ModelSpecification constructor builds `engine.weights` itself (via
+    // `nml::build_weight_matrix_from_projections`, rank=1, straight from `model.projections`' single
+    // 0->1 connection -- the identical adjacency this test used to build by hand), replacing this
+    // test's own previously-separate `allocate_model`/manual-adjacency `WeightMatrix`/`AssembledModel`
+    // construction.
+    SpikeEngine engine(model, programs, dt_seconds);
+    engine.weights.set_constant_weight(0.0f); // explicit no-op -- see this test's own header comment
 
-    vector<vector<s32>> adjacency = {{1}, {}};
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(0.0f); // explicit no-op -- see this test's own header comment
-
-    AssembledModel assembled_model(model, programs);
-
-    GpuPointer<f32> network_inputs = allocate<f32>(2 * sizeof(f32));
-    memset(network_inputs.get_contents(), 0, 2 * sizeof(f32));
-    GpuPointer<s64> last_spiked = allocate<s64>(2 * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + 2, (s64)-1);
-    GpuPointer<s32> next_active_indices = allocate<s32>(2 * sizeof(s32));
-    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
-    next_active_count.get_contents()[0] = 0;
-    GpuPointer<s32> active_generation = allocate<s32>(2 * sizeof(s32));
-    std::fill(active_generation.get_contents(), active_generation.get_contents() + 2, -1);
-    GpuPointer<bool> emit_spike = allocate<bool>(2 * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, 2 * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-
-    Vector<f32> observed_current;
+    spikecorec::Vector<f32> observed_current;
     observed_current.reserve((usize)tick_count);
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        emit_spike.get_contents()[0] = (tick == spike_tick); // one presynaptic spike, exactly this tick
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
-        emit_spike.get_contents()[0] = false;
-        observed_current.push_back(network_inputs.get_contents()[1]);
+        if (tick == spike_tick) engine.force_emit("spike", 0); // one presynaptic spike, exactly this tick
+        engine.step_tick(dt_seconds, tick, tick + 1);
+        observed_current.push_back(engine.network_inputs.get_contents()[1]);
     }
-
-    deallocate(std::move(network_inputs));
-    deallocate(std::move(last_spiked));
-    deallocate(std::move(next_active_indices));
-    deallocate(std::move(next_active_count));
-    deallocate(std::move(active_generation));
-    deallocate(std::move(emit_spike));
 
     AlphaCurrentSynapseForwardEulerResult reference = run_alpha_current_synapse_forward_euler(
         tau_seconds, ibase_amperes, weight, (f64)dt_seconds, tick_count, spike_tick);

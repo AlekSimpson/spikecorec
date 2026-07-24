@@ -6,7 +6,6 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -17,11 +16,9 @@
 
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
-#include "spikecorec/nml/allocator.h"
 #include "spikecorec/nml/cell_lowering.h"
 #include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/ir.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/plasticity_wiring.h"
@@ -94,41 +91,42 @@ using namespace spikecorec::nml;
 // implementation started -- see this ticket's own coordination note -- so this is built independently
 // here, not shared) ──────────────────────────────────────────────────────────────────────────────────
 // A host-provided `spikecorec::Vector<s32>` of 0s/1s, one entry per tick, drives a DESIGNATED input neuron
-// directly: on a tick where the array holds 1, the test driver writes
-// `buffers.emit_port_flags["spike"][input_neuron_index] = true` BEFORE calling
-// `AssembledModel::step_tick` for that tick. Master-kernel.cpp's own generated `_tick` kernels only
-// ever WRITE `emit_<port>[neuron] = true` inside their own `if spiked { emit spike }` block (never an
-// unconditional `= false` -- see gpu_source.cpp's `emit_emit`), and the FIXED propagate stage is what
-// clears it back to false, immediately after consuming it (master_kernel.cpp's
-// `spikecorec_master_propagate`/`..._ring`: `if (!emit_spike[neuron_index]) return; emit_spike[...] =
-// false;`) -- so a host-side pre-set `true` survives untouched into that same tick's real propagate
-// dispatch (real k^2-tree scatter, real `last_spiked` bookkeeping, real delay-ring interaction if
-// enabled) exactly as if the neuron's OWN dynamics had spiked it, with ZERO new engine code. The
-// forced neuron's own `v`/reset cycle is untouched by this (propagate never reads/writes cell state) --
+// directly: on a tick where the array holds 1, the test driver calls
+// `engine.force_emit("spike", input_neuron_index)` BEFORE calling `SpikeEngine::step_tick` for that
+// tick. `force_emit` sets the same `emit_<port>[neuron]` flag a generated `_tick` kernel would set
+// inside its own `if spiked { emit spike }` block (never an unconditional `= false` -- see
+// gpu_source.cpp's `emit_emit`), and the FIXED propagate stage is what clears it back to false,
+// immediately after consuming it -- so a host-side forced `true` survives untouched into that same
+// tick's real propagate dispatch (real k^2-tree scatter, real `last_spiked` bookkeeping, real
+// delay-ring interaction if enabled) exactly as if the neuron's OWN dynamics had spiked it. The forced
+// neuron's own `v`/reset cycle is untouched by this (propagate never reads/writes cell state) --
 // documented and expected, matching how a real external spike-source input is a synthetic drive, not
 // itself simulated through this cell's own accumulate/threshold dynamics.
 //
 // ── Known limitations / scope boundaries a reviewer should scrutinize closely ───────────────────────
-// 1. AssembledModel's own fixed propagate stage still does not invoke a real per-edge SYNAPSE
-//    ComponentType's own `.tick`/`.deliver_<port>` dynamics (master_kernel.h's own long-documented
-//    scope boundary, unchanged since ticket #6, carried through #61/#64/#66/#67 unchanged). This
-//    file's own `SimpleStdpSynapse` ComponentType is included in every generated network purely so
-//    `find_stdp_spec` (ticket #66) can structurally detect its baked `tauPlus`/`tauMinus`/`aPlus`/
-//    `aMinus` parameter VALUES -- its own Dynamics (`g`, `OnEvent`, ...) are compiled (via
-//    `lower_synapse_to_ir`) but never dispatched by AssembledModel, exactly as documented.
+// (Originally written against the AssembledModel/ModelRuntimeBuffers driver this file used before its
+// own SpikeEngine migration -- see this file's own "SpikeEngine migration status" note further down.
+// SpikeEngine's fixed propagate stage inherits this same fixed scaffold verbatim (assembled via the
+// SAME `assemble_master_kernel_source`/`lower_synapse_ir_program_to_gpu_source` codegen either driver
+// calls), so every finding below still applies unchanged; only the driver names below were updated to
+// say `SpikeEngine` where they describe what THIS file's own tests now actually run through.)
+// 1. SpikeEngine's own fixed propagate stage still does not invoke a real per-edge SYNAPSE
+//    ComponentType's own `.tick`/`.deliver_<port>` dynamics whenever a model's real per-edge delay
+//    forces `nml_projections_` empty (engine.h's own doc comment on this precedent, ported as-is from
+//    master_kernel.h's own long-documented scope boundary, unchanged since ticket #6, carried through
+//    #61/#64/#66/#67/the SpikeEngine fold) -- true for every test below, since every generated network
+//    here configures a real per-edge delay. This file's own `SimpleStdpSynapse` ComponentType is
+//    included in every generated network purely so `find_stdp_spec` (ticket #66) can structurally
+//    detect its baked `tauPlus`/`tauMinus`/`aPlus`/`aMinus` parameter VALUES -- its own Dynamics (`g`,
+//    `OnEvent`, ...) are compiled (via `lower_synapse_to_ir`) but never dispatched, exactly as documented.
 // 2. A DEEPER, newly-surfaced architecture gap this ticket's own implementation discovered while
-//    trying to satisfy "combine real per-edge storage + delays + ACTIVE STDP together": ticket #66's
-//    own `apply_stdp_wiring` drives `SpikeEngine::enable_plasticity` -- the LEGACY, pre-NML hardcoded
-//    LIF engine (`src/core/engine.cpp`, the ONLY place `step_apply_hebbian_update` is ever actually
-//    invoked, from `step`/`step_no_active_optimization`) -- NOT `AssembledModel` (the NML-codegen
-//    master-kernel path this ticket's own custom cell/delay-ring/real-per-edge-storage all run
-//    through). Grepping `src/core/`, `src/metal/`, `src/cuda/`, and `master_kernel.cpp` confirms: the
-//    legacy engine has NO delay-ring support at all (delay_ring.h/.cpp is exclusively an
-//    AssembledModel-side subsystem), and AssembledModel has NO automatic STDP/plasticity dispatch at
-//    all (master_kernel.h's own documented "STDP/plasticity (stage 7) is not part of the fixed
-//    propagate stage" -- ticket #66's own scope was wiring the LEGACY engine, not this one). So there
-//    is currently NO single simulation driver in this codebase that runs BOTH the delay ring AND the
-//    automatic Hebbian kernel. `SimpleAccumulatorNetwork.
+//    trying to satisfy "combine real per-edge storage + delays + ACTIVE STDP together": at the time
+//    this ticket's own implementation was originally written, ticket #66's own `apply_stdp_wiring`
+//    drove `SpikeEngine::enable_plasticity` on the LEGACY, pre-NML hardcoded LIF engine only, and the
+//    separate NML-codegen master-kernel path (AssembledModel at the time, since folded into
+//    SpikeEngine itself -- see this file's own "SpikeEngine migration status" note) had NO automatic
+//    STDP/plasticity dispatch at all, and no single simulation driver in the codebase combined the
+//    delay ring with an automatic Hebbian kernel. `SimpleAccumulatorNetwork.
 //    anchor_b_combines_real_per_edge_synapse_storage_spike_delays_and_active_stdp_together` below
 //    resolves this the same way this codebase already resolves "the fixed stage doesn't do X yet" in
 //    other places (e.g. run_delayed_coupling_network's own manual ring-slot stimulus injection): it
@@ -139,12 +137,16 @@ using namespace spikecorec::nml;
 //    the same internal 0.5/1.0 constants the real kernel bakes in) from the TEST'S OWN per-tick driver
 //    loop, calling the REAL, already-implemented, standalone `WeightMatrix::update()` API
 //    (weight_matrix.h's own documented "a standalone, directly-callable rank-1 Hebbian nudge ... a
-//    manually-invokable API", NOT invented math. This is not "AssembledModel automatically running
-//    STDP" -- it is a genuine, honest, host-driven reproduction of the same real weight-changing
+//    manually-invokable API", NOT invented math). This test is deliberately kept on that same manual
+//    reproduction even now that SpikeEngine separately supports combining `enable_plasticity` with a
+//    real delay ring (verified elsewhere, e.g. glif_stdp_network_tests.cpp's own GLIF3/GLIF5 ring+STDP
+//    tests) -- switching this test's own STDP mechanism is out of scope for a re-hosting migration;
+//    this remains a genuine, honest, host-driven reproduction of the same real weight-changing
 //    machinery, clearly flagged as such rather than silently assumed to already be wired.
 // 3. "Real per-edge synapse storage" (tickets #52-54) for the SAME reason needs a deliberate choice,
-//    including a genuine, newly-surfaced finding from building this ticket: AssembledModel's own fixed
-//    propagate kernel (`spikecorec_master_propagate`/`..._ring`, master_kernel.cpp) scatters a raw
+//    including a genuine, newly-surfaced finding from building this ticket: the fixed propagate
+//    kernel (`spikecorec_master_propagate`/`..._ring`, master_kernel.cpp, reused as-is by SpikeEngine)
+//    scatters a raw
 //    `dot(U[source], V[target])` (or `constant_weight`) -- it takes no `coefficient_vectors`
 //    parameter at all, so it implicitly assumes DEFAULT_MATRIX_INDEX's own coefficient vector `Ck`
 //    stays the all-ones default forever (ticket #52's own "bit-compatible with pre-shared-basis
@@ -190,16 +192,16 @@ using namespace spikecorec::nml;
 //
 // ── SpikeEngine migration status (added when this file was migrated off AssembledModel/
 // ModelRuntimeBuffers onto SpikeEngine) ─────────────────────────────────────────────────────────────
-// The isolation test and the three CONTINUOUS-current-injection anchor tests below (anchor_a/b/c) now
-// run through SpikeEngine directly (`run_chain_network_via_spike_engine`, defined below). The
-// discrete-spike-array test (`anchor_a_50_neurons_50_ticks_discrete_spike_array_drives_input_neuron`)
-// and the combined per-edge-storage/delay/STDP test
-// (`anchor_b_combines_real_per_edge_synapse_storage_spike_delays_and_active_stdp_together`) are NOT
-// migrated: both need to force `emit_port_flags["spike"][neuron] = true` directly before a tick, and
-// SpikeEngine has no public accessor for its own private `nml_emit_port_flags_` equivalent -- a real,
-// newly-discovered gap, not something this migration papers over. See this file's own "SpikeEngine
-// migration gap" comment further down (immediately above `run_chain_network_via_spike_engine`) for
-// the full detail. Both stay on `run_chain_network`/`AssembledModel`/`ModelRuntimeBuffers`, unchanged.
+// Every test in this file now runs through SpikeEngine directly
+// (`run_chain_network_via_spike_engine`, defined below), including the discrete-spike-array test
+// (`anchor_a_50_neurons_50_ticks_discrete_spike_array_drives_input_neuron`) and the combined
+// per-edge-storage/delay/STDP test
+// (`anchor_b_combines_real_per_edge_synapse_storage_spike_delays_and_active_stdp_together`). Both of
+// those two originally stayed on `AssembledModel`/`ModelRuntimeBuffers` because SpikeEngine had no
+// public accessor for its own private `nml_emit_port_flags_` equivalent -- that real, then-newly-
+// discovered gap is now closed by `SpikeEngine::force_emit(port_name, neuron_index)` (engine.h/.cpp),
+// a minimal, scoped setter for exactly this one host-driven synthetic-spike use case (see this file's
+// own "Discrete spike-array driving mechanism" note above for the full mechanism it enables).
 
 namespace {
 
@@ -409,109 +411,18 @@ struct ChainNetworkRunResult {
     double wall_clock_seconds = 0.0;
 };
 
-// Builds and runs a feed-forward chain network end to end through the real master-kernel path
-// (AssembledModel, ticket #6, with the delay ring enabled -- ticket #64) for `tick_count` ticks.
-// `drive_tick` is invoked once per tick, BEFORE step_tick, so the caller can inject that tick's own
-// stimulus (continuous current into the ring's current slot, or a forced `emit_port_flags` write for
-// the discrete spike-array mechanism -- see this file's own header comment). Only
-// `watched_neuron_indices`' own spike-tick histories are recorded (network scale can make recording
-// EVERY neuron's full history needlessly heavy); every neuron's `v` is still checked for
-// finiteness, and `total_spike_count` tallies across the WHOLE population, every tick.
-ChainNetworkRunResult run_chain_network(
-    const String &fixture_id, s32 population_size, s64 tick_count, s64 delay_ticks, f32 constant_weight,
-    f64 spike_threshold_volts, f64 resting_potential_volts, f32 dt_seconds, const spikecorec::Vector<s32> &watched_neuron_indices,
-    const std::function<void(ModelRuntimeBuffers &, DelayRingAllocation &, s64)> &drive_tick) {
-    spikecorec::Vector<GeneratedConnection> connections =
-        build_chain_connections(population_size, (f64)constant_weight, (f64)delay_ticks * (f64)dt_seconds);
-    ModelSpecification model = load_generated_network_model(
-        fixture_id, build_network_content_xml(fixture_id, population_size, spike_threshold_volts,
-                                               resting_potential_volts, connections, /*a_minus_stdp_amplitude=*/0.0));
-
-    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ModelAllocation allocation = allocate_model(model, programs);
-
-    vector<vector<s32>> adjacency((usize)population_size);
-    for (const auto &connection : connections) {
-        adjacency[(usize)connection.source_neuron_index].push_back(connection.target_neuron_index);
-    }
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(constant_weight);
-
-    DelayRingAllocation ring = allocate_delay_ring(model, weights, dt_seconds);
-    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
-
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)population_size * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + population_size, (s64)-1);
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)population_size * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)population_size * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    buffers.delay_ring = &ring;
-
-    ChainNetworkRunResult result;
-    for (s32 neuron_index : watched_neuron_indices) result.spike_ticks_by_watched_neuron[neuron_index] = {};
-
-    auto start_time = std::chrono::steady_clock::now();
-    for (s64 tick = 0; tick < tick_count; ++tick) {
-        drive_tick(buffers, ring, tick);
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
-
-        for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-            if (!std::isfinite(allocation.cell_state.get_contents()[neuron_index])) result.all_values_finite = false;
-            if (buffers.last_spiked[neuron_index] == tick) {
-                ++result.total_spike_count;
-                auto watched = result.spike_ticks_by_watched_neuron.find(neuron_index);
-                if (watched != result.spike_ticks_by_watched_neuron.end()) watched->second.push_back(tick);
-            }
-        }
-    }
-    auto end_time = std::chrono::steady_clock::now();
-    result.wall_clock_seconds = std::chrono::duration<double>(end_time - start_time).count();
-    return result;
-}
-
-// ── SpikeEngine migration gap (found while migrating this file off AssembledModel/
-// ModelRuntimeBuffers onto SpikeEngine) ───────────────────────────────────────────────────────────
-//
-// SpikeEngine (src/core/engine.cpp) has no public accessor for its own private
-// `nml_emit_port_flags_` map -- unlike `ModelRuntimeBuffers::emit_port_flags` (a plain public
-// `UnorderedMap<String, bool*>`), there is currently no way for a caller outside SpikeEngine to force
-// `emit_<port>[neuron] = true` for a given neuron/tick before calling `step_tick`. That is exactly
-// this file's own "discrete spike-array driving mechanism" (this file's own header comment above) --
-// the ONLY way to make a neuron's own real k^2-tree propagate/scatter (and hence any downstream
-// cascade, and `apply_nml_stdp_plasticity`'s own "did the source genuinely fire, with a real
-// propagate-stage-driven last_spiked" precondition) run as though that neuron spiked externally, not
-// from its own accumulate/threshold dynamics. Manually poking `engine.last_spiked` directly does NOT
-// substitute for this: the fixed propagate stage decides whether to scatter by reading the
-// emit-port flag buffer, not `last_spiked` (engine.cpp's own step_tick), so a neuron "forced" only via
-// `last_spiked` would never actually propagate to its downstream targets.
-//
-// `SimpleAccumulatorNetwork.anchor_a_50_neurons_50_ticks_discrete_spike_array_drives_input_neuron`
-// and `SimpleAccumulatorNetwork.anchor_b_combines_real_per_edge_synapse_storage_spike_delays_and_
-// active_stdp_together` both need exactly this mechanism (the latter ALSO combines it with real,
-// distinct per-edge U/V weights and delay-ring mode, this file's own header comment #2/#3) -- so, per
-// this migration's own explicit instruction not to force a broken/hacky substitute, both are left
-// exactly as they were (still built on `run_chain_network`/`AssembledModel`/`ModelRuntimeBuffers`
-// directly below) rather than migrated. Every OTHER test in this file (the isolation test above, and
-// the three CONTINUOUS-current-injection anchor tests below) drives its network purely through
-// `network_inputs`/ring writes, which SpikeEngine's own public `network_inputs` field already
-// supports byte-for-byte the same way -- those are migrated onto the new
-// `run_chain_network_via_spike_engine` helper just below.
-
-// SpikeEngine-based counterpart to run_chain_network above, for the CONTINUOUS-current-injection
-// drive mechanism only (see this file's own "SpikeEngine migration gap" comment just above for why
-// the discrete-spike-array mechanism has its own, separate helper that stays on AssembledModel).
+// SpikeEngine-based network-run harness used by every test in this file (continuous-current-
+// injection AND the discrete-spike-array mechanism alike, since `SpikeEngine::force_emit` -- added
+// alongside this migration -- lets a caller force `emit_<port>[neuron] = true` for a given neuron
+// directly, the same real, minimal capability `ModelRuntimeBuffers::emit_port_flags` used to provide).
 // `drive_tick` receives the engine itself, the model's own ring_slot_count (computed once here via
 // delay_ring.h's own already-tested `compute_max_delay_ticks`, since SpikeEngine's own internal ring
 // size is a private field with no public accessor -- see engine.h's own doc comment on
 // nml_ring_slot_count_ for why this is exactly the same value the engine derives internally for a
-// uniform per-edge delay), and the tick -- mirrors `drive_continuous`'s own
-// `(ModelRuntimeBuffers&, DelayRingAllocation&, s64)` shape, just reading ring_slot_count/neuron_count
-// off the engine/a plain s64 instead of a separate DelayRingAllocation struct.
+// uniform per-edge delay), and the tick. Only `watched_neuron_indices`' own spike-tick histories are
+// recorded (network scale can make recording EVERY neuron's full history needlessly heavy); every
+// neuron's `v` is still checked for finiteness, and `total_spike_count` tallies across the WHOLE
+// population, every tick.
 ChainNetworkRunResult run_chain_network_via_spike_engine(
     const String &fixture_id, s32 population_size, s64 tick_count, s64 delay_ticks, f32 constant_weight,
     f64 spike_threshold_volts, f64 resting_potential_volts, f32 dt_seconds, const spikecorec::Vector<s32> &watched_neuron_indices,
@@ -714,12 +625,12 @@ TEST(SimpleAccumulatorNetwork, anchor_a_50_neurons_50_ticks_discrete_spike_array
     spikecorec::Vector<s32> watched_neuron_indices;
     for (s32 index = 0; index < population_size; ++index) watched_neuron_indices.push_back(index);
 
-    auto drive_discrete = [&input_spike_array](ModelRuntimeBuffers &buffers, DelayRingAllocation &, s64 tick) {
-        if (input_spike_array[tick] == 1) buffers.emit_port_flags.at("spike")[0] = true;
+    auto drive_discrete = [&input_spike_array](SpikeEngine &engine, s64 /*ring_slot_count*/, s64 tick) {
+        if (input_spike_array[tick] == 1) engine.force_emit("spike", 0);
     };
 
     ChainNetworkRunResult result =
-        run_chain_network("anchor_a_discrete", population_size, tick_count, delay_ticks, constant_weight,
+        run_chain_network_via_spike_engine("anchor_a_discrete", population_size, tick_count, delay_ticks, constant_weight,
                            spike_threshold_volts, resting_potential_volts, dt_seconds, watched_neuron_indices,
                            drive_discrete);
 
@@ -820,13 +731,14 @@ TEST(SimpleAccumulatorNetwork,
     EXPECT_NEAR(mapped_learning_rate, (f32)a_minus_stdp_amplitude, 1e-6f);
 
     spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ModelAllocation allocation = allocate_model(model, programs);
 
-    vector<vector<s32>> adjacency((usize)population_size);
-    for (const auto &connection : connections) {
-        adjacency[(usize)connection.source_neuron_index].push_back(connection.target_neuron_index);
-    }
-    WeightMatrix weights(adjacency, /*rank=*/-1);
+    // SpikeEngine's own ModelSpecification constructor builds `engine.weights` itself (via
+    // `nml::build_weight_matrix_from_projections`, rank=1) straight from `model.projections`'
+    // adjacency, and derives its own delay-ring sizing (`nml_ring_slot_count_`) from those same
+    // connections' real per-edge delays -- exactly replacing this test's own previously-separate
+    // `allocate_model`/manual-adjacency `WeightMatrix`/`allocate_delay_ring`/`AssembledModel`
+    // construction. `engine.weights` is still seeded directly below, same as before.
+    SpikeEngine engine(model, programs, dt_seconds);
 
     // ── real per-edge synapse storage (tickets #52-54; this file's own header comment #3) ──────────
     // Seeds each edge's own U/V rows DIRECTLY (a single float4 lane per row: U[source]=(sqrt(w),0,0,0),
@@ -835,30 +747,36 @@ TEST(SimpleAccumulatorNetwork,
     // implementation, not the originally-planned approach: `refit()` legitimately re-fits EVERY
       // registered matrix's coefficient vector Ck, INCLUDING DEFAULT_MATRIX_INDEX's (weight_matrix.h's
     // own documented behavior) -- but master_kernel.cpp's fixed propagate kernel
-    // (`spikecorec_master_propagate`/`..._ring`) was never updated to read `coefficient_vectors` at
-    // all; it hardcodes a raw `dot(U[source], V[target])`, implicitly assuming DEFAULT_MATRIX_INDEX's
-    // Ck stays the all-ones default forever. Calling `refit()` on a model ALSO driven through
-    // AssembledModel therefore silently desyncs the LIVE scattered weight from what
-    // `WeightMatrix::get()` reports (verified empirically while building this test: refit converged
-    // `get()` to within a 0.14% relative RMS error of the intended values, yet the live cascade
-    // stopped propagating past neuron 1 -- `get()`'s own Ck-aware reconstruction and the propagate
-    // kernel's Ck-unaware one had diverged). Directly setting U/V rows (each edge exclusive to its own
-    // node pair in this chain topology, so no cross-edge interference) keeps DEFAULT_MATRIX_INDEX's Ck
-    // untouched, making `get()` and the live propagate kernel compute the IDENTICAL raw dot(U,V) --
-    // and `WeightMatrix::update()` (the STDP path below) also only ever touches U[source]/V[target]
-    // directly, never Ck, so it stays consistent with this too. tests/weight_matrix_tests.cpp already
-    // exhaustively covers accumulate_edge_delta/refit correctness in isolation (e.g.
+    // (`spikecorec_master_propagate`/`..._ring`, reused as-is by SpikeEngine) was never updated to read
+    // `coefficient_vectors` at all; it hardcodes a raw `dot(U[source], V[target])`, implicitly assuming
+    // DEFAULT_MATRIX_INDEX's Ck stays the all-ones default forever. Calling `refit()` on a model driven
+    // through that same fixed propagate kernel therefore silently desyncs the LIVE scattered weight
+    // from what `WeightMatrix::get()` reports (verified empirically while building this test: refit
+    // converged `get()` to within a 0.14% relative RMS error of the intended values, yet the live
+    // cascade stopped propagating past neuron 1 -- `get()`'s own Ck-aware reconstruction and the
+    // propagate kernel's Ck-unaware one had diverged). Directly setting U/V rows (each edge exclusive
+    // to its own node pair in this chain topology, so no cross-edge interference) keeps
+    // DEFAULT_MATRIX_INDEX's Ck untouched, making `get()` and the live propagate kernel compute the
+    // IDENTICAL raw dot(U,V) -- and `WeightMatrix::update()` (the STDP path below) also only ever
+    // touches U[source]/V[target] directly, never Ck, so it stays consistent with this too. Also
+    // unaffected by `engine.weights`' own rank being 1 rather than this test's originally-hand-picked
+    // rank=-1 (64): every lane beyond lane 0 is explicitly zeroed below exactly like lane 0's own
+    // padding components are, so `dot(U,V)`/the STDP update's own per-lane L2 norm are bit-identical
+    // regardless of how many always-zero lanes exist alongside the one real one. tests/weight_matrix_
+    // tests.cpp already exhaustively covers accumulate_edge_delta/refit correctness in isolation (e.g.
     // `refit_recovers_a_known_low_rank_fixture_within_tolerance`); this file does not re-prove that,
     // and reports this refit/master-kernel interaction as a genuine, newly-surfaced gap for
     // task_master/the user to weigh -- not something this ticket's own scope owns fixing.
     for (usize edge_index = 0; edge_index < connections.size(); ++edge_index) {
         const GeneratedConnection &connection = connections[edge_index];
         f32 root = std::sqrt((f32)intended_weight[edge_index]);
-        float4 *u_row = weights.U_matrix.get_contents() + (s64)connection.source_neuron_index * weights.rank_float4_stride;
-        float4 *v_row = weights.V_matrix.get_contents() + (s64)connection.target_neuron_index * weights.rank_float4_stride;
+        float4 *u_row = engine.weights.U_matrix.get_contents() +
+                        (s64)connection.source_neuron_index * engine.weights.rank_float4_stride;
+        float4 *v_row = engine.weights.V_matrix.get_contents() +
+                        (s64)connection.target_neuron_index * engine.weights.rank_float4_stride;
         u_row[0] = float4{root, 0.0f, 0.0f, 0.0f};
         v_row[0] = float4{root, 0.0f, 0.0f, 0.0f};
-        for (s64 lane = 1; lane < weights.rank_float4_stride; ++lane) {
+        for (s64 lane = 1; lane < engine.weights.rank_float4_stride; ++lane) {
             u_row[lane] = float4{0.0f, 0.0f, 0.0f, 0.0f};
             v_row[lane] = float4{0.0f, 0.0f, 0.0f, 0.0f};
         }
@@ -867,7 +785,7 @@ TEST(SimpleAccumulatorNetwork,
     spikecorec::Vector<f32> seeded_edge_weight(connections.size());
     for (usize edge_index = 0; edge_index < connections.size(); ++edge_index) {
         const GeneratedConnection &connection = connections[edge_index];
-        f32 reconstructed = weights.get(connection.source_neuron_index, connection.target_neuron_index);
+        f32 reconstructed = engine.weights.get(connection.source_neuron_index, connection.target_neuron_index);
         seeded_edge_weight[edge_index] = reconstructed;
         EXPECT_NEAR(reconstructed, (f32)intended_weight[edge_index], 1e-3f) << "edge_index=" << edge_index;
         ASSERT_GT(reconstructed, (f32)spike_threshold_volts + 0.1f)
@@ -879,21 +797,6 @@ TEST(SimpleAccumulatorNetwork,
               << " edges seeded with real, distinct per-edge U/V weights (see this file's own header "
                  "comment #3 on why direct U/V seeding, not accumulate_edge_delta+refit, is what reaches "
                  "the live propagate kernel)\n";
-
-    DelayRingAllocation ring = allocate_delay_ring(model, weights, dt_seconds);
-    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
-
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)population_size * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + population_size, (s64)-1);
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)population_size * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)population_size * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    buffers.delay_ring = &ring;
 
     // ── discrete spike-array driving, deliberately SPARSE (this file's own header comment #4): 30
     // forced fires of neuron 0, spaced 5 ticks apart (comfortably above the largest single-edge delay
@@ -912,22 +815,23 @@ TEST(SimpleAccumulatorNetwork,
 
     auto run_start_time = std::chrono::steady_clock::now();
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        if (input_spike_array[tick] == 1) buffers.emit_port_flags.at("spike")[0] = true;
+        if (input_spike_array[tick] == 1) engine.force_emit("spike", 0);
 
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
         for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-            if (!std::isfinite(allocation.cell_state.get_contents()[neuron_index])) all_finite = false;
-            if (buffers.last_spiked[neuron_index] == tick && chain_first_fire_tick[neuron_index] == -1) {
+            if (!std::isfinite(engine.nml_allocation_.cell_state.get_contents()[neuron_index])) all_finite = false;
+            if (engine.last_spiked.get_contents()[neuron_index] == tick && chain_first_fire_tick[neuron_index] == -1) {
                 chain_first_fire_tick[neuron_index] = tick;
             }
         }
-        if (buffers.last_spiked[control_source] == tick || buffers.last_spiked[control_target] == tick) {
+        if (engine.last_spiked.get_contents()[control_source] == tick ||
+            engine.last_spiked.get_contents()[control_target] == tick) {
             ++control_pair_spike_count;
         }
 
-        total_stdp_update_calls +=
-            apply_manual_stdp_after_tick(weights, connections, buffers.last_spiked, tick, mapped_learning_rate);
+        total_stdp_update_calls += apply_manual_stdp_after_tick(
+            engine.weights, connections, engine.last_spiked.get_contents(), tick, mapped_learning_rate);
     }
     auto run_end_time = std::chrono::steady_clock::now();
     double run_wall_clock_seconds = std::chrono::duration<double>(run_end_time - run_start_time).count();
@@ -957,7 +861,7 @@ TEST(SimpleAccumulatorNetwork,
     s32 edges_with_measurable_depression = 0;
     for (usize edge_index = 0; edge_index < (usize)(chain_length - 1); ++edge_index) {
         const GeneratedConnection &connection = connections[edge_index];
-        f32 final_weight = weights.get(connection.source_neuron_index, connection.target_neuron_index);
+        f32 final_weight = engine.weights.get(connection.source_neuron_index, connection.target_neuron_index);
         EXPECT_LE(final_weight, seeded_edge_weight[edge_index] + 1e-6f) << "edge_index=" << edge_index;
         if (seeded_edge_weight[edge_index] - final_weight > 1e-4f) ++edges_with_measurable_depression;
     }
@@ -966,7 +870,7 @@ TEST(SimpleAccumulatorNetwork,
 
     // Specificity: the isolated control edge never fires, so it never receives a single
     // WeightMatrix::update() call -- its weight must be untouched.
-    f32 control_final_weight = weights.get(control_source, control_target);
+    f32 control_final_weight = engine.weights.get(control_source, control_target);
     EXPECT_NEAR(control_final_weight, seeded_edge_weight.back(), 1e-6f);
 }
 

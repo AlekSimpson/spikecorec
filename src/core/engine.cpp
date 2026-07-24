@@ -1072,6 +1072,28 @@ void SpikeEngine::step_tick(f32 dt, s64 tick, s64 next_tick) {
     apply_nml_stdp_plasticity(tick);
 }
 
+void SpikeEngine::force_emit(const String &port_name, s64 neuron_index) {
+    if (!nml_mode_enabled_) {
+        log::throw_runtime_error(*logger,
+            "SpikeEngine::force_emit: this engine was not constructed via the NML ModelSpecification "
+            "constructor");
+    }
+
+    auto found = nml_emit_port_flags_.find(port_name);
+    if (found == nml_emit_port_flags_.end()) {
+        log::throw_runtime_error(*logger,
+            "SpikeEngine::force_emit: '" + port_name + "' is not a known emit port for this model");
+    }
+
+    if (neuron_index < 0 || neuron_index >= neuron_count) {
+        log::throw_runtime_error(*logger,
+            "SpikeEngine::force_emit: neuron_index " + std::to_string(neuron_index) +
+            " is out of range for neuron_count=" + std::to_string(neuron_count));
+    }
+
+    found->second.get_contents()[neuron_index] = true;
+}
+
 // ── Stage 2 of folding nml::AssembledModel into SpikeEngine: real per-edge synapse dispatch (ticket
 // #131) -- ported from nml::AssembledModel's own (anonymous-namespace) append_synapse_edge_argument/
 // ensure_synapse_dispatch_topology_built/dispatch_synapse_integrate_edges/
