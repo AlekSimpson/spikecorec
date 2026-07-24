@@ -664,7 +664,8 @@ Tickets #2/#3/#7/#8 and the first slice of #4/#5 are all **Phase 1** work (pipel
 rest of #4/#5 grow across Phases 2–3 as the feature surface widens (see §5 for the sequencing).
 
 - **#2 Parser** — XML → tree; process `<include>`; emit the pre-lowering model. *(Phase 1.)*
-- **#3 Std lib** — vendor `NeuroML2CoreTypes/`; merge at resolve. *(Phase 1.)*
+- **#3 Std lib** — vendor `NeuroML2CoreTypes/`; merge at resolve. Version pin recorded in
+  `third_party/neuroml2/VERSION.md` (NeuroML schema v2.3, LEMS schema v0.7.6). *(Phase 1.)*
 - **#8 XSD validator** — structural gate before resolve. *(Phase 1.)*
 - **#7 `ModelSpecification`** — the flat lowered tables (cell/synapse types with dynamics trees,
   populations + boundaries, adjacency + weights, inputs, outputs). *(Phase 1 minimal; extended per phase.)*
