@@ -1596,28 +1596,45 @@ TEST(WeightMatrix, refit_occupancy_threshold_triggers_early_when_enabled) {
 // just once.
 //
 // ── Why a real GLIF network, and why manual accumulate_edge_delta on top of it ──
-// A live AssembledModel tick loop never itself writes to DEFAULT_MATRIX_INDEX's own Sk (STDP's own
-// WeightMatrix::update() nudges U/V directly, not any Ck/Sk; real per-edge synapse dynamics register
-// and mutate a SEPARATE matrix, never DEFAULT_MATRIX_INDEX -- see master_kernel.h's own header
-// comment on ticket #131). So this test drives realistic, continuously-varying per-edge drift onto
-// DEFAULT_MATRIX_INDEX (and a second registered matrix -- ticket #103's own reproduction required
-// refit()'s full multi-matrix Ck sweep to actually run, not a single-matrix shortcut) via deterministic
-// accumulate_edge_delta bumps every tick, while a REAL, compiled GLIF3 population (driven by a real
-// continuous current injection, so it genuinely spikes and scatters through this SAME WeightMatrix's
-// own propagate path too) runs its own step_tick loop concurrently against the exact same WeightMatrix
-// instance -- proving periodic refit and a live GLIF simulation can safely share one WeightMatrix
-// without desyncing.
+// Nothing this test's own dispatch drives ever writes to DEFAULT_MATRIX_INDEX's own Sk on its own
+// (STDP's own WeightMatrix::update() nudges U/V directly, not any Ck/Sk; a real per-edge synapse
+// dispatch, ticket #131, would register and mutate a SEPARATE matrix, never DEFAULT_MATRIX_INDEX --
+// see master_kernel.h's own header comment -- but this test's own manual dispatch below never wires
+// that up at all, see the next paragraph). So this test drives realistic, continuously-varying
+// per-edge drift onto DEFAULT_MATRIX_INDEX (and a second registered matrix -- ticket #103's own
+// reproduction required refit()'s full multi-matrix Ck sweep to actually run, not a single-matrix
+// shortcut) via deterministic accumulate_edge_delta bumps every tick, while a REAL, compiled GLIF3
+// population (driven by a real continuous current injection, so it genuinely spikes and scatters
+// through this SAME WeightMatrix's own propagate path too) runs concurrently against the exact same
+// WeightMatrix instance -- proving periodic refit and a live GLIF simulation can safely share one
+// WeightMatrix without desyncing.
+//
+// ── Manual master-kernel dispatch, not AssembledModel ──
+// nml::AssembledModel (the class this test used to build both the real GLIF3 network and the probe
+// below on top of) is being folded into SpikeEngine and deleted outright; this test instead drives
+// both directly off the stateless free functions AssembledModel itself is built on top of
+// (assemble_master_kernel_source/compile_kernel_or_throw_with_source, master_kernel.h) plus a small,
+// test-local mirror of AssembledModel's own per-tick dispatch loop (this file's own
+// refit_soak_dispatch_one_tick and its helpers, in the anonymous namespace above -- a direct port of
+// master_kernel.cpp's file-local DispatchArgumentBuilder/append_cell_tick_argument/
+// launch_config_for). That manual dispatch never wires up ticket #131's real per-edge synapse
+// dispatch (AssembledModel-private machinery, not exposed as a free function) -- the real GLIF3
+// population's own scatter above therefore goes through the propagate kernel's real dot(U,V)
+// reconstruction against DEFAULT_MATRIX_INDEX directly, rather than through a separate per-edge
+// synapse matrix the way the AssembledModel-mediated version of this test used to (an accidental
+// side effect of this fixture's own NML projection/synapse, never itself exercised by either
+// invariant check below).
 //
 // ── The consistency check itself ──
 // Immediately after every refit() call, every matrix's Sk is guaranteed cleared (refit()'s own
 // documented contract), so WeightMatrix::get()'s reconstruction reduces to the pure
 // Σ U[i,r]·Ck[r]·V[j,r] the live propagate kernel also computes -- the exact moment a
-// Ck[DEFAULT_MATRIX_INDEX] desync becomes observable. A tiny "AlwaysSpikeCell" probe AssembledModel
-// (mirroring master_kernel_tests.cpp's own regression test exactly) sharing the SAME WeightMatrix
-// instance is dispatched at each checkpoint -- every neuron spikes unconditionally, so one dispatch
-// exercises the propagate kernel's real dot(U,V) scatter across every real edge in the network at
-// once -- and its network_inputs output is compared against WeightMatrix::get()'s own reconstruction
-// for every real edge.
+// Ck[DEFAULT_MATRIX_INDEX] desync becomes observable. A tiny "AlwaysSpikeCell" probe (compiled and
+// dispatched the same manual way, mirroring master_kernel_tests.cpp's own regression test's
+// mechanics) sharing the SAME WeightMatrix instance is dispatched at each checkpoint -- every neuron
+// spikes unconditionally, so one dispatch exercises the propagate kernel's real dot(U,V) scatter
+// across every real edge in the network at once -- and its network_inputs output is compared against
+// WeightMatrix::get()'s own reconstruction for every real edge.
 
 namespace {
 using namespace spikecorec::nml;
@@ -1706,6 +1723,217 @@ bool refit_soak_all_finite(const ModelAllocation &allocation) {
     return true;
 }
 
+// ── manual master-kernel dispatch (replacing AssembledModel, which is being retired -- see this
+// test's own header comment above) -- a direct, test-local mirror of AssembledModel's OWN private
+// dispatch mechanics (src/nml/master_kernel.cpp's file-local DispatchArgumentBuilder/
+// append_cell_tick_argument/launch_config_for/source_text_for_this_backend, plus step_tick's own
+// flat -- no delay ring, no ticket #131 real-per-edge-synapse-projection dispatch, neither of
+// which either fixture here uses -- dispatch order), built entirely on the stateless free
+// functions that stay after AssembledModel's own deletion (assemble_master_kernel_source,
+// compile_kernel_or_throw_with_source) plus the generic backend dispatch primitive
+// (metal_dispatch/cuda_dispatch). Because this test's own manual dispatch never wires up ticket
+// #131's synapse machinery, the propagate stage's constant_weight/using_constant_weight are read
+// straight off the live `weights` instance (real dot(U,V) reconstruction against
+// DEFAULT_MATRIX_INDEX) rather than forced to zero -- matching this test's own header comment
+// above ("scatters through this SAME WeightMatrix's own propagate path too") more directly than
+// the AssembledModel-mediated version this replaces (which, because its GLIF3 network's model
+// happened to carry a real projection/synapse, actually routed that network's own weight
+// contribution through ticket #131's per-edge synapse dispatch instead -- a real per-edge synapse
+// matrix registered on the shared instance, but never itself exercised by either of this test's
+// own two invariant checks below, both of which only ever depend on the probe's dispatch and
+// DEFAULT_MATRIX_INDEX/matrix_b).
+
+const String &refit_soak_source_text_for_this_backend(const GpuSource &source) {
+#ifdef SPIKECOREC_CUDA
+    return source.cuda_source;
+#else
+    return source.msl_source;
+#endif
+}
+
+class RefitSoakDispatchArgumentBuilder {
+public:
+    void add_pointer(const void *pointer) { add_bytes(&pointer, sizeof(void *)); }
+    void add_f32(f32 value) { add_bytes(&value, sizeof(f32)); }
+    void add_s64(s64 value) { add_bytes(&value, sizeof(s64)); }
+    void add_s32(s32 value) { add_bytes(&value, sizeof(s32)); }
+
+    void dispatch(KernelHandle handle, LaunchConfig config) const {
+        vector<const void *> args(slots_.size());
+        vector<usize> sizes(slots_.size());
+        for (usize index = 0; index < slots_.size(); ++index) {
+            args[index] = slots_[index].data();
+            sizes[index] = slots_[index].size();
+        }
+#ifdef SPIKECOREC_METAL
+        metal_dispatch(handle, config, args.data(), sizes.data(), (u32)slots_.size());
+#elif defined(SPIKECOREC_CUDA)
+        cuda_dispatch(handle, config, args.data(), sizes.data(), (u32)slots_.size());
+#endif
+    }
+
+private:
+    void add_bytes(const void *value, usize size) {
+        vector<u8> storage(size);
+        std::memcpy(storage.data(), value, size);
+        slots_.push_back(std::move(storage));
+    }
+
+    vector<vector<u8>> slots_;
+};
+
+LaunchConfig refit_soak_launch_config_for(s64 element_count) {
+    constexpr u32 threads_per_block = 256;
+    if (element_count <= 0) return LaunchConfig{0, threads_per_block};
+    u32 grid = (u32)((element_count + threads_per_block - 1) / threads_per_block);
+    return LaunchConfig{grid, threads_per_block};
+}
+
+s32 refit_soak_state_variable_offset(const IrProgram &program, const String &state_name) {
+    s32 offset = 0;
+    for (const auto &directive : program.alloc) {
+        if (const auto *state = std::get_if<StateDirective>(&directive)) {
+            if (state->name == state_name) return offset;
+            ++offset;
+        }
+    }
+    throw std::runtime_error("refit_soak: '" + state_name + "' is not a StateDirective of program '" +
+                              program.component_type_name + "'");
+}
+
+// Mirrors master_kernel.cpp's own file-local append_cell_tick_argument exactly, minus the
+// synapse-dispatch-only parameter kinds (ticket #131) neither fixture below references.
+void refit_soak_append_cell_tick_argument(RefitSoakDispatchArgumentBuilder &builder, const String &parameter_name,
+                                           const IrProgram &program, s32 type_library_index, s32 neuron_index_begin,
+                                           s32 population_size, s64 cell_state_chunk_base_offset,
+                                           ModelAllocation &allocation, f32 dt, s64 tick, f32 *network_inputs,
+                                           bool *emit_spike_flags) {
+    if (parameter_name == "dt") { builder.add_f32(dt); return; }
+    if (parameter_name == "tick") { builder.add_s64(tick); return; }
+    if (parameter_name == "network_inputs") { builder.add_pointer(network_inputs + neuron_index_begin); return; }
+    if (parameter_name == "neuron_count") { builder.add_s64((s64)population_size); return; }
+    if (parameter_name == "emit_spike") { builder.add_pointer(emit_spike_flags + neuron_index_begin); return; }
+
+    for (const auto &directive : program.alloc) {
+        if (const auto *state = std::get_if<StateDirective>(&directive)) {
+            if (state->name != parameter_name) continue;
+            s32 offset_within_type = refit_soak_state_variable_offset(program, parameter_name);
+            f32 *base = allocation.cell_state.get_contents() + cell_state_chunk_base_offset +
+                        (s64)offset_within_type * population_size;
+            builder.add_pointer(base);
+            return;
+        }
+        if (const auto *accum = std::get_if<AccumDirective>(&directive)) {
+            if (accum->name != parameter_name) continue;
+            auto found = allocation.accumulators.find(type_scoped_key(type_library_index, parameter_name));
+            if (found == allocation.accumulators.end()) {
+                throw std::runtime_error("refit_soak: accum '" + parameter_name + "' has no allocated buffer");
+            }
+            builder.add_pointer(found->second.get_contents() + neuron_index_begin);
+            return;
+        }
+        if (const auto *param_dynamic = std::get_if<ParamDynamicDirective>(&directive)) {
+            if (param_dynamic->name != parameter_name) continue;
+            auto found = allocation.dynamic_parameter_arrays.find(type_scoped_key(type_library_index, parameter_name));
+            if (found == allocation.dynamic_parameter_arrays.end()) {
+                throw std::runtime_error("refit_soak: param:dyn '" + parameter_name + "' has no allocated buffer");
+            }
+            builder.add_pointer(found->second.get_contents() + neuron_index_begin);
+            return;
+        }
+        if (const auto *regime = std::get_if<RegimeDirective>(&directive)) {
+            if (regime->name != parameter_name) continue;
+            if (!allocation.has_regime_index) {
+                throw std::runtime_error("refit_soak: regime '" + parameter_name + "' has no allocated regime_indices buffer");
+            }
+            builder.add_pointer(allocation.regime_indices.get_contents() + neuron_index_begin);
+            return;
+        }
+        if (const auto *expose = std::get_if<ExposeDirective>(&directive)) {
+            if (expose->name != parameter_name) continue;
+            auto found = allocation.derived_exposure_scratch_buffers.find(type_scoped_key(type_library_index, parameter_name));
+            if (found == allocation.derived_exposure_scratch_buffers.end()) {
+                throw std::runtime_error("refit_soak: expose '" + parameter_name + "' has no derived-exposure-scratch buffer");
+            }
+            builder.add_pointer(found->second.get_contents() + neuron_index_begin);
+            return;
+        }
+        if (const auto *require = std::get_if<RequireDirective>(&directive)) {
+            if (require->name != parameter_name) continue;
+            throw std::runtime_error("refit_soak: cell-type kernel parameter '" + parameter_name +
+                                      "' resolves to a `require` binding -- not supported by this test's dispatch");
+        }
+        if (const auto *param_constant = std::get_if<ParamConstantDirective>(&directive)) {
+            if (param_constant->name != parameter_name) continue;
+            throw std::runtime_error("refit_soak: cell-type kernel parameter '" + parameter_name +
+                                      "' is an un-baked (bare) `param` -- not supported by this test's dispatch");
+        }
+    }
+
+    throw std::runtime_error("refit_soak: cell-type kernel parameter '" + parameter_name +
+                              "' is not a recognized reserved name, .alloc name, or emit port for this test's dispatch");
+}
+
+// Mirrors AssembledModel::step_tick's own flat dispatch order exactly: one population's own
+// compiled per-neuron kernel (stages 2-5) -> the fixed deliver-drain kernel -> the active-set
+// enqueue-counter reset -> the fixed k^2-tree propagate/scatter kernel (stage 6/9).
+void refit_soak_dispatch_one_tick(KernelHandle population_kernel, const Vector<String> &population_parameter_names,
+                                   const IrProgram &population_program, s32 type_library_index,
+                                   s32 neuron_index_begin, s32 population_size, s64 cell_state_chunk_base_offset,
+                                   ModelAllocation &allocation, f32 dt, s64 tick, s64 next_tick, f32 *network_inputs,
+                                   bool *emit_spike_flags, KernelHandle drain_kernel, KernelHandle propagate_kernel,
+                                   WeightMatrix &weights, s64 total_neuron_count, s64 *last_spiked,
+                                   s32 *next_active_neuron_indices, s32 *next_active_neuron_count,
+                                   s32 *active_generation) {
+    {
+        RefitSoakDispatchArgumentBuilder builder;
+        for (const String &parameter_name : population_parameter_names) {
+            refit_soak_append_cell_tick_argument(builder, parameter_name, population_program, type_library_index,
+                                                  neuron_index_begin, population_size, cell_state_chunk_base_offset,
+                                                  allocation, dt, tick, network_inputs, emit_spike_flags);
+        }
+        builder.dispatch(population_kernel, refit_soak_launch_config_for(population_size));
+    }
+
+    {
+        RefitSoakDispatchArgumentBuilder builder;
+        builder.add_pointer(network_inputs);
+        builder.add_s64(total_neuron_count);
+        builder.dispatch(drain_kernel, refit_soak_launch_config_for(total_neuron_count));
+    }
+
+    *next_active_neuron_count = 0;
+
+    {
+        RefitSoakDispatchArgumentBuilder builder;
+        builder.add_s64(tick);
+        builder.add_s64(next_tick);
+        builder.add_pointer(weights.U_matrix.get_contents());
+        builder.add_pointer(weights.V_matrix.get_contents());
+        builder.add_s64(weights.rank_float4_stride);
+        builder.add_f32(weights.constant_weight);
+        builder.add_s32(weights.using_constant_weight ? 1 : 0);
+        builder.add_pointer(weights.k2tree.internal_node_words.get_contents());
+        builder.add_pointer(weights.k2tree.leaf_node_words.get_contents());
+        builder.add_pointer(weights.k2tree.rank_superblock_table.get_contents());
+        builder.add_pointer(weights.k2tree.rank_subblock_table.get_contents());
+        builder.add_s32(weights.k2tree.branching_factor);
+        builder.add_s32(weights.k2tree.superblock_size_words);
+        builder.add_s32(weights.k2tree.padded_node_count);
+        builder.add_s32(weights.k2tree.tree_height);
+        builder.add_s32(weights.k2tree.internal_bit_count);
+        builder.add_s64(total_neuron_count);
+        builder.add_s64(weights.max_neighbor_count);
+        builder.add_pointer(network_inputs);
+        builder.add_pointer(last_spiked);
+        builder.add_pointer(next_active_neuron_indices);
+        builder.add_pointer(next_active_neuron_count);
+        builder.add_pointer(active_generation);
+        builder.add_pointer(emit_spike_flags);
+        builder.dispatch(propagate_kernel, refit_soak_launch_config_for(total_neuron_count));
+    }
+}
+
 } // namespace
 
 TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kernel_across_many_refit_cycles) {
@@ -1754,7 +1982,23 @@ TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kerne
     spikecorec::Vector<IrProgram> programs = refit_soak_build_type_library_ir_programs(model);
     ModelAllocation allocation = allocate_model(model, programs);
     refit_soak_seed_glif3_initial_v(allocation, model);
-    AssembledModel assembled_model(model, programs);
+
+    // Manual master-kernel assembly + compile, replacing AssembledModel's own constructor (see
+    // this test file's own "manual master-kernel dispatch" header comment above).
+    AssembledMasterKernelSource assembled = assemble_master_kernel_source(model, programs);
+    ASSERT_EQ(assembled.population_gpu_sources.size(), 1u);
+    ASSERT_FALSE(assembled.population_gpu_sources[0].functions.empty());
+    const GpuFunctionSignature &glif3_signature = assembled.population_gpu_sources[0].functions.at(0);
+    KernelHandle glif3_kernel_handle = compile_kernel_or_throw_with_source(
+        refit_soak_source_text_for_this_backend(assembled.population_gpu_sources[0]), glif3_signature.function_name,
+        "population 'Pop3' (GLIF3)", print_ir_program(programs[(usize)model.populations[0].type_library_index]));
+    KernelHandle drain_kernel_handle = compile_kernel_or_throw_with_source(
+        refit_soak_source_text_for_this_backend(assembled.drain_network_inputs_source),
+        assembled.drain_network_inputs_source.functions.at(0).function_name,
+        "the engine-fixed deliver-drain kernel", "");
+    KernelHandle propagate_kernel_handle = compile_kernel_or_throw_with_source(
+        refit_soak_source_text_for_this_backend(assembled.propagate_source),
+        assembled.propagate_source.functions.at(0).function_name, "the engine-fixed propagate kernel", "");
 
     vector<vector<s32>> adjacency = refit_soak_adjacency_from_model(model);
     WeightMatrix weight_matrix(adjacency, rank, /*check_indexing=*/true, /*max_neighbor_count=*/-1,
@@ -1778,16 +2022,6 @@ TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kerne
     std::fill(active_generation.get_contents(), active_generation.get_contents() + neuron_count, -1);
     GpuPointer<bool> emit_spike = allocate<bool>((usize)neuron_count * sizeof(bool));
     memset(emit_spike.get_contents(), 0, (usize)neuron_count * sizeof(bool));
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weight_matrix;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
 
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt_seconds);
     const s32 driven_neuron_index = 0; // Pop3/0 -- the only population, so global index == local index
@@ -1820,7 +2054,17 @@ TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kerne
     spikecorec::Vector<IrProgram> probe_programs = {probe_program};
 
     ModelAllocation probe_allocation = allocate_model(probe_model, probe_programs);
-    AssembledModel probe_assembled_model(probe_model, probe_programs);
+
+    // Manual master-kernel assembly + compile for the probe (reusing the SAME already-compiled
+    // drain_kernel_handle/propagate_kernel_handle above -- both are generic over the pointers
+    // passed to them, so one compile of each suffices for both this probe and the real network).
+    AssembledMasterKernelSource probe_assembled = assemble_master_kernel_source(probe_model, probe_programs);
+    ASSERT_EQ(probe_assembled.population_gpu_sources.size(), 1u);
+    ASSERT_FALSE(probe_assembled.population_gpu_sources[0].functions.empty());
+    const GpuFunctionSignature &probe_signature = probe_assembled.population_gpu_sources[0].functions.at(0);
+    KernelHandle probe_kernel_handle = compile_kernel_or_throw_with_source(
+        refit_soak_source_text_for_this_backend(probe_assembled.population_gpu_sources[0]),
+        probe_signature.function_name, "population 'ProbePop' (AlwaysSpikeCell)", print_ir_program(probe_program));
 
     GpuPointer<f32> probe_network_inputs = allocate<f32>((usize)neuron_count * sizeof(f32));
     memset(probe_network_inputs.get_contents(), 0, (usize)neuron_count * sizeof(f32));
@@ -1834,27 +2078,26 @@ TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kerne
     GpuPointer<bool> probe_emit_spike = allocate<bool>((usize)neuron_count * sizeof(bool));
     memset(probe_emit_spike.get_contents(), 0, (usize)neuron_count * sizeof(bool));
 
-    ModelRuntimeBuffers probe_buffers;
-    probe_buffers.allocation = &probe_allocation;
-    probe_buffers.weights = &weight_matrix; // the SAME live WeightMatrix under soak
-    probe_buffers.network_inputs = probe_network_inputs.get_contents();
-    probe_buffers.last_spiked = probe_last_spiked.get_contents();
-    probe_buffers.next_active_neuron_indices = probe_next_active_indices.get_contents();
-    probe_buffers.next_active_neuron_count = probe_next_active_count.get_contents();
-    probe_buffers.active_generation = probe_active_generation.get_contents();
-    probe_buffers.emit_port_flags["spike"] = probe_emit_spike.get_contents();
     s64 probe_tick_counter = 0;
 
     s64 refit_cycle_count = 0;
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        buffers.network_inputs[driven_neuron_index] += (f32)schedule.current_at(driven_neuron_index, tick);
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
+        network_inputs.get_contents()[driven_neuron_index] += (f32)schedule.current_at(driven_neuron_index, tick);
+        refit_soak_dispatch_one_tick(
+            glif3_kernel_handle, glif3_signature.parameter_names_in_order,
+            programs[(usize)model.populations[0].type_library_index], model.populations[0].type_library_index,
+            model.populations[0].neuron_index_begin, model.populations[0].size,
+            allocation.cell_type_boundaries.get_contents()[0], allocation, dt_seconds, tick, tick + 1,
+            network_inputs.get_contents(), emit_spike.get_contents(), drain_kernel_handle, propagate_kernel_handle,
+            weight_matrix, neuron_count, last_spiked.get_contents(), next_active_indices.get_contents(),
+            next_active_count.get_contents(), active_generation.get_contents());
         ASSERT_TRUE(refit_soak_all_finite(allocation)) << "tick=" << tick;
 
         // Deterministic, continuously-varying per-edge drift on BOTH DEFAULT_MATRIX_INDEX and
-        // matrix_b -- no live AssembledModel path writes to DEFAULT_MATRIX_INDEX's own Sk (see this
-        // test's own header comment), so this stands in for the ongoing per-edge weight updates
+        // matrix_b -- nothing this test's own dispatch drives writes to DEFAULT_MATRIX_INDEX's own
+        // Sk on its own (see this test's own header comment), so this stands in for the ongoing
+        // per-edge weight updates
         // periodic refit exists to compact.
         for (s32 source_node = 0; source_node < neuron_count; ++source_node) {
             for (s32 target_node : adjacency[(usize)source_node]) {
@@ -1885,7 +2128,14 @@ TEST(WeightMatrix, refit_default_matrix_stays_synced_with_a_real_propagate_kerne
         // ── invariant 2: WeightMatrix::get() reconstruction stays synced with a REAL propagate-kernel
         // dispatch (reproduces 8eacd1d's own regression check, re-run at every cycle) ──
         memset(probe_network_inputs.get_contents(), 0, (usize)neuron_count * sizeof(f32));
-        probe_assembled_model.step_tick(probe_buffers, /*dt=*/1.0f, probe_tick_counter, probe_tick_counter + 1);
+        refit_soak_dispatch_one_tick(probe_kernel_handle, probe_signature.parameter_names_in_order, probe_program,
+                                      /*type_library_index=*/0, /*neuron_index_begin=*/0, neuron_count,
+                                      probe_allocation.cell_type_boundaries.get_contents()[0], probe_allocation,
+                                      /*dt=*/1.0f, probe_tick_counter, probe_tick_counter + 1,
+                                      probe_network_inputs.get_contents(), probe_emit_spike.get_contents(),
+                                      drain_kernel_handle, propagate_kernel_handle, weight_matrix, neuron_count,
+                                      probe_last_spiked.get_contents(), probe_next_active_indices.get_contents(),
+                                      probe_next_active_count.get_contents(), probe_active_generation.get_contents());
         ++probe_tick_counter;
 
         vector<f32> expected_network_inputs((usize)neuron_count, 0.0f);
