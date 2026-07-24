@@ -142,10 +142,14 @@ struct ProjectionEntry {
     Vector<ConnectionEntry> connections;
 };
 
-// Input (stimulus) spec (arch §1.4, §3.3 D4) — one `explicitInput`: which
-// input component instance drives which target neuron. Phase 1
-// host-precomputes generator output (arch §5); this table is what a later
-// INIT stage reads to do that.
+// Input (stimulus) spec (arch §1.4, §3.3 D4) — one `explicitInput`, or one
+// `<input>` child of an `<inputList>` (the population-scale idiom real
+// NeuroML networks use instead of hand-writing one `explicitInput` per
+// neuron; every `<input>` under the same `<inputList>` shares its one
+// `component` IDref, so their StimulusEntry rows share one
+// `input_type_library_index`): which input component instance drives which
+// target neuron. Phase 1 host-precomputes generator output (arch §5); this
+// table is what a later INIT stage reads to do that.
 struct StimulusEntry {
     s32 target_neuron_index = -1;
     s32 input_type_library_index = -1;
@@ -199,8 +203,8 @@ struct ModelSpecification {
 // Builds the ModelSpecification from a resolved model (ticket #49 [A4]'s
 // output). `weight_matrix_rank` is forwarded to the WeightMatrix constructor
 // (-1 -> its own default). Throws std::runtime_error if a
-// population/projection/explicitInput references something resolve should
-// have already guaranteed exists (a malformed ResolvedModel).
+// population/projection/explicitInput/inputList references something
+// resolve should have already guaranteed exists (a malformed ResolvedModel).
 ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 weight_matrix_rank = -1);
 
 // Builds the exact-edge-set WeightMatrix (arch §0.3) from every projection's connections -- the

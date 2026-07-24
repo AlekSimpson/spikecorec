@@ -88,18 +88,21 @@ using namespace spikecorec::nml;
 //    membrane_potentials" rule describes the ORIGINAL hardcoded engine's own
 //    mechanism specifically, not a constraint on how this validation harness
 //    drives a real NML cell's `network_inputs` read).
-// 2. The GLIF E/I network's `<inputList>`/`<input>` stimulus (needed --
-//    see glif_ei_network.nml's own header comment -- because jLEMS cannot
-//    resolve `explicitInput`'s indexed target against a `populationList`
-//    population) is NOT a tag spikecorec's own front-end recognizes today
-//    (only `explicitInput` is, model_specification.cpp's own
-//    `collect_by_tag(..., {"explicitInput"}, ...)`) -- so `model.stimuli` is
-//    empty for this fixture, and this file's own network driver
-//    reconstructs the identical stimulus window by hand from the .nml's own
+// 2. UPDATE (ticket SC-149): the GLIF E/I network's `<inputList>`/`<input>`
+//    stimulus (needed -- see glif_ei_network.nml's own header comment --
+//    because jLEMS cannot resolve `explicitInput`'s indexed target against a
+//    `populationList` population) was NOT a tag spikecorec's own front-end
+//    recognized (only `explicitInput` was, model_specification.cpp's own
+//    `collect_by_tag(..., {"explicitInput"}, ...)`), so `model.stimuli` used
+//    to come back empty for this fixture and this file's own network driver
+//    reconstructed the identical stimulus window by hand from the .nml's own
 //    literal `pulseGenerator` attributes instead of via
-//    `build_stimulus_schedule`. Adding `inputList`/`input` parsing is a
-//    front-end (ticket #2/#49-territory) feature, out of this validation
-//    ticket's own scope.
+//    `build_stimulus_schedule`. `inputList`/`input` parsing/resolution/
+//    lowering is now implemented (model_specification.cpp's own
+//    `collect_by_tag(..., {"inputList"}, ...)` block, one StimulusEntry per
+//    `<input>` child, sharing the inputList's one `component` type-library
+//    entry) -- `run_glif_ei_network` below now drives its stimulus through
+//    the real `build_stimulus_schedule`, no manual reconstruction left.
 // 3. AssembledModel's fixed propagate stage (ticket #6) scatters spikes via
 //    the k^2-tree/WeightMatrix path (arch's "one shared U/V basis"), NOT by
 //    invoking a projection's actual SYNAPSE ComponentType's own per-edge
@@ -188,10 +191,13 @@ ModelSpecification load_model_from_nml_fixture(const String &fixture_base_name) 
 }
 
 // Parallel to model.type_library, one IrProgram per entry -- same convention
-// allocator_tests.cpp's own build_type_library_ir_programs uses (an Inputs
-// entry would get an empty placeholder, but neither fixture in this file
-// produces one -- see this file's own header comment on why `inputList`
-// leaves no TypeLibraryEntry behind at all).
+// allocator_tests.cpp's own build_type_library_ir_programs uses. Every
+// fixture in this file has at least one Inputs entry (its own pulseGenerator,
+// bound via `explicitInput` or `inputList`/`input` -- ticket SC-149), which
+// gets an empty placeholder here (Phase 1 host-precomputes pulseGenerator
+// rather than lowering it to IR, arch §3.3 D4/§5) -- allocate_model handles
+// an empty-`.alloc` placeholder entry as a no-op (see its own per-type-library
+// walk).
 spikecorec::Vector<IrProgram> build_type_library_ir_programs(const ModelSpecification &model) {
     spikecorec::Vector<IrProgram> programs;
     programs.reserve(model.type_library.size());
@@ -311,15 +317,12 @@ NetworkRunResult run_glif_ei_network(s64 tick_count, f32 dt_seconds) {
     // here" convention, previously documented at this file's own header comment (#3).
     engine.weights.set_constant_weight(0.0f);
 
-    // Manual stimulus reconstruction (see this file's own header comment
-    // #2): the fixture's own <pulseGenerator id="pulseGen1" delay="10ms"
-    // duration="200ms" amplitude="0.5nA"/>, applied to ExcPop's neuron 0
-    // (global neuron index 0, since ExcPop is declared first).
-    const f64 seconds_per_tick = (f64)dt_seconds;
-    const s64 delay_ticks = (s64)std::round(0.010 / seconds_per_tick);
-    const s64 duration_ticks = (s64)std::round(0.200 / seconds_per_tick);
-    const f32 amplitude_amperes = 0.5e-9f;
-    const s32 stimulus_target_neuron_index = 0;
+    // Real stimulus schedule (ticket SC-149: the fixture's own <inputList
+    // component="pulseGen1" population="ExcPop"><input target="../ExcPop/0/
+    // .../"/></inputList> now lowers to a real StimulusEntry -- see this
+    // file's own header comment #2 above, previously a manual reconstruction
+    // here because the front-end did not recognize `<inputList>`/`<input>`).
+    StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt_seconds);
 
     NetworkRunResult result;
     result.membrane_traces.resize((usize)model.total_neuron_count);
@@ -327,8 +330,9 @@ NetworkRunResult run_glif_ei_network(s64 tick_count, f32 dt_seconds) {
     for (auto &trace : result.membrane_traces) trace.reserve((usize)tick_count);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        if (tick >= delay_ticks && tick < delay_ticks + duration_ticks) {
-            engine.network_inputs.get_contents()[stimulus_target_neuron_index] += amplitude_amperes;
+        for (const auto &stimulus : model.stimuli) {
+            engine.network_inputs.get_contents()[stimulus.target_neuron_index] +=
+                (f32)schedule.current_at(stimulus.target_neuron_index, tick);
         }
         engine.step_tick(dt_seconds, tick, tick + 1);
 
@@ -588,8 +592,11 @@ TEST(ExitModelGlifEiNetwork, parses_resolves_lowers_allocates_and_compiles_witho
     ASSERT_EQ(model.projections.size(), 3u);
 
     // 2 Cell entries (excitatory/inhibitory GLIF1Cell) + 3 Synapse entries
-    // (expOneSynapse, alphaCurrentSynapse, TestNmdaSynapse/NMDA).
-    ASSERT_EQ(model.type_library.size(), 5u);
+    // (expOneSynapse, alphaCurrentSynapse, TestNmdaSynapse/NMDA) + 1 Inputs
+    // entry (pulseGen1, bound via the fixture's own <inputList>/<input> --
+    // ticket SC-149's own ModelSpecification catalogs every bound instance a
+    // population/projection/explicitInput/inputList references, arch §1.4).
+    ASSERT_EQ(model.type_library.size(), 6u);
     s32 cell_count = 0, synapse_count = 0;
     for (const auto &entry : model.type_library) {
         if (entry.category == TypeLibraryCategory::Cell) ++cell_count;
@@ -608,7 +615,7 @@ TEST(ExitModelGlifEiNetwork, parses_resolves_lowers_allocates_and_compiles_witho
     EXPECT_TRUE(found_current_based);     // alphaCurrentSynapse
 
     spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ASSERT_EQ(programs.size(), 5u);
+    ASSERT_EQ(programs.size(), 6u);
 
     ModelAllocation allocation = allocate_model(model, programs);
     // ExcPop: 3 neurons * V_t 2 (v, refractoryTimeElapsed) = 6.
@@ -621,13 +628,17 @@ TEST(ExitModelGlifEiNetwork, parses_resolves_lowers_allocates_and_compiles_witho
     });
 }
 
-TEST(ExitModelGlifEiNetwork, front_end_does_not_recognize_inputList_yet_documented_gap) {
-    // See this file's own header comment (#2) -- asserts the documented gap
-    // itself stays true, so a future ticket that adds inputList/input
-    // parsing doesn't silently leave this file's own manual stimulus
-    // reconstruction stale without anyone noticing.
+TEST(ExitModelGlifEiNetwork, input_list_resolves_to_a_real_stimulus_schedule) {
+    // Ticket SC-149: was front_end_does_not_recognize_inputList_yet_documented_gap, asserting
+    // model.stimuli stayed empty (the front-end didn't recognize <inputList>/<input> at all -- see
+    // this file's own header comment #2 above). The front-end now lowers the fixture's own
+    // <inputList component="pulseGen1" population="ExcPop"><input target="../ExcPop/0/.../"/>
+    // </inputList> to exactly the one StimulusEntry an equivalent single-neuron <explicitInput> would
+    // have produced.
     ModelSpecification model = load_model_from_nml_fixture("glif_ei_network");
-    EXPECT_TRUE(model.stimuli.empty());
+    ASSERT_EQ(model.stimuli.size(), 1u);
+    EXPECT_EQ(model.stimuli[0].target_neuron_index, 0); // ExcPop[0], the global neuron index since ExcPop is declared first
+    EXPECT_EQ(model.type_library[model.stimuli[0].input_type_library_index].bound_instance_id, "pulseGen1");
 }
 
 // ── GLIF E/I network: driven simulation sanity (enabled) ──────────────────
@@ -847,13 +858,18 @@ TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_prop
 // documents, unrelated to synapse dispatch.
 //
 // ── Known limitations a reviewer should look at closely (Phase-2 section) ────────────────────────
-// 1. Both network fixtures use `<inputList>`/`<input>` for their own pulseGenerator stimulus (NOT
-//    `<explicitInput>`) -- the SAME real, jLEMS-proven-working shape glif_ei_network.nml's own header
-//    comment documents for a multi-population network against this exact jLEMS build (bundled with
-//    pyneuroml 1.3.22). Per this file's own header comment (#2) above, spikecorec's own front-end
-//    does not recognize `inputList` either, so `model.stimuli` is empty for both, and each fixture's
-//    own driver below reconstructs the identical stimulus window by hand from the .nml's own literal
-//    `pulseGenerator` attributes, exactly mirroring `run_glif_ei_network`'s own established pattern.
+// 1. UPDATE (ticket SC-149): both network fixtures use `<inputList>`/`<input>` for their own
+//    pulseGenerator stimulus (NOT `<explicitInput>`) -- the SAME real, jLEMS-proven-working shape
+//    glif_ei_network.nml's own header comment documents for a multi-population network against this
+//    exact jLEMS build (bundled with pyneuroml 1.3.22). Per this file's own header comment (#2) above,
+//    spikecorec's own front-end now recognizes `inputList` too, so `model.stimuli` is populated for
+//    both -- each driver below still reconstructs the stimulus window by hand from the .nml's own
+//    literal `pulseGenerator` attributes rather than via `build_stimulus_schedule` (unlike
+//    `run_glif_ei_network`'s own now-updated pattern above), purely to avoid touching these two
+//    already-validated Phase-2 drivers' own ring-indexed (`run_delayed_coupling_network`) and
+//    otherwise-working injection logic; each fixture's own now-populated `model.stimuli` is asserted
+//    directly instead (see each fixture's own `input_list_resolves_to_a_real_stimulus_schedule` test
+//    below, replacing the old `front_end_does_not_recognize_inputList_yet_documented_gap` ones).
 // 2. UPDATE (direct user instruction, 2026-07-23): ticket #131 has since built the "spike-scatter
 //    batch construction" subsystem this item originally flagged as unbuilt -- see this file's own
 //    header comment (#3) above for the full update. For the izhikevich network specifically: its own
@@ -1071,8 +1087,9 @@ TEST(ExitModelIzhikevichNetwork, parses_resolves_lowers_allocates_and_compiles_w
     ASSERT_EQ(model.projections.size(), 1u);
 
     // izhikevich2007Cell (Cell, ONE bound instance shared by both populations) + izhCurrSynapse
-    // (Synapse).
-    ASSERT_EQ(model.type_library.size(), 2u);
+    // (Synapse) + pulseGen1 (Inputs, bound via the fixture's own <inputList>/<input> -- ticket
+    // SC-149).
+    ASSERT_EQ(model.type_library.size(), 3u);
     s32 cell_count = 0, synapse_count = 0;
     for (const auto &entry : model.type_library) {
         if (entry.category == TypeLibraryCategory::Cell) ++cell_count;
@@ -1082,7 +1099,7 @@ TEST(ExitModelIzhikevichNetwork, parses_resolves_lowers_allocates_and_compiles_w
     EXPECT_EQ(synapse_count, 1);
 
     spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ASSERT_EQ(programs.size(), 2u);
+    ASSERT_EQ(programs.size(), 3u);
 
     ModelAllocation allocation = allocate_model(model, programs);
     EXPECT_EQ(allocation.cell_state_element_count, 4); // 2 neurons * (v, u)
@@ -1093,10 +1110,15 @@ TEST(ExitModelIzhikevichNetwork, parses_resolves_lowers_allocates_and_compiles_w
     });
 }
 
-TEST(ExitModelIzhikevichNetwork, front_end_does_not_recognize_inputList_yet_documented_gap) {
-    // See this file's own header comment (Phase-2 section, #1).
+TEST(ExitModelIzhikevichNetwork, input_list_resolves_to_a_real_stimulus_schedule) {
+    // Ticket SC-149: was front_end_does_not_recognize_inputList_yet_documented_gap (see this file's
+    // own header comment, Phase-2 section, #1). run_izhikevich_network below still reconstructs its
+    // own injection by hand (see that comment for why) -- this only asserts the front-end itself now
+    // populates model.stimuli correctly from the fixture's own <inputList>/<input>.
     ModelSpecification model = load_model_from_nml_fixture("izhikevich_network");
-    EXPECT_TRUE(model.stimuli.empty());
+    ASSERT_EQ(model.stimuli.size(), 1u);
+    EXPECT_EQ(model.stimuli[0].target_neuron_index, 0); // DrivenPop[0], declared first
+    EXPECT_EQ(model.type_library[model.stimuli[0].input_type_library_index].bound_instance_id, "pulseGen1");
 }
 
 // ── izhikevich network: driven simulation sanity (enabled) ───────────────────────────────────────
@@ -1142,11 +1164,12 @@ TEST(ExitModelDelayedCouplingNetwork, parses_resolves_lowers_allocates_and_compi
     ASSERT_EQ(model.projections[0].connections.size(), 1u);
     EXPECT_NEAR(model.projections[0].connections[0].delay, 0.010, 1e-9); // connectionWD delay="10ms"
 
-    // GLIF1Cell (Cell) + delaySynapse (Synapse).
-    ASSERT_EQ(model.type_library.size(), 2u);
+    // GLIF1Cell (Cell) + delaySynapse (Synapse) + pulseGen1 (Inputs, bound via the fixture's own
+    // <inputList>/<input> -- ticket SC-149).
+    ASSERT_EQ(model.type_library.size(), 3u);
 
     spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
-    ASSERT_EQ(programs.size(), 2u);
+    ASSERT_EQ(programs.size(), 3u);
 
     ModelAllocation allocation = allocate_model(model, programs);
     EXPECT_EQ(allocation.cell_state_element_count, 4); // 2 neurons * (v, refractoryTimeElapsed)
@@ -1160,10 +1183,16 @@ TEST(ExitModelDelayedCouplingNetwork, parses_resolves_lowers_allocates_and_compi
     });
 }
 
-TEST(ExitModelDelayedCouplingNetwork, front_end_does_not_recognize_inputList_yet_documented_gap) {
-    // See this file's own header comment (Phase-2 section, #1).
+TEST(ExitModelDelayedCouplingNetwork, input_list_resolves_to_a_real_stimulus_schedule) {
+    // Ticket SC-149: was front_end_does_not_recognize_inputList_yet_documented_gap (see this file's
+    // own header comment, Phase-2 section, #1). run_delayed_coupling_network below still
+    // reconstructs its own ring-indexed injection by hand (see that comment for why) -- this only
+    // asserts the front-end itself now populates model.stimuli correctly from the fixture's own
+    // <inputList>/<input>.
     ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
-    EXPECT_TRUE(model.stimuli.empty());
+    ASSERT_EQ(model.stimuli.size(), 1u);
+    EXPECT_EQ(model.stimuli[0].target_neuron_index, 0); // SourcePop[0], declared first
+    EXPECT_EQ(model.type_library[model.stimuli[0].input_type_library_index].bound_instance_id, "pulseGen1");
 }
 
 TEST(ExitModelDelayedCouplingNetwork, delay_ring_sizing_matches_the_connections_own_real_delay) {

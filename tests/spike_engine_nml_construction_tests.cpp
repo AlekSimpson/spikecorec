@@ -635,11 +635,12 @@ TEST(SpikeEngineNmlDelayRing,
     // nml_compute_ring_slot_count_from_weight_matrix, engine.cpp).
     const s64 ring_slot_count = engine.weights.constant_delay_ticks;
 
-    // Manual stimulus reconstruction (the front end does not yet recognize inputList/pulseGenerator
-    // -- see ExitModelDelayedCouplingNetwork.front_end_does_not_recognize_inputList_yet_documented_
-    // gap, exit_model_validation_tests.cpp): delayed_coupling_network.nml's own <pulseGenerator
-    // id="pulseGen1" delay="10ms" duration="6ms" amplitude="0.5nA"/>, applied to SourcePop's neuron 0
-    // (global neuron index 0, declared first).
+    // Manual stimulus reconstruction (this test's own focus is delay-ring delivery timing, not the
+    // stimulus pipeline -- see ExitModelDelayedCouplingNetwork.input_list_resolves_to_a_real_stimulus_
+    // schedule, exit_model_validation_tests.cpp, for confirmation that the front end DOES now
+    // recognize this fixture's own <inputList>/<input>, ticket SC-149): delayed_coupling_network.nml's
+    // own <pulseGenerator id="pulseGen1" delay="10ms" duration="6ms" amplitude="0.5nA"/>, applied to
+    // SourcePop's neuron 0 (global neuron index 0, declared first).
     const s64 tick_count = 600;             // 60ms / 0.1ms, matching this fixture's own
                                              // <Simulation length="60ms">
     const s64 stimulus_delay_ticks = 100;   // pulseGen1 delay="10ms"

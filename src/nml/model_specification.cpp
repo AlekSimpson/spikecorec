@@ -410,6 +410,54 @@ ModelSpecification build_model_specification(const ResolvedModel &resolved, s64 
         specification.stimuli.push_back(stimulus);
     }
 
+    // 4b. Input (stimulus) specs via `<inputList>` (arch §1.4, §3.3 D4): the
+    // population-scale idiom real NeuroML networks actually use -- one
+    // `<inputList population="..." component="...">` wrapping N `<input
+    // target="..."/>` children, all bound to the SAME shared generator
+    // component (`inputList`'s own `component` IDref), instead of hand-
+    // writing one `<explicitInput>` per neuron. Each `<input>` child lowers
+    // to exactly one StimulusEntry, mirroring the `explicitInput` block
+    // above -- its own `target` is the same population-index path shape
+    // (parse_population_path handles both), and the whole inputList's shared
+    // `component` is resolved to a type-library entry ONCE, outside the
+    // per-`<input>` loop, so every resulting StimulusEntry shares the same
+    // (not duplicated) `input_type_library_index`.
+    Vector<const ResolvedInstance *> input_list_instances;
+    collect_by_tag(resolved.instances, {"inputList"}, input_list_instances);
+
+    for (const auto *input_list : input_list_instances) {
+        auto component_idref = input_list->idref_attributes.find("component");
+        if (component_idref == input_list->idref_attributes.end()) {
+            log::throw_runtime_error(log::logger(), "model_specification: inputList is missing `component`");
+        }
+
+        s32 input_type_library_index = get_or_create_type_library_entry(
+            component_idref->second, resolved, instances_by_symbol, type_library_index_by_symbol, specification.type_library);
+
+        for (const auto &input_instance : input_list->children) {
+            if (input_instance.tag_name != "input") continue;
+
+            auto target = input_instance.string_attributes.find("target");
+            if (target == input_instance.string_attributes.end()) {
+                log::throw_runtime_error(log::logger(), "model_specification: inputList's <input> is missing target");
+            }
+
+            ParsedPopulationPath target_path = parse_population_path(target->second);
+            auto target_population = population_index_by_name.find(target_path.population_name);
+            if (target_population == population_index_by_name.end()) {
+                log::throw_runtime_error(log::logger(),
+                    "model_specification: inputList <input> target names an uncataloged population '" +
+                    target_path.population_name + "'");
+            }
+
+            StimulusEntry stimulus;
+            stimulus.target_neuron_index = resolve_required_neuron_index(
+                specification.populations[target_population->second], target_path.local_index, "inputList <input> target");
+            stimulus.input_type_library_index = input_type_library_index;
+            specification.stimuli.push_back(stimulus);
+        }
+    }
+
     // 5. Output (recording) selections (arch §1.4, §4.6): state traces
     // (OutputColumn/Line) and spike records (EventSelection).
     auto add_recording = [&](const ResolvedInstance &recording_instance, const String &path_attribute_name,

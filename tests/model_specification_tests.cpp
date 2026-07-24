@@ -221,6 +221,65 @@ String write_single_population_recording_fixture(const String &quantity_path) {
         "</neuroml>");
 }
 
+// A minimal single-population (size 3) network driven by ONE `<inputList>`
+// wrapping two `<input>` children (targeting Pop0[0] and Pop0[2], sharing the
+// same `pulseGen1` generator component) -- the real-NML population-scale
+// stimulus idiom, as opposed to one `<explicitInput>` per neuron.
+String write_input_list_fixture() {
+    write_temp_file("spikecorec_model_spec_input_list_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"InputListContent\">"
+        "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <GLIF1Cell id=\"glifCellInstance\" C=\"1.0e-10\"/>"
+        "  <pulseGenerator id=\"pulseGen1\" delay=\"10ms\" duration=\"100ms\" amplitude=\"1nA\"/>"
+        "  <network id=\"InputListNet\">"
+        "    <population id=\"Pop0\" component=\"glifCellInstance\" size=\"3\"/>"
+        "    <inputList id=\"stimList\" component=\"pulseGen1\" population=\"Pop0\">"
+        "      <input id=\"0\" target=\"Pop0[0]\" destination=\"synapses\"/>"
+        "      <input id=\"1\" target=\"Pop0[2]\" destination=\"synapses\"/>"
+        "    </inputList>"
+        "  </network>"
+        "</neuroml>");
+
+    return write_temp_file("spikecorec_model_spec_input_list_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"InputListTop\">"
+        "  <include href=\"spikecorec_model_spec_input_list_content.nml\"/>"
+        "</neuroml>");
+}
+
+// Same shape as write_input_list_fixture(), parameterized by the second
+// `<input>`'s own `target` -- used to exercise an inputList `<input>` naming
+// an uncataloged population without repeating the whole fixture above.
+String write_input_list_bad_target_fixture(const String &second_input_target) {
+    write_temp_file("spikecorec_model_spec_bad_input_list_content.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"BadInputListContent\">"
+        "  <ComponentType name=\"GLIF1Cell\" extends=\"baseCell\">"
+        "    <Parameter name=\"C\" dimension=\"capacitance\"/>"
+        "    <Dynamics>"
+        "      <StateVariable name=\"v\" dimension=\"voltage\" exposure=\"v\"/>"
+        "    </Dynamics>"
+        "  </ComponentType>"
+        "  <GLIF1Cell id=\"glifCellInstance\" C=\"1.0e-10\"/>"
+        "  <pulseGenerator id=\"pulseGen1\" delay=\"10ms\" duration=\"100ms\" amplitude=\"1nA\"/>"
+        "  <network id=\"BadInputListNet\">"
+        "    <population id=\"Pop0\" component=\"glifCellInstance\" size=\"3\"/>"
+        "    <inputList id=\"stimList\" component=\"pulseGen1\" population=\"Pop0\">"
+        "      <input id=\"0\" target=\"Pop0[0]\" destination=\"synapses\"/>"
+        "      <input id=\"1\" target=\"" + second_input_target + "\" destination=\"synapses\"/>"
+        "    </inputList>"
+        "  </network>"
+        "</neuroml>");
+
+    return write_temp_file("spikecorec_model_spec_bad_input_list_top.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"BadInputListTop\">"
+        "  <include href=\"spikecorec_model_spec_bad_input_list_content.nml\"/>"
+        "</neuroml>");
+}
+
 } // namespace
 
 // ── Type library: classification flags (acceptance criterion) ─────────────
@@ -387,6 +446,42 @@ TEST(ModelSpecification, captures_stimulus_and_recording_specs) {
 
     EXPECT_EQ(event_recording->target_neuron_index, 4); // InhPop[1]
     EXPECT_EQ(event_recording->exposure_name, "spike");
+}
+
+// ── inputList: the population-scale stimulus idiom (real-NML gap fix) ──────
+
+TEST(ModelSpecification, captures_input_list_with_multiple_inputs_sharing_one_type_library_entry) {
+    String path = write_input_list_fixture();
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+    ModelSpecification specification = build_model_specification(resolved);
+
+    ASSERT_EQ(specification.stimuli.size(), 2u);
+    EXPECT_EQ(specification.stimuli[0].target_neuron_index, 0); // Pop0[0]
+    EXPECT_EQ(specification.stimuli[1].target_neuron_index, 2); // Pop0[2]
+
+    // Both <input> children share the SAME (not duplicated) type-library
+    // entry, since they both reference the inputList's one `component`.
+    EXPECT_EQ(specification.stimuli[0].input_type_library_index, specification.stimuli[1].input_type_library_index);
+    EXPECT_EQ(specification.type_library[specification.stimuli[0].input_type_library_index].bound_instance_id, "pulseGen1");
+
+    s32 pulse_generator_entry_count = 0;
+    for (const auto &entry : specification.type_library) {
+        if (entry.bound_instance_id == "pulseGen1") ++pulse_generator_entry_count;
+    }
+    EXPECT_EQ(pulse_generator_entry_count, 1) << "inputList's shared component must not be cataloged twice";
+}
+
+TEST(ModelSpecification, throws_when_input_list_input_target_names_an_uncataloged_population) {
+    String path = write_input_list_bad_target_fixture("NoSuchPop[0]");
+
+    NML_Parser parser;
+    parser.parse(path);
+    ResolvedModel resolved = resolve_and_lower(parser);
+
+    EXPECT_THROW(build_model_specification(resolved), std::runtime_error);
 }
 
 // ── Regression: path-index safety (review findings #1-#3) ──────────────────

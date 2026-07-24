@@ -490,6 +490,53 @@ TEST(ResolveAndLower, treats_path_shaped_target_as_opaque_and_resolves_genuine_i
     EXPECT_EQ(explicit_input->idref_attributes.at("input"), model.symbols.index_of("pulseGen1"));
 }
 
+// `<inputList>`/`<input>` (the population-scale stimulus idiom real NeuroML
+// networks use instead of one `<explicitInput>` per neuron) resolve via the
+// exact SAME generic, tag-agnostic attribute rules as `<explicitInput>`
+// above: `<inputList>`'s own `component` is a genuine IDref (same allowlist
+// entry as `explicitInput`'s `input`), while each nested `<input>`'s own
+// `target` is the same population-index path shape, opaque, never
+// IDref-resolved. Neither tag needs its own dedicated parser/resolver code --
+// this is a regression test proving that, not a feature that had to be added
+// at this layer.
+TEST(ResolveAndLower, resolves_input_list_component_idref_and_treats_nested_input_target_as_opaque) {
+    String path = write_temp_file("spikecorec_resolve_input_list_test.nml",
+        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"InputListTestDoc\">"
+        "  <pulseGenerator id=\"pulseGen1\" delay=\"10ms\" duration=\"100ms\" amplitude=\"1nA\"/>"
+        "  <network id=\"net1\">"
+        "    <population id=\"Pop0\" component=\"pulseGen1\" size=\"3\"/>"
+        "    <inputList id=\"stimList\" component=\"pulseGen1\" population=\"Pop0\">"
+        "      <input id=\"0\" target=\"Pop0[0]\" destination=\"synapses\"/>"
+        "    </inputList>"
+        "  </network>"
+        "</neuroml>");
+
+    NML_Parser parser;
+    parser.parse(path);
+
+    ResolvedModel model;
+    EXPECT_NO_THROW(model = resolve_and_lower(parser));
+
+    const ResolvedInstance *network = find_instance_by_tag(model.instances, "network");
+    ASSERT_NE(network, nullptr);
+    const ResolvedInstance *input_list = find_instance_by_tag(network->children, "inputList");
+    ASSERT_NE(input_list, nullptr);
+
+    // `component="pulseGen1"` on <inputList> IS a genuine bare-id IDref.
+    ASSERT_EQ(input_list->idref_attributes.count("component"), 1u);
+    EXPECT_EQ(input_list->idref_attributes.at("component"), model.symbols.index_of("pulseGen1"));
+
+    const ResolvedInstance *input = find_instance_by_tag(input_list->children, "input");
+    ASSERT_NE(input, nullptr);
+
+    // `target="Pop0[0]"` on the nested <input> is a population-index path,
+    // not a bare id -- passed through as an opaque string, same as
+    // explicitInput's own target.
+    ASSERT_EQ(input->string_attributes.count("target"), 1u);
+    EXPECT_EQ(input->string_attributes.at("target"), "Pop0[0]");
+    EXPECT_EQ(input->idref_attributes.count("target"), 0u);
+}
+
 // ── Regression: an unlisted string attribute is opaque, not a "bad unit" (review finding #2) ──
 
 TEST(ResolveAndLower, treats_an_unlisted_non_numeric_attribute_as_opaque_instead_of_throwing) {

@@ -94,10 +94,11 @@ int main(int argument_count, char **argument_values) {
     // ── 5. Stimulus ─────────────────────────────────────────────────────────────────────────────
     // This model drives its pulseGenerator through `<inputList>`/`<input>` rather than
     // `<explicitInput>` — jLEMS cannot resolve explicitInput's indexed target against a
-    // populationList population. The front-end only recognizes explicitInput today, so `model.stimuli`
-    // is empty here and the window is reconstructed from the file's own literal pulseGenerator
-    // attributes. (The torus examples, whose plain population does parse, use the real
-    // build_stimulus_schedule path instead.)
+    // populationList population. The front-end now recognizes `<inputList>`/`<input>` too (ticket
+    // SC-149), so `model.stimuli` is populated here same as for an equivalent `<explicitInput>` --
+    // reconstructed from the file's own literal pulseGenerator attributes below anyway, purely to
+    // keep this example's own tick loop self-contained (matching the torus examples' own established
+    // style, which build_stimulus_schedule-drives instead).
     const f64 seconds_per_tick = (f64)options.dt_seconds;
     const s64 stimulus_delay_ticks = (s64)std::round(0.010 / seconds_per_tick);
     const s64 stimulus_duration_ticks = (s64)std::round(0.200 / seconds_per_tick);
