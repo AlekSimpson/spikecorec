@@ -5,19 +5,18 @@
 #endif
 
 #include <cmath>
-#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/allocator.h"
 #include "spikecorec/nml/cell_lowering.h"
 #include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/inputs_lowering.h"
-#include "spikecorec/nml/master_kernel.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
@@ -27,6 +26,15 @@
 using namespace std;
 using namespace spikecorec;
 using namespace spikecorec::nml;
+
+// `spikecorec::core/engine.h` (pulled in below for SpikeEngine, the folding-nml::AssembledModel-into-
+// SpikeEngine migration) has its own file-scope `using namespace spikecorec::log;`, whose alias
+// TEMPLATE `spikecorec::log::Vector` is ambiguous with `spikecorec::Vector` for a plain unqualified
+// `Vector<...>` lookup (two distinct alias-template declarations at the same scope via two
+// using-directives) -- unlike a plain type alias such as `String`, which is never ambiguous this way.
+// This file spells out `spikecorec::Vector<...>` fully throughout (matching
+// tests/simple_lif_stdp_network_tests.cpp's/tests/end_to_end_network_tests.cpp's own established
+// workaround for the same header clash) instead of the bare `Vector<...>` this file used before.
 
 // ── Phase-1 validation / exit models (ticket #61 [H1]; arch §5) ──────────────
 //
@@ -141,6 +149,21 @@ using namespace spikecorec::nml;
 //    model.projections at all), so its own nonzero placeholder weight (0.6f) remains the sole,
 //    genuinely load-bearing propagation mechanism there -- see run_delayed_coupling_network's own
 //    comment below.
+//
+// UPDATE (folding nml::AssembledModel into SpikeEngine, project owner instruction,
+// include/spikecorec/nml/master_kernel.h's own "REFACTOR" comments above class AssembledModel): every
+// driver/test below that used to construct its own `nml::AssembledModel` + `ModelRuntimeBuffers`/
+// `LiveModelBuffers` now constructs a single `SpikeEngine` (its own `ModelSpecification` constructor,
+// include/spikecorec/core/engine.h) instead -- `SpikeEngine` owns the `ModelAllocation`
+// (`engine.nml_allocation_`, public) and `WeightMatrix` (`engine.weights`, public) internally, so a
+// caller no longer builds either by hand, and drives ticks via `engine.step_tick(dt, tick, next_tick)`
+// (no buffers argument) instead of `assembled_model.step_tick(buffers, dt, tick, next_tick)`. Every
+// item above describing AssembledModel's own mechanics (ticket #6's fixed propagate stage, ticket
+// #131's real per-edge synapse dispatch, ticket #64's delay ring) still applies unchanged -- ticket
+// #131's dispatch and ticket #64's delay ring are both folded into SpikeEngine byte-for-byte (engine.cpp),
+// so every spike count/timing claim above (and the delay-ring network's own nonzero 0.6f placeholder
+// weight staying load-bearing) still holds exactly as described, just reached through SpikeEngine's own
+// `step_tick` rather than AssembledModel's.
 
 namespace {
 
@@ -169,8 +192,8 @@ ModelSpecification load_model_from_nml_fixture(const String &fixture_base_name) 
 // entry would get an empty placeholder, but neither fixture in this file
 // produces one -- see this file's own header comment on why `inputList`
 // leaves no TypeLibraryEntry behind at all).
-Vector<IrProgram> build_type_library_ir_programs(const ModelSpecification &model) {
-    Vector<IrProgram> programs;
+spikecorec::Vector<IrProgram> build_type_library_ir_programs(const ModelSpecification &model) {
+    spikecorec::Vector<IrProgram> programs;
     programs.reserve(model.type_library.size());
     for (const auto &entry : model.type_library) {
         if (entry.category == TypeLibraryCategory::Cell) {
@@ -205,55 +228,6 @@ WeightMatrix build_weight_matrix(const ModelSpecification &model) {
     return WeightMatrix(adjacency, /*rank=*/1);
 }
 
-// One assembled model's live runtime buffers, gathered so a driving loop
-// only has to thread one struct through step_tick calls -- same buffer set
-// master_kernel_tests.cpp's own fixtures build by hand, just grouped here
-// since this file drives two different models over many ticks each rather
-// than asserting on one hand-worked trajectory.
-struct LiveModelBuffers {
-    GpuPointer<f32> network_inputs;
-    GpuPointer<s64> last_spiked;
-    GpuPointer<s32> next_active_indices;
-    GpuPointer<s32> next_active_count;
-    GpuPointer<s32> active_generation;
-    GpuPointer<bool> emit_spike;
-    ModelRuntimeBuffers buffers;
-};
-
-LiveModelBuffers make_live_model_buffers(ModelAllocation &allocation, WeightMatrix &weights, s64 total_neuron_count) {
-    LiveModelBuffers live;
-    live.network_inputs = allocate<f32>((usize)total_neuron_count * sizeof(f32));
-    memset(live.network_inputs.get_contents(), 0, (usize)total_neuron_count * sizeof(f32));
-
-    live.last_spiked = allocate<s64>((usize)total_neuron_count * sizeof(s64));
-    // -1 (never fired), not the base engine's own zero-initialization
-    // convention -- ticket #59's review comment flags that zero-init reads
-    // as "fired at tick 0" for a spike-raster sample; -1 sidesteps that
-    // entirely for this file's own tick-0-inclusive comparisons.
-    std::fill(live.last_spiked.get_contents(), live.last_spiked.get_contents() + total_neuron_count, (s64)-1);
-
-    live.next_active_indices = allocate<s32>((usize)total_neuron_count * sizeof(s32));
-    live.next_active_count = allocate<s32>(sizeof(s32));
-    live.next_active_count.get_contents()[0] = 0;
-
-    live.active_generation = allocate<s32>((usize)total_neuron_count * sizeof(s32));
-    std::fill(live.active_generation.get_contents(), live.active_generation.get_contents() + total_neuron_count, -1);
-
-    live.emit_spike = allocate<bool>((usize)total_neuron_count * sizeof(bool));
-    memset(live.emit_spike.get_contents(), 0, (usize)total_neuron_count * sizeof(bool));
-
-    live.buffers.allocation = &allocation;
-    live.buffers.weights = &weights;
-    live.buffers.network_inputs = live.network_inputs.get_contents();
-    live.buffers.last_spiked = live.last_spiked.get_contents();
-    live.buffers.next_active_neuron_indices = live.next_active_indices.get_contents();
-    live.buffers.next_active_neuron_count = live.next_active_count.get_contents();
-    live.buffers.active_generation = live.active_generation.get_contents();
-    live.buffers.emit_port_flags["spike"] = live.emit_spike.get_contents();
-
-    return live;
-}
-
 // Finds a population's cell type's "v" StateVariable slot (always index 0
 // for both GLIF3Cell and GLIF1Cell -- it's declared first in each fixture's
 // own <Dynamics>) and returns the absolute cell_state element index for
@@ -283,20 +257,16 @@ void seed_initial_membrane_potentials(ModelAllocation &allocation, const ModelSp
 // ── GLIF3 single cell driver (deliverable #1) ────────────────────────────
 
 struct Glif3RunResult {
-    Vector<f32> membrane_trace; // one sample per tick, tick 0..tick_count-1
-    Vector<s64> spike_ticks;    // every tick a spike occurred, in order
+    spikecorec::Vector<f32> membrane_trace; // one sample per tick, tick 0..tick_count-1
+    spikecorec::Vector<s64> spike_ticks;    // every tick a spike occurred, in order
 };
 
 Glif3RunResult run_glif3_single_cell(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("glif3_single_cell");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_initial_membrane_potentials(allocation, model);
-    WeightMatrix weights = build_weight_matrix(model);
-    AssembledModel assembled_model(model, programs);
-
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model);
 
     // Real SI-unit stimulus schedule from the fixture's own pulseGenerator +
     // explicitInput (a plain, single-neuron population -- explicitInput
@@ -308,11 +278,12 @@ Glif3RunResult run_glif3_single_cell(s64 tick_count, f32 dt_seconds) {
     result.membrane_trace.reserve((usize)tick_count);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        live.buffers.network_inputs[0] += (f32)schedule.current_at(0, tick);
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+        engine.network_inputs.get_contents()[0] += (f32)schedule.current_at(0, tick);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
-        result.membrane_trace.push_back(allocation.cell_state.get_contents()[v_state_index(allocation, 0, 0)]);
-        if (live.buffers.last_spiked[0] == tick) result.spike_ticks.push_back(tick);
+        result.membrane_trace.push_back(
+            engine.nml_allocation_.cell_state.get_contents()[v_state_index(engine.nml_allocation_, 0, 0)]);
+        if (engine.last_spiked.get_contents()[0] == tick) result.spike_ticks.push_back(tick);
     }
 
     return result;
@@ -322,27 +293,23 @@ Glif3RunResult run_glif3_single_cell(s64 tick_count, f32 dt_seconds) {
 
 struct NetworkRunResult {
     // Per-neuron (global index) membrane-potential trace and spike ticks.
-    Vector<Vector<f32>> membrane_traces; // [neuron_index][tick]
-    Vector<Vector<s64>> spike_ticks;     // [neuron_index] -> ticks that neuron spiked
+    spikecorec::Vector<spikecorec::Vector<f32>> membrane_traces; // [neuron_index][tick]
+    spikecorec::Vector<spikecorec::Vector<s64>> spike_ticks;     // [neuron_index] -> ticks that neuron spiked
 };
 
 NetworkRunResult run_glif_ei_network(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("glif_ei_network");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_initial_membrane_potentials(allocation, model);
-    WeightMatrix weights = build_weight_matrix(model);
-    // ticket #131: AssembledModel now dispatches this model's real expOneSynapse/
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model);
+    // ticket #131: SpikeEngine now dispatches this model's real expOneSynapse/
     // alphaCurrentSynapse/NMDA per-edge dynamics for a model with real projections (which this one
     // has), forcing this constant-weight placeholder's own scattered contribution to zero
-    // regardless (see master_kernel.h) -- left set anyway as an explicit, harmless no-op rather
+    // regardless (see engine.cpp) -- left set anyway as an explicit, harmless no-op rather
     // than deleting the call, matching this file's own established "state the placeholder was
     // here" convention, previously documented at this file's own header comment (#3).
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    engine.weights.set_constant_weight(0.0f);
 
     // Manual stimulus reconstruction (see this file's own header comment
     // #2): the fixture's own <pulseGenerator id="pulseGen1" delay="10ms"
@@ -361,17 +328,18 @@ NetworkRunResult run_glif_ei_network(s64 tick_count, f32 dt_seconds) {
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
         if (tick >= delay_ticks && tick < delay_ticks + duration_ticks) {
-            live.buffers.network_inputs[stimulus_target_neuron_index] += amplitude_amperes;
+            engine.network_inputs.get_contents()[stimulus_target_neuron_index] += amplitude_amperes;
         }
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
         for (s32 population_index = 0; population_index < (s32)model.populations.size(); ++population_index) {
             const PopulationEntry &population = model.populations[(usize)population_index];
             for (s32 local_index = 0; local_index < population.size; ++local_index) {
                 s32 neuron_index = population.neuron_index_begin + local_index;
                 result.membrane_traces[(usize)neuron_index].push_back(
-                    allocation.cell_state.get_contents()[v_state_index(allocation, population_index, local_index)]);
-                if (live.buffers.last_spiked[neuron_index] == tick) {
+                    engine.nml_allocation_.cell_state.get_contents()[
+                        v_state_index(engine.nml_allocation_, population_index, local_index)]);
+                if (engine.last_spiked.get_contents()[neuron_index] == tick) {
                     result.spike_ticks[(usize)neuron_index].push_back(tick);
                 }
             }
@@ -390,8 +358,8 @@ NetworkRunResult run_glif_ei_network(s64 tick_count, f32 dt_seconds) {
 // <selection_id>".
 
 struct ReferenceTrace {
-    Vector<f64> time_seconds;
-    Vector<Vector<f64>> column_values; // column_values[row_index][column_index]
+    spikecorec::Vector<f64> time_seconds;
+    spikecorec::Vector<spikecorec::Vector<f64>> column_values; // column_values[row_index][column_index]
 };
 
 ReferenceTrace load_reference_trace(const String &path) {
@@ -409,7 +377,7 @@ ReferenceTrace load_reference_trace(const String &path) {
         line_stream >> time_value;
         trace.time_seconds.push_back(time_value);
 
-        Vector<f64> row_values;
+        spikecorec::Vector<f64> row_values;
         f64 value = 0.0;
         while (line_stream >> value) row_values.push_back(value);
         trace.column_values.push_back(std::move(row_values));
@@ -422,13 +390,13 @@ struct ReferenceSpikeRecord {
     String selection_id;
 };
 
-Vector<ReferenceSpikeRecord> load_reference_spikes(const String &path) {
+spikecorec::Vector<ReferenceSpikeRecord> load_reference_spikes(const String &path) {
     std::ifstream file(path);
     if (!file.is_open()) {
         throw std::runtime_error("exit_model_validation_tests: could not open reference spikes file '" + path + "'");
     }
 
-    Vector<ReferenceSpikeRecord> spikes;
+    spikecorec::Vector<ReferenceSpikeRecord> spikes;
     String line;
     while (std::getline(file, line)) {
         if (line.find_first_not_of(" \t\r\n") == String::npos) continue;
@@ -440,8 +408,8 @@ Vector<ReferenceSpikeRecord> load_reference_spikes(const String &path) {
     return spikes;
 }
 
-Vector<f64> extract_spike_time_seconds(const Vector<ReferenceSpikeRecord> &spikes) {
-    Vector<f64> times;
+spikecorec::Vector<f64> extract_spike_time_seconds(const spikecorec::Vector<ReferenceSpikeRecord> &spikes) {
+    spikecorec::Vector<f64> times;
     times.reserve(spikes.size());
     for (const auto &spike : spikes) times.push_back(spike.time_seconds);
     return times;
@@ -476,8 +444,8 @@ const f64 SPIKE_EDGE_TIME_TOLERANCE_SECONDS = 5e-3;  // first/last spike time wi
 // when the reference itself has at least one spike (a from-zero comparison is exact-or-not, not a
 // question of "roughly" -- callers with a genuinely-silent reference population use a plain
 // EXPECT_TRUE(empty()) instead, see e.g. ExitModelGlifEiNetwork's own tests).
-void expect_spike_train_roughly_matches_reference(const Vector<s64> &own_spike_ticks,
-                                                   const Vector<f64> &reference_spike_times_seconds, f64 dt_seconds,
+void expect_spike_train_roughly_matches_reference(const spikecorec::Vector<s64> &own_spike_ticks,
+                                                   const spikecorec::Vector<f64> &reference_spike_times_seconds, f64 dt_seconds,
                                                    const String &label) {
     ASSERT_FALSE(reference_spike_times_seconds.empty()) << label << ": reference has no spikes to compare against";
 
@@ -546,15 +514,15 @@ TEST(ExitModelGlif3SingleCell, parses_resolves_lowers_allocates_and_compiles_wit
     EXPECT_EQ(cell_entry.component_type_name, "GLIF3Cell");
     EXPECT_EQ(cell_entry.state_variable_count, 4); // v, asc1, asc2, refractoryTimeElapsed
 
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
     ASSERT_EQ(programs.size(), 2u);
 
     ModelAllocation allocation = allocate_model(model, programs);
     EXPECT_EQ(allocation.cell_state_element_count, 4);
 
     EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs);
-        (void)assembled_model;
+        SpikeEngine engine(model, programs);
+        (void)engine;
     });
 }
 
@@ -639,7 +607,7 @@ TEST(ExitModelGlifEiNetwork, parses_resolves_lowers_allocates_and_compiles_witho
     EXPECT_TRUE(found_conductance_based); // expOneSynapse and/or the NMDA synapse
     EXPECT_TRUE(found_current_based);     // alphaCurrentSynapse
 
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
     ASSERT_EQ(programs.size(), 5u);
 
     ModelAllocation allocation = allocate_model(model, programs);
@@ -648,8 +616,8 @@ TEST(ExitModelGlifEiNetwork, parses_resolves_lowers_allocates_and_compiles_witho
     EXPECT_EQ(allocation.cell_state_element_count, 10);
 
     EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs);
-        (void)assembled_model;
+        SpikeEngine engine(model, programs);
+        (void)engine;
     });
 }
 
@@ -722,7 +690,7 @@ TEST(ExitModelReferenceDataLoader, loads_glif3_single_cell_membrane_trace_and_sp
     EXPECT_NEAR(trace.time_seconds.back(), 0.35, 1e-9);
     EXPECT_NEAR(trace.column_values[0][0], -0.07, 1e-6); // v starts at EL = -70mV
 
-    Vector<ReferenceSpikeRecord> spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> spikes =
         load_reference_spikes(fixture_path("reference_data/glif3_single_cell/glif3_spikes.dat"));
     // Real captured jLEMS spike-frequency-adaptation raster under this
     // fixture's own current step: 13 spikes with growing inter-spike
@@ -742,7 +710,7 @@ TEST(ExitModelReferenceDataLoader, loads_glif_ei_network_membrane_trace_and_spik
     ASSERT_EQ(trace.time_seconds.size(), 2501u);
     EXPECT_EQ(trace.column_values[0].size(), 5u);
 
-    Vector<ReferenceSpikeRecord> spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> spikes =
         load_reference_spikes(fixture_path("reference_data/glif_ei_network/glif_ei_network_spikes.dat"));
     ASSERT_EQ(spikes.size(), 192u);
 
@@ -776,7 +744,7 @@ TEST(ExitModelGlif3SingleCell, matches_pyneuroml_reference) {
     Glif3RunResult own_result = run_glif3_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace = load_reference_trace(
         fixture_path("reference_data/glif3_single_cell/glif3_membrane_trace.dat"));
-    Vector<ReferenceSpikeRecord> reference_spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif3_single_cell/glif3_spikes.dat"));
 
     expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
@@ -811,10 +779,10 @@ TEST(ExitModelGlifEiNetwork, roughly_matches_pyneuroml_reference_where_real_prop
     const f32 dt_seconds = 1e-4f;
 
     NetworkRunResult own_result = run_glif_ei_network(tick_count, dt_seconds);
-    Vector<ReferenceSpikeRecord> reference_spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif_ei_network/glif_ei_network_spikes.dat"));
 
-    UnorderedMap<String, Vector<f64>> reference_spike_times_by_selection;
+    UnorderedMap<String, spikecorec::Vector<f64>> reference_spike_times_by_selection;
     for (const auto &spike : reference_spikes) {
         reference_spike_times_by_selection[spike.selection_id].push_back(spike.time_seconds);
     }
@@ -933,31 +901,27 @@ void seed_izhikevich_initial_state(ModelAllocation &allocation, const ModelSpeci
 }
 
 struct IzhikevichNetworkRunResult {
-    Vector<f32> driven_membrane_trace; // one sample per tick, DrivenPop's own neuron
-    Vector<s64> driven_spike_ticks;
-    Vector<s64> target_spike_ticks;
+    spikecorec::Vector<f32> driven_membrane_trace; // one sample per tick, DrivenPop's own neuron
+    spikecorec::Vector<s64> driven_spike_ticks;
+    spikecorec::Vector<s64> target_spike_ticks;
 };
 
 IzhikevichNetworkRunResult run_izhikevich_network(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("izhikevich_network");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_izhikevich_initial_state(allocation, model);
-    WeightMatrix weights = build_weight_matrix(model);
-    // ticket #131: AssembledModel now dispatches this model's real izhCurrSynapse (actually an
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_izhikevich_initial_state(engine.nml_allocation_, model);
+    // ticket #131: SpikeEngine now dispatches this model's real izhCurrSynapse (actually an
     // `alphaCurrentSynapse` instance, see izhikevich_network.nml's own header comment) per-edge
     // dynamics automatically (model.projections is non-empty here), forcing this constant-weight
-    // placeholder's own scattered contribution to zero regardless (see master_kernel.h) -- left set
+    // placeholder's own scattered contribution to zero regardless (see engine.cpp) -- left set
     // anyway as an explicit, harmless no-op rather than deleting the call, matching
     // run_glif_ei_network's own established convention above. TargetPop genuinely spikes now:
     // alphaCurrentSynapse's own coupled `I`/`J` TimeDerivative lowers via synapse_lowering.cpp's
     // general forward-Euler fallback for per-edge state (see that file's own doc comment) -- see
     // izhikevich_network_target_neuron_matches_pyneuroml_reference below.
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    engine.weights.set_constant_weight(0.0f);
 
     // Manual stimulus reconstruction (see this file's own header comment, Phase-2 section, #1):
     // izhikevich_network.nml's own <pulseGenerator id="pulseGen1" delay="10ms" duration="200ms"
@@ -972,13 +936,14 @@ IzhikevichNetworkRunResult run_izhikevich_network(s64 tick_count, f32 dt_seconds
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
         if (tick >= delay_ticks && tick < delay_ticks + duration_ticks) {
-            live.buffers.network_inputs[0] += amplitude_amperes;
+            engine.network_inputs.get_contents()[0] += amplitude_amperes;
         }
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
-        result.driven_membrane_trace.push_back(allocation.cell_state.get_contents()[v_state_index(allocation, 0, 0)]);
-        if (live.buffers.last_spiked[0] == tick) result.driven_spike_ticks.push_back(tick);
-        if (live.buffers.last_spiked[1] == tick) result.target_spike_ticks.push_back(tick);
+        result.driven_membrane_trace.push_back(
+            engine.nml_allocation_.cell_state.get_contents()[v_state_index(engine.nml_allocation_, 0, 0)]);
+        if (engine.last_spiked.get_contents()[0] == tick) result.driven_spike_ticks.push_back(tick);
+        if (engine.last_spiked.get_contents()[1] == tick) result.target_spike_ticks.push_back(tick);
     }
 
     return result;
@@ -987,42 +952,34 @@ IzhikevichNetworkRunResult run_izhikevich_network(s64 tick_count, f32 dt_seconds
 // ── delayed-coupling network driver (exit model #2) ───────────────────────────────────────────────
 
 struct DelayedCouplingRunResult {
-    Vector<s64> source_spike_ticks;
-    Vector<s64> target_delivery_ticks; // ticks at which the delay ring's own input_ring shows a
-                                        // nonzero contribution reaching TargetPop's own neuron
+    spikecorec::Vector<s64> source_spike_ticks;
+    spikecorec::Vector<s64> target_delivery_ticks; // ticks at which the delay ring's own input_ring shows a
+                                                    // nonzero contribution reaching TargetPop's own neuron
 };
 
 DelayedCouplingRunResult run_delayed_coupling_network(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_initial_membrane_potentials(allocation, model); // GLIF1Cell -- reuses ticket #61's own EL seed
-    WeightMatrix weights = build_weight_matrix(model);
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model); // GLIF1Cell -- reuses ticket #61's own EL seed
     // An arbitrary nonzero placeholder (see this file's own header comment, Phase-2 section, #2) --
     // this exit model's own validation target is delivery TIMING (arch §4.4), which the delay ring
     // derives purely from the connection's own `delay` attribute, independent of whatever value gets
     // scattered -- unlike the izhikevich network's own zero-weight precedent (a magnitude comparison
     // that WOULD need real per-edge synapse dynamics), no magnitude comparison is made here at all.
-    weights.set_constant_weight(0.6f);
+    engine.weights.set_constant_weight(0.6f);
 
-    DelayRingAllocation ring = allocate_delay_ring(model, weights, dt_seconds);
-    AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
-
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)model.total_neuron_count * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + model.total_neuron_count, (s64)-1);
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)model.total_neuron_count * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)model.total_neuron_count * sizeof(bool));
-
-    // Delay-ring mode: ModelRuntimeBuffers::network_inputs/next_active_neuron_indices/count/
-    // active_generation are unused (superseded by `delay_ring`'s own ring-shaped equivalents,
-    // master_kernel.h's own documented contract) and are left unallocated/null.
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    buffers.delay_ring = &ring;
+    // SpikeEngine folds the delay ring (ticket #64) straight into `network_inputs`/`last_spiked`/the
+    // active-set bookkeeping itself -- there is no separate DelayRingAllocation to build (see
+    // include/spikecorec/core/engine.h's own "delay-ring fold" doc comment). This fixture's single
+    // connection means the uniform-delay path always applies (WeightMatrix::using_constant_delay_ticks),
+    // so `engine.weights.constant_delay_ticks` is this engine's own ring_slot_count -- exactly the
+    // pattern tests/spike_engine_nml_construction_tests.cpp's own
+    // real_nml_connection_delay_converts_to_the_correct_whole_tick_count_and_delivers_on_time
+    // establishes for this exact fixture.
+    EXPECT_TRUE(engine.weights.using_constant_delay_ticks);
+    const s64 ring_slot_count = engine.weights.constant_delay_ticks;
 
     // Manual stimulus reconstruction (see this file's own header comment, Phase-2 section, #1):
     // delayed_coupling_network.nml's own <pulseGenerator id="pulseGen1" delay="10ms" duration="6ms"
@@ -1036,28 +993,24 @@ DelayedCouplingRunResult run_delayed_coupling_network(s64 tick_count, f32 dt_sec
 
     DelayedCouplingRunResult result;
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        s64 current_slot = tick % ring.ring_slot_count;
-        // This tick's own ring slot (master_kernel.cpp's own step_tick, ticket #64) -- read BEFORE
-        // this tick's own stimulus/step_tick call so it reflects only whatever a PRIOR tick's
-        // propagate stage already scattered into it (arch §3.5's >=1-tick latency).
+        s64 current_slot = tick % ring_slot_count;
+        // This tick's own ring slot (engine.cpp's own step_tick, ticket #64) -- read BEFORE this
+        // tick's own stimulus/step_tick call so it reflects only whatever a PRIOR tick's propagate
+        // stage already scattered into it (arch §3.5's >=1-tick latency).
         f32 target_network_input_this_tick =
-            ring.input_ring.get_contents()[current_slot * model.total_neuron_count + target_neuron_index];
+            engine.network_inputs.get_contents()[current_slot * engine.neuron_count + target_neuron_index];
         if (std::fabs(target_network_input_this_tick) > delivery_epsilon) result.target_delivery_ticks.push_back(tick);
 
         if (tick >= stimulus_delay_ticks && tick < stimulus_delay_ticks + stimulus_duration_ticks) {
             // Direct injection into the ring's own CURRENT slot -- the same real, SI-unit-current
             // stimulus-injection channel run_glif3_single_cell/run_glif_ei_network use above (this
             // cell's own iSyn DerivedVariable aliases straight to whatever the per-population `_tick`
-            // kernel reads as "network_inputs" THIS tick), just ring-indexed rather than flat
-            // (ModelRuntimeBuffers::delay_ring's own doc comment: the flat `network_inputs` field is
-            // unused/superseded in ring mode, but the per-population `_tick` kernel still reads
-            // whatever THIS tick's own ring slot holds under that same reserved parameter name --
-            // master_kernel.cpp's own `network_inputs_for_this_tick`).
-            ring.input_ring.get_contents()[current_slot * model.total_neuron_count + 0] += amplitude_amperes;
+            // kernel reads as "network_inputs" THIS tick), just ring-indexed rather than flat.
+            engine.network_inputs.get_contents()[current_slot * engine.neuron_count + 0] += amplitude_amperes;
         }
 
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
-        if (buffers.last_spiked[0] == tick) result.source_spike_ticks.push_back(tick);
+        engine.step_tick(dt_seconds, tick, tick + 1);
+        if (engine.last_spiked.get_contents()[0] == tick) result.source_spike_ticks.push_back(tick);
     }
 
     return result;
@@ -1080,59 +1033,29 @@ struct PoissonPopulationRunResult {
 
 PoissonPopulationRunResult run_poisson_population(s32 population_size, s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("poisson_population");
-    Vector<IrProgram> programs{lower_inputs_to_ir(model.type_library[0])};
-    ModelAllocation allocation = allocate_model(model, programs);
+    spikecorec::Vector<IrProgram> programs{lower_inputs_to_ir(model.type_library[0])};
 
-    // WeightMatrix rejects an edge-free adjacency (ticket #65's own established workaround) -- a
-    // trivial ring (neuron n -> (n+1)%population_size, since K2Tree rejects self-loops) purely to
-    // satisfy that constructor; this test only cares about spike TIMING (last_spiked), never
-    // network_inputs/propagation, so the edge's own weight is irrelevant.
-    vector<vector<s32>> adjacency((usize)population_size);
-    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        adjacency[(usize)neuron_index] = {(neuron_index + 1) % population_size};
-    }
-    WeightMatrix weights(adjacency, /*rank=*/1);
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-
-    GpuPointer<f32> network_inputs = allocate<f32>((usize)population_size * sizeof(f32));
-    memset(network_inputs.get_contents(), 0, (usize)population_size * sizeof(f32));
-    GpuPointer<s64> last_spiked = allocate<s64>((usize)population_size * sizeof(s64));
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + population_size, (s64)-1);
-    GpuPointer<s32> next_active_indices = allocate<s32>((usize)population_size * sizeof(s32));
-    GpuPointer<s32> next_active_count = allocate<s32>(sizeof(s32));
-    next_active_count.get_contents()[0] = 0;
-    GpuPointer<s32> active_generation = allocate<s32>((usize)population_size * sizeof(s32));
-    std::fill(active_generation.get_contents(), active_generation.get_contents() + population_size, -1);
-    GpuPointer<bool> emit_spike = allocate<bool>((usize)population_size * sizeof(bool));
-    memset(emit_spike.get_contents(), 0, (usize)population_size * sizeof(bool));
-    GpuPointer<u32> rng_state = allocate<u32>((usize)population_size * sizeof(u32));
-    for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        rng_state.get_contents()[neuron_index] = (u32)((neuron_index + 1) * 2654435761u) | 1u; // nonzero seed
-    }
-
-    ModelRuntimeBuffers buffers;
-    buffers.allocation = &allocation;
-    buffers.weights = &weights;
-    buffers.network_inputs = network_inputs.get_contents();
-    buffers.last_spiked = last_spiked.get_contents();
-    buffers.next_active_neuron_indices = next_active_indices.get_contents();
-    buffers.next_active_neuron_count = next_active_count.get_contents();
-    buffers.active_generation = active_generation.get_contents();
-    buffers.emit_port_flags["spike"] = emit_spike.get_contents();
-    buffers.rng_state = rng_state.get_contents();
+    // SpikeEngine builds its own WeightMatrix internally (nml::build_weight_matrix_from_projections)
+    // from model.projections -- empty here (poisson_population.nml declares no projections at all),
+    // which WeightMatrix accepts directly (an edge-free adjacency is a legal, degenerate case -- see
+    // weight_matrix_tests.cpp's own WeightMatrix.no_edges_at_all_graph), so unlike the old
+    // AssembledModel/ModelRuntimeBuffers path, no separate trivial-ring-adjacency workaround is
+    // needed here. rng_state is likewise seeded automatically by SpikeEngine's own constructor (the
+    // exact same (neuron_index + 1) * 2654435761u | 1u scheme this function used to seed by hand --
+    // see engine.cpp) whenever a population's kernel references rand/randn, as SpikeSourcePoisson's
+    // own lowered program does here.
+    SpikeEngine engine(model, programs, dt_seconds);
 
     PoissonPopulationRunResult result;
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        assembled_model.step_tick(buffers, dt_seconds, tick, tick + 1);
-        const s64 *last_spiked_contents = last_spiked.get_contents();
+        engine.step_tick(dt_seconds, tick, tick + 1);
+        const s64 *last_spiked_contents = engine.last_spiked.get_contents();
         for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
             if (last_spiked_contents[neuron_index] == tick) ++result.total_spike_count;
         }
     }
     for (s32 neuron_index = 0; neuron_index < population_size; ++neuron_index) {
-        if (last_spiked.get_contents()[neuron_index] != -1) ++result.neurons_that_fired;
+        if (engine.last_spiked.get_contents()[neuron_index] != -1) ++result.neurons_that_fired;
     }
     return result;
 }
@@ -1158,15 +1081,15 @@ TEST(ExitModelIzhikevichNetwork, parses_resolves_lowers_allocates_and_compiles_w
     EXPECT_EQ(cell_count, 1);
     EXPECT_EQ(synapse_count, 1);
 
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
     ASSERT_EQ(programs.size(), 2u);
 
     ModelAllocation allocation = allocate_model(model, programs);
     EXPECT_EQ(allocation.cell_state_element_count, 4); // 2 neurons * (v, u)
 
     EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs);
-        (void)assembled_model;
+        SpikeEngine engine(model, programs);
+        (void)engine;
     });
 }
 
@@ -1222,15 +1145,18 @@ TEST(ExitModelDelayedCouplingNetwork, parses_resolves_lowers_allocates_and_compi
     // GLIF1Cell (Cell) + delaySynapse (Synapse).
     ASSERT_EQ(model.type_library.size(), 2u);
 
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
     ASSERT_EQ(programs.size(), 2u);
 
     ModelAllocation allocation = allocate_model(model, programs);
     EXPECT_EQ(allocation.cell_state_element_count, 4); // 2 neurons * (v, refractoryTimeElapsed)
 
+    // 0.1ms, matching this fixture's own <Simulation step="0.1ms"> -- the delay-ring fold
+    // (include/spikecorec/core/engine.h) is unconditional (no enable_delay_ring flag anymore): a real
+    // per-connection delay converting to > 1 tick against this dt_seconds is enough to activate it.
     EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs, /*enable_delay_ring=*/true);
-        (void)assembled_model;
+        SpikeEngine engine(model, programs, /*dt_seconds=*/1e-4f);
+        (void)engine;
     });
 }
 
@@ -1279,13 +1205,13 @@ TEST(ExitModelPoissonPopulation, parses_resolves_lowers_allocates_and_compiles_w
     EXPECT_EQ(model.type_library[0].component_type_name, "SpikeSourcePoisson");
 
     IrProgram program = lower_inputs_to_ir(model.type_library[0]);
-    Vector<IrProgram> programs{program};
+    spikecorec::Vector<IrProgram> programs{program};
     ModelAllocation allocation = allocate_model(model, programs);
     (void)allocation;
 
     EXPECT_NO_THROW({
-        AssembledModel assembled_model(model, programs);
-        (void)assembled_model;
+        SpikeEngine engine(model, programs);
+        (void)engine;
     });
 }
 
@@ -1321,7 +1247,7 @@ TEST(ExitModelReferenceDataLoader, loads_izhikevich_network_membrane_trace_and_s
     EXPECT_EQ(trace.column_values[0].size(), 3u);
     EXPECT_NEAR(trace.column_values[0][0], -0.06, 1e-6); // v_driven starts at v0 = -60mV
 
-    Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
         fixture_path("reference_data/izhikevich_network/izhikevich_network_spikes.dat"));
     // Real captured jLEMS raster: 5 DrivenPop spikes, 5 TargetPop spikes (real network propagation
     // through izhCurrSynapse -- see izhikevich_network.nml's own header comment).
@@ -1343,7 +1269,7 @@ TEST(ExitModelReferenceDataLoader, loads_delayed_coupling_network_membrane_trace
     EXPECT_EQ(trace.column_values[0].size(), 2u);
     EXPECT_NEAR(trace.column_values[0][0], -0.07, 1e-6); // both start at EL = -70mV
 
-    Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
         fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_spikes.dat"));
     // Real captured jLEMS raster: exactly one SourcePop spike (this fixture's own deliberately short
     // pulseGenerator window, see delayed_coupling_network.nml's own header comment); TargetPop never
@@ -1354,7 +1280,7 @@ TEST(ExitModelReferenceDataLoader, loads_delayed_coupling_network_membrane_trace
 }
 
 TEST(ExitModelReferenceDataLoader, loads_poisson_population_spike_raster) {
-    Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> spikes = load_reference_spikes(
         fixture_path("reference_data/poisson_population/poisson_population_spikes.dat"));
     // Real captured jLEMS raster (seed=17, poisson_population.nml): 100 neurons * 10Hz * 8s ->
     // expected 8000, observed 7929 (a genuine sample of the same rate-10Hz Poisson process).
@@ -1389,10 +1315,10 @@ TEST(ExitModelValidation, izhikevich_network_driven_neuron_matches_pyneuroml_ref
     const f32 dt_seconds = 1e-4f;
 
     IzhikevichNetworkRunResult own_result = run_izhikevich_network(tick_count, dt_seconds);
-    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
         fixture_path("reference_data/izhikevich_network/izhikevich_network_spikes.dat"));
 
-    Vector<f64> reference_driven_spike_times;
+    spikecorec::Vector<f64> reference_driven_spike_times;
     for (const auto &spike : reference_spikes) {
         if (spike.selection_id == "sel_driven") reference_driven_spike_times.push_back(spike.time_seconds);
     }
@@ -1415,10 +1341,10 @@ TEST(ExitModelValidation, izhikevich_network_target_neuron_matches_pyneuroml_ref
     const f32 dt_seconds = 1e-4f;
 
     IzhikevichNetworkRunResult own_result = run_izhikevich_network(tick_count, dt_seconds);
-    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
         fixture_path("reference_data/izhikevich_network/izhikevich_network_spikes.dat"));
 
-    Vector<f64> reference_target_spike_times;
+    spikecorec::Vector<f64> reference_target_spike_times;
     for (const auto &spike : reference_spikes) {
         if (spike.selection_id == "sel_target") reference_target_spike_times.push_back(spike.time_seconds);
     }
@@ -1437,7 +1363,7 @@ TEST(ExitModelValidation, delayed_coupling_network_source_spike_matches_pyneurom
     const f32 dt_seconds = 1e-4f;
 
     DelayedCouplingRunResult own_result = run_delayed_coupling_network(tick_count, dt_seconds);
-    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
         fixture_path("reference_data/delayed_coupling_network/delayed_coupling_network_spikes.dat"));
 
     expect_spike_train_roughly_matches_reference(own_result.source_spike_ticks, extract_spike_time_seconds(reference_spikes),
@@ -1501,7 +1427,7 @@ TEST(ExitModelValidation, DISABLED_poisson_population_aggregate_spike_count_matc
     const f32 dt_seconds = 0.001f;
 
     PoissonPopulationRunResult own_result = run_poisson_population(population_size, tick_count, dt_seconds);
-    Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes = load_reference_spikes(
         fixture_path("reference_data/poisson_population/poisson_population_spikes.dat"));
 
     f64 expected_spike_count = (f64)population_size * rate_hz * ((f64)tick_count * (f64)dt_seconds);
@@ -1581,8 +1507,8 @@ void seed_theta_initial_value(ModelAllocation &allocation, const ModelSpecificat
 }
 
 struct SingleCellRunResult {
-    Vector<f32> membrane_trace; // one sample per tick, tick 0..tick_count-1
-    Vector<s64> spike_ticks;    // every tick a spike occurred, in order
+    spikecorec::Vector<f32> membrane_trace; // one sample per tick, tick 0..tick_count-1
+    spikecorec::Vector<s64> spike_ticks;    // every tick a spike occurred, in order
 };
 
 // GLIF2: scaled reset, no after-spike currents, no adapting threshold -- `v` alone needs seeding
@@ -1590,25 +1516,22 @@ struct SingleCellRunResult {
 // run_glif3_single_cell above.
 SingleCellRunResult run_glif2_single_cell(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("glif2_single_cell");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_initial_membrane_potentials(allocation, model);
-    WeightMatrix weights = build_weight_matrix(model);
-    AssembledModel assembled_model(model, programs);
-
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model);
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt_seconds);
 
     SingleCellRunResult result;
     result.membrane_trace.reserve((usize)tick_count);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        live.buffers.network_inputs[0] += (f32)schedule.current_at(0, tick);
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+        engine.network_inputs.get_contents()[0] += (f32)schedule.current_at(0, tick);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
-        result.membrane_trace.push_back(allocation.cell_state.get_contents()[v_state_index(allocation, 0, 0)]);
-        if (live.buffers.last_spiked[0] == tick) result.spike_ticks.push_back(tick);
+        result.membrane_trace.push_back(
+            engine.nml_allocation_.cell_state.get_contents()[v_state_index(engine.nml_allocation_, 0, 0)]);
+        if (engine.last_spiked.get_contents()[0] == tick) result.spike_ticks.push_back(tick);
     }
 
     return result;
@@ -1618,26 +1541,23 @@ SingleCellRunResult run_glif2_single_cell(s64 tick_count, f32 dt_seconds) {
 // `theta` (seed_theta_initial_value above) both need seeding.
 SingleCellRunResult run_glif4_single_cell(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("glif4_single_cell");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_initial_membrane_potentials(allocation, model);
-    seed_theta_initial_value(allocation, model);
-    WeightMatrix weights = build_weight_matrix(model);
-    AssembledModel assembled_model(model, programs);
-
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model);
+    seed_theta_initial_value(engine.nml_allocation_, model);
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt_seconds);
 
     SingleCellRunResult result;
     result.membrane_trace.reserve((usize)tick_count);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        live.buffers.network_inputs[0] += (f32)schedule.current_at(0, tick);
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+        engine.network_inputs.get_contents()[0] += (f32)schedule.current_at(0, tick);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
-        result.membrane_trace.push_back(allocation.cell_state.get_contents()[v_state_index(allocation, 0, 0)]);
-        if (live.buffers.last_spiked[0] == tick) result.spike_ticks.push_back(tick);
+        result.membrane_trace.push_back(
+            engine.nml_allocation_.cell_state.get_contents()[v_state_index(engine.nml_allocation_, 0, 0)]);
+        if (engine.last_spiked.get_contents()[0] == tick) result.spike_ticks.push_back(tick);
     }
 
     return result;
@@ -1648,26 +1568,23 @@ SingleCellRunResult run_glif4_single_cell(s64 tick_count, f32 dt_seconds) {
 // zero-init (same as GLIF3), so no separate seeding is needed for them.
 SingleCellRunResult run_glif5_single_cell(s64 tick_count, f32 dt_seconds) {
     ModelSpecification model = load_model_from_nml_fixture("glif5_single_cell");
-    Vector<IrProgram> programs = build_type_library_ir_programs(model);
+    spikecorec::Vector<IrProgram> programs = build_type_library_ir_programs(model);
 
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_initial_membrane_potentials(allocation, model);
-    seed_theta_initial_value(allocation, model);
-    WeightMatrix weights = build_weight_matrix(model);
-    AssembledModel assembled_model(model, programs);
-
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model);
+    seed_theta_initial_value(engine.nml_allocation_, model);
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)dt_seconds);
 
     SingleCellRunResult result;
     result.membrane_trace.reserve((usize)tick_count);
 
     for (s64 tick = 0; tick < tick_count; ++tick) {
-        live.buffers.network_inputs[0] += (f32)schedule.current_at(0, tick);
-        assembled_model.step_tick(live.buffers, dt_seconds, tick, tick + 1);
+        engine.network_inputs.get_contents()[0] += (f32)schedule.current_at(0, tick);
+        engine.step_tick(dt_seconds, tick, tick + 1);
 
-        result.membrane_trace.push_back(allocation.cell_state.get_contents()[v_state_index(allocation, 0, 0)]);
-        if (live.buffers.last_spiked[0] == tick) result.spike_ticks.push_back(tick);
+        result.membrane_trace.push_back(
+            engine.nml_allocation_.cell_state.get_contents()[v_state_index(engine.nml_allocation_, 0, 0)]);
+        if (engine.last_spiked.get_contents()[0] == tick) result.spike_ticks.push_back(tick);
     }
 
     return result;
@@ -1684,7 +1601,7 @@ TEST(ExitModelReferenceDataLoader, loads_glif2_single_cell_membrane_trace_and_sp
     EXPECT_NEAR(trace.time_seconds.back(), 0.35, 1e-9);
     EXPECT_NEAR(trace.column_values[0][0], -0.07, 1e-6); // v starts at EL = -70mV
 
-    Vector<ReferenceSpikeRecord> spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> spikes =
         load_reference_spikes(fixture_path("reference_data/glif2_single_cell/glif2_spikes.dat"));
     // Real captured jLEMS raster under this fixture's own current step: no adaptation mechanism at
     // all (unlike GLIF3/GLIF4/GLIF5), so a regular, non-slowing spike train.
@@ -1704,7 +1621,7 @@ TEST(ExitModelReferenceDataLoader, loads_glif4_single_cell_membrane_trace_and_sp
     EXPECT_NEAR(trace.column_values[0][0], -0.07, 1e-6);  // v starts at EL = -70mV
     EXPECT_NEAR(trace.column_values[0][1], -0.05, 1e-6);  // theta starts at thetaInf = -50mV
 
-    Vector<ReferenceSpikeRecord> spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> spikes =
         load_reference_spikes(fixture_path("reference_data/glif4_single_cell/glif4_spikes.dat"));
     // Real captured jLEMS spike-frequency-adaptation raster (adapting threshold, not after-spike
     // currents): growing inter-spike intervals under this fixture's own current step.
@@ -1726,7 +1643,7 @@ TEST(ExitModelReferenceDataLoader, loads_glif5_single_cell_membrane_trace_and_sp
     EXPECT_NEAR(trace.column_values[0][2], 0.0, 1e-9);    // asc1 starts at 0
     EXPECT_NEAR(trace.column_values[0][3], 0.0, 1e-9);    // asc2 starts at 0
 
-    Vector<ReferenceSpikeRecord> spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> spikes =
         load_reference_spikes(fixture_path("reference_data/glif5_single_cell/glif5_spikes.dat"));
     // Real captured jLEMS spike-frequency-adaptation raster: BOTH mechanisms acting together
     // (after-spike currents + adapting threshold), the most complex of the five GLIF variants.
@@ -1749,7 +1666,7 @@ TEST(ExitModelGlif2SingleCell, matches_pyneuroml_reference) {
     SingleCellRunResult own_result = run_glif2_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace =
         load_reference_trace(fixture_path("reference_data/glif2_single_cell/glif2_membrane_trace.dat"));
-    Vector<ReferenceSpikeRecord> reference_spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif2_single_cell/glif2_spikes.dat"));
 
     expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
@@ -1773,7 +1690,7 @@ TEST(ExitModelGlif4SingleCell, matches_pyneuroml_reference) {
     SingleCellRunResult own_result = run_glif4_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace =
         load_reference_trace(fixture_path("reference_data/glif4_single_cell/glif4_membrane_trace.dat"));
-    Vector<ReferenceSpikeRecord> reference_spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif4_single_cell/glif4_spikes.dat"));
 
     expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
@@ -1797,7 +1714,7 @@ TEST(ExitModelGlif5SingleCell, matches_pyneuroml_reference) {
     SingleCellRunResult own_result = run_glif5_single_cell(tick_count, dt_seconds);
     ReferenceTrace reference_trace =
         load_reference_trace(fixture_path("reference_data/glif5_single_cell/glif5_membrane_trace.dat"));
-    Vector<ReferenceSpikeRecord> reference_spikes =
+    spikecorec::Vector<ReferenceSpikeRecord> reference_spikes =
         load_reference_spikes(fixture_path("reference_data/glif5_single_cell/glif5_spikes.dat"));
 
     expect_spike_train_roughly_matches_reference(own_result.spike_ticks, extract_spike_time_seconds(reference_spikes),
