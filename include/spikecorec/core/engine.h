@@ -114,10 +114,16 @@ namespace spikecorec {
         // state directly from a lowered NML ModelSpecification + its per-ComponentType IR programs,
         // instead of the hardcoded LIF cell the two constructors above build. `model` is taken by
         // mutable reference to match nml::allocate_model's own signature (it configures
-        // model.adjacency's per-edge variable count in place). Only the non-delay-ring case is
-        // supported by this constructor/step_tick() below -- delay-ring folding is a separate, later
-        // stage.
-        SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrProgram> &type_library_ir_programs);
+        // model.adjacency's per-edge variable count in place). `dt_seconds` is this model's own fixed
+        // tick duration (the same value every step_tick call's own `dt` argument uses) -- needed here
+        // to convert each ConnectionEntry::delay (SI seconds, already unit-resolved by resolve.cpp's
+        // own unit_value_to_si) into the whole-tick counts `weights`' delay fields store (mirrors
+        // delay_ring.cpp's own, separate, untouched seconds->ticks conversion -- see engine.cpp's
+        // constructor body). Defaults to 1e-4f, the established Phase-1 tick duration (examples/
+        // nml_pipeline_support.h's own ExampleOptions::dt_seconds default), so every existing caller
+        // that only ever runs at that convention keeps compiling and behaving unchanged.
+        SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrProgram> &type_library_ir_programs,
+                    f32 dt_seconds = 1e-4f);
 
         ~SpikeEngine();
 

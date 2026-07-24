@@ -262,16 +262,37 @@ private:
 // master_kernel.h/master_kernel.cpp this generalizes -- those files/AssembledModel are left
 // completely untouched by this fold; this is new, additive capability on SpikeEngine alone. ──────
 
+// Converts one connection's own delay (SI seconds, already unit-resolved by resolve.cpp's own
+// unit_value_to_si -- see model_specification.cpp) to whole ticks against `dt_seconds`, floored to
+// the engine's existing implicit one-tick latency -- the SAME math delay_ring.cpp's own (anonymous-
+// namespace, so not directly reusable from here without touching that untouchable file) private
+// delay_seconds_to_ticks performs, mirrored here rather than exposed from there, matching this
+// file's own established "small, file-local mirror" convention (see
+// nml_compute_ring_slot_count_from_weight_matrix's own doc comment just below). A plain `connection`
+// with no `delay` attribute at all (ConnectionEntry::delay == 0.0, model_specification.cpp's own
+// default) lands here exactly, reproducing today's implicit one-tick latency as this conversion's
+// own zero-delay case.
+s64 nml_delay_seconds_to_ticks(f64 delay_seconds, f32 dt_seconds) {
+    if (dt_seconds <= 0.0f) {
+        log::throw_runtime_error(log::logger(), "SpikeEngine (nml): dt_seconds must be > 0");
+    }
+    s64 ticks = (s64)std::llround(delay_seconds / (f64)dt_seconds);
+    return ticks < 1 ? 1 : ticks;
+}
+
 // `nml_compute_ring_slot_count_from_weight_matrix`-equivalent of delay_ring.h's own
 // compute_max_delay_ticks(model, dt_seconds): same "scan for the longest delay, floored to the
 // engine's existing implicit 1-tick minimum" shape, but reading the delay straight off `weights`
 // (constant_delay_ticks/using_constant_delay_ticks/edge_delay_ticks -- already whole-tick-
 // denominated, weight_matrix.h) instead of walking a ModelSpecification's connections through a
 // separate DelayRingAllocation (REFACTOR comment #1, delay_ring.h) -- no dt_seconds conversion is
-// needed here at all, unlike delay_ring.cpp's own (untouched) version. Padding slots beyond a
-// node's real degree are never written past their default (1), so scanning the WHOLE
-// edge_delay_ticks array (real edges and padding together) gives exactly the same answer as
-// restricting to real edges only.
+// needed in THIS function specifically, since by the time it runs, `weights`' own delay fields are
+// already whole-tick-denominated (the real SI-seconds->ticks conversion, against the SAME math
+// delay_ring.cpp's own (untouched) delay_seconds_to_ticks performs, now happens upstream of this
+// call, in the ModelSpecification constructor's own delay-seeding step below -- see
+// nml_delay_seconds_to_ticks). Padding slots beyond a node's real degree are never written past
+// their default (1), so scanning the WHOLE edge_delay_ticks array (real edges and padding together)
+// gives exactly the same answer as restricting to real edges only.
 s64 nml_compute_ring_slot_count_from_weight_matrix(const WeightMatrix &weights) {
     if (weights.using_constant_delay_ticks) {
         return weights.constant_delay_ticks < 1 ? 1 : weights.constant_delay_ticks;
@@ -628,7 +649,8 @@ SpikeEngine::NmlResolvedArgument SpikeEngine::resolve_nml_cell_tick_argument(
         "GLIF-family cell (see master_kernel.h)");
 }
 
-SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrProgram> &type_library_ir_programs)
+SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrProgram> &type_library_ir_programs,
+                          f32 dt_seconds)
     : logger(make_logger())
     , weights(nml::build_weight_matrix_from_projections(model))
     , nml_allocation_(nml::allocate_model(model, type_library_ir_programs))
@@ -654,29 +676,49 @@ SpikeEngine::SpikeEngine(nml::ModelSpecification &model, const Vector<nml::IrPro
     block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
 
     // ── delay-ring fold (SpikeEngine-only) -- seed `weights`' own per-edge delay from
-    // model.projections' ConnectionEntry::delay, then determine nml_ring_slot_count_ from
-    // `weights` (REFACTOR comment #1, delay_ring.h: delay lives in WeightMatrix now, not a
-    // separate DelayRingAllocation). WeightMatrix::constant_delay_ticks/edge_delay_ticks are
-    // already whole-tick-denominated (weight_matrix.h), and this constructor has no dt_seconds
-    // available to redo delay_ring.cpp's OLD seconds->ticks conversion (compute_max_delay_ticks/
-    // allocate_delay_ring, used only by the separate, untouched AssembledModel/DelayRingAllocation
-    // system) -- so ConnectionEntry::delay is interpreted DIRECTLY as a whole-tick count here. A
-    // connection whose delay rounds to <= 1 (including the "no delay attribute given" default of
-    // 0.0) leaves its edge at weights' own already-established 1-tick baseline, so an ordinary
-    // model (no caller-configured delay) sees nml_ring_slot_count_ == 1 -- exactly today's flat,
-    // single-buffer behavior.
+    // model.projections' ConnectionEntry::delay (real SI seconds, converted to whole ticks against
+    // this model's own `dt_seconds` via nml_delay_seconds_to_ticks -- the SAME math delay_ring.cpp's
+    // own, separate, untouched compute_max_delay_ticks/allocate_delay_ring use), then determine
+    // nml_ring_slot_count_ from `weights` (REFACTOR comment #1, delay_ring.h: delay lives in
+    // WeightMatrix now, not a separate DelayRingAllocation). A connection whose delay converts to
+    // <= 1 tick (including the "no delay attribute given" default of 0.0 seconds) leaves its edge at
+    // weights' own already-established 1-tick baseline, so an ordinary model (no caller-configured
+    // delay) sees nml_ring_slot_count_ == 1 -- exactly today's flat, single-buffer behavior.
+    //
+    // Mirrors WeightMatrix's own using_constant_weight/constant_weight vs U*V split (weight_matrix.h)
+    // for the uniform case: if every connection converts to the SAME whole-tick count, that single
+    // value is set via the simpler weights.set_constant_delay_ticks(...) path (also covers "no
+    // connections at all", which trivially leaves weights at its own default constant 1-tick delay);
+    // only a model whose connections actually disagree on delay falls through to the true per-edge
+    // weights.set_edge_delay_ticks(...) path (skipping any edge whose own delay already matches the
+    // 1-tick default every slot starts at).
     {
-        bool any_non_default_edge_delay = false;
+        bool any_connection_seen = false;
+        bool all_connections_share_one_delay = true;
+        s64 shared_delay_ticks = 1;
         for (const nml::ProjectionEntry &projection : model.projections) {
             for (const nml::ConnectionEntry &connection : projection.connections) {
-                s64 rounded_delay_ticks = (s64)std::llround(connection.delay);
-                if (rounded_delay_ticks <= 1) continue;
-                if (!any_non_default_edge_delay) {
-                    weights.using_constant_delay_ticks = false;
-                    any_non_default_edge_delay = true;
+                s64 delay_ticks = nml_delay_seconds_to_ticks(connection.delay, dt_seconds);
+                if (!any_connection_seen) {
+                    shared_delay_ticks = delay_ticks;
+                    any_connection_seen = true;
+                } else if (delay_ticks != shared_delay_ticks) {
+                    all_connections_share_one_delay = false;
                 }
-                weights.set_edge_delay_ticks(connection.source_neuron_index, connection.target_neuron_index,
-                                              (s32)rounded_delay_ticks);
+            }
+        }
+
+        if (any_connection_seen && all_connections_share_one_delay) {
+            weights.set_constant_delay_ticks((s32)shared_delay_ticks);
+        } else if (!all_connections_share_one_delay) {
+            weights.using_constant_delay_ticks = false;
+            for (const nml::ProjectionEntry &projection : model.projections) {
+                for (const nml::ConnectionEntry &connection : projection.connections) {
+                    s64 delay_ticks = nml_delay_seconds_to_ticks(connection.delay, dt_seconds);
+                    if (delay_ticks <= 1) continue; // already the array's own 1-tick default
+                    weights.set_edge_delay_ticks(connection.source_neuron_index, connection.target_neuron_index,
+                                                  (s32)delay_ticks);
+                }
             }
         }
     }

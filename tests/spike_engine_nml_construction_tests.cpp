@@ -15,6 +15,7 @@
 
 #include "spikecorec/core/engine.h"
 #include "spikecorec/nml/cell_lowering.h"
+#include "spikecorec/nml/delay_ring.h"
 #include "spikecorec/nml/model_specification.h"
 #include "spikecorec/nml/nml.h"
 #include "spikecorec/nml/resolve.h"
@@ -458,13 +459,15 @@ TEST(SpikeEngineNmlMoveSafety, move_assignment_does_not_double_release_nml_resou
 // synapse dispatch is force-disabled for that case, so a re-used conductance-synapse model would
 // never even exercise the delay ring at all) -- build_two_neuron_delay_ring_model, a plain
 // (no real per-edge synapse type) projection relying on the FIXED scalar propagate stage's own
-// constant_weight instead. This constructor's own delay-seeding step (engine.cpp) interprets
-// ConnectionEntry::delay DIRECTLY as a whole-tick count (SpikeEngine's NML constructor has no
-// dt_seconds available to redo delay_ring.cpp's OLD seconds->ticks conversion, and WeightMatrix's
-// own delay fields are already whole-tick-denominated) -- so the fixture below just sets `delay`
-// to the desired tick count directly. Only valid for a delay that rounds to > 1 (forcing
-// nml_ring_slot_count_ > 1, and so nml_projections_ empty, and so its own bogus
-// synapse_type_library_index never gets validated) -- NOT a general-purpose "any delay" fixture.
+// constant_weight instead. The engine's constructor now converts ConnectionEntry::delay (real SI
+// seconds) to whole ticks against its own `dt_seconds` constructor argument (engine.cpp's
+// nml_delay_seconds_to_ticks) -- this fixture's own dt=1.0 convention (every step_tick call below
+// passes dt=1.0f) means passing dt_seconds=1.0f to the engine's constructor too makes that
+// conversion an exact identity, so `connection_delay_ticks` below can still be handed straight to
+// ConnectionEntry::delay and read back as that same whole-tick count. Only valid for a delay that
+// converts to > 1 tick (forcing nml_ring_slot_count_ > 1, and so nml_projections_ empty, and so its
+// own bogus synapse_type_library_index never gets validated) -- NOT a general-purpose "any delay"
+// fixture.
 
 namespace {
 
@@ -516,7 +519,10 @@ vector<f32> run_two_neuron_delay_ring_network_through_spike_engine(f64 connectio
     vector<IrProgram> programs;
     ModelSpecification model = build_two_neuron_delay_ring_model(connection_delay_ticks, programs);
 
-    SpikeEngine engine(model, programs);
+    // dt_seconds=1.0f matches this fixture's own dt=1.0 convention (every step_tick call below), so
+    // the constructor's real seconds->ticks delay conversion is an identity against
+    // `connection_delay_ticks` (see this section's own header comment above).
+    SpikeEngine engine(model, programs, 1.0f);
     engine.weights.set_constant_weight(constant_weight);
 
     vector<f32> postsynaptic_trajectory;
@@ -576,4 +582,100 @@ TEST(SpikeEngineNmlDelayRing, ring_shaped_path_delivers_a_spike_exactly_delay_ti
     std::cout << "[SpikeEngineNmlDelayRing] ring_slot_count==" << delay_ticks << " postsynaptic trajectory: ";
     for (f32 voltage : trajectory) std::cout << voltage << " ";
     std::cout << std::endl;
+}
+
+// ── real NML per-connection delay -> whole-tick conversion ────────────────────────────────────────
+//
+// Both fixtures above manually build a ModelSpecification whose ConnectionEntry::delay is either
+// exactly 0.0 (build_two_neuron_conductance_synapse_model) or handed to the engine's constructor
+// alongside a dt_seconds=1.0f chosen specifically to make the seconds->ticks conversion an identity
+// (build_two_neuron_delay_ring_model's own doc comment above) -- neither actually exercises a REAL
+// NeuroML `delay` attribute's unit conversion against a real dt_seconds. This test drives an actual
+// NeuroML model (tests/fixtures/nml/delayed_coupling_network.nml -- the SAME fixture
+// tests/exit_model_validation_tests.cpp's own run_delayed_coupling_network validates against a real
+// jLEMS reference) through the real parse/resolve/lower pipeline and SpikeEngine's own NML
+// constructor with a real dt_seconds, proving engine.cpp's nml_delay_seconds_to_ticks genuinely
+// converts a real `delay="10ms"` NeuroML attribute (already unit-resolved to 0.010 SI seconds by
+// resolve.cpp) into exactly 100 whole ticks at this fixture's own 0.1ms step -- not just "didn't
+// throw".
+TEST(SpikeEngineNmlDelayRing,
+     real_nml_connection_delay_converts_to_the_correct_whole_tick_count_and_delivers_on_time) {
+    ModelSpecification model = load_model_from_nml_fixture("delayed_coupling_network");
+    ASSERT_EQ(model.projections.size(), 1u);
+    ASSERT_EQ(model.projections[0].connections.size(), 1u);
+    // connectionWD's own delay="10ms", already unit-resolved to SI seconds by resolve.cpp.
+    EXPECT_NEAR(model.projections[0].connections[0].delay, 0.010, 1e-9);
+
+    vector<IrProgram> programs = build_type_library_ir_programs(model);
+
+    const f32 dt_seconds = 1e-4f;         // matches this fixture's own <Simulation step="0.1ms">
+    const s64 expected_delay_ticks = 100; // 10ms / 0.1ms
+
+    // Cross-check against delay_ring.cpp's own, separate, already-tested seconds->ticks conversion
+    // (compute_max_delay_ticks) before even constructing the engine.
+    ASSERT_EQ(compute_max_delay_ticks(model, dt_seconds), expected_delay_ticks);
+
+    SpikeEngine engine(model, programs, dt_seconds);
+    seed_initial_membrane_potentials(engine.nml_allocation_, model);
+    // Arbitrary nonzero placeholder -- this test's own target is delivery TIMING (derived purely
+    // from the connection's own delay), not magnitude (mirrors exit_model_validation_tests.cpp's
+    // own run_delayed_coupling_network, which uses this exact same fixture/placeholder).
+    engine.weights.set_constant_weight(0.6f);
+
+    // Exactly one real connection in this whole model, so the uniform-delay path applies
+    // (SpikeEngine's constructor, engine.cpp): weights.set_constant_delay_ticks(...), not the
+    // per-edge array.
+    ASSERT_TRUE(engine.weights.using_constant_delay_ticks);
+    EXPECT_EQ(engine.weights.constant_delay_ticks, expected_delay_ticks)
+        << "measured: a real delay=\"10ms\" NeuroML attribute at dt_seconds=1e-4 produced "
+        << "constant_delay_ticks=" << engine.weights.constant_delay_ticks
+        << " (expected exactly " << expected_delay_ticks << ")";
+    // == this engine's own private nml_ring_slot_count_ in the uniform-delay case (see
+    // nml_compute_ring_slot_count_from_weight_matrix, engine.cpp).
+    const s64 ring_slot_count = engine.weights.constant_delay_ticks;
+
+    // Manual stimulus reconstruction (the front end does not yet recognize inputList/pulseGenerator
+    // -- see ExitModelDelayedCouplingNetwork.front_end_does_not_recognize_inputList_yet_documented_
+    // gap, exit_model_validation_tests.cpp): delayed_coupling_network.nml's own <pulseGenerator
+    // id="pulseGen1" delay="10ms" duration="6ms" amplitude="0.5nA"/>, applied to SourcePop's neuron 0
+    // (global neuron index 0, declared first).
+    const s64 tick_count = 600;             // 60ms / 0.1ms, matching this fixture's own
+                                             // <Simulation length="60ms">
+    const s64 stimulus_delay_ticks = 100;   // pulseGen1 delay="10ms"
+    const s64 stimulus_duration_ticks = 60; // pulseGen1 duration="6ms"
+    const f32 amplitude_amperes = 0.5e-9f;
+    const s32 source_neuron_index = 0; // SourcePop, declared first
+    const s32 target_neuron_index = 1; // TargetPop, declared second
+    const f32 delivery_epsilon = 1e-9f;
+
+    vector<s64> source_spike_ticks;
+    vector<s64> target_delivery_ticks;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        s64 current_ring_slot = tick % ring_slot_count;
+        // This tick's own ring slot, read BEFORE this tick's own stimulus/step_tick call so it
+        // reflects only whatever a PRIOR tick's propagate stage already scattered into it.
+        f32 target_network_input_this_tick =
+            engine.network_inputs.get_contents()[current_ring_slot * engine.neuron_count + target_neuron_index];
+        if (std::fabs(target_network_input_this_tick) > delivery_epsilon) target_delivery_ticks.push_back(tick);
+
+        if (tick >= stimulus_delay_ticks && tick < stimulus_delay_ticks + stimulus_duration_ticks) {
+            engine.network_inputs.get_contents()[current_ring_slot * engine.neuron_count + source_neuron_index] +=
+                amplitude_amperes;
+        }
+
+        engine.step_tick(dt_seconds, tick, tick + 1);
+        if (engine.last_spiked.get_contents()[source_neuron_index] == tick) source_spike_ticks.push_back(tick);
+    }
+
+    ASSERT_EQ(source_spike_ticks.size(), 1u);
+    ASSERT_EQ(target_delivery_ticks.size(), 1u);
+    EXPECT_EQ(target_delivery_ticks[0], source_spike_ticks[0] + expected_delay_ticks)
+        << "measured source spike tick=" << source_spike_ticks[0]
+        << " measured target delivery tick=" << target_delivery_ticks[0]
+        << " (expected delivery exactly " << expected_delay_ticks << " ticks later)";
+
+    std::cout << "[SpikeEngineNmlDelayRing] real NML delay=\"10ms\" at dt_seconds=1e-4 -> "
+              << "constant_delay_ticks=" << engine.weights.constant_delay_ticks
+              << ", source_spike_tick=" << source_spike_ticks[0]
+              << ", target_delivery_tick=" << target_delivery_ticks[0] << std::endl;
 }
