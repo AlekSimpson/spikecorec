@@ -58,8 +58,8 @@ using namespace spikecorec::nml::network_generation;
 // sharing that same basis. So this file's network is a real per-edge-delay ring (ticket #64),
 // which forces #131's dispatch off entirely regardless of `model.projections` -- the one combination
 // `enable_plasticity` already accepts (see
-// AssembledModelPlasticity.enable_plasticity_does_not_throw_under_delay_ring_mode_even_with_projections_present,
-// tests/assembled_model_plasticity_tests.cpp).
+// SpikeEngineNmlPlasticity.enable_plasticity_does_not_throw_under_delay_ring_mode_even_with_projections_present,
+// tests/spike_engine_nml_construction_tests.cpp).
 //
 // The `WeightMatrix` below is left exactly as its constructor's own random U/V init produces (rank=8,
 // a fixed seed for reproducibility) -- deliberately NOT passed through `set_constant_weight()` or
