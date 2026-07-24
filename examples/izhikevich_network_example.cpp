@@ -40,11 +40,20 @@
 #include <cmath>
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "nml_pipeline_support.h"
 
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
+
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a file-scope
+// `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template -- ambiguous
+// with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates of the
+// same name from two using-directives at the same scope, regardless of expanding to the identical
+// type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_tests.cpp/
+// examples/stdp_plasticity_example.cpp already do for the same reason.
 
 namespace {
 
@@ -66,23 +75,21 @@ int main(int argument_count, char **argument_values) {
     GpuContextScope gpu_context_scope;
 
     ModelSpecification model = load_model_specification("izhikevich_network");
-    Vector<IrProgram> programs = lower_type_library_to_ir(model);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model);
     print_model_summary(model, programs);
     if (options.print_ir) print_ir_programs(model, programs);
 
-    // ── The active-set × nonlinear tag, read back from the assembled model ──────────────────────
-    ModelAllocation allocation = allocate_model(model, programs);
-    seed_izhikevich_initial_state(allocation, model);
+    // ── The active-set × nonlinear tag, read back from the engine ──────────────────────────────
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally, then every `.tick`
+    // section → one master kernel, compiled once.
+    SpikeEngine engine(model, programs, options.dt_seconds);
+    seed_izhikevich_initial_state(engine.nml_allocation_, model);
 
     // set_constant_weight(0.0f) is documentation, not the mechanism: this model has a real
-    // projection, so AssembledModel dispatches alphaCurrentSynapse's own dynamics automatically
+    // projection, so SpikeEngine dispatches alphaCurrentSynapse's own dynamics automatically
     // (ticket #131) and forces this WeightMatrix's own scattered contribution to zero regardless.
     // See this file's own header comment for why TargetPop stays silent anyway.
-    WeightMatrix weights = build_weight_matrix(model);
-    weights.set_constant_weight(0.0f);
-
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    engine.weights.set_constant_weight(0.0f);
 
     print_heading("Active-set × nonlinear tags");
     std::cout << "  A closed-form-advanceable population may be skipped for many ticks and caught up\n"
@@ -108,25 +115,25 @@ int main(int argument_count, char **argument_values) {
               << "  driving neuron " << driven_neuron_index << " with " << stimulus_amplitude_amperes * 1e12f
               << " pA for " << format_seconds((f64)stimulus_duration_ticks * seconds_per_tick) << "\n";
 
-    Vector<f32> driven_membrane_trace;
+    spikecorec::Vector<f32> driven_membrane_trace;
     driven_membrane_trace.reserve((usize)options.tick_count);
-    Vector<f32> recovery_variable_trace;
+    spikecorec::Vector<f32> recovery_variable_trace;
     recovery_variable_trace.reserve((usize)options.tick_count);
-    Vector<s64> driven_spike_ticks;
+    spikecorec::Vector<s64> driven_spike_ticks;
 
     const PopulationEntry &driven_population = model.populations[0];
 
     for (s64 tick = 0; tick < options.tick_count; ++tick) {
         if (tick >= stimulus_delay_ticks && tick < stimulus_delay_ticks + stimulus_duration_ticks) {
-            live.buffers.network_inputs[driven_neuron_index] += stimulus_amplitude_amperes;
+            engine.network_inputs.get_contents()[driven_neuron_index] += stimulus_amplitude_amperes;
         }
 
-        assembled_model.step_tick(live.buffers, options.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.dt_seconds, tick, tick + 1);
 
-        driven_membrane_trace.push_back(read_membrane_potential(allocation, model, /*population_index=*/0, 0));
-        recovery_variable_trace.push_back(allocation.cell_state.get_contents()[
-            state_element_index(allocation, driven_population, /*population_index=*/0, /*state_slot_index=*/1, 0)]);
-        if (live.buffers.last_spiked[driven_neuron_index] == tick) driven_spike_ticks.push_back(tick);
+        driven_membrane_trace.push_back(read_membrane_potential(engine.nml_allocation_, model, /*population_index=*/0, 0));
+        recovery_variable_trace.push_back(engine.nml_allocation_.cell_state.get_contents()[
+            state_element_index(engine.nml_allocation_, driven_population, /*population_index=*/0, /*state_slot_index=*/1, 0)]);
+        if (engine.last_spiked.get_contents()[driven_neuron_index] == tick) driven_spike_ticks.push_back(tick);
     }
 
     print_heading("Membrane potential (v)");

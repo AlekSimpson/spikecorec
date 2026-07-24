@@ -43,6 +43,7 @@
 
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/nml/stimulus_schedule.h"
 
 #include "glif_torus_network.h"
@@ -50,6 +51,14 @@
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
+
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other torus example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a
+// file-scope `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template --
+// ambiguous with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates
+// of the same name from two using-directives at the same scope, regardless of expanding to the
+// identical type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_
+// tests.cpp/examples/stdp_plasticity_example.cpp already do for the same reason.
 
 int main(int argument_count, char **argument_values) {
     TorusExampleOptions options = parse_torus_example_options(
@@ -68,7 +77,7 @@ int main(int argument_count, char **argument_values) {
 
     ModelSpecification model = load_generated_model("glif5_torus", generate_glif_torus_network_nml(network_options));
 
-    Vector<IrProgram> programs = lower_type_library_to_ir(model);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model);
     print_model_summary(model, programs);
     if (options.base.print_ir) print_ir_programs(model, programs);
 
@@ -80,8 +89,10 @@ int main(int argument_count, char **argument_values) {
               << "  synapse         : expOneSynapse, gbase=" << options.synapse_gbase
               << " (real per-edge dispatch, ticket #131)\n";
 
-    // ── 2. Allocation and the GLIF5-specific initial state ──────────────────────────────────────
-    ModelAllocation allocation = allocate_model(model, programs);
+    // ── 2. Assembly and the GLIF5-specific initial state ────────────────────────────────────────
+    // SpikeEngine builds its own ModelAllocation + WeightMatrix internally, then every `.tick`
+    // section → one master kernel, compiled once.
+    SpikeEngine engine(model, programs, options.base.dt_seconds);
 
     print_heading("State variables");
     std::cout << "  GLIF5 declares " << model.type_library[0].state_variable_count
@@ -91,20 +102,12 @@ int main(int argument_count, char **argument_values) {
               << "    slot 2  asc1                    after-spike current, tau = 100ms\n"
               << "    slot 3  asc2                    after-spike current, tau = 10ms\n"
               << "    slot 4  refractoryTimeElapsed   refractory-regime timer\n"
-              << "\n  cell_state elements : " << allocation.cell_state_element_count << "\n";
+              << "\n  cell_state elements : " << engine.nml_allocation_.cell_state_element_count << "\n";
 
     // OnStart is `v = EL, theta = thetaInf, asc1 = asc2 = 0`. allocate_model does not evaluate
     // OnStart, so seeding theta by hand is REQUIRED here — left at zero it would sit above the
     // -50mV threshold and no neuron would ever fire.
-    seed_glif_initial_state(allocation, model, GlifVariant::Glif5);
-
-    // No `set_constant_weight` call: this model has real projections, so AssembledModel dispatches
-    // expOneSynapse's own dynamics automatically (ticket #131) and forces this WeightMatrix's own
-    // scalar scatter contribution to zero regardless.
-    WeightMatrix weights = build_weight_matrix(model);
-
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
+    seed_glif_initial_state(engine.nml_allocation_, model, GlifVariant::Glif5);
 
     std::cout << "  population tagged   : "
               << (population_is_closed_form_advanceable(model, 0) ? "closed-form advanceable" : "nonlinear")
@@ -139,31 +142,31 @@ int main(int argument_count, char **argument_values) {
     const s32 theta_slot = glif_state_variable_slot(GlifVariant::Glif5, "theta");
     const s32 asc1_slot = glif_state_variable_slot(GlifVariant::Glif5, "asc1");
 
-    Vector<f32> membrane_trace;
-    Vector<f32> threshold_trace;
-    Vector<f32> after_spike_current_trace;
-    Vector<s64> stimulated_spike_ticks;
-    Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
-    Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
+    spikecorec::Vector<f32> membrane_trace;
+    spikecorec::Vector<f32> threshold_trace;
+    spikecorec::Vector<f32> after_spike_current_trace;
+    spikecorec::Vector<s64> stimulated_spike_ticks;
+    spikecorec::Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
+    spikecorec::Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
 
     for (s64 tick = 0; tick < options.base.tick_count; ++tick) {
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            live.buffers.network_inputs[neuron_index] += (f32)schedule.current_at(neuron_index, tick);
+            engine.network_inputs.get_contents()[neuron_index] += (f32)schedule.current_at(neuron_index, tick);
         }
 
-        assembled_model.step_tick(live.buffers, options.base.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.base.dt_seconds, tick, tick + 1);
 
-        if (recorder) recorder->record_tick(allocation, model, live.buffers.last_spiked, tick);
+        if (recorder) recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
 
         membrane_trace.push_back(
-            read_membrane_potential(allocation, model, /*population_index=*/0, stimulated_neuron_index));
-        threshold_trace.push_back(allocation.cell_state.get_contents()[
-            state_element_index(allocation, population, 0, theta_slot, stimulated_neuron_index)]);
-        after_spike_current_trace.push_back(allocation.cell_state.get_contents()[
-            state_element_index(allocation, population, 0, asc1_slot, stimulated_neuron_index)]);
+            read_membrane_potential(engine.nml_allocation_, model, /*population_index=*/0, stimulated_neuron_index));
+        threshold_trace.push_back(engine.nml_allocation_.cell_state.get_contents()[
+            state_element_index(engine.nml_allocation_, population, 0, theta_slot, stimulated_neuron_index)]);
+        after_spike_current_trace.push_back(engine.nml_allocation_.cell_state.get_contents()[
+            state_element_index(engine.nml_allocation_, population, 0, asc1_slot, stimulated_neuron_index)]);
 
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            if (live.buffers.last_spiked[neuron_index] != tick) continue;
+            if (engine.last_spiked.get_contents()[neuron_index] != tick) continue;
             ++spike_count_by_neuron[(usize)neuron_index];
             if (first_spike_tick_by_neuron[(usize)neuron_index] == -1) {
                 first_spike_tick_by_neuron[(usize)neuron_index] = tick;

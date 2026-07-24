@@ -42,6 +42,7 @@
 
 #include <iostream>
 
+#include "spikecorec/core/engine.h"
 #include "spikecorec/nml/stimulus_schedule.h"
 
 #include "glif_torus_network.h"
@@ -49,6 +50,14 @@
 using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::examples;
+
+// `Vector<...>` is spelled out fully as `spikecorec::Vector<...>` throughout this file, unlike every
+// other torus example prior to the SpikeEngine migration. spikecorec/core/engine.h pulls in a
+// file-scope `using namespace spikecorec::log;`, which declares its OWN `Vector` alias template --
+// ambiguous with `spikecorec::Vector` for bare unqualified `Vector<...>` lookup (two alias templates
+// of the same name from two using-directives at the same scope, regardless of expanding to the
+// identical type). Mirrors what tests/simple_lif_stdp_network_tests.cpp/tests/end_to_end_network_
+// tests.cpp/examples/stdp_plasticity_example.cpp already do for the same reason.
 
 int main(int argument_count, char **argument_values) {
     TorusExampleOptions options = parse_torus_example_options(
@@ -69,7 +78,7 @@ int main(int argument_count, char **argument_values) {
     ModelSpecification model = load_generated_model("glif2_torus", generate_glif_torus_network_nml(network_options));
 
     // ── 2. Lowering: one small IR program per ComponentType ─────────────────────────────────────
-    Vector<IrProgram> programs = lower_type_library_to_ir(model);
+    spikecorec::Vector<IrProgram> programs = lower_type_library_to_ir(model);
     print_model_summary(model, programs);
     if (options.base.print_ir) print_ir_programs(model, programs);
 
@@ -82,26 +91,17 @@ int main(int argument_count, char **argument_values) {
               << "  synapse         : expOneSynapse, gbase=" << options.synapse_gbase
               << " (real per-edge dispatch, ticket #131)\n";
 
-    // ── 3. Allocation ───────────────────────────────────────────────────────────────────────────
-    ModelAllocation allocation = allocate_model(model, programs);
+    // ── 3. Assembly: SpikeEngine builds its own ModelAllocation + WeightMatrix internally, then
+    // every `.tick` section → one master kernel, compiled once ─────────────────────────────────
+    SpikeEngine engine(model, programs, options.base.dt_seconds);
     print_heading("Allocation");
-    std::cout << "  cell_state elements : " << allocation.cell_state_element_count
+    std::cout << "  cell_state elements : " << engine.nml_allocation_.cell_state_element_count
               << "   (" << model.type_library[0].state_variable_count << " state variables × "
               << model.total_neuron_count << " neurons, structure-of-arrays per population)\n";
 
-    seed_glif_initial_state(allocation, model, GlifVariant::Glif2);
+    seed_glif_initial_state(engine.nml_allocation_, model, GlifVariant::Glif2);
 
-    // ── 4. Adjacency → WeightMatrix ─────────────────────────────────────────────────────────────
-    // No `set_constant_weight` call: this model has real projections, so AssembledModel dispatches
-    // expOneSynapse's own dynamics and forces this WeightMatrix's scalar scatter contribution to
-    // zero regardless (see nml_pipeline_support.h's own build_weight_matrix doc comment).
-    WeightMatrix weights = build_weight_matrix(model);
-
-    // ── 5. Assembly: every `.tick` section → one master kernel, compiled once ───────────────────
-    AssembledModel assembled_model(model, programs);
-    LiveModelBuffers live = make_live_model_buffers(allocation, weights, model.total_neuron_count);
-
-    // ── 6. Stimulus ─────────────────────────────────────────────────────────────────────────────
+    // ── 4. Stimulus ─────────────────────────────────────────────────────────────────────────────
     StimulusSchedule schedule = build_stimulus_schedule(model, (f64)options.base.dt_seconds);
     print_heading("Stimulus schedule");
     for (s32 window_index = 0; window_index < schedule.window_count; ++window_index) {
@@ -112,7 +112,7 @@ int main(int argument_count, char **argument_values) {
                   << "  current " << schedule.current_values[window_index] * 1e12 << " pA\n";
     }
 
-    // ── 7. Recording (ticket #138) ──────────────────────────────────────────────────────────────
+    // ── 5. Recording (ticket #138) ──────────────────────────────────────────────────────────────
     // Two `.spire` streams over the whole 64-neuron population: membrane potential and a 0/1 spike
     // raster mask, one frame per tick each — a real recorded artifact of the whole network's
     // activity, playable with `examples/render_spire_video.py --side 8`.
@@ -125,39 +125,39 @@ int main(int argument_count, char **argument_values) {
             membrane_recording_path, spike_recording_path, model.total_neuron_count);
     }
 
-    // ── 8. The reset rule this example is about ─────────────────────────────────────────────────
+    // ── 6. The reset rule this example is about ─────────────────────────────────────────────────
     const PopulationEntry &population = model.populations[0];
     const TypeLibraryEntry &cell_entry = model.type_library[(usize)population.type_library_index];
     const f32 vreset_volts = (f32)cell_entry.baked_constants.at("vreset");
     const f32 reset_scale = (f32)cell_entry.baked_constants.at("resetScale");
 
-    // ── 9. Tick loop ────────────────────────────────────────────────────────────────────────────
+    // ── 7. Tick loop ────────────────────────────────────────────────────────────────────────────
     print_heading("Simulating");
     std::cout << "  " << options.base.tick_count << " ticks × " << options.base.dt_seconds * 1000.0f << "ms = "
               << format_seconds((f64)options.base.tick_count * options.base.dt_seconds) << "\n";
 
     const s32 stimulated_neuron_index = 0;
-    Vector<f32> stimulated_membrane_trace;
+    spikecorec::Vector<f32> stimulated_membrane_trace;
     stimulated_membrane_trace.reserve((usize)options.base.tick_count);
-    Vector<s64> stimulated_spike_ticks;
-    Vector<f32> post_reset_membrane_potential_by_spike;
-    Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
-    Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
+    spikecorec::Vector<s64> stimulated_spike_ticks;
+    spikecorec::Vector<f32> post_reset_membrane_potential_by_spike;
+    spikecorec::Vector<s64> spike_count_by_neuron((usize)model.total_neuron_count, 0);
+    spikecorec::Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
 
     for (s64 tick = 0; tick < options.base.tick_count; ++tick) {
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            live.buffers.network_inputs[neuron_index] += (f32)schedule.current_at(neuron_index, tick);
+            engine.network_inputs.get_contents()[neuron_index] += (f32)schedule.current_at(neuron_index, tick);
         }
 
-        assembled_model.step_tick(live.buffers, options.base.dt_seconds, tick, tick + 1);
+        engine.step_tick(options.base.dt_seconds, tick, tick + 1);
 
-        if (recorder) recorder->record_tick(allocation, model, live.buffers.last_spiked, tick);
+        if (recorder) recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
 
         stimulated_membrane_trace.push_back(
-            read_membrane_potential(allocation, model, /*population_index=*/0, stimulated_neuron_index));
+            read_membrane_potential(engine.nml_allocation_, model, /*population_index=*/0, stimulated_neuron_index));
 
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            if (live.buffers.last_spiked[neuron_index] != tick) continue;
+            if (engine.last_spiked.get_contents()[neuron_index] != tick) continue;
             ++spike_count_by_neuron[(usize)neuron_index];
             if (first_spike_tick_by_neuron[(usize)neuron_index] == -1) {
                 first_spike_tick_by_neuron[(usize)neuron_index] = tick;
@@ -168,7 +168,7 @@ int main(int argument_count, char **argument_values) {
                 // back out, exactly the same "capture right after the reset" pattern
                 // tests/end_to_end_network_tests.cpp's own GLIF2 anchor test uses.
                 post_reset_membrane_potential_by_spike.push_back(
-                    read_membrane_potential(allocation, model, /*population_index=*/0, stimulated_neuron_index));
+                    read_membrane_potential(engine.nml_allocation_, model, /*population_index=*/0, stimulated_neuron_index));
             }
         }
     }
@@ -182,7 +182,7 @@ int main(int argument_count, char **argument_values) {
                   << " --side " << options.side_length << " --membrane " << membrane_recording_path << "\n";
     }
 
-    // ── 10. Results ─────────────────────────────────────────────────────────────────────────────
+    // ── 8. Results ──────────────────────────────────────────────────────────────────────────────
     s64 total_spike_count = 0;
     s32 neurons_that_fired = 0;
     for (s64 count : spike_count_by_neuron) {
