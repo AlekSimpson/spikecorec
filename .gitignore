@@ -10,6 +10,8 @@ logs/
 
 notebooks/
 
+recordings/
+
 # CUDA
 *.ptx
 *.cubin
