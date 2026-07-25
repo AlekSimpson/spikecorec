@@ -4,6 +4,10 @@
 
 namespace spikecorec::nml {
 
+
+// REFACTOR: so this is the "compiler/codegen" file, this is fine but needs refactor and can stay as a standalone file that should be moved to core/
+
+
 // ── IR `.tick` → GPU source (ticket #55 [C1]; docs/nml_ir_spec.md §3.3-§3.4, §5; arch §4.3) ──
 //
 // Lowers one IrProgram's `.tick` section to a standalone, compilable MSL source string and a

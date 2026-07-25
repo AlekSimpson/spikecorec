@@ -151,13 +151,15 @@ int main(int argument_count, char **argument_values) {
 
     // ── 9. Recording (ticket #138) ─────────────────────────────────────────────────────────────
     std::unique_ptr<NetworkActivityRecorder> recorder;
-    String membrane_recording_path = options.record_directory + "/glif_stdp_torus_membrane.spire";
-    String spike_recording_path = options.record_directory + "/glif_stdp_torus_spikes.spire";
+    String membrane_recording_path = options.record_directory + "/glif_stdp_torus_membrane" + options.record_extension;
+    String spike_recording_path = options.record_directory + "/glif_stdp_torus_spikes" + options.record_extension;
     if (options.record) {
         ensure_directory_exists(options.record_directory);
         recorder = std::make_unique<NetworkActivityRecorder>(
             membrane_recording_path, spike_recording_path, model.total_neuron_count);
     }
+    TicksPerSecondTelemetry ticks_per_second(
+        options.record_directory, "glif_stdp_torus", options.record, options.record_stride);
 
     // ── 10. Tick loop ───────────────────────────────────────────────────────────────────────────
     print_heading("Simulating");
@@ -180,7 +182,10 @@ int main(int argument_count, char **argument_values) {
 
         engine.step_tick(options.base.dt_seconds, tick, tick + 1);
 
-        if (recorder) recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
+        if (recorder && tick % options.record_stride == 0) {
+            recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
+        }
+        ticks_per_second.record_tick(tick, options.base.tick_count);
 
         for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
             if (engine.last_spiked.get_contents()[neuron_index] != tick) continue;
@@ -197,8 +202,19 @@ int main(int argument_count, char **argument_values) {
         print_heading("Recording");
         std::cout << "  membrane potential  : " << membrane_recording_path << "\n"
                   << "  spike raster        : " << spike_recording_path << "\n"
+                  << "  ticks/sec telemetry : " << ticks_per_second.path()
+                  << "   (auto-detected by render_spire_video.py, no flag needed)\n"
                   << "  render with         : ./examples/render_spire_video.py " << spike_recording_path
-                  << " --side " << options.side_length << " --membrane " << membrane_recording_path << "\n";
+                  << " --side " << options.side_length << " --membrane " << membrane_recording_path
+                  << (options.record_stride > 1
+                          ? " --dt " + std::to_string(options.base.dt_seconds * (f32)options.record_stride)
+                          : String(""))
+                  << "\n";
+        if (options.record_stride > 1) {
+            std::cout << "  record stride       : every " << options.record_stride << " ticks ("
+                      << (options.base.tick_count + options.record_stride - 1) / options.record_stride
+                      << " frames recorded instead of " << options.base.tick_count << ")\n";
+        }
     }
 
     // ── 11. Network activity ───────────────────────────────────────────────────────────────────

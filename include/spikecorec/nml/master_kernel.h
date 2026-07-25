@@ -10,6 +10,8 @@
 
 namespace spikecorec::nml {
 
+// REFACTOR: Ya this needs to be totally rewritten or deleted and turned into a set of utiltiy methods in the engine
+
 // ── Master-kernel assembly + compile + cache + dispatch (ticket #6 [C3]; arch §0.4, §4.1, §6;
 // IR spec §5) ──────────────────────────────────────────────────────────────────────────────────
 //

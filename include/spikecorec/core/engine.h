@@ -57,9 +57,6 @@ namespace spikecorec {
         GpuPointer<f32> input_staging; // [neuron_count] — staged input_values
         GpuPointer<s64> override_staging; // [neuron_count] — staged override_input_neurons
 
-        // constexpr (not plain const) so it is implicitly inline in C++17 — it is
-        // ODR-used as a default-argument value in the pybind11 bindings
-        // (bindings.cpp), which would otherwise require an out-of-line definition.
         static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
         f32 **cell_state_logs = nullptr;
 
@@ -136,10 +133,15 @@ namespace spikecorec {
         void reset_state(s64 last_spiked_value = 0, s32 active_gen_value = -1);
 
         void step_simulation(
-            const vector<f32> &input_values,
-            s64 tick,
-            const vector<s64> &override_input_neurons = {},
-            bool decay_all_neurons = false);
+                s64 tick,
+                f32 dt,
+                optional<UnorderedMap<s64, f32>> override_network_inputs_this_tick = nullopt)
+
+        // void step_simulation(
+        //     const vector<f32> &input_values,
+        //     s64 tick,
+        //     const vector<s64> &override_input_neurons = {},
+        //     bool decay_all_neurons = false);
 
         // Runs one NML-model tick: stages 2-5 (one dispatch per population with a per-neuron
         // kernel, over its own full neuron range) followed by the fixed deliver-drain and
@@ -147,7 +149,7 @@ namespace spikecorec {
         // nml::AssembledModel::step_tick's own non-delay-ring branch (see master_kernel.cpp). Only
         // valid on a SpikeEngine constructed via the ModelSpecification constructor above; throws
         // otherwise.
-        void step_tick(f32 dt, s64 tick, s64 next_tick);
+        // void step_tick(f32 dt, s64 tick, s64 next_tick);
 
         // Sets a single neuron's emit-port flag directly, ahead of calling step_tick for that same
         // tick -- a real, minimal way to host-drive a synthetic/external spike into the fixed
@@ -161,19 +163,6 @@ namespace spikecorec {
         // otherwise). Deliberately scoped to this single setter rather than exposing
         // nml_emit_port_flags_ itself.
         void force_emit(const String &port_name, s64 neuron_index);
-
-        void start_static_record(
-            const vector<vector<f32>> &input_spikes,
-            s64 lifetime,
-            const string &filename,
-            bool record_membrane = true,
-            s64 record_stride = 1,
-            optional<string> compression = string("auto"),
-            optional<int> compression_level = nullopt,
-            bool full_decay = true,
-            bool compression_async = false,
-            usize compression_queue_max = 8,
-            usize compression_chunk_bytes = 4 * 1024 * 1024);
 
         [[nodiscard]] pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
 
@@ -236,8 +225,6 @@ namespace spikecorec {
             Vector<NmlResolvedArgument> arguments;
         };
 
-        bool nml_mode_enabled_ = false;
-
         // ── delay-ring fold (SpikeEngine-only; see the three REFACTOR comments in delay_ring.h/
         // master_kernel.h/master_kernel.cpp this generalizes) -- network_inputs/
         // next_active_neuron_indices/next_active_neuron_count/active_generation above are all
@@ -253,7 +240,6 @@ namespace spikecorec {
 
         Vector<NmlPopulationDispatchPlan> nml_population_dispatch_plans_;
 
-        UnorderedMap<String, GpuPointer<bool>> nml_emit_port_flags_;
         Vector<String> nml_emit_port_names_; // dispatch order for the propagate stage
 
         KernelHandle nml_drain_kernel_{};

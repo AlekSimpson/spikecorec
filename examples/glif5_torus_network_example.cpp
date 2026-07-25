@@ -44,7 +44,6 @@
 #include <iostream>
 
 #include "spikecorec/core/engine.h"
-#include "spikecorec/nml/stimulus_schedule.h"
 
 #include "glif_torus_network.h"
 
@@ -63,16 +62,30 @@ using namespace spikecorec::examples;
 int main(int argument_count, char **argument_values) {
     TorusExampleOptions options = parse_torus_example_options(
         argument_count, argument_values,
-        TorusExampleOptions{{5000, 1e-4f, false, false}, 8, "15nS", "recordings", true});
+        TorusExampleOptions{{15000, 1e-4f, false, false}, 1000, "15nS", "recordings", true});
 
     GpuContextScope gpu_context_scope;
 
     // ── 1. Generate and parse ───────────────────────────────────────────────────────────────────
+    // The model's own NML `pulseGenerator` only supports a single delay/duration window, so it
+    // cannot express a repeating on/off burst pattern. `stimulus_delay`/`stimulus_duration` are left
+    // at the struct's own defaults purely so the generated network still declares a structural
+    // `explicitInput` for each stimulated neuron; the REAL, periodic current is computed by hand in
+    // the tick loop below (section 3), the same "reconstructed stimulus" approach
+    // glif_ei_network_example.cpp/izhikevich_network_example.cpp already use for their own custom
+    // timing needs.
     TorusNetworkOptions network_options;
     network_options.variant = GlifVariant::Glif5;
     network_options.side_length = options.side_length;
-    network_options.stimulated_neuron_indices = {0};
-    network_options.stimulus_amplitude = "600pA";
+    // The hand-picked default suits the 8×8 grid this example was written against; on a large --side
+    // every one of those indices falls in the first few rows, so --stimulus-count swaps in that many
+    // sites scattered across the whole torus instead (see pick_scattered_stimulus_neurons).
+    network_options.stimulated_neuron_indices = {0, 25, 50, 100, 500, 1000, 4000, 4750, 4500, 4250, 4998};
+    if (options.stimulus_count > 0) {
+        network_options.stimulated_neuron_indices = pick_scattered_stimulus_neurons(
+            options.side_length, options.stimulus_count, options.stimulus_seed);
+    }
+    network_options.stimulus_amplitude = "800pA";
     network_options.synapse_gbase = options.synapse_gbase;
 
     ModelSpecification model = load_generated_model("glif5_torus", generate_glif_torus_network_nml(network_options));
@@ -114,23 +127,47 @@ int main(int argument_count, char **argument_values) {
               << "   (GLIF is linear in its own state variables)\n";
 
     // ── 3. Stimulus ─────────────────────────────────────────────────────────────────────────────
-    StimulusSchedule schedule = build_stimulus_schedule(model, (f64)options.base.dt_seconds);
+    // Intermittent rather than constant: every `stimulus_period_ticks` ticks, drive the stimulated
+    // neurons for the first `stimulus_on_ticks` of them, then let the network run undriven for the
+    // rest of the period, repeating for the whole simulation — keeps spiking activity going in
+    // bursts throughout the run instead of either a single short pulse or one continuous drive.
+    const s64 stimulus_period_ticks = 500;
+    const s64 stimulus_on_ticks = 250;
+    const f32 stimulus_amplitude_amperes = 800e-12f; // matches network_options.stimulus_amplitude above
+
     print_heading("Stimulus schedule");
-    for (s32 window_index = 0; window_index < schedule.window_count; ++window_index) {
-        std::cout << "  neuron " << schedule.target_neurons[window_index]
-                  << "  ticks [" << schedule.start_ticks[window_index] << ", " << schedule.end_ticks[window_index] << ")"
-                  << "  current " << schedule.current_values[window_index] * 1e12 << " pA\n";
+    // Truncated after a handful: --stimulus-count can ask for dozens of sites, and a bare dump of
+    // every six-digit index wraps across the terminal without telling the reader anything more.
+    const usize stimulus_indices_to_print = 12;
+    std::cout << "  neurons  : " << network_options.stimulated_neuron_indices.size() << " site(s)";
+    if (options.stimulus_count > 0) {
+        std::cout << " scattered at random (seed " << options.stimulus_seed << ")";
     }
+    std::cout << "\n             ";
+    for (usize stimulus_index = 0;
+         stimulus_index < network_options.stimulated_neuron_indices.size(); ++stimulus_index) {
+        if (stimulus_index == stimulus_indices_to_print) {
+            std::cout << "…";
+            break;
+        }
+        std::cout << network_options.stimulated_neuron_indices[stimulus_index] << " ";
+    }
+    std::cout << "\n  pattern  : " << stimulus_on_ticks << " ticks on, " << stimulus_period_ticks - stimulus_on_ticks
+              << " ticks off, repeating every " << stimulus_period_ticks << " ticks, at "
+              << stimulus_amplitude_amperes * 1e12f << " pA\n";
 
     // ── 4. Recording (ticket #138) ──────────────────────────────────────────────────────────────
     std::unique_ptr<NetworkActivityRecorder> recorder;
-    String membrane_recording_path = options.record_directory + "/glif5_torus_membrane.spire";
-    String spike_recording_path = options.record_directory + "/glif5_torus_spikes.spire";
+    String membrane_recording_path = options.record_directory + "/glif5_torus_membrane" + options.record_extension;
+    String spike_recording_path = options.record_directory + "/glif5_torus_spikes" + options.record_extension;
     if (options.record) {
         ensure_directory_exists(options.record_directory);
         recorder = std::make_unique<NetworkActivityRecorder>(
             membrane_recording_path, spike_recording_path, model.total_neuron_count);
     }
+
+    TicksPerSecondTelemetry ticks_per_second(
+        options.record_directory, "glif5_torus", options.record, options.record_stride);
 
     // ── 5. Tick loop ────────────────────────────────────────────────────────────────────────────
     print_heading("Simulating");
@@ -150,13 +187,18 @@ int main(int argument_count, char **argument_values) {
     spikecorec::Vector<s64> first_spike_tick_by_neuron((usize)model.total_neuron_count, -1);
 
     for (s64 tick = 0; tick < options.base.tick_count; ++tick) {
-        for (s32 neuron_index = 0; neuron_index < model.total_neuron_count; ++neuron_index) {
-            engine.network_inputs.get_contents()[neuron_index] += (f32)schedule.current_at(neuron_index, tick);
+        if ((tick % stimulus_period_ticks) < stimulus_on_ticks) {
+            for (s32 neuron_index_to_stimulate : network_options.stimulated_neuron_indices) {
+                engine.network_inputs.get_contents()[neuron_index_to_stimulate] += stimulus_amplitude_amperes;
+            }
         }
 
         engine.step_tick(options.base.dt_seconds, tick, tick + 1);
 
-        if (recorder) recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
+        if (recorder && tick % options.record_stride == 0) {
+            recorder->record_tick(engine.nml_allocation_, model, engine.last_spiked.get_contents(), tick);
+        }
+        ticks_per_second.record_tick(tick, options.base.tick_count);
 
         membrane_trace.push_back(
             read_membrane_potential(engine.nml_allocation_, model, /*population_index=*/0, stimulated_neuron_index));
@@ -175,13 +217,28 @@ int main(int argument_count, char **argument_values) {
         }
     }
 
+    print_heading("Performance");
+    std::cout << "  last measured sim speed : " << ticks_per_second.current_ticks_per_second() << " ticks/sec"
+              << "   (rolling 100-tick window)\n";
+
     if (recorder) {
         recorder->finish();
         print_heading("Recording");
         std::cout << "  membrane potential  : " << membrane_recording_path << "\n"
                   << "  spike raster        : " << spike_recording_path << "\n"
+                  << "  ticks/sec telemetry : " << ticks_per_second.path()
+                  << "   (auto-detected by render_spire_video.py, no flag needed)\n"
                   << "  render with         : ./examples/render_spire_video.py " << spike_recording_path
-                  << " --side " << options.side_length << " --membrane " << membrane_recording_path << "\n";
+                  << " --side " << options.side_length << " --membrane " << membrane_recording_path
+                  << (options.record_stride > 1
+                          ? " --dt " + std::to_string(options.base.dt_seconds * (f32)options.record_stride)
+                          : String(""))
+                  << "\n";
+        if (options.record_stride > 1) {
+            std::cout << "  record stride       : every " << options.record_stride << " ticks ("
+                      << (options.base.tick_count + options.record_stride - 1) / options.record_stride
+                      << " frames recorded instead of " << options.base.tick_count << ")\n";
+        }
     }
 
     // ── 6. Results ──────────────────────────────────────────────────────────────────────────────

@@ -7,6 +7,8 @@
 
 namespace spikecorec::nml {
 
+// REFACTOR: Delete this, this is something that codegen/compiler could handle way easier
+
 // ── NML STDP -> stage-7 WeightMatrix::update wiring (ticket #66 [F5]; arch §3.3 D6) ────────────
 //
 // Per CLAUDE.md's own "U/V factorization is a memory optimization, NOT learning" section: what

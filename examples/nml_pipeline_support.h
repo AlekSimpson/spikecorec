@@ -1,10 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -531,6 +533,61 @@ private:
     SimulationRecorder spike_raster_recorder_;
     Vector<f32> membrane_potential_scratch_;
     Vector<f32> spike_raster_scratch_;
+};
+
+// Ticks-per-second telemetry: a simple side-channel text file (one value per simulated tick, NOT
+// part of the `.spire` format) so render_spire_video.py can overlay live simulation throughput
+// alongside the membrane/spike video by default -- it auto-detects `<base_name>_ticks_per_second.txt`
+// sitting next to the spike recording, the same directory/naming convention NetworkActivityRecorder
+// itself uses for its own two files, no extra flag needed on the render side.
+//
+// Measured over a rolling window rather than per-tick, since a single tick's own wall-clock time is
+// too short/noisy on its own to be a meaningful rate.
+//
+// `record_stride` mirrors TorusExampleOptions::record_stride: the RATE MEASUREMENT still updates
+// every tick (skipping ticks here would misalign the window-boundary check below, since it compares
+// against fixed multiples of `window_ticks`, and could leave the reading stuck at its initial value
+// for a stride that never lands on one), but a FILE ROW is only written every `record_stride` ticks
+// -- so this file always ends up with exactly as many rows as NetworkActivityRecorder wrote frames,
+// which render_spire_video.py requires (it validates the two counts match).
+class TicksPerSecondTelemetry {
+public:
+    TicksPerSecondTelemetry(
+        const String &record_directory, const String &base_name, bool enabled,
+        s64 record_stride = 1, s64 window_ticks = 100
+    ) : record_stride_(record_stride < 1 ? 1 : record_stride),
+        window_ticks_(window_ticks), window_start_time_(std::chrono::steady_clock::now()) {
+        if (!enabled) return;
+        ensure_directory_exists(record_directory);
+        path_ = record_directory + "/" + base_name + "_ticks_per_second.txt";
+        file_.open(path_);
+    }
+
+    // Call once per simulated tick, right after step_tick -- mirrors NetworkActivityRecorder's own
+    // record_tick calling convention.
+    void record_tick(s64 tick, s64 total_tick_count) {
+        if ((tick + 1) % window_ticks_ == 0 || tick == total_tick_count - 1) {
+            auto now = std::chrono::steady_clock::now();
+            f64 elapsed_seconds = std::chrono::duration<f64>(now - window_start_time_).count();
+            s64 ticks_in_window = (tick + 1) - window_start_tick_;
+            current_ticks_per_second_ = elapsed_seconds > 0.0 ? (f64)ticks_in_window / elapsed_seconds : 0.0;
+            window_start_time_ = now;
+            window_start_tick_ = tick + 1;
+        }
+        if (file_.is_open() && tick % record_stride_ == 0) file_ << current_ticks_per_second_ << "\n";
+    }
+
+    f64 current_ticks_per_second() const { return current_ticks_per_second_; }
+    const String &path() const { return path_; }
+
+private:
+    s64 record_stride_;
+    s64 window_ticks_;
+    std::chrono::steady_clock::time_point window_start_time_;
+    s64 window_start_tick_ = 0;
+    f64 current_ticks_per_second_ = 0.0;
+    std::ofstream file_;
+    String path_;
 };
 
 } // namespace spikecorec::examples

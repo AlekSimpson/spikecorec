@@ -7,6 +7,8 @@
 
 namespace spikecorec::nml {
 
+// REFACTOR: ya so allocator.h can be folded into this and refactored to be more memory efficient
+
 // ── ModelSpecification (ticket #7 [A5]; arch §1.4) ──────────────────────
 //
 // The lowered, flat, index-addressed representation the whole back half of
@@ -184,6 +186,7 @@ struct ModelSpecification {
 
     s32 total_neuron_count = 0;
 
+    // REFACTOR: ya this isnt needed in this struct yet, we are putting the cart before the horse kinda here
     // Adjacency (arch §1.4): the existing `vector<vector<s32>>` ->
     // WeightMatrix/k²-tree path (§0.3), built from the union of every
     // projection's connections -- the exact edge SET (topology) only.
@@ -197,7 +200,7 @@ struct ModelSpecification {
     // to) is future allocator work (#52-#54/#57), not this ticket's job.
     // Unset if the model has no connections (WeightMatrix rejects an empty
     // network).
-    std::optional<WeightMatrix> adjacency;
+    //std::optional<WeightMatrix> adjacency;
 };
 
 // Builds the ModelSpecification from a resolved model (ticket #49 [A4]'s

@@ -2,8 +2,10 @@
 
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "spikecorec/core/topologies.h"
 
@@ -381,7 +383,7 @@ struct TorusNetworkOptions {
     Vector<s32> stimulated_neuron_indices = {0};
 
     // pulseGenerator attributes, as verbatim unit-suffixed NML literals.
-    String stimulus_delay = "10ms";
+    String stimulus_delay = "5ms";
     String stimulus_duration = "200ms";
     String stimulus_amplitude = "600pA";
 
@@ -562,6 +564,34 @@ struct TorusExampleOptions {
     String synapse_gbase = "10nS";     // expOneSynapse's real per-edge conductance amplitude
     String record_directory = "recordings"; // where torus examples write their .spire pairs
     bool record = true;                // pass --no-record to skip writing .spire files entirely
+
+    // Appended to every recorded file's base name (e.g. "glif3_torus_membrane" + record_extension).
+    // SimulationRecorder (include/spikecorec/core/recording.h) infers the compression codec from
+    // this suffix at open time -- ".spire.gz"/".spire.xz"/".spire.bz2" are read back exactly like
+    // plain ".spire" (spikecorec.read_spire_recording and render_spire_video.py both auto-detect
+    // it too), just far smaller on disk. Set via --compress.
+    String record_extension = ".spire";
+
+    // Replaces an example's own hand-picked `stimulated_neuron_indices` with this many DISTINCT
+    // neurons drawn uniformly at random across the WHOLE torus (pick_scattered_stimulus_neurons
+    // below), so a large grid can be driven from many scattered sites at once instead of the handful
+    // of low, clustered indices an example hardcodes for its 8×8 default. 0 (the default) keeps
+    // whatever list the example itself set. Set via --stimulus-count.
+    s64 stimulus_count = 0;
+
+    // Seed for that draw. A given (--stimulus-count, --stimulus-seed, --side) triple always selects
+    // the same neurons, so a recording made from scattered stimuli stays reproducible.
+    u64 stimulus_seed = 20260725;
+
+    // Only ticks where `tick % record_stride == 0` get written to the .spire recording -- every
+    // other tick still simulates normally, it just isn't captured. Off (1 = every tick) by default;
+    // set via --record-stride. A larger value divides recording size by roughly that same factor
+    // (frame count, hence file size, scales as tick_count / record_stride), at the cost of a
+    // coarser video -- at record_stride N the effective time between recorded frames is
+    // N * dt_seconds, not dt_seconds, so render_spire_video.py needs --dt <N * dt_seconds> for its
+    // on-screen time readout to stay correct (each example's own "render with" printout does this
+    // automatically).
+    s64 record_stride = 1;
 };
 
 // Parses the shared flags plus `--side <length>`, `--gbase <siemens literal, e.g. 3nS>`,
@@ -606,6 +636,28 @@ inline TorusExampleOptions parse_torus_example_options(
             options.record_directory = argument_values[++argument_index];
         } else if (argument == "--no-record") {
             options.record = false;
+        } else if (argument == "--compress" && has_value) {
+            String format = argument_values[++argument_index];
+            if (format == "gz" || format == "gzip") {
+                options.record_extension = ".spire.gz";
+            } else if (format == "xz" || format == "lzma") {
+                options.record_extension = ".spire.xz";
+            } else if (format == "bz2") {
+                options.record_extension = ".spire.bz2";
+            } else if (format == "none") {
+                options.record_extension = ".spire";
+            } else {
+                std::cerr << "ignoring unrecognized --compress value '" << format
+                          << "' (supported: gz, xz, bz2, none)\n";
+            }
+        } else if (argument == "--stimulus-count" && has_value) {
+            options.stimulus_count = std::strtoll(argument_values[++argument_index], nullptr, 10);
+            if (options.stimulus_count < 0) options.stimulus_count = 0;
+        } else if (argument == "--stimulus-seed" && has_value) {
+            options.stimulus_seed = std::strtoull(argument_values[++argument_index], nullptr, 10);
+        } else if (argument == "--record-stride" && has_value) {
+            options.record_stride = std::strtoll(argument_values[++argument_index], nullptr, 10);
+            if (options.record_stride < 1) options.record_stride = 1;
         } else if (argument == "--print-ir") {
             options.base.print_ir = true;
         } else if (argument == "--verbose") {
@@ -613,11 +665,47 @@ inline TorusExampleOptions parse_torus_example_options(
         } else {
             std::cerr << "ignoring unrecognized argument '" << argument << "' (supported: --ticks <count> "
                       << "--dt <seconds> --side <length> --gbase <siemens, e.g. 3nS> "
-                      << "--record-dir <path> --no-record --print-ir --verbose)\n";
+                      << "--record-dir <path> --no-record --compress <gz|xz|bz2|none> "
+                      << "--record-stride <N> --stimulus-count <N> --stimulus-seed <N> "
+                      << "--print-ir --verbose)\n";
         }
     }
     configure_example_logging(options.base.verbose);
     return options;
+}
+
+// Draws `stimulus_count` DISTINCT neuron indices uniformly at random from a `side_length²`-neuron
+// torus, deterministically for a given `seed` (mt19937_64, so the same triple always yields the same
+// sites regardless of platform -- a recording driven this way stays reproducible).
+//
+// The examples hardcode a handful of low indices (glif5's `{0, 25, 50, 100, …, 4998}`), which on an
+// 8×8 grid scatters nicely but on a 1000×1000 one lands every single stimulus inside the first five
+// rows -- the whole torus then gets recruited from one clustered edge. Scattering the sites across
+// the full index range instead seeds wavefronts everywhere at once, which is what a large grid needs
+// to look like a network rather than a single spreading front.
+//
+// Rejection sampling rather than a shuffle of all `side_length²` indices: at 1000×1000 that vector
+// would be 4 MB and the draw is tiny by comparison, so sampling-with-rejection converges in
+// essentially `stimulus_count` iterations.
+inline Vector<s32> pick_scattered_stimulus_neurons(s64 side_length, s64 stimulus_count, u64 seed) {
+    const s64 neuron_count = side_length * side_length;
+    if (stimulus_count > neuron_count) stimulus_count = neuron_count;
+    if (stimulus_count <= 0) return {};
+
+    std::mt19937_64 random_engine(seed);
+    std::uniform_int_distribution<s64> index_distribution(0, neuron_count - 1);
+
+    std::unordered_set<s64> already_chosen;
+    already_chosen.reserve((usize)stimulus_count * 2);
+    Vector<s32> stimulated_neuron_indices;
+    stimulated_neuron_indices.reserve((usize)stimulus_count);
+    while ((s64)stimulated_neuron_indices.size() < stimulus_count) {
+        s64 candidate_index = index_distribution(random_engine);
+        if (already_chosen.insert(candidate_index).second) {
+            stimulated_neuron_indices.push_back((s32)candidate_index);
+        }
+    }
+    return stimulated_neuron_indices;
 }
 
 // ── Torus-shaped output ─────────────────────────────────────────────────────────────────────────

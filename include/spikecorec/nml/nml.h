@@ -11,6 +11,8 @@ using namespace spikecorec;
 using namespace std;
 
 namespace spikecorec::nml {
+// REFACTOR: this is for the most part good actually but still things can be consolidated and managed better
+
 // deliverables:
 //  - A lookup API the resolve pass calls to fetch a core ComponentType / include target by name/href.
 //  - Document how the bundle is refreshed and where the version is pinned.
