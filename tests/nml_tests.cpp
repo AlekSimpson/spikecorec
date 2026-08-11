@@ -119,6 +119,40 @@ Vector<String> declaration_names(const ComponentType &component_type,
     return names;
 }
 
+// The result stores entities, not name->index maps, so tests scan for what they want the
+// same way a consumer would.
+const CellTypeSpecification *cell_type_named(const NML_ParseResult &result, const String &name) {
+    for (const CellTypeSpecification &cell_type : result.cell_types) {
+        if (cell_type.name == name) return &cell_type;
+    }
+    return nullptr;
+}
+
+const SynapseTypeSpecification *synapse_type_named(const NML_ParseResult &result,
+                                                   const String &name) {
+    for (const SynapseTypeSpecification &synapse_type : result.synapse_types) {
+        if (synapse_type.name == name) return &synapse_type;
+    }
+    return nullptr;
+}
+
+const ComponentPrototype *prototype_named(const Vector<ComponentPrototype> &prototypes,
+                                          const String &instance_id) {
+    for (const ComponentPrototype &prototype : prototypes) {
+        if (prototype.instance_id == instance_id) return &prototype;
+    }
+    return nullptr;
+}
+
+// A prototype's value for one named parameter, looked up through its type's column order.
+f64 parameter_value(const Vector<String> &column_names, const Vector<Real> &values,
+                    const String &parameter_name) {
+    auto column = std::find(column_names.begin(), column_names.end(), parameter_name);
+    EXPECT_NE(column, column_names.end()) << parameter_name;
+    if (column == column_names.end()) return 0.0;
+    return values[static_cast<usize>(column - column_names.begin())].float64;
+}
+
 } // namespace
 
 
@@ -618,12 +652,12 @@ TEST(Dynamics, exported_program_tags_stages_regimes_and_conditions) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.cell_dynamics.count("iafCell"), 1u);
-    const Vector<DynamicsInstruction> &program = result.cell_dynamics.at("iafCell");
-    ASSERT_FALSE(program.empty());
+    const CellTypeSpecification *iaf = cell_type_named(result, "iafCell");
+    ASSERT_NE(iaf, nullptr);
+    ASSERT_FALSE(iaf->dynamics.empty());
 
     // iafCell writes v from two different handlers:
-    //   <OnStart>                      <StateAssignment variable="v" value="leakReversal"/>
+    //   <OnStart>                          <StateAssignment variable="v" value="leakReversal"/>
     //   <OnCondition test="v .gt. thresh"> <StateAssignment variable="v" value="reset"/>
     // Both are StateAssignments on v, so the tag alone cannot tell them apart. The stage
     // has to come from the enclosing handler -- tagging the OnStart one as Reset would
@@ -632,7 +666,7 @@ TEST(Dynamics, exported_program_tags_stages_regimes_and_conditions) {
     bool saw_initialisation = false;
     bool saw_conditional_reset = false;
 
-    for (const DynamicsInstruction &instruction : program) {
+    for (const DynamicsInstruction &instruction : iaf->dynamics) {
         if (instruction.source_tag == NML_DeclarationType::TimeDerivative &&
             instruction.target == "v") {
             EXPECT_EQ(instruction.stage, DynamicsStage::Integrate);
@@ -662,7 +696,7 @@ TEST(Dynamics, exported_program_tags_stages_regimes_and_conditions) {
 
     // The spike EventOut is gated by the same threshold condition.
     bool saw_gated_spike = false;
-    for (const DynamicsInstruction &instruction : program) {
+    for (const DynamicsInstruction &instruction : iaf->dynamics) {
         if (instruction.source_tag != NML_DeclarationType::EventOut) continue;
         EXPECT_EQ(instruction.stage, DynamicsStage::Emit);
         EXPECT_EQ(instruction.target, "spike");
@@ -682,14 +716,14 @@ TEST(Dynamics, an_on_event_body_is_gated_by_its_port) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.synapse_dynamics.count("expOneSynapse"), 1u);
-    const Vector<DynamicsInstruction> &program = result.synapse_dynamics.at("expOneSynapse");
+    const SynapseTypeSpecification *synapse = synapse_type_named(result, "expOneSynapse");
+    ASSERT_NE(synapse, nullptr);
 
     // expOneSynapse steps its conductance when a spike arrives:
     //   <OnEvent port="in"><StateAssignment variable="g" value="g + gbase"/></OnEvent>
     // Which port delivered the event is the gate, and it has to survive flattening.
     bool saw_arrival_assignment = false;
-    for (const DynamicsInstruction &instruction : program) {
+    for (const DynamicsInstruction &instruction : synapse->dynamics) {
         if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
         if (instruction.condition.empty()) continue;
 
@@ -777,7 +811,7 @@ TEST(Export, reads_simulation_settings_from_the_lems_target) {
 
     EXPECT_EQ(result.simulation_component_id, "sim1");
     EXPECT_EQ(result.target_network_id, "net1");
-    EXPECT_DOUBLE_EQ(result.step_dt, 1e-5);          // 0.01ms
+    EXPECT_DOUBLE_EQ(result.step_dt, 1e-5);            // 0.01ms
     EXPECT_DOUBLE_EQ(result.simulation_duration, 0.1); // 100ms
     EXPECT_EQ(result.total_tick_count, 10000);
     ASSERT_TRUE(result.random_seed.has_value());
@@ -794,27 +828,34 @@ TEST(Export, numbers_populations_contiguously_in_document_order) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    EXPECT_EQ(result.total_cell_count, 5);
-    ASSERT_EQ(result.population_layouts.size(), 2u);
+    EXPECT_EQ(result.neurons.size(), 5u);
+    ASSERT_EQ(result.populations.size(), 2u);
 
-    EXPECT_EQ(result.population_layouts[0].population_name, "pop1");
-    EXPECT_EQ(result.population_layouts[0].first_neuron_index, 0);
-    EXPECT_EQ(result.population_layouts[0].neuron_count, 3);
+    EXPECT_EQ(result.populations[0].population_name, "pop1");
+    EXPECT_EQ(result.populations[0].first_neuron_index, 0);
+    EXPECT_EQ(result.populations[0].neuron_count, 3);
 
-    EXPECT_EQ(result.population_layouts[1].population_name, "pop2");
-    EXPECT_EQ(result.population_layouts[1].first_neuron_index, 3);
-    EXPECT_EQ(result.population_layouts[1].neuron_count, 2);
+    EXPECT_EQ(result.populations[1].population_name, "pop2");
+    EXPECT_EQ(result.populations[1].first_neuron_index, 3);
+    EXPECT_EQ(result.populations[1].neuron_count, 2);
 
-    // Every neuron is labelled with the cell type its population instantiates.
-    ASSERT_EQ(result.neuron_cell_type_indices.size(), 5u);
-    s64 pop1_type = result.population_layouts[0].cell_type_index;
-    s64 pop2_type = result.population_layouts[1].cell_type_index;
+    // Every neuron carries the type, prototype and population it belongs to.
+    s64 pop1_type = result.populations[0].cell_type_index;
+    s64 pop2_type = result.populations[1].cell_type_index;
     EXPECT_NE(pop1_type, pop2_type);
-    EXPECT_EQ(result.neuron_cell_type_indices,
-              (Vector<s64>{pop1_type, pop1_type, pop1_type, pop2_type, pop2_type}));
+
+    for (usize neuron = 0; neuron < result.neurons.size(); neuron += 1) {
+        s64 expected_population = neuron < 3 ? 0 : 1;
+        const PopulationLayout &population =
+                result.populations[static_cast<usize>(expected_population)];
+
+        EXPECT_EQ(result.neurons[neuron].population_index, expected_population) << neuron;
+        EXPECT_EQ(result.neurons[neuron].cell_type_index, population.cell_type_index) << neuron;
+        EXPECT_EQ(result.neurons[neuron].prototype_index, population.prototype_index) << neuron;
+    }
 }
 
-TEST(Export, cell_type_tables_are_consistent_and_indexable) {
+TEST(Export, cell_type_entries_are_self_describing) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
     FixtureDirectory fixture("cell_types");
@@ -824,161 +865,38 @@ TEST(Export, cell_type_tables_are_consistent_and_indexable) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.cell_type_count, 2);
-    ASSERT_EQ(result.cell_type_names.size(), 2u);
-    ASSERT_EQ(result.cell_state_size.size(), 2u);
+    ASSERT_EQ(result.cell_types.size(), 2u);
+    EXPECT_NE(cell_type_named(result, "iafCell"), nullptr);
+    EXPECT_NE(cell_type_named(result, "izhikevich2007Cell"), nullptr);
 
-    // Type-keyed tables: one entry per ComponentType.
-    for (usize type_index = 0; type_index < result.cell_type_names.size(); type_index += 1) {
-        const String &type_name = result.cell_type_names[type_index];
-
-        // The name -> index map and the index -> name vector must agree.
-        ASSERT_EQ(result.cell_type_indices.count(type_name), 1u);
-        EXPECT_EQ(result.cell_type_indices.at(type_name), static_cast<s64>(type_index));
-
-        // state_size must match the named state variables.
-        ASSERT_EQ(result.cell_state_variable_names.count(type_name), 1u);
-        EXPECT_EQ(static_cast<usize>(result.cell_state_size[type_index]),
-                  result.cell_state_variable_names.at(type_name).size());
-
-        ASSERT_EQ(result.cell_type_parameter_names.count(type_name), 1u);
-        EXPECT_EQ(result.cell_dynamics.count(type_name), 1u);
+    for (const CellTypeSpecification &cell_type : result.cell_types) {
+        EXPECT_FALSE(cell_type.name.empty());
+        EXPECT_FALSE(cell_type.state_variable_names.empty()) << cell_type.name;
+        EXPECT_FALSE(cell_type.parameter_names.empty()) << cell_type.name;
+        EXPECT_FALSE(cell_type.dynamics.empty()) << cell_type.name;
     }
 
-    // Instance-keyed tables: one row per prototype, each carrying its own type index and
-    // a width matching that type's column names.
-    ASSERT_EQ(result.cell_parameter_row_instance_ids.size(),
-              result.cell_starting_parameters.size());
-    ASSERT_EQ(result.cell_parameter_row_type_indices.size(),
-              result.cell_starting_parameters.size());
+    // Every prototype names a real type, and its row width matches that type's columns.
+    ASSERT_FALSE(result.cell_prototypes.empty());
+    for (const ComponentPrototype &prototype : result.cell_prototypes) {
+        ASSERT_GE(prototype.type_index, 0);
+        ASSERT_LT(prototype.type_index, static_cast<s64>(result.cell_types.size()));
 
-    for (usize row = 0; row < result.cell_starting_parameters.size(); row += 1) {
-        const String &instance_id = result.cell_parameter_row_instance_ids[row];
-        ASSERT_EQ(result.cell_parameter_row_indices.count(instance_id), 1u);
-        EXPECT_EQ(result.cell_parameter_row_indices.at(instance_id), static_cast<s64>(row));
-
-        s64 type_index = result.cell_parameter_row_type_indices[row];
-        ASSERT_GE(type_index, 0);
-        ASSERT_LT(type_index, static_cast<s64>(result.cell_type_names.size()));
-
-        // A row is only interpretable alongside its column names.
-        const String &type_name = result.cell_type_names[static_cast<usize>(type_index)];
-        EXPECT_EQ(result.cell_starting_parameters[row].size(),
-                  result.cell_type_parameter_names.at(type_name).size());
+        const CellTypeSpecification &cell_type =
+                result.cell_types[static_cast<usize>(prototype.type_index)];
+        EXPECT_EQ(prototype.starting_parameters.size(), cell_type.parameter_names.size())
+                << prototype.instance_id;
     }
 
-    // Every population points at a real row.
-    for (const PopulationLayout &layout : result.population_layouts) {
-        ASSERT_GE(layout.parameter_row_index, 0);
-        ASSERT_LT(layout.parameter_row_index,
-                  static_cast<s64>(result.cell_starting_parameters.size()));
-        EXPECT_EQ(result.cell_parameter_row_type_indices[
-                          static_cast<usize>(layout.parameter_row_index)],
-                  layout.cell_type_index);
+    // Every population points at a real prototype, and they agree on the type.
+    for (const PopulationLayout &population : result.populations) {
+        ASSERT_GE(population.prototype_index, 0);
+        ASSERT_LT(population.prototype_index,
+                  static_cast<s64>(result.cell_prototypes.size()));
+        EXPECT_EQ(result.cell_prototypes[static_cast<usize>(population.prototype_index)]
+                          .type_index,
+                  population.cell_type_index);
     }
-}
-
-TEST(Export, populations_sharing_a_component_type_keep_their_own_parameter_values) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    FixtureDirectory fixture("shared_type_distinct_values");
-    // Both populations are iafCell, but they name different prototypes and differ in
-    // leakReversal -- an excitatory/inhibitory pair built from one cell type. Keying
-    // starting parameters by type would collapse these onto one row and silently
-    // simulate two populations with identical parameters.
-    fixture.write("net.nml", R"(<neuroml id="sharednet">
-    <iafCell id="cellA" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
-             C="0.2nF" leakConductance="0.01uS"/>
-    <iafCell id="cellB" leakReversal="-90mV" thresh="-55mV" reset="-70mV"
-             C="0.2nF" leakConductance="0.01uS"/>
-    <network id="net1">
-        <population id="pop1" component="cellA" size="2"/>
-        <population id="pop2" component="cellB" size="2"/>
-    </network>
-</neuroml>
-)");
-    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
-
-    NML_Parser parser;
-    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
-
-    // One ComponentType, because that is genuinely what both populations instantiate.
-    EXPECT_EQ(result.cell_type_count, 1);
-    ASSERT_EQ(result.population_layouts.size(), 2u);
-    EXPECT_EQ(result.population_layouts[0].cell_type_index,
-              result.population_layouts[1].cell_type_index);
-
-    // Two prototype rows, because the two populations are parameterised differently.
-    ASSERT_EQ(result.cell_starting_parameters.size(), 2u);
-    EXPECT_EQ(result.population_layouts[0].component_instance_id, "cellA");
-    EXPECT_EQ(result.population_layouts[1].component_instance_id, "cellB");
-    EXPECT_NE(result.population_layouts[0].parameter_row_index,
-              result.population_layouts[1].parameter_row_index);
-
-    const Vector<String> &columns = result.cell_type_parameter_names.at("iafCell");
-    auto leak_reversal = std::find(columns.begin(), columns.end(), "leakReversal");
-    ASSERT_NE(leak_reversal, columns.end());
-    usize column = static_cast<usize>(leak_reversal - columns.begin());
-
-    auto row_of = [&](usize population_index) {
-        return static_cast<usize>(
-                result.population_layouts[population_index].parameter_row_index);
-    };
-
-    EXPECT_DOUBLE_EQ(result.cell_starting_parameters[row_of(0)][column].float64, -0.05);
-    EXPECT_DOUBLE_EQ(result.cell_starting_parameters[row_of(1)][column].float64, -0.09);
-}
-
-TEST(Export, projections_sharing_a_synapse_type_keep_their_own_parameter_values) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    FixtureDirectory fixture("shared_synapse_type");
-    fixture.write("net.nml", R"(<neuroml id="synnet">
-    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
-             C="0.2nF" leakConductance="0.01uS"/>
-    <expOneSynapse id="synFast" gbase="0.5nS" erev="0mV" tauDecay="1ms"/>
-    <expOneSynapse id="synSlow" gbase="0.5nS" erev="0mV" tauDecay="50ms"/>
-    <network id="net1">
-        <population id="pop1" component="cell0" size="3"/>
-        <projection id="projFast" presynapticPopulation="pop1"
-                    postsynapticPopulation="pop1" synapse="synFast">
-            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[1]"/>
-        </projection>
-        <projection id="projSlow" presynapticPopulation="pop1"
-                    postsynapticPopulation="pop1" synapse="synSlow">
-            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[2]"/>
-        </projection>
-    </network>
-</neuroml>
-)");
-    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
-
-    NML_Parser parser;
-    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
-
-    EXPECT_EQ(result.synapse_type_count, 1);
-    ASSERT_EQ(result.synapse_starting_parameters.size(), 2u);
-
-    // Neuron 0 has one edge from each projection; they share a type but not a row.
-    ASSERT_EQ(result.network_edges[0].size(), 2u);
-    const NetworkEdge &fast = result.network_edges[0][0];
-    const NetworkEdge &slow = result.network_edges[0][1];
-    EXPECT_EQ(fast.synapse_type_index, slow.synapse_type_index);
-    EXPECT_NE(fast.synapse_parameter_row_index, slow.synapse_parameter_row_index);
-
-    const Vector<String> &columns = result.synapse_type_parameter_names.at("expOneSynapse");
-    auto tau_decay = std::find(columns.begin(), columns.end(), "tauDecay");
-    ASSERT_NE(tau_decay, columns.end());
-    usize column = static_cast<usize>(tau_decay - columns.begin());
-
-    EXPECT_DOUBLE_EQ(
-            result.synapse_starting_parameters[
-                    static_cast<usize>(fast.synapse_parameter_row_index)][column].float64,
-            0.001);
-    EXPECT_DOUBLE_EQ(
-            result.synapse_starting_parameters[
-                    static_cast<usize>(slow.synapse_parameter_row_index)][column].float64,
-            0.05);
 }
 
 TEST(Export, parameters_are_converted_to_si_in_declared_column_order) {
@@ -991,26 +909,24 @@ TEST(Export, parameters_are_converted_to_si_in_declared_column_order) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    // cell0 is pop1's prototype; its row is the one to read.
-    ASSERT_EQ(result.cell_parameter_row_indices.count("cell0"), 1u);
-    usize cell0_row = static_cast<usize>(result.cell_parameter_row_indices.at("cell0"));
+    const CellTypeSpecification *iaf = cell_type_named(result, "iafCell");
+    ASSERT_NE(iaf, nullptr);
 
-    const Vector<String> &columns = result.cell_type_parameter_names.at("iafCell");
-    const Vector<Real> &values = result.cell_starting_parameters[cell0_row];
-    ASSERT_EQ(columns.size(), values.size());
+    const ComponentPrototype *cell0 = prototype_named(result.cell_prototypes, "cell0");
+    ASSERT_NE(cell0, nullptr);
+    ASSERT_EQ(cell0->starting_parameters.size(), iaf->parameter_names.size());
 
     auto value_of = [&](const String &parameter_name) {
-        auto column = std::find(columns.begin(), columns.end(), parameter_name);
-        EXPECT_NE(column, columns.end()) << parameter_name;
-        return values[static_cast<usize>(column - columns.begin())].float64;
+        return parameter_value(iaf->parameter_names, cell0->starting_parameters,
+                               parameter_name);
     };
 
     // cell0's attributes, in SI.
-    EXPECT_DOUBLE_EQ(value_of("leakReversal"), -0.05);  // -50mV
-    EXPECT_DOUBLE_EQ(value_of("thresh"), -0.055);       // -55mV
-    EXPECT_DOUBLE_EQ(value_of("reset"), -0.07);         // -70mV
-    EXPECT_DOUBLE_EQ(value_of("C"), 0.2e-9);            // 0.2nF
-    EXPECT_DOUBLE_EQ(value_of("leakConductance"), 0.01e-6); // 0.01uS
+    EXPECT_DOUBLE_EQ(value_of("leakReversal"), -0.05);       // -50mV
+    EXPECT_DOUBLE_EQ(value_of("thresh"), -0.055);            // -55mV
+    EXPECT_DOUBLE_EQ(value_of("reset"), -0.07);              // -70mV
+    EXPECT_DOUBLE_EQ(value_of("C"), 0.2e-9);                 // 0.2nF
+    EXPECT_DOUBLE_EQ(value_of("leakConductance"), 0.01e-6);  // 0.01uS
 }
 
 TEST(Export, cell_state_offsets_are_the_running_sum_of_state_sizes) {
@@ -1023,19 +939,22 @@ TEST(Export, cell_state_offsets_are_the_running_sum_of_state_sizes) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.cell_type_names.size(), 2u);
+    ASSERT_EQ(result.cell_types.size(), 2u);
 
     s32 expected_offset = 0;
-    for (usize type_index = 0; type_index < result.cell_type_names.size(); type_index += 1) {
-        const String &type_name = result.cell_type_names[type_index];
-        ASSERT_EQ(result.cell_state_offsets.count(type_name), 1u);
-        EXPECT_EQ(result.cell_state_offsets.at(type_name), expected_offset) << type_name;
-        expected_offset += static_cast<s32>(result.cell_state_size[type_index]);
+    for (const CellTypeSpecification &cell_type : result.cell_types) {
+        EXPECT_EQ(cell_type.state_offset, expected_offset) << cell_type.name;
+        expected_offset += static_cast<s32>(cell_type.state_variable_names.size());
     }
 
     // The first type starts at zero and the offsets strictly advance.
-    EXPECT_EQ(result.cell_state_offsets.at(result.cell_type_names[0]), 0);
+    EXPECT_EQ(result.cell_types[0].state_offset, 0);
     EXPECT_GT(expected_offset, 0);
+
+    // iafCell has one state variable (v); izhikevich2007Cell has two (v, u).
+    const CellTypeSpecification *iaf = cell_type_named(result, "iafCell");
+    ASSERT_NE(iaf, nullptr);
+    EXPECT_EQ(iaf->state_variable_names, (Vector<String>{"v"}));
 }
 
 TEST(Export, synapse_types_are_classified_for_storage) {
@@ -1048,20 +967,20 @@ TEST(Export, synapse_types_are_classified_for_storage) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.synapse_type_count, 1);
-    ASSERT_EQ(result.synapse_type_indices.count("expOneSynapse"), 1u);
-    s64 synapse_index = result.synapse_type_indices.at("expOneSynapse");
+    ASSERT_EQ(result.synapse_types.size(), 1u);
+    const SynapseTypeSpecification *synapse = synapse_type_named(result, "expOneSynapse");
+    ASSERT_NE(synapse, nullptr);
 
     // expOneSynapse computes g * (erev - v): it declares erev and requires v, so it needs
     // the postsynaptic voltage.
-    EXPECT_EQ(result.conductance_based_synapse_types.count(synapse_index), 1u);
+    EXPECT_TRUE(synapse->is_conductance_based);
 
     // It carries no plasticity or block child, so its state superposes and it does not
     // need per-edge storage.
-    EXPECT_EQ(result.per_edge_synapse_projection_types.count(synapse_index), 0u);
+    EXPECT_FALSE(synapse->requires_per_edge_state);
 
-    EXPECT_EQ(result.synapse_state_variable_names.count("expOneSynapse"), 1u);
-    EXPECT_EQ(result.synapse_dynamics.count("expOneSynapse"), 1u);
+    EXPECT_FALSE(synapse->state_variable_names.empty());
+    EXPECT_FALSE(synapse->dynamics.empty());
 }
 
 TEST(Export, connections_resolve_to_global_neuron_indices_with_weight_and_delay) {
@@ -1074,42 +993,63 @@ TEST(Export, connections_resolve_to_global_neuron_indices_with_weight_and_delay)
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.network_adjacency_list.size(), 5u);
-    ASSERT_EQ(result.network_edges.size(), 5u);
+    ASSERT_EQ(result.neurons.size(), 5u);
 
     // pop1[0] is neuron 0; pop2[1] is 3 + 1 = 4.
-    ASSERT_EQ(result.network_adjacency_list[0].size(), 1u);
-    EXPECT_EQ(result.network_adjacency_list[0][0], 4);
-
-    ASSERT_EQ(result.network_edges[0].size(), 1u);
-    const NetworkEdge &weighted = result.network_edges[0][0];
+    ASSERT_EQ(result.neurons[0].outgoing_edges.size(), 1u);
+    const NetworkEdge &weighted = result.neurons[0].outgoing_edges[0];
     EXPECT_EQ(weighted.target_neuron_index, 4);
     EXPECT_DOUBLE_EQ(weighted.weight, 2.5);
     // 2ms at dt=0.01ms. Truncation would give 199 here.
     EXPECT_EQ(weighted.delay_tick_count, 200);
-    EXPECT_EQ(weighted.synapse_type_index, result.synapse_type_indices.at("expOneSynapse"));
+    ASSERT_GE(weighted.synapse_type_index, 0);
+    EXPECT_EQ(result.synapse_types[static_cast<usize>(weighted.synapse_type_index)].name,
+              "expOneSynapse");
+    ASSERT_GE(weighted.synapse_prototype_index, 0);
+    EXPECT_EQ(result.synapse_prototypes[static_cast<usize>(weighted.synapse_prototype_index)]
+                      .instance_id,
+              "syn0");
 
     // pop1[2] is neuron 2; pop2[0] is neuron 3. A plain <connection> carries neither
     // weight nor delay, so it takes the defaults.
-    ASSERT_EQ(result.network_edges[2].size(), 1u);
-    const NetworkEdge &plain = result.network_edges[2][0];
+    ASSERT_EQ(result.neurons[2].outgoing_edges.size(), 1u);
+    const NetworkEdge &plain = result.neurons[2].outgoing_edges[0];
     EXPECT_EQ(plain.target_neuron_index, 3);
     EXPECT_DOUBLE_EQ(plain.weight, 1.0);
     EXPECT_EQ(plain.delay_tick_count, 0);
 
     // Neurons with no outgoing edges stay empty rather than being dropped.
-    EXPECT_TRUE(result.network_adjacency_list[1].empty());
-    EXPECT_TRUE(result.network_edges[1].empty());
+    EXPECT_TRUE(result.neurons[1].outgoing_edges.empty());
+    EXPECT_TRUE(result.neurons[3].outgoing_edges.empty());
+}
 
-    // The two views agree edge for edge.
-    for (usize source = 0; source < result.network_edges.size(); source += 1) {
-        ASSERT_EQ(result.network_edges[source].size(),
-                  result.network_adjacency_list[source].size());
-        for (usize edge = 0; edge < result.network_edges[source].size(); edge += 1) {
-            EXPECT_EQ(result.network_edges[source][edge].target_neuron_index,
-                      result.network_adjacency_list[source][edge]);
+TEST(Export, adjacency_projection_matches_the_stored_edges) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("adjacency");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    // The plain source -> targets form WeightMatrix consumes is derived, not stored, so
+    // there is only one edge list that can be wrong.
+    Vector<Vector<s64>> adjacency = build_adjacency_list(result);
+
+    ASSERT_EQ(adjacency.size(), result.neurons.size());
+    for (usize source = 0; source < result.neurons.size(); source += 1) {
+        const Vector<NetworkEdge> &edges = result.neurons[source].outgoing_edges;
+        ASSERT_EQ(adjacency[source].size(), edges.size()) << source;
+
+        for (usize edge = 0; edge < edges.size(); edge += 1) {
+            EXPECT_EQ(adjacency[source][edge], edges[edge].target_neuron_index);
         }
     }
+
+    EXPECT_EQ(adjacency[0], (Vector<s64>{4}));
+    EXPECT_EQ(adjacency[2], (Vector<s64>{3}));
+    EXPECT_TRUE(adjacency[1].empty());
 }
 
 TEST(Export, inputs_resolve_their_targets_and_times) {
@@ -1133,14 +1073,16 @@ TEST(Export, inputs_resolve_their_targets_and_times) {
     // 10ms and 10ms + 40ms at dt = 0.01ms. Truncation would give 999 and 4998.
     EXPECT_EQ(explicit_input.start_tick, 1000);
     EXPECT_EQ(explicit_input.end_tick, 5000);
-    EXPECT_EQ(explicit_input.input_neuron_indices, (Vector<s64>{0}));
+    ASSERT_EQ(explicit_input.targets.size(), 1u);
+    EXPECT_EQ(explicit_input.targets[0].neuron_index, 0);
 
     const SimulationInputConfig &input_list = result.input_profiles[1];
-    EXPECT_EQ(input_list.input_neuron_indices, (Vector<s64>{3, 4}));
+    ASSERT_EQ(input_list.targets.size(), 2u);
+    EXPECT_EQ(input_list.targets[0].neuron_index, 3);
+    EXPECT_EQ(input_list.targets[1].neuron_index, 4);
     // <input> carries no weight and defaults to 1; <inputW> carries 3.
-    ASSERT_EQ(input_list.input_weights.size(), 2u);
-    EXPECT_DOUBLE_EQ(input_list.input_weights[0], 1.0);
-    EXPECT_DOUBLE_EQ(input_list.input_weights[1], 3.0);
+    EXPECT_DOUBLE_EQ(input_list.targets[0].weight, 1.0);
+    EXPECT_DOUBLE_EQ(input_list.targets[1].weight, 3.0);
 }
 
 TEST(Export, spike_array_inputs_become_tick_indexed_event_trains) {
@@ -1171,11 +1113,12 @@ TEST(Export, spike_array_inputs_become_tick_indexed_event_trains) {
 
     EXPECT_EQ(train.input_component_type_name, "spikeArray");
     EXPECT_FALSE(train.continuous_current_injection);
-    EXPECT_EQ(train.input_neuron_indices, (Vector<s64>{1}));
 
-    // One train per target, sorted into tick order regardless of document order.
-    ASSERT_EQ(train.simulation_input_events.size(), 1u);
-    EXPECT_EQ(train.simulation_input_events[0], (Vector<s32>{1000, 2000, 3000}));
+    // The train rides on the target it feeds, sorted into tick order regardless of
+    // document order.
+    ASSERT_EQ(train.targets.size(), 1u);
+    EXPECT_EQ(train.targets[0].neuron_index, 1);
+    EXPECT_EQ(train.targets[0].event_ticks, (Vector<s32>{1000, 2000, 3000}));
     EXPECT_EQ(train.max_delay_time, 3000);
 }
 
@@ -1213,6 +1156,106 @@ TEST(Export, recording_selections_resolve_to_neurons_and_variables) {
     EXPECT_EQ(events.selections[0].event_port, "spike");
 }
 
+TEST(Export, populations_sharing_a_component_type_keep_their_own_parameter_values) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("shared_type_distinct_values");
+    // Both populations are iafCell, but they name different prototypes and differ in
+    // leakReversal -- an excitatory/inhibitory pair built from one cell type. Keying
+    // starting parameters by type would collapse these onto one row and silently
+    // simulate two populations with identical parameters.
+    fixture.write("net.nml", R"(<neuroml id="sharednet">
+    <iafCell id="cellA" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <iafCell id="cellB" leakReversal="-90mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <network id="net1">
+        <population id="pop1" component="cellA" size="2"/>
+        <population id="pop2" component="cellB" size="2"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    // One ComponentType, because that is genuinely what both populations instantiate.
+    ASSERT_EQ(result.cell_types.size(), 1u);
+    ASSERT_EQ(result.populations.size(), 2u);
+    EXPECT_EQ(result.populations[0].cell_type_index, result.populations[1].cell_type_index);
+
+    // Two prototypes, because the two populations are parameterised differently.
+    ASSERT_EQ(result.cell_prototypes.size(), 2u);
+    EXPECT_EQ(result.populations[0].component_instance_id, "cellA");
+    EXPECT_EQ(result.populations[1].component_instance_id, "cellB");
+    EXPECT_NE(result.populations[0].prototype_index, result.populations[1].prototype_index);
+
+    const Vector<String> &columns = result.cell_types[0].parameter_names;
+    auto leak_reversal_of = [&](usize population_index) {
+        const ComponentPrototype &prototype = result.cell_prototypes[static_cast<usize>(
+                result.populations[population_index].prototype_index)];
+        return parameter_value(columns, prototype.starting_parameters, "leakReversal");
+    };
+
+    EXPECT_DOUBLE_EQ(leak_reversal_of(0), -0.05);
+    EXPECT_DOUBLE_EQ(leak_reversal_of(1), -0.09);
+
+    // The neurons of each population inherit their population's prototype.
+    EXPECT_EQ(result.neurons[0].prototype_index, result.populations[0].prototype_index);
+    EXPECT_EQ(result.neurons[3].prototype_index, result.populations[1].prototype_index);
+}
+
+TEST(Export, projections_sharing_a_synapse_type_keep_their_own_parameter_values) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("shared_synapse_type");
+    fixture.write("net.nml", R"(<neuroml id="synnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <expOneSynapse id="synFast" gbase="0.5nS" erev="0mV" tauDecay="1ms"/>
+    <expOneSynapse id="synSlow" gbase="0.5nS" erev="0mV" tauDecay="50ms"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="3"/>
+        <projection id="projFast" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="synFast">
+            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[1]"/>
+        </projection>
+        <projection id="projSlow" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="synSlow">
+            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[2]"/>
+        </projection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.synapse_types.size(), 1u);
+    ASSERT_EQ(result.synapse_prototypes.size(), 2u);
+
+    // Neuron 0 has one edge from each projection; they share a type but not a prototype.
+    ASSERT_EQ(result.neurons[0].outgoing_edges.size(), 2u);
+    const NetworkEdge &fast = result.neurons[0].outgoing_edges[0];
+    const NetworkEdge &slow = result.neurons[0].outgoing_edges[1];
+    EXPECT_EQ(fast.synapse_type_index, slow.synapse_type_index);
+    EXPECT_NE(fast.synapse_prototype_index, slow.synapse_prototype_index);
+
+    const Vector<String> &columns = result.synapse_types[0].parameter_names;
+    auto tau_decay_of = [&](s64 prototype_index) {
+        return parameter_value(
+                columns,
+                result.synapse_prototypes[static_cast<usize>(prototype_index)]
+                        .starting_parameters,
+                "tauDecay");
+    };
+
+    EXPECT_DOUBLE_EQ(tau_decay_of(fast.synapse_prototype_index), 0.001);
+    EXPECT_DOUBLE_EQ(tau_decay_of(slow.synapse_prototype_index), 0.05);
+}
+
 TEST(Export, is_deterministic_across_parses) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
@@ -1228,43 +1271,58 @@ TEST(Export, is_deterministic_across_parses) {
     NML_Parser second_parser;
     NML_ParseResult second = second_parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    EXPECT_EQ(first.cell_type_names, second.cell_type_names);
-    EXPECT_EQ(first.synapse_type_names, second.synapse_type_names);
-    EXPECT_EQ(first.neuron_cell_type_indices, second.neuron_cell_type_indices);
-    EXPECT_EQ(first.network_adjacency_list, second.network_adjacency_list);
-    EXPECT_EQ(first.cell_state_size, second.cell_state_size);
-
-    ASSERT_EQ(first.population_layouts.size(), second.population_layouts.size());
-    for (usize index = 0; index < first.population_layouts.size(); index += 1) {
-        EXPECT_EQ(first.population_layouts[index].population_name,
-                  second.population_layouts[index].population_name);
-        EXPECT_EQ(first.population_layouts[index].first_neuron_index,
-                  second.population_layouts[index].first_neuron_index);
-        EXPECT_EQ(first.population_layouts[index].cell_type_index,
-                  second.population_layouts[index].cell_type_index);
+    // Type order fixes every type index, so it has to be stable.
+    ASSERT_EQ(first.cell_types.size(), second.cell_types.size());
+    for (usize index = 0; index < first.cell_types.size(); index += 1) {
+        EXPECT_EQ(first.cell_types[index].name, second.cell_types[index].name);
+        EXPECT_EQ(first.cell_types[index].state_offset, second.cell_types[index].state_offset);
+        EXPECT_EQ(first.cell_types[index].parameter_names,
+                  second.cell_types[index].parameter_names);
     }
 
-    // Parameter rows must land in the same order, so a row index means the same thing
-    // across parses.
-    EXPECT_EQ(first.cell_parameter_row_instance_ids, second.cell_parameter_row_instance_ids);
-    EXPECT_EQ(first.cell_parameter_row_type_indices, second.cell_parameter_row_type_indices);
-    EXPECT_EQ(first.synapse_parameter_row_instance_ids,
-              second.synapse_parameter_row_instance_ids);
+    ASSERT_EQ(first.synapse_types.size(), second.synapse_types.size());
+    for (usize index = 0; index < first.synapse_types.size(); index += 1) {
+        EXPECT_EQ(first.synapse_types[index].name, second.synapse_types[index].name);
+    }
 
-    ASSERT_EQ(first.cell_starting_parameters.size(), second.cell_starting_parameters.size());
-    for (usize row = 0; row < first.cell_starting_parameters.size(); row += 1) {
-        ASSERT_EQ(first.cell_starting_parameters[row].size(),
-                  second.cell_starting_parameters[row].size());
-        for (usize column = 0; column < first.cell_starting_parameters[row].size();
-             column += 1) {
-            EXPECT_DOUBLE_EQ(first.cell_starting_parameters[row][column].float64,
-                             second.cell_starting_parameters[row][column].float64);
+    // Prototype order fixes every prototype index.
+    ASSERT_EQ(first.cell_prototypes.size(), second.cell_prototypes.size());
+    for (usize index = 0; index < first.cell_prototypes.size(); index += 1) {
+        EXPECT_EQ(first.cell_prototypes[index].instance_id,
+                  second.cell_prototypes[index].instance_id);
+        EXPECT_EQ(first.cell_prototypes[index].type_index,
+                  second.cell_prototypes[index].type_index);
+
+        ASSERT_EQ(first.cell_prototypes[index].starting_parameters.size(),
+                  second.cell_prototypes[index].starting_parameters.size());
+        for (usize column = 0;
+             column < first.cell_prototypes[index].starting_parameters.size(); column += 1) {
+            EXPECT_DOUBLE_EQ(
+                    first.cell_prototypes[index].starting_parameters[column].float64,
+                    second.cell_prototypes[index].starting_parameters[column].float64);
         }
     }
 
-    for (usize type_index = 0; type_index < first.cell_type_names.size(); type_index += 1) {
-        EXPECT_EQ(first.cell_type_parameter_names.at(first.cell_type_names[type_index]),
-                  second.cell_type_parameter_names.at(second.cell_type_names[type_index]));
+    // Neuron numbering, and therefore the whole graph.
+    ASSERT_EQ(first.neurons.size(), second.neurons.size());
+    for (usize neuron = 0; neuron < first.neurons.size(); neuron += 1) {
+        EXPECT_EQ(first.neurons[neuron].cell_type_index,
+                  second.neurons[neuron].cell_type_index);
+        EXPECT_EQ(first.neurons[neuron].prototype_index,
+                  second.neurons[neuron].prototype_index);
+        EXPECT_EQ(first.neurons[neuron].population_index,
+                  second.neurons[neuron].population_index);
+    }
+    EXPECT_EQ(build_adjacency_list(first), build_adjacency_list(second));
+
+    ASSERT_EQ(first.populations.size(), second.populations.size());
+    for (usize index = 0; index < first.populations.size(); index += 1) {
+        EXPECT_EQ(first.populations[index].population_name,
+                  second.populations[index].population_name);
+        EXPECT_EQ(first.populations[index].first_neuron_index,
+                  second.populations[index].first_neuron_index);
+        EXPECT_EQ(first.populations[index].prototype_index,
+                  second.populations[index].prototype_index);
     }
 }
 
@@ -1282,11 +1340,12 @@ TEST(Export, reparsing_with_the_same_parser_does_not_duplicate_the_network) {
     NML_ParseResult first = parser.parse_lems(fixture.path_of("LEMS.xml"));
     NML_ParseResult second = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    EXPECT_EQ(second.total_cell_count, first.total_cell_count);
-    EXPECT_EQ(second.population_layouts.size(), first.population_layouts.size());
-    EXPECT_EQ(second.network_adjacency_list, first.network_adjacency_list);
+    EXPECT_EQ(second.neurons.size(), first.neurons.size());
+    EXPECT_EQ(second.populations.size(), first.populations.size());
+    EXPECT_EQ(build_adjacency_list(second), build_adjacency_list(first));
     EXPECT_EQ(second.input_profiles.size(), first.input_profiles.size());
     EXPECT_EQ(second.recording_profiles.size(), first.recording_profiles.size());
+    EXPECT_EQ(second.cell_prototypes.size(), first.cell_prototypes.size());
 }
 
 TEST(Export, resolves_populationlist_paths) {
@@ -1318,13 +1377,12 @@ TEST(Export, resolves_populationlist_paths) {
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
     // Size comes from the three <instance> children, not from a size attribute.
-    EXPECT_EQ(result.total_cell_count, 3);
-    ASSERT_EQ(result.population_layouts.size(), 1u);
-    EXPECT_EQ(result.population_layouts[0].neuron_count, 3);
+    EXPECT_EQ(result.neurons.size(), 3u);
+    ASSERT_EQ(result.populations.size(), 1u);
+    EXPECT_EQ(result.populations[0].neuron_count, 3);
 
-    ASSERT_EQ(result.network_edges.size(), 3u);
-    ASSERT_EQ(result.network_edges[0].size(), 1u);
-    EXPECT_EQ(result.network_edges[0][0].target_neuron_index, 2);
+    ASSERT_EQ(result.neurons[0].outgoing_edges.size(), 1u);
+    EXPECT_EQ(result.neurons[0].outgoing_edges[0].target_neuron_index, 2);
 }
 
 
@@ -1425,6 +1483,6 @@ TEST(Errors, unmodelled_metadata_tags_are_skipped_rather_than_fatal) {
     NML_ParseResult result;
     ASSERT_NO_THROW(result = parser.parse_lems(fixture.path_of("LEMS.xml")));
 
-    EXPECT_EQ(result.total_cell_count, 2);
-    EXPECT_EQ(result.cell_type_count, 1);
+    EXPECT_EQ(result.neurons.size(), 2u);
+    EXPECT_EQ(result.cell_types.size(), 1u);
 }
