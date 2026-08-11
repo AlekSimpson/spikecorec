@@ -1,17 +1,9 @@
-#ifdef SPIKECOREC_CUDA
-#include <cuda_runtime.h>
-#elif defined(SPIKECOREC_METAL)
-#include <Metal/Metal.hpp>
-#endif
-
-#include <any>
-#include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+
 #include <gtest/gtest.h>
-#include <libxml/parser.h>
-#include <libxml/tree.h>
 
 #include "spikecorec/nml/nml.h"
 
@@ -21,187 +13,1270 @@ using namespace spikecorec::nml;
 
 namespace {
 
-String get_string_attribute(const ComponentType &component, const String &key) {
-    auto entry = component.attributes.find(key);
-    if (entry == component.attributes.end()) return "";
-    return std::any_cast<String>(entry->second);
+// Fixtures are written to disk because the parser's unit of work is a file: include
+// resolution, canonical-path deduping and cycle detection are all path behaviour, and a
+// string-fed parser would test none of it. Each fixture gets its own directory so tests
+// cannot see each other's files.
+class FixtureDirectory {
+public:
+    explicit FixtureDirectory(const String &test_name) {
+        root_ = filesystem::temp_directory_path() / "spikecorec_nml_tests" / test_name;
+        filesystem::remove_all(root_);
+        filesystem::create_directories(root_);
+    }
+
+    ~FixtureDirectory() {
+        std::error_code ignored;
+        filesystem::remove_all(root_, ignored);
+    }
+
+    FixtureDirectory(const FixtureDirectory &) = delete;
+    FixtureDirectory &operator=(const FixtureDirectory &) = delete;
+
+    // Returns the absolute path of the written file.
+    String write(const String &relative_name, const String &contents) const {
+        filesystem::path destination = root_ / relative_name;
+        filesystem::create_directories(destination.parent_path());
+
+        ofstream file(destination);
+        file << contents;
+        file.close();
+
+        return destination.string();
+    }
+
+    String path_of(const String &relative_name) const {
+        return (root_ / relative_name).string();
+    }
+
+private:
+    filesystem::path root_;
+};
+
+bool standard_library_available() {
+    NML_Parser parser;
+    return !parser.STANDARD_LIBRARY_PATH.empty() &&
+           filesystem::exists(parser.STANDARD_LIBRARY_PATH);
+}
+
+// A complete, simulable two-population model. Reused by the export tests so each one
+// asserts on the same known-good document rather than inventing its own.
+String two_population_network_nml() {
+    return R"(<neuroml id="testnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <izhikevich2007Cell id="cell1" C="100pF" v0="-60mV" k="0.7nS_per_mV"
+                        vr="-60mV" vt="-40mV" vpeak="35mV" a="0.03per_ms"
+                        b="-2nS" c="-50mV" d="100pA"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+    <pulseGenerator id="pg0" delay="10ms" duration="40ms" amplitude="0.5nA"/>
+
+    <network id="net1">
+        <population id="pop1" component="cell0" size="3"/>
+        <population id="pop2" component="cell1" size="2"/>
+
+        <projection id="proj1" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop2" synapse="syn0">
+            <connectionWD id="0" preCellId="../pop1[0]" postCellId="../pop2[1]"
+                          weight="2.5" delay="2ms"/>
+            <connection id="1" preCellId="../pop1[2]" postCellId="../pop2[0]"/>
+        </projection>
+
+        <explicitInput target="pop1[0]" input="pg0"/>
+        <inputList id="il1" component="pg0" population="pop2">
+            <input id="0" target="../pop2[0]"/>
+            <inputW id="1" target="../pop2[1]" weight="3.0"/>
+        </inputList>
+    </network>
+</neuroml>
+)";
+}
+
+String lems_simulation_xml(const String &included_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+    <Include file=")" + included_file + R"("/>
+    <Simulation id="sim1" length="100ms" step="0.01ms" target="net1" seed="1234">
+        <OutputFile id="of1" fileName="out.dat">
+            <OutputColumn id="c0" quantity="pop1[0]/v"/>
+            <OutputColumn id="c1" quantity="pop2[1]/v"/>
+        </OutputFile>
+        <EventOutputFile id="ef1" fileName="spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="pop2[1]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+// Names of a type's declarations of one tag, in the order the resolved type holds them.
+Vector<String> declaration_names(const ComponentType &component_type,
+                                 NML_DeclarationType tag_type) {
+    Vector<String> names;
+    for (const NML_Declaration *declaration : component_type.declarations.find_all(tag_type)) {
+        names.push_back(declaration->value_or("name"));
+    }
+    return names;
 }
 
 } // namespace
 
-// ── ComponentType ────────────────────────────────────────────
 
-TEST(ComponentType, construction) {
-    ComponentType component("ComponentType");
-    EXPECT_EQ(component.tag, "ComponentType");
-    EXPECT_TRUE(component.attributes.empty());
-    EXPECT_TRUE(component.body.empty());
+// ── quantities and units ─────────────────────────────────────────────────────────
+
+TEST(Quantity, splits_magnitude_from_unit_suffix) {
+    EXPECT_EQ(split_quantity("-60mV").first, -60.0);
+    EXPECT_EQ(split_quantity("-60mV").second, "mV");
+
+    EXPECT_EQ(split_quantity("1.5e-3 mV").first, 1.5e-3);
+    EXPECT_EQ(split_quantity("1.5e-3 mV").second, "mV");
+
+    // A bare number has no suffix, and must not be mistaken for one.
+    EXPECT_EQ(split_quantity("10").second, "");
+    EXPECT_EQ(split_quantity("10").first, 10.0);
 }
 
-TEST(ComponentType, add_attribute_stores_any_value) {
-    ComponentType component("ComponentType");
-    component.add_attribute("name", String("iafCell"));
-
-    auto entry = component.attributes.find("name");
-    ASSERT_NE(entry, component.attributes.end());
-    EXPECT_EQ(std::any_cast<String>(entry->second), "iafCell");
+TEST(Quantity, scales_to_si_with_the_builtin_table) {
+    EXPECT_DOUBLE_EQ(parse_quantity("-60mV"), -0.06);
+    EXPECT_DOUBLE_EQ(parse_quantity("5ms"), 0.005);
+    EXPECT_DOUBLE_EQ(parse_quantity("0.2nF"), 0.2e-9);
+    EXPECT_DOUBLE_EQ(parse_quantity("10"), 10.0);
 }
 
-TEST(ComponentType, nest_appends_child) {
-    ComponentType parent("ComponentType");
-    ComponentType child("Parameter");
-    child.add_attribute("name", String("a"));
-
-    parent.nest(child);
-
-    ASSERT_EQ(parent.body.size(), 1u);
-    EXPECT_EQ(parent.body[0].tag, "Parameter");
-    EXPECT_EQ(get_string_attribute(parent.body[0], "name"), "a");
+TEST(Quantity, malformed_input_yields_zero_rather_than_throwing) {
+    EXPECT_DOUBLE_EQ(parse_quantity(""), 0.0);
+    EXPECT_DOUBLE_EQ(parse_quantity("mV"), 0.0);
+    EXPECT_DOUBLE_EQ(parse_quantity("   "), 0.0);
 }
 
-// Directly exercises deep-copy correctness: mutating the original after the
-// copy is taken must not affect the copy, for both `attributes` (std::any,
-// copies itself) and `body` (Vector<ComponentType>, must recurse).
-TEST(ComponentType, copy_constructor_deep_copies_body_and_attributes) {
-    ComponentType parent("ComponentType");
-    parent.add_attribute("name", String("testCell"));
+TEST(Quantity, declared_units_take_precedence_over_the_builtin_table) {
+    FixtureDirectory fixture("declared_units");
+    // A deliberately non-SI redefinition: if the document's <Unit> is being consulted,
+    // "mV" scales by 1000 here rather than the built-in 1e-3.
+    fixture.write("units.xml", R"(<Lems>
+    <Unit symbol="mV" dimension="voltage" power="3"/>
+    <Unit symbol="quux" dimension="none" power="0" scale="7"/>
+</Lems>
+)");
 
-    ComponentType child("Parameter");
-    child.add_attribute("name", String("a"));
-    parent.nest(child);
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("units.xml"));
 
-    ComponentType copy(parent);
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("2mV"), 2000.0);
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("3quux"), 21.0);
 
-    parent.add_attribute("name", String("mutated"));
-    parent.body.clear();
+    // The built-in table still answers for symbols no document declared.
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("5ms"), 0.005);
 
-    EXPECT_EQ(copy.tag, "ComponentType");
-    EXPECT_EQ(get_string_attribute(copy, "name"), "testCell");
-    ASSERT_EQ(copy.body.size(), 1u);
-    EXPECT_EQ(copy.body[0].tag, "Parameter");
-    EXPECT_EQ(get_string_attribute(copy.body[0], "name"), "a");
+    // The free function is unaffected by what a parser ingested.
+    EXPECT_DOUBLE_EQ(parse_quantity("2mV"), 0.002);
 }
 
-// ── xml_node_to_component_type ──────────────────────────────
+TEST(Quantity, unit_offset_is_applied) {
+    FixtureDirectory fixture("unit_offset");
+    fixture.write("units.xml", R"(<Lems>
+    <Unit symbol="degC" dimension="temperature" offset="273.15"/>
+</Lems>
+)");
 
-TEST(XmlNodeToComponentType, parses_tag_attributes_and_nested_children) {
-    const char *xml =
-        "<Lems>"
-        "  <ComponentType name=\"testCell\" extends=\"baseCell\">"
-        "    <Parameter name=\"a\" dimension=\"none\"/>"
-        "    <Parameter name=\"b\" dimension=\"voltage\"/>"
-        "  </ComponentType>"
-        "</Lems>";
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("units.xml"));
 
-    xmlDocPtr document = xmlReadMemory(xml, static_cast<int>(strlen(xml)), "test.xml", nullptr, XML_PARSE_NOBLANKS);
-    ASSERT_NE(document, nullptr);
-
-    xmlNodePtr root = xmlDocGetRootElement(document);
-    ASSERT_NE(root, nullptr);
-
-    xmlNodePtr component_type_node = root->children;
-    ASSERT_NE(component_type_node, nullptr);
-    ASSERT_TRUE(xmlStrEqual(component_type_node->name, BAD_CAST "ComponentType"));
-
-    ComponentType component = xml_node_to_component_type(component_type_node);
-
-    EXPECT_EQ(component.tag, "ComponentType");
-    EXPECT_EQ(get_string_attribute(component, "name"), "testCell");
-    EXPECT_EQ(get_string_attribute(component, "extends"), "baseCell");
-
-    ASSERT_EQ(component.body.size(), 2u);
-    EXPECT_EQ(component.body[0].tag, "Parameter");
-    EXPECT_EQ(get_string_attribute(component.body[0], "name"), "a");
-    EXPECT_EQ(get_string_attribute(component.body[0], "dimension"), "none");
-    EXPECT_EQ(component.body[1].tag, "Parameter");
-    EXPECT_EQ(get_string_attribute(component.body[1], "name"), "b");
-
-    xmlFreeDoc(document);
+    // Offsets are why the built-in scale-only table cannot express temperature.
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("20degC"), 293.15);
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("0degC"), 273.15);
 }
 
-// ── NML_StandardLibrary ─────────────────────────────────────
+TEST(Quantity, standard_library_units_are_ingested) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
-TEST(NmlStandardLibrary, standard_library_path_is_baked_and_exists) {
-    NML_StandardLibrary library;
-    EXPECT_FALSE(library.STANDARD_LIBRARY_PATH.empty());
-    EXPECT_TRUE(std::filesystem::exists(library.STANDARD_LIBRARY_PATH));
+    NML_Parser parser;
+    parser.parse_lems("");
+
+    // NeuroMLCoreDimensions.xml declares these; scale, power and offset must all survive.
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("20degC"), 293.15);
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("-60mV"), -0.06);
+    EXPECT_DOUBLE_EQ(parser.resolve_quantity("2min"), 120.0);
 }
 
-// Acceptance criterion: "Core types resolve fully offline" — load_library
-// only ever reads STANDARD_LIBRARY_PATH off the local filesystem, no network.
-TEST(NmlStandardLibrary, load_library_loads_vendored_bundle_offline) {
-    NML_StandardLibrary library;
-    bool failed = library.load_library();
 
-    EXPECT_FALSE(failed);
-    EXPECT_GT(library.standard_library.size(), 100u);
+// ── ComponentType resolution ─────────────────────────────────────────────────────
+
+TEST(Resolution, flattens_a_multi_hop_extends_chain) {
+    FixtureDirectory fixture("multi_hop");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="base_a">
+        <Parameter name="alpha" dimension="none"/>
+        <Parameter name="beta" dimension="none"/>
+    </ComponentType>
+    <ComponentType name="mid_b" extends="base_a">
+        <Parameter name="gamma" dimension="none"/>
+    </ComponentType>
+    <ComponentType name="leaf_c" extends="mid_b">
+        <Parameter name="delta" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &leaf = parser.declared_component_types.at("leaf_c");
+    EXPECT_EQ(leaf.extends, "mid_b");
+
+    // Every ancestor's parameters, ancestors first, then the type's own.
+    EXPECT_EQ(declaration_names(leaf, NML_DeclarationType::Parameter),
+              (Vector<String>{"alpha", "beta", "gamma", "delta"}));
 }
 
-TEST(NmlStandardLibrary, get_type_by_name_finds_a_real_core_type) {
-    NML_StandardLibrary library;
-    ASSERT_FALSE(library.load_library());
+TEST(Resolution, resolves_a_forward_reference_within_one_file) {
+    FixtureDirectory fixture("forward_reference");
+    // The child is declared before the parent. Declaration order is not significant:
+    // extends is a name reference resolved by lookup.
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="child_type" extends="parent_type">
+        <Parameter name="own" dimension="none"/>
+    </ComponentType>
+    <ComponentType name="parent_type">
+        <Parameter name="inherited" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
 
-    ComponentType &iaf_cell = library.get_type_by_name("iafCell");
-    EXPECT_EQ(iaf_cell.tag, "ComponentType");
-    EXPECT_EQ(get_string_attribute(iaf_cell, "name"), "iafCell");
-    EXPECT_GT(iaf_cell.body.size(), 0u);
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    EXPECT_EQ(declaration_names(parser.declared_component_types.at("child_type"),
+                                NML_DeclarationType::Parameter),
+              (Vector<String>{"inherited", "own"}));
 }
 
-// This is also the merge-point/lookup API the resolve pass (A4) will call;
-// a missing type must fail loudly rather than return something usable.
-TEST(NmlStandardLibrary, get_type_by_name_throws_on_missing_type) {
-    NML_StandardLibrary library;
-    ASSERT_FALSE(library.load_library());
+TEST(Resolution, resolves_extends_across_files) {
+    FixtureDirectory fixture("cross_file");
+    fixture.write("parent.xml", R"(<Lems>
+    <ComponentType name="parent_type">
+        <Parameter name="inherited" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
+    // No include: the two files are ingested independently, so resolution has to span
+    // them from the global catalogue rather than from one document's scope.
+    fixture.write("child.xml", R"(<Lems>
+    <ComponentType name="child_type" extends="parent_type">
+        <Parameter name="own" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
 
-    EXPECT_THROW(library.get_type_by_name("definitelyNotARealType_xyz"), std::runtime_error);
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("child.xml"));
+    parser.ingest_document(fixture.path_of("parent.xml"));
+    parser.resolve_all_component_types();
+
+    EXPECT_EQ(declaration_names(parser.declared_component_types.at("child_type"),
+                                NML_DeclarationType::Parameter),
+              (Vector<String>{"inherited", "own"}));
 }
 
-// ── validate_against_schema (ticket #8 [A2]) ────────────────
+TEST(Resolution, a_redeclared_parameter_overrides_rather_than_duplicates) {
+    FixtureDirectory fixture("override");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="parent_type">
+        <Parameter name="alpha" dimension="none"/>
+        <Parameter name="beta" dimension="voltage"/>
+        <Parameter name="gamma" dimension="none"/>
+    </ComponentType>
+    <ComponentType name="child_type" extends="parent_type">
+        <Parameter name="beta" dimension="current"/>
+    </ComponentType>
+</Lems>
+)");
 
-namespace {
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
 
-String write_temp_file(const String &filename, const String &contents) {
-    String path = (std::filesystem::temp_directory_path() / filename).string();
-    std::ofstream out(path);
-    out << contents;
-    out.close();
-    return path;
+    const ComponentType &child = parser.declared_component_types.at("child_type");
+
+    // One beta, not two, and it keeps the ancestor's position in declaration order.
+    EXPECT_EQ(declaration_names(child, NML_DeclarationType::Parameter),
+              (Vector<String>{"alpha", "beta", "gamma"}));
+
+    // The most-derived declaration wins.
+    const NML_Declaration *beta =
+            child.declarations.find(NML_DeclarationType::Parameter, "beta");
+    ASSERT_NE(beta, nullptr);
+    EXPECT_EQ(beta->value_or("dimension"), "current");
 }
 
-} // namespace
+TEST(Resolution, a_state_variable_overrides_an_inherited_parameter_of_the_same_name) {
+    FixtureDirectory fixture("cross_tag_override");
+    // Seven tags share the `variables` namespace, so this is a collision, not a pair.
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="parent_type">
+        <Parameter name="tau" dimension="time"/>
+    </ComponentType>
+    <ComponentType name="child_type" extends="parent_type">
+        <Dynamics>
+            <StateVariable name="tau" dimension="time"/>
+        </Dynamics>
+    </ComponentType>
+</Lems>
+)");
 
-TEST(ValidateAgainstSchema, schema_path_is_baked_and_exists) {
-    EXPECT_FALSE(NML_SCHEMA_PATH.empty());
-    EXPECT_TRUE(std::filesystem::exists(NML_SCHEMA_PATH));
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &child = parser.declared_component_types.at("child_type");
+    EXPECT_TRUE(declaration_names(child, NML_DeclarationType::Parameter).empty());
+    EXPECT_EQ(declaration_names(child, NML_DeclarationType::StateVariable),
+              (Vector<String>{"tau"}));
 }
 
-TEST(ValidateAgainstSchema, accepts_a_conformant_neuroml_document) {
-    String path = write_temp_file("spikecorec_valid_test.nml",
-        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TestDoc\">"
-        "  <izhikevichCell id=\"izTest\" v0=\"-70mV\" thresh=\"30mV\" a=\"0.02\" b=\"0.2\" c=\"-65\" d=\"6\"/>"
-        "</neuroml>");
+TEST(Resolution, fixed_pins_an_inherited_parameter) {
+    FixtureDirectory fixture("fixed");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="parent_type">
+        <Parameter name="tau" dimension="time"/>
+        <Parameter name="loose" dimension="time"/>
+    </ComponentType>
+    <ComponentType name="child_type" extends="parent_type">
+        <Fixed parameter="tau" value="10ms"/>
+    </ComponentType>
+</Lems>
+)");
 
-    EXPECT_TRUE(validate_against_schema(path));
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &child = parser.declared_component_types.at("child_type");
+
+    const NML_Declaration *tau =
+            child.declarations.find(NML_DeclarationType::Parameter, "tau");
+    ASSERT_NE(tau, nullptr);
+    EXPECT_EQ(tau->value_or("value"), "10ms");
+
+    // An unpinned parameter is untouched.
+    const NML_Declaration *loose =
+            child.declarations.find(NML_DeclarationType::Parameter, "loose");
+    ASSERT_NE(loose, nullptr);
+    EXPECT_EQ(loose->value_or("value"), "");
+
+    // The parent itself must not acquire the pin.
+    const NML_Declaration *parent_tau =
+            parser.declared_component_types.at("parent_type")
+                    .declarations.find(NML_DeclarationType::Parameter, "tau");
+    ASSERT_NE(parent_tau, nullptr);
+    EXPECT_EQ(parent_tau->value_or("value"), "");
 }
 
-TEST(ValidateAgainstSchema, rejects_a_document_with_an_unknown_element) {
-    String path = write_temp_file("spikecorec_invalid_test.nml",
-        "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"TestDoc\">"
-        "  <thisTagDoesNotExistInSchema id=\"oops\"/>"
-        "</neuroml>");
+TEST(Resolution, an_extends_cycle_throws) {
+    FixtureDirectory fixture("cycle");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="type_a" extends="type_b"/>
+    <ComponentType name="type_b" extends="type_a"/>
+</Lems>
+)");
 
-    EXPECT_FALSE(validate_against_schema(path));
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+
+    EXPECT_THROW(parser.resolve_all_component_types(), std::runtime_error);
 }
 
-// A LEMS file (root <Lems>) is a real, well-formed XML document, but it is
-// not a NeuroML2 document — validating it against the NeuroML2 XSD must
-// still fail rather than silently pass.
-TEST(ValidateAgainstSchema, rejects_a_wellformed_but_wrong_schema_document) {
-    NML_StandardLibrary library;
-    String lems_file = library.STANDARD_LIBRARY_PATH + "/Cells.xml";
-    EXPECT_FALSE(validate_against_schema(lems_file));
+TEST(Resolution, an_unresolved_extends_throws_naming_the_missing_type) {
+    FixtureDirectory fixture("missing_parent");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="orphan_type" extends="no_such_type"/>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+
+    try {
+        parser.resolve_all_component_types();
+        FAIL() << "expected resolve_all_component_types to throw";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(String(error.what()).find("no_such_type"), String::npos);
+    }
 }
 
-TEST(ValidateAgainstSchema, rejects_a_missing_file) {
-    EXPECT_FALSE(validate_against_schema("/tmp/definitely_not_a_real_file_xyz.nml"));
+TEST(Resolution, declaration_order_within_a_tag_group_follows_source_order) {
+    FixtureDirectory fixture("declaration_order");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="ordered_type">
+        <Parameter name="first" dimension="none"/>
+        <Parameter name="second" dimension="none"/>
+        <Parameter name="third" dimension="none"/>
+        <Parameter name="fourth" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &ordered = parser.declared_component_types.at("ordered_type");
+
+    // Parameter order is the column order of the exported starting-parameter rows, so a
+    // reversal here silently mislabels every parameter the engine reads.
+    EXPECT_EQ(ordered.ordered_parameter_names(),
+              (Vector<String>{"first", "second", "third", "fourth"}));
+}
+
+
+// ── includes ─────────────────────────────────────────────────────────────────────
+
+TEST(Include, resolves_relative_to_the_including_file_not_the_process_directory) {
+    FixtureDirectory fixture("relative_include");
+    fixture.write("nested/leaf.xml", R"(<Lems>
+    <ComponentType name="leaf_type">
+        <Parameter name="leaf_parameter" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
+    fixture.write("nested/branch.xml", R"(<Lems>
+    <Include file="leaf.xml"/>
+</Lems>
+)");
+    fixture.write("root.xml", R"(<Lems>
+    <Include file="nested/branch.xml"/>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("root.xml"));
+    parser.resolve_all_component_types();
+
+    // branch.xml names "leaf.xml" with no directory, so it only resolves if the include
+    // is taken relative to branch.xml's own directory.
+    EXPECT_EQ(parser.declared_component_types.count("leaf_type"), 1u);
+}
+
+TEST(Include, a_cycle_terminates_instead_of_recursing_forever) {
+    FixtureDirectory fixture("include_cycle");
+    fixture.write("first.xml", R"(<Lems>
+    <Include file="second.xml"/>
+    <ComponentType name="first_type"/>
+</Lems>
+)");
+    fixture.write("second.xml", R"(<Lems>
+    <Include file="first.xml"/>
+    <ComponentType name="second_type"/>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("first.xml"));
+
+    EXPECT_EQ(parser.component_type_catalogue.count("first_type"), 1u);
+    EXPECT_EQ(parser.component_type_catalogue.count("second_type"), 1u);
+}
+
+TEST(Include, a_diamond_include_is_idempotent_and_not_a_redefinition) {
+    FixtureDirectory fixture("diamond");
+    fixture.write("shared.xml", R"(<Lems>
+    <ComponentType name="shared_type"/>
+</Lems>
+)");
+    fixture.write("left.xml", R"(<Lems>
+    <Include file="shared.xml"/>
+</Lems>
+)");
+    fixture.write("right.xml", R"(<Lems>
+    <Include file="./shared.xml"/>
+</Lems>
+)");
+    fixture.write("root.xml", R"(<Lems>
+    <Include file="left.xml"/>
+    <Include file="right.xml"/>
+</Lems>
+)");
+
+    // Deduping on the raw href would let "shared.xml" and "./shared.xml" through as two
+    // different files and turn shared_type into a spurious duplicate.
+    NML_Parser parser;
+    EXPECT_NO_THROW(parser.ingest_document(fixture.path_of("root.xml")));
+    EXPECT_EQ(parser.component_type_catalogue.count("shared_type"), 1u);
+}
+
+TEST(Include, a_genuine_redefinition_across_two_files_throws) {
+    FixtureDirectory fixture("redefinition");
+    fixture.write("first.xml", R"(<Lems>
+    <ComponentType name="clashing_type">
+        <Parameter name="from_first" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
+    fixture.write("second.xml", R"(<Lems>
+    <ComponentType name="clashing_type">
+        <Parameter name="from_second" dimension="none"/>
+    </ComponentType>
+</Lems>
+)");
+    fixture.write("root.xml", R"(<Lems>
+    <Include file="first.xml"/>
+    <Include file="second.xml"/>
+</Lems>
+)");
+
+    NML_Parser parser;
+    try {
+        parser.ingest_document(fixture.path_of("root.xml"));
+        FAIL() << "expected a duplicate ComponentType to throw";
+    } catch (const std::runtime_error &error) {
+        // Silent first-wins would make the model depend on ingest order.
+        EXPECT_NE(String(error.what()).find("clashing_type"), String::npos);
+    }
+}
+
+
+// ── dynamics extraction ──────────────────────────────────────────────────────────
+
+TEST(Dynamics, regime_scoped_instructions_carry_their_regime_and_gating_condition) {
+    FixtureDirectory fixture("regimes");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="regime_cell">
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <Regime name="integrating" initial="true">
+                <TimeDerivative variable="v" value="(vrest - v) / tau"/>
+                <OnCondition test="v .gt. vthresh">
+                    <StateAssignment variable="v" value="vreset"/>
+                    <EventOut port="spike"/>
+                    <Transition regime="refractory"/>
+                </OnCondition>
+            </Regime>
+            <Regime name="refractory">
+                <OnEntry>
+                    <StateAssignment variable="elapsed" value="0"/>
+                </OnEntry>
+                <TimeDerivative variable="elapsed" value="1"/>
+            </Regime>
+        </Dynamics>
+    </ComponentType>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &cell = parser.declared_component_types.at("regime_cell");
+
+    // A Regime carries the cell's derivatives; an extractor that stops descending at
+    // <Regime> loses the entire dynamics.
+    const NML_Declaration *integrating =
+            cell.declarations.find(NML_DeclarationType::Regime, "integrating");
+    ASSERT_NE(integrating, nullptr);
+    EXPECT_FALSE(integrating->children.empty());
+
+    // Walk the resolved declarations the way the export does and check the tagging.
+    bool saw_regime_scoped_derivative = false;
+    bool saw_gated_assignment = false;
+    bool saw_gated_event = false;
+
+    for (const NML_Declaration &declaration : cell.declarations.for_all()) {
+        if (declaration.tag_type != NML_DeclarationType::Regime) continue;
+        if (declaration.value_or("name") != "integrating") continue;
+
+        for (const NML_Declaration &child : declaration.children) {
+            if (child.tag_type == NML_DeclarationType::TimeDerivative &&
+                child.value_or("variable") == "v") {
+                saw_regime_scoped_derivative = true;
+            }
+            if (child.tag_type != NML_DeclarationType::OnCondition) continue;
+
+            EXPECT_EQ(child.value_or("test"), "v .gt. vthresh");
+            for (const NML_Declaration &fired : child.children) {
+                if (fired.tag_type == NML_DeclarationType::StateAssignment) {
+                    saw_gated_assignment = true;
+                }
+                if (fired.tag_type == NML_DeclarationType::EventOut) saw_gated_event = true;
+            }
+        }
+    }
+
+    EXPECT_TRUE(saw_regime_scoped_derivative);
+    EXPECT_TRUE(saw_gated_assignment);
+    EXPECT_TRUE(saw_gated_event);
+}
+
+TEST(Dynamics, exported_program_tags_stages_regimes_and_conditions) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("exported_dynamics");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.cell_dynamics.count("iafCell"), 1u);
+    const Vector<DynamicsInstruction> &program = result.cell_dynamics.at("iafCell");
+    ASSERT_FALSE(program.empty());
+
+    // iafCell writes v from two different handlers:
+    //   <OnStart>                      <StateAssignment variable="v" value="leakReversal"/>
+    //   <OnCondition test="v .gt. thresh"> <StateAssignment variable="v" value="reset"/>
+    // Both are StateAssignments on v, so the tag alone cannot tell them apart. The stage
+    // has to come from the enclosing handler -- tagging the OnStart one as Reset would
+    // make the assembled tick re-apply it every tick and pin v to leakReversal.
+    bool saw_voltage_derivative = false;
+    bool saw_initialisation = false;
+    bool saw_conditional_reset = false;
+
+    for (const DynamicsInstruction &instruction : program) {
+        if (instruction.source_tag == NML_DeclarationType::TimeDerivative &&
+            instruction.target == "v") {
+            EXPECT_EQ(instruction.stage, DynamicsStage::Integrate);
+            EXPECT_EQ(instruction.expression, "iMemb / C");
+            saw_voltage_derivative = true;
+        }
+
+        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+        if (instruction.target != "v") continue;
+
+        if (instruction.expression == "leakReversal") {
+            EXPECT_EQ(instruction.stage, DynamicsStage::Initialize);
+            // Nothing gates an OnStart body; it is located by stage.
+            EXPECT_EQ(instruction.condition, "");
+            saw_initialisation = true;
+        } else if (instruction.expression == "reset") {
+            EXPECT_EQ(instruction.stage, DynamicsStage::Reset);
+            // A reset is only meaningful with the condition that fires it.
+            EXPECT_EQ(instruction.condition, "v .gt. thresh");
+            saw_conditional_reset = true;
+        }
+    }
+
+    EXPECT_TRUE(saw_voltage_derivative);
+    EXPECT_TRUE(saw_initialisation);
+    EXPECT_TRUE(saw_conditional_reset);
+
+    // The spike EventOut is gated by the same threshold condition.
+    bool saw_gated_spike = false;
+    for (const DynamicsInstruction &instruction : program) {
+        if (instruction.source_tag != NML_DeclarationType::EventOut) continue;
+        EXPECT_EQ(instruction.stage, DynamicsStage::Emit);
+        EXPECT_EQ(instruction.target, "spike");
+        EXPECT_EQ(instruction.condition, "v .gt. thresh");
+        saw_gated_spike = true;
+    }
+    EXPECT_TRUE(saw_gated_spike);
+}
+
+TEST(Dynamics, an_on_event_body_is_gated_by_its_port) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("on_event");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.synapse_dynamics.count("expOneSynapse"), 1u);
+    const Vector<DynamicsInstruction> &program = result.synapse_dynamics.at("expOneSynapse");
+
+    // expOneSynapse steps its conductance when a spike arrives:
+    //   <OnEvent port="in"><StateAssignment variable="g" value="g + gbase"/></OnEvent>
+    // Which port delivered the event is the gate, and it has to survive flattening.
+    bool saw_arrival_assignment = false;
+    for (const DynamicsInstruction &instruction : program) {
+        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+        if (instruction.condition.empty()) continue;
+
+        EXPECT_EQ(instruction.stage, DynamicsStage::Arrival);
+        EXPECT_EQ(instruction.condition, "in");
+        saw_arrival_assignment = true;
+    }
+    EXPECT_TRUE(saw_arrival_assignment);
+}
+
+
+// ── runtime categories ───────────────────────────────────────────────────────────
+
+TEST(Category, standard_library_types_classify_by_their_extends_chain) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    NML_Parser parser;
+    parser.parse_lems("");
+
+    auto category_of = [&](const String &type_name) {
+        auto entry = parser.declared_component_types.find(type_name);
+        EXPECT_NE(entry, parser.declared_component_types.end()) << type_name;
+        if (entry == parser.declared_component_types.end()) return RuntimeCategory::General;
+        return entry->second.runtime_category;
+    };
+
+    EXPECT_EQ(category_of("iafCell"), RuntimeCategory::Cell);
+    EXPECT_EQ(category_of("izhikevich2007Cell"), RuntimeCategory::Cell);
+    EXPECT_EQ(category_of("expOneSynapse"), RuntimeCategory::Synapse);
+    EXPECT_EQ(category_of("expTwoSynapse"), RuntimeCategory::Synapse);
+    EXPECT_EQ(category_of("pulseGenerator"), RuntimeCategory::InputScheme);
+    EXPECT_EQ(category_of("spikeArray"), RuntimeCategory::InputScheme);
+
+    EXPECT_EQ(category_of("network"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("population"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("populationList"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("projection"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("inputList"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("explicitInput"), RuntimeCategory::Graph);
+
+    // connection and input have no `extends` at all, so they only classify if they are
+    // category roots in their own right.
+    EXPECT_EQ(category_of("connection"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("connectionWD"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("synapticConnection"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("input"), RuntimeCategory::Graph);
+    EXPECT_EQ(category_of("inputW"), RuntimeCategory::Graph);
+}
+
+TEST(Category, the_whole_standard_library_resolves) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    NML_Parser parser;
+    ASSERT_NO_THROW(parser.parse_lems(""));
+
+    // Every catalogued type must resolve; a stale per-file resolver silently leaves
+    // default-constructed entries behind.
+    EXPECT_EQ(parser.declared_component_types.size(), parser.component_type_catalogue.size());
+    EXPECT_GT(parser.declared_component_types.size(), 250u);
+
+    for (const auto &[type_name, component_type] : parser.declared_component_types) {
+        EXPECT_EQ(component_type.name, type_name);
+
+        if (component_type.extends.empty()) continue;
+        // A resolved child must be at least as rich as its parent.
+        auto parent = parser.declared_component_types.find(component_type.extends);
+        ASSERT_NE(parent, parser.declared_component_types.end()) << type_name;
+        EXPECT_GE(component_type.declarations.for_all().size(),
+                  parent->second.declarations.for_all().size()) << type_name;
+    }
+}
+
+
+// ── export ───────────────────────────────────────────────────────────────────────
+
+TEST(Export, reads_simulation_settings_from_the_lems_target) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("simulation_settings");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    EXPECT_EQ(result.simulation_component_id, "sim1");
+    EXPECT_EQ(result.target_network_id, "net1");
+    EXPECT_DOUBLE_EQ(result.step_dt, 1e-5);          // 0.01ms
+    EXPECT_DOUBLE_EQ(result.simulation_duration, 0.1); // 100ms
+    EXPECT_EQ(result.total_tick_count, 10000);
+    ASSERT_TRUE(result.random_seed.has_value());
+    EXPECT_EQ(*result.random_seed, 1234u);
+}
+
+TEST(Export, numbers_populations_contiguously_in_document_order) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("population_layout");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    EXPECT_EQ(result.total_cell_count, 5);
+    ASSERT_EQ(result.population_layouts.size(), 2u);
+
+    EXPECT_EQ(result.population_layouts[0].population_name, "pop1");
+    EXPECT_EQ(result.population_layouts[0].first_neuron_index, 0);
+    EXPECT_EQ(result.population_layouts[0].neuron_count, 3);
+
+    EXPECT_EQ(result.population_layouts[1].population_name, "pop2");
+    EXPECT_EQ(result.population_layouts[1].first_neuron_index, 3);
+    EXPECT_EQ(result.population_layouts[1].neuron_count, 2);
+
+    // Every neuron is labelled with the cell type its population instantiates.
+    ASSERT_EQ(result.neuron_cell_type_indices.size(), 5u);
+    s64 pop1_type = result.population_layouts[0].cell_type_index;
+    s64 pop2_type = result.population_layouts[1].cell_type_index;
+    EXPECT_NE(pop1_type, pop2_type);
+    EXPECT_EQ(result.neuron_cell_type_indices,
+              (Vector<s64>{pop1_type, pop1_type, pop1_type, pop2_type, pop2_type}));
+}
+
+TEST(Export, cell_type_tables_are_consistent_and_indexable) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("cell_types");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.cell_type_count, 2);
+    ASSERT_EQ(result.cell_type_names.size(), 2u);
+    ASSERT_EQ(result.cell_state_size.size(), 2u);
+    ASSERT_EQ(result.cell_starting_parameters.size(), 2u);
+
+    for (usize type_index = 0; type_index < result.cell_type_names.size(); type_index += 1) {
+        const String &type_name = result.cell_type_names[type_index];
+
+        // The name -> index map and the index -> name vector must agree.
+        ASSERT_EQ(result.cell_type_indices.count(type_name), 1u);
+        EXPECT_EQ(result.cell_type_indices.at(type_name), static_cast<s64>(type_index));
+
+        // A starting-parameter row is only interpretable alongside its column names.
+        ASSERT_EQ(result.cell_type_parameter_names.count(type_name), 1u);
+        EXPECT_EQ(result.cell_starting_parameters[type_index].size(),
+                  result.cell_type_parameter_names.at(type_name).size());
+
+        // state_size must match the named state variables.
+        ASSERT_EQ(result.cell_state_variable_names.count(type_name), 1u);
+        EXPECT_EQ(static_cast<usize>(result.cell_state_size[type_index]),
+                  result.cell_state_variable_names.at(type_name).size());
+
+        EXPECT_EQ(result.cell_dynamics.count(type_name), 1u);
+    }
+}
+
+TEST(Export, parameters_are_converted_to_si_in_declared_column_order) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("parameter_values");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.cell_type_indices.count("iafCell"), 1u);
+    usize iaf_index = static_cast<usize>(result.cell_type_indices.at("iafCell"));
+
+    const Vector<String> &columns = result.cell_type_parameter_names.at("iafCell");
+    const Vector<Real> &values = result.cell_starting_parameters[iaf_index];
+    ASSERT_EQ(columns.size(), values.size());
+
+    auto value_of = [&](const String &parameter_name) {
+        auto column = std::find(columns.begin(), columns.end(), parameter_name);
+        EXPECT_NE(column, columns.end()) << parameter_name;
+        return values[static_cast<usize>(column - columns.begin())].float64;
+    };
+
+    // cell0's attributes, in SI.
+    EXPECT_DOUBLE_EQ(value_of("leakReversal"), -0.05);  // -50mV
+    EXPECT_DOUBLE_EQ(value_of("thresh"), -0.055);       // -55mV
+    EXPECT_DOUBLE_EQ(value_of("reset"), -0.07);         // -70mV
+    EXPECT_DOUBLE_EQ(value_of("C"), 0.2e-9);            // 0.2nF
+    EXPECT_DOUBLE_EQ(value_of("leakConductance"), 0.01e-6); // 0.01uS
+}
+
+TEST(Export, cell_state_offsets_are_the_running_sum_of_state_sizes) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("state_offsets");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.cell_type_names.size(), 2u);
+
+    s32 expected_offset = 0;
+    for (usize type_index = 0; type_index < result.cell_type_names.size(); type_index += 1) {
+        const String &type_name = result.cell_type_names[type_index];
+        ASSERT_EQ(result.cell_state_offsets.count(type_name), 1u);
+        EXPECT_EQ(result.cell_state_offsets.at(type_name), expected_offset) << type_name;
+        expected_offset += static_cast<s32>(result.cell_state_size[type_index]);
+    }
+
+    // The first type starts at zero and the offsets strictly advance.
+    EXPECT_EQ(result.cell_state_offsets.at(result.cell_type_names[0]), 0);
+    EXPECT_GT(expected_offset, 0);
+}
+
+TEST(Export, synapse_types_are_classified_for_storage) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("synapse_types");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.synapse_type_count, 1);
+    ASSERT_EQ(result.synapse_type_indices.count("expOneSynapse"), 1u);
+    s64 synapse_index = result.synapse_type_indices.at("expOneSynapse");
+
+    // expOneSynapse computes g * (erev - v): it declares erev and requires v, so it needs
+    // the postsynaptic voltage.
+    EXPECT_EQ(result.conductance_based_synapse_types.count(synapse_index), 1u);
+
+    // It carries no plasticity or block child, so its state superposes and it does not
+    // need per-edge storage.
+    EXPECT_EQ(result.per_edge_synapse_projection_types.count(synapse_index), 0u);
+
+    EXPECT_EQ(result.synapse_state_variable_names.count("expOneSynapse"), 1u);
+    EXPECT_EQ(result.synapse_dynamics.count("expOneSynapse"), 1u);
+}
+
+TEST(Export, connections_resolve_to_global_neuron_indices_with_weight_and_delay) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("connections");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.network_adjacency_list.size(), 5u);
+    ASSERT_EQ(result.network_edges.size(), 5u);
+
+    // pop1[0] is neuron 0; pop2[1] is 3 + 1 = 4.
+    ASSERT_EQ(result.network_adjacency_list[0].size(), 1u);
+    EXPECT_EQ(result.network_adjacency_list[0][0], 4);
+
+    ASSERT_EQ(result.network_edges[0].size(), 1u);
+    const NetworkEdge &weighted = result.network_edges[0][0];
+    EXPECT_EQ(weighted.target_neuron_index, 4);
+    EXPECT_DOUBLE_EQ(weighted.weight, 2.5);
+    // 2ms at dt=0.01ms. Truncation would give 199 here.
+    EXPECT_EQ(weighted.delay_tick_count, 200);
+    EXPECT_EQ(weighted.synapse_type_index, result.synapse_type_indices.at("expOneSynapse"));
+
+    // pop1[2] is neuron 2; pop2[0] is neuron 3. A plain <connection> carries neither
+    // weight nor delay, so it takes the defaults.
+    ASSERT_EQ(result.network_edges[2].size(), 1u);
+    const NetworkEdge &plain = result.network_edges[2][0];
+    EXPECT_EQ(plain.target_neuron_index, 3);
+    EXPECT_DOUBLE_EQ(plain.weight, 1.0);
+    EXPECT_EQ(plain.delay_tick_count, 0);
+
+    // Neurons with no outgoing edges stay empty rather than being dropped.
+    EXPECT_TRUE(result.network_adjacency_list[1].empty());
+    EXPECT_TRUE(result.network_edges[1].empty());
+
+    // The two views agree edge for edge.
+    for (usize source = 0; source < result.network_edges.size(); source += 1) {
+        ASSERT_EQ(result.network_edges[source].size(),
+                  result.network_adjacency_list[source].size());
+        for (usize edge = 0; edge < result.network_edges[source].size(); edge += 1) {
+            EXPECT_EQ(result.network_edges[source][edge].target_neuron_index,
+                      result.network_adjacency_list[source][edge]);
+        }
+    }
+}
+
+TEST(Export, inputs_resolve_their_targets_and_times) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("inputs");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    // One profile from <explicitInput>, one from <inputList>.
+    ASSERT_EQ(result.input_profiles.size(), 2u);
+
+    const SimulationInputConfig &explicit_input = result.input_profiles[0];
+    EXPECT_EQ(explicit_input.input_component_id, "pg0");
+    EXPECT_EQ(explicit_input.input_component_type_name, "pulseGenerator");
+    EXPECT_TRUE(explicit_input.continuous_current_injection);
+    EXPECT_DOUBLE_EQ(explicit_input.amplitude, 0.5e-9); // 0.5nA
+    // 10ms and 10ms + 40ms at dt = 0.01ms. Truncation would give 999 and 4998.
+    EXPECT_EQ(explicit_input.start_tick, 1000);
+    EXPECT_EQ(explicit_input.end_tick, 5000);
+    EXPECT_EQ(explicit_input.input_neuron_indices, (Vector<s64>{0}));
+
+    const SimulationInputConfig &input_list = result.input_profiles[1];
+    EXPECT_EQ(input_list.input_neuron_indices, (Vector<s64>{3, 4}));
+    // <input> carries no weight and defaults to 1; <inputW> carries 3.
+    ASSERT_EQ(input_list.input_weights.size(), 2u);
+    EXPECT_DOUBLE_EQ(input_list.input_weights[0], 1.0);
+    EXPECT_DOUBLE_EQ(input_list.input_weights[1], 3.0);
+}
+
+TEST(Export, spike_array_inputs_become_tick_indexed_event_trains) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("spike_array");
+    fixture.write("net.nml", R"(<neuroml id="spikenet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <spikeArray id="train0">
+        <spike id="0" time="30ms"/>
+        <spike id="1" time="10ms"/>
+        <spike id="2" time="20ms"/>
+    </spikeArray>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+        <explicitInput target="pop1[1]" input="train0"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.input_profiles.size(), 1u);
+    const SimulationInputConfig &train = result.input_profiles[0];
+
+    EXPECT_EQ(train.input_component_type_name, "spikeArray");
+    EXPECT_FALSE(train.continuous_current_injection);
+    EXPECT_EQ(train.input_neuron_indices, (Vector<s64>{1}));
+
+    // One train per target, sorted into tick order regardless of document order.
+    ASSERT_EQ(train.simulation_input_events.size(), 1u);
+    EXPECT_EQ(train.simulation_input_events[0], (Vector<s32>{1000, 2000, 3000}));
+    EXPECT_EQ(train.max_delay_time, 3000);
+}
+
+TEST(Export, recording_selections_resolve_to_neurons_and_variables) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("recordings");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.recording_profiles.size(), 2u);
+
+    const RecordingConfig &columns = result.recording_profiles[0];
+    ASSERT_EQ(columns.output_filenames.size(), 1u);
+    EXPECT_EQ(columns.output_filenames[0], "out.dat");
+    EXPECT_EQ(columns.file_output_format[0], OutputFileFormat::NML_STANDARD);
+    EXPECT_EQ(columns.recordings_count, 2);
+    ASSERT_EQ(columns.selections.size(), 2u);
+
+    EXPECT_EQ(columns.selections[0].quantity_path, "pop1[0]/v");
+    EXPECT_EQ(columns.selections[0].variable_name, "v");
+    EXPECT_EQ(columns.selections[0].neuron_index, 0);
+
+    EXPECT_EQ(columns.selections[1].quantity_path, "pop2[1]/v");
+    EXPECT_EQ(columns.selections[1].neuron_index, 4);
+
+    const RecordingConfig &events = result.recording_profiles[1];
+    EXPECT_EQ(events.output_filenames[0], "spikes.dat");
+    EXPECT_EQ(events.file_output_format[0], OutputFileFormat::SPIKE_EVENTS);
+    ASSERT_EQ(events.selections.size(), 1u);
+    EXPECT_EQ(events.selections[0].neuron_index, 4);
+    EXPECT_EQ(events.selections[0].event_port, "spike");
+}
+
+TEST(Export, is_deterministic_across_parses) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("determinism");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    // Two independent parsers. Anything derived from hash-map iteration order would
+    // differ between them.
+    NML_Parser first_parser;
+    NML_ParseResult first = first_parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    NML_Parser second_parser;
+    NML_ParseResult second = second_parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    EXPECT_EQ(first.cell_type_names, second.cell_type_names);
+    EXPECT_EQ(first.synapse_type_names, second.synapse_type_names);
+    EXPECT_EQ(first.neuron_cell_type_indices, second.neuron_cell_type_indices);
+    EXPECT_EQ(first.network_adjacency_list, second.network_adjacency_list);
+    EXPECT_EQ(first.cell_state_size, second.cell_state_size);
+
+    ASSERT_EQ(first.population_layouts.size(), second.population_layouts.size());
+    for (usize index = 0; index < first.population_layouts.size(); index += 1) {
+        EXPECT_EQ(first.population_layouts[index].population_name,
+                  second.population_layouts[index].population_name);
+        EXPECT_EQ(first.population_layouts[index].first_neuron_index,
+                  second.population_layouts[index].first_neuron_index);
+        EXPECT_EQ(first.population_layouts[index].cell_type_index,
+                  second.population_layouts[index].cell_type_index);
+    }
+
+    ASSERT_EQ(first.cell_starting_parameters.size(), second.cell_starting_parameters.size());
+    for (usize type_index = 0; type_index < first.cell_starting_parameters.size();
+         type_index += 1) {
+        EXPECT_EQ(first.cell_type_parameter_names.at(first.cell_type_names[type_index]),
+                  second.cell_type_parameter_names.at(second.cell_type_names[type_index]));
+    }
+}
+
+TEST(Export, reparsing_with_the_same_parser_does_not_duplicate_the_network) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("reparse");
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    // instantiate() appends each child onto its parent's structured_instance_data, so a
+    // second pass over the same nodes must rebuild the table rather than add to it.
+    // Otherwise every population and connection appears twice.
+    NML_Parser parser;
+    NML_ParseResult first = parser.parse_lems(fixture.path_of("LEMS.xml"));
+    NML_ParseResult second = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    EXPECT_EQ(second.total_cell_count, first.total_cell_count);
+    EXPECT_EQ(second.population_layouts.size(), first.population_layouts.size());
+    EXPECT_EQ(second.network_adjacency_list, first.network_adjacency_list);
+    EXPECT_EQ(second.input_profiles.size(), first.input_profiles.size());
+    EXPECT_EQ(second.recording_profiles.size(), first.recording_profiles.size());
+}
+
+TEST(Export, resolves_populationlist_paths) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("population_list");
+    // populationList sizes itself from its <instance> children, and its connections
+    // address cells as "../pop/0/cellType" rather than "../pop[0]".
+    fixture.write("net.nml", R"(<neuroml id="listnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+    <network id="net1">
+        <populationList id="pop1" component="cell0">
+            <instance id="0"><location x="0" y="0" z="0"/></instance>
+            <instance id="1"><location x="10" y="0" z="0"/></instance>
+            <instance id="2"><location x="20" y="0" z="0"/></instance>
+        </populationList>
+        <projection id="proj1" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="syn0">
+            <connection id="0" preCellId="../pop1/0/cell0" postCellId="../pop1/2/cell0"/>
+        </projection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    // Size comes from the three <instance> children, not from a size attribute.
+    EXPECT_EQ(result.total_cell_count, 3);
+    ASSERT_EQ(result.population_layouts.size(), 1u);
+    EXPECT_EQ(result.population_layouts[0].neuron_count, 3);
+
+    ASSERT_EQ(result.network_edges.size(), 3u);
+    ASSERT_EQ(result.network_edges[0].size(), 1u);
+    EXPECT_EQ(result.network_edges[0][0].target_neuron_index, 2);
+}
+
+
+// ── error handling ───────────────────────────────────────────────────────────────
+
+TEST(Errors, a_connection_naming_an_unknown_population_throws) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("bad_endpoint");
+    fixture.write("net.nml", R"(<neuroml id="badnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+        <projection id="proj1" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="syn0">
+            <connection id="0" preCellId="../pop1[0]" postCellId="../nosuchpop[0]"/>
+        </projection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    try {
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        FAIL() << "expected an unresolvable connection endpoint to throw";
+    } catch (const std::runtime_error &error) {
+        // Silently dropping the edge would produce a quietly wrong network.
+        EXPECT_NE(String(error.what()).find("nosuchpop"), String::npos);
+    }
+}
+
+TEST(Errors, an_out_of_range_cell_index_throws) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("index_out_of_range");
+    fixture.write("net.nml", R"(<neuroml id="badnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+        <projection id="proj1" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="syn0">
+            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[7]"/>
+        </projection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    EXPECT_THROW(parser.parse_lems(fixture.path_of("LEMS.xml")), std::runtime_error);
+}
+
+TEST(Errors, a_population_naming_an_unknown_component_throws) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("bad_component");
+    fixture.write("net.nml", R"(<neuroml id="badnet">
+    <network id="net1">
+        <population id="pop1" component="no_such_cell" size="2"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    try {
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        FAIL() << "expected an unresolvable population component to throw";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(String(error.what()).find("no_such_cell"), String::npos);
+    }
+}
+
+TEST(Errors, unmodelled_metadata_tags_are_skipped_rather_than_fatal) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("metadata");
+    // Real documents carry RDF/Dublin Core provenance that maps to no runtime entity.
+    // None of it affects the simulation, so it must not fail the parse.
+    fixture.write("net.nml", R"(<neuroml id="metanet">
+    <someUnmodelledAnnotation foo="bar"/>
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <network id="net1">
+        <someOtherAnnotation/>
+        <population id="pop1" component="cell0" size="2"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result;
+    ASSERT_NO_THROW(result = parser.parse_lems(fixture.path_of("LEMS.xml")));
+
+    EXPECT_EQ(result.total_cell_count, 2);
+    EXPECT_EQ(result.cell_type_count, 1);
 }
