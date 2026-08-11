@@ -3,11 +3,11 @@
 #include <gtest/gtest.h>
 
 #include "spikecorec/core/types.h"
-#include "spikecorec/core/time_utilities.h"
+#include "spikecorec/core/units.h"
 
 using namespace std;
 using namespace spikecorec;
-using namespace spikecorec::time;
+using namespace spikecorec::units;
 
 namespace {
 

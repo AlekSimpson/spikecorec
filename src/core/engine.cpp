@@ -11,6 +11,7 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include "spikecorec/nml/nml.h"
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/recording.h"
@@ -94,6 +95,31 @@ SpikeEngine::SpikeEngine()
                   neuron_count, resting_membrane_potential, decay_rate, learning_rate);
 }
 
+SpikeEngine::SpikeEngine(String &neuroml_input_file) {
+    NML_Parser parser = NML_Parser();
+
+    try {
+
+    boolean is_valid_neuroml = parser.validate_against_schema(neuroml_input_file);
+    if (!is_valid_neuroml) {
+        throw new runtime_error("Given NeuroML file is not valid.");
+    }
+    
+
+
+
+    }
+    catch (Exception exception) {
+
+    // do something with the error
+    
+       
+
+
+
+    }
+}
+
 SpikeEngine::SpikeEngine(
     vector<vector<s32>> *network,
     const vector<s64> &shape,
@@ -103,8 +129,7 @@ SpikeEngine::SpikeEngine(
     f32 learning_rate,
     bool plasticity_enabled, 
     bool active_set_optimization_enabled
-)
-    : logger(make_logger())
+)   : logger(make_logger())
     , weights(*network, rank, true)
     , neuron_count(shape[0] * shape[1])
     , input_neuron_count(0)
@@ -119,7 +144,9 @@ SpikeEngine::SpikeEngine(
     , active_set_optimization_enabled(active_set_optimization_enabled)
 {
     if (!plasticity_enabled && learning_rate > 0.0f) {
-        throw std::runtime_error("Spike engine cannot be initialized with learning rate > 0.0f while plasticity is disabled.");
+        throw std::runtime_error(
+                "Spike engine cannot be initialized with learning rate > 0.0f" 
+                + " while plasticity is disabled.");
     }
 
     if (!plasticity_enabled) learning_rate = 0.0f;
@@ -167,7 +194,7 @@ SpikeEngine::SpikeEngine(
     prefetch_to_gpu(last_tick_updated, neuron_s64_byte_size);
     prefetch_to_gpu(active_neuron_indices, neuron_s32_byte_size);
     prefetch_to_gpu(next_active_neuron_indices, neuron_s32_byte_size);
-    prefetch_to_gpu(active_neuron_count, sizeof(s32));
+prefetch_to_gpu(active_neuron_count, sizeof(s32));
     prefetch_to_gpu(next_active_neuron_count, sizeof(s32));
     prefetch_to_gpu(active_generation, neuron_s32_byte_size);
     prefetch_to_gpu(input_staging, neuron_f32_byte_size);
@@ -225,7 +252,8 @@ void SpikeEngine::setup_lifetime(int lifetime_, bool allocate_logs, s64 max_log_
     for (s64 i = 0; i < neuron_count; ++i)
         cell_state_logs[i] = new f32[lifetime];
 
-    logger->debug("setup_lifetime: allocated cell_state_logs for {} neurons x {} ticks", neuron_count, lifetime);
+    logger->debug("setup_lifetime: allocated cell_state_logs for {} neurons x {} ticks", 
+                  neuron_count, lifetime);
 }
 
 void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
@@ -246,19 +274,24 @@ void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
 }
 
 void SpikeEngine::reset_state(s64 last_spiked_value, s32 active_gen_value) {
-    logger->debug("reset_state: last_spiked_value={} active_gen_value={}", last_spiked_value, active_gen_value);
+    logger->debug("reset_state: last_spiked_value={} active_gen_value={}", 
+                  last_spiked_value, active_gen_value);
     s32 f32_byte_size = 4;
     usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
 
     memset(network_inputs.get_contents(), 0, (usize) neuron_count * f32_byte_size);
     std::fill(membrane_potentials.get_contents(),
-            membrane_potentials.get_contents() + neuron_count,
-            resting_membrane_potential);
-    std::fill(last_spiked.get_contents(), last_spiked.get_contents() + neuron_count, last_spiked_value);
+              membrane_potentials.get_contents() + neuron_count,
+              resting_membrane_potential);
+    std::fill(last_spiked.get_contents(), 
+              last_spiked.get_contents() + neuron_count, 
+              last_spiked_value);
     memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
     active_neuron_count.get_contents()[0] = 0;
     next_active_neuron_count.get_contents()[0] = 0;
-    std::fill(active_generation.get_contents(), active_generation.get_contents() + neuron_count, active_gen_value);
+    std::fill(active_generation.get_contents(), 
+              active_generation.get_contents() + neuron_count, 
+              active_gen_value);
 }
 
 void SpikeEngine::step_simulation(
@@ -268,10 +301,12 @@ void SpikeEngine::step_simulation(
     bool decay_all_neurons
 ) {
     if (input_values.empty()) {
-        log::throw_runtime_error(*logger, fmt::format("step_simulation: input_values is empty (tick={})", tick));
+        log::throw_runtime_error(*logger, 
+                fmt::format("step_simulation: input_values is empty (tick={})", tick));
     }
 
-    logger->trace("step_simulation: tick={} input_values.size={} override_input_neurons.size={} decay_all_neurons={}",
+    logger->trace("step_simulation: tick={} input_values.size={} override_input_neurons.size={}" 
+                  + " decay_all_neurons={}",
                   tick, input_values.size(), override_input_neurons.size(), decay_all_neurons);
 
     MetalCommandBatch *batch = begin_command_batch();
@@ -287,9 +322,11 @@ void SpikeEngine::step_simulation(
             batch);
     }
 
-    memcpy(input_staging.get_contents(), input_values.data(), input_values.size() * sizeof(f32));
+    memcpy(input_staging.get_contents(), 
+           input_values.data(), input_values.size() * sizeof(f32));
 
-    // QUESTION: anyway to combine these two steps? what exactly is the merge_input_neurons for?
+    // QUESTION: anyway to combine these two steps? 
+    // what exactly is the merge_input_neurons for?
     gpu_add_network_input(
         membrane_potentials.get_contents(),
         input_neuron_indices.get_contents(),
@@ -300,7 +337,8 @@ void SpikeEngine::step_simulation(
     next_active_neuron_count.get_contents()[0] = 0;
 
     if (!override_input_neurons.empty()) {
-        memcpy(override_staging.get_contents(), override_input_neurons.data(), override_input_neurons.size() * sizeof(s64));
+        memcpy(override_staging.get_contents(), 
+               override_input_neurons.data(), override_input_neurons.size() * sizeof(s64));
 
         gpu_merge_input_neurons(
             active_neuron_indices.get_contents(),
@@ -369,11 +407,13 @@ void SpikeEngine::start_static_record(
     usize compression_chunk_bytes
 ) {
     if (lifetime < 0) {
-        log::throw_runtime_error(*logger, fmt::format("start_static_record: lifetime must be >= 0 (got {})", lifetime));
+        log::throw_runtime_error(*logger, 
+                fmt::format("start_static_record: lifetime must be >= 0 (got {})", lifetime));
     }
     if (record_stride < 1) {
         log::throw_runtime_error(*logger,
-            fmt::format("start_static_record: record_stride must be >= 1 (got {})", record_stride));
+            fmt::format("start_static_record: record_stride must be >= 1 (got {})", 
+                        record_stride));
     }
     if (input_neuron_count <= 0) {
         log::throw_runtime_error(*logger,
@@ -381,7 +421,8 @@ void SpikeEngine::start_static_record(
     }
     if ((s64)input_spikes.size() < lifetime) {
         log::throw_runtime_error(*logger,
-            fmt::format("start_static_record: input_spikes has {} ticks but lifetime requires {}",
+            fmt::format("start_static_record: input_spikes has {} " + 
+                        "ticks but lifetime requires {}",
                         input_spikes.size(), lifetime));
     }
 
@@ -464,7 +505,11 @@ void SpikeEngine::scale_uniform_weights_near_bifurcation(
                   input_period, scale, *target, *w_accum, *w_instant, use_constant_weight);
 }
 
-ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(s32 input_period, f32 scale, bool freeze_learning) {
+ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(
+    s32 input_period, 
+    f32 scale, 
+    bool freeze_learning
+) {
     auto [w_accum, w_instant] = estimate_bifurcation_weight(input_period);
     f32 target = abs(w_accum * scale);
     ScaleResult result = weights.scale_neighbor_weights_to_root_mean_square(target);
@@ -475,15 +520,22 @@ ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(s32
         learning_rate = 0.0f;
     }
 
-    logger->debug("scale_randomized_weights_near_bifurcation: input_period={} scale={} target={} "
+    logger->debug("scale_randomized_weights_near_bifurcation: " +
+                  "input_period={} scale={} target={} " +
                   "w_accum={} w_instant={}",
                   input_period, scale, target, w_accum, w_instant);
 
     return ScaledReservoirResult{result,w_accum,w_instant};
 }
 
-void SpikeEngine::get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 voltage_scale, GpuPointer<f32> output_buffer) {
-    logger->trace("get_reservoir_features_vector: tick={} spike_tau={} voltage_scale={}", tick, spike_tau, voltage_scale);
+void SpikeEngine::get_reservoir_features_vector(
+    s64 tick, 
+    f32 spike_tau, 
+    f32 voltage_scale, 
+    GpuPointer<f32> output_buffer
+) {
+    logger->trace("get_reservoir_features_vector: tick={} spike_tau={} voltage_scale={}", 
+                  tick, spike_tau, voltage_scale);
     if (spike_tau <= 0.0f) {
         logger->warn("get_reservoir_features_vector: spike_tau was <= 0.0. Aborting.");
         return;

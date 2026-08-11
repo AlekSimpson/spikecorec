@@ -19,6 +19,42 @@
 using namespace std;
 
 namespace spikecorec {
+    enum class OutputFileFormat {
+        SPIRE, 
+        SPIREGZIP,
+        SPIREBZ2,
+        SPIREXZ,
+        SPIKE_EVENTS,
+        NML_STANDARD // can be any file format
+                     // but the data is always 
+                     // written as a matrix of
+                     // columns where the first
+                     // column is time and the 
+                     // rest are the values 
+                     // specified to record
+    };
+    
+    union RecordedValue {
+        // TODO: this is not final and is just filler code really until we 
+        // use it and think of something better
+        f64 float64;
+        s64 int64;
+        f32 float32;
+        s32 int32;
+    };
+    
+    struct RecordingConfig {
+        Vector<String> output_filenames;
+        Vector<OutputFileFormat> file_output_format;
+        Vector<RecordedValue> recored_data;
+    
+        static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1014;
+        s32 recordings_count;
+    
+        void add_output(String &filename);
+    };
+
+
 
     enum class SpireCompression { None, Gzip, Xz, Bz2 };
 
