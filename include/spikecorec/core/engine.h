@@ -12,6 +12,8 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/log.h"
 #include "spikecorec/core/weight_matrix.h"
+#include "spikecorec/core/recording.h"
+#include "spikecorec/nml/nml.h"
 
 using namespace std;
 using namespace spikecorec::log;
@@ -29,41 +31,48 @@ namespace spikecorec {
 
         WeightMatrix weights;
 
-        GpuPointer<f32> network_inputs; // [neuron_count] — external input accumulator
-        GpuPointer<f32> membrane_potentials; // [neuron_count]
-        GpuPointer<s64> last_spiked; // [neuron_count] — tick each neuron last fired
-        GpuPointer<s64> last_tick_updated; // [neuron_count] — tick each neuron last received input
-        GpuPointer<s32> active_neuron_indices; // [neuron_count] — current active set (compacted)
-        GpuPointer<s32> next_active_neuron_indices; // [neuron_count] — active set for next tick
-        GpuPointer<s32> active_neuron_count; // [1]
-        GpuPointer<s32> next_active_neuron_count; // [1]
-        GpuPointer<s32> active_generation; // [neuron_count] — generation tag, -1 = inactive
-        GpuPointer<s32> input_neuron_indices; // set via set_input_neurons()
+        EngineAllocator allocator;
 
-        // Persistent step_simulation scratch buffers, sized to neuron_count (the existing
-        // hard upper bound already relied on by input_neuron_indices / active_neuron_indices)
-        // and overwritten in place each tick instead of allocate/copy/free per tick (SC-20).
-        GpuPointer<f32> input_staging; // [neuron_count] — staged input_values
-        GpuPointer<s64> override_staging; // [neuron_count] — staged override_input_neurons
+        // GpuPointer<f32> network_inputs; // [neuron_count] — external input accumulator
+        // GpuPointer<f32> membrane_potentials; // [neuron_count]
+        // GpuPointer<s64> last_spiked; // [neuron_count] — tick each neuron last fired
+        // GpuPointer<s64> last_tick_updated; // [neuron_count] — tick each neuron last received input
+        // GpuPointer<s32> active_neuron_indices; // [neuron_count] — current active set (compacted)
+        // GpuPointer<s32> next_active_neuron_indices; // [neuron_count] — active set for next tick
+        // GpuPointer<s32> active_neuron_count; // [1]
+        // GpuPointer<s32> next_active_neuron_count; // [1]
+        // GpuPointer<s32> active_generation; // [neuron_count] — generation tag, -1 = inactive
+        // GpuPointer<s32> input_neuron_indices; // set via set_input_neurons()
 
-        // constexpr (not plain const) so it is implicitly inline in C++17 — it is
-        // ODR-used as a default-argument value in the pybind11 bindings
-        // (bindings.cpp), which would otherwise require an out-of-line definition.
-        static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
-        f32 **cell_state_logs = nullptr;
+        // Persistent step_simulation scratch buffers, sized to neuron_count 
+        // (the existing hard upper bound already relied on by 
+        // input_neuron_indices / active_neuron_indices)
+        // and overwritten in place each tick instead of allocate/copy/free per 
+        // tick (SC-20).
+        // GpuPointer<f32> input_staging; // [neuron_count] — staged input_values
+        // [neuron_count] — staged override_input_neurons
+        // GpuPointer<s64> override_staging; 
+
+        // constexpr (not plain const) so it is implicitly inline in C++17 
+        // it is ODR-used as a default-argument value in the pybind11 bindings
+        // (bindings.cpp), which would otherwise require an out-of-line 
+        // definition.
+        // static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
+        // f32 **cell_state_logs = nullptr;
+        RecordingConfig recordings;
 
         s64 lifetime = 0;
-        s64 neuron_count;
+        s64 total_neuron_count;
         s64 input_neuron_count;
 
         s32 thread_count_per_block;
         s32 block_count;
 
-        f32 resting_membrane_potential;
-        f32 decay_rate;
-        f32 learning_rate;
-        s32 spike_period;
-        f32 spike_threshold;
+        // f32 resting_membrane_potential;
+        // f32 decay_rate;
+        // f32 learning_rate;
+        // s32 spike_period;
+        // f32 spike_threshold;
 
         bool use_constant_weight = false;
         bool alive = false;
@@ -76,6 +85,8 @@ namespace spikecorec {
         SpikeEngine(SpikeEngine &&) = default;
 
         SpikeEngine &operator=(SpikeEngine &&) = default;
+
+        SpikeEngine(String &neuroml_input_file);
 
         SpikeEngine(
             vector<vector<s32> > *network,
@@ -92,7 +103,11 @@ namespace spikecorec {
 
         ~SpikeEngine();
 
-        void setup_lifetime(int lifetime, bool allocate_logs, s64 max_log_bytes = DEFAULT_MAX_LOG_BYTES);
+        void setup_lifetime(
+            int lifetime, 
+            bool allocate_logs, 
+            s64 max_log_bytes = DEFAULT_MAX_LOG_BYTES
+        );
 
         void set_input_neurons(const vector<s32> &input_neuron_list);
 
@@ -102,7 +117,8 @@ namespace spikecorec {
             const vector<f32> &input_values,
             s64 tick,
             const vector<s64> &override_input_neurons = {},
-            bool decay_all_neurons = false);
+            bool decay_all_neurons = false
+        );
 
         void start_static_record(
             const vector<vector<f32>> &input_spikes,
@@ -115,26 +131,39 @@ namespace spikecorec {
             bool full_decay = true,
             bool compression_async = false,
             usize compression_queue_max = 8,
-            usize compression_chunk_bytes = 4 * 1024 * 1024);
+            usize compression_chunk_bytes = 4 * 1024 * 1024
+        );
 
-        [[nodiscard]] pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
+        [[nodiscard]] 
+        pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
 
         bool plasticity_enabled();
         void enable_plasticity(f32 _learning_rate = 0.00222f);
         void disable_plasticity();
 
-        void get_reservoir_features_vector(s64 tick, f32 spike_tau, f32 voltage_scale, GpuPointer<f32> output_buffer);
+        void get_reservoir_features_vector(
+            s64 tick, 
+            f32 spike_tau, 
+            f32 voltage_scale, 
+            GpuPointer<f32> output_buffer
+        );
 
         // first three args are the return values
-        void scale_uniform_weights_near_bifurcation(f32 *target_,
-                                                   f32 *w_accum_,
-                                                   f32 *w_instant_,
-                                                   s32 input_period = 1,
-                                                   f32 scale = 1.2,
-                                                   bool freeze_learning = false,
-                                                   const bool *use_constant_weight_ = nullptr);
+        void scale_uniform_weights_near_bifurcation(
+            f32 *target_,
+            f32 *w_accum_,
+            f32 *w_instant_,
+            s32 input_period = 1,
+            f32 scale = 1.2,
+            bool freeze_learning = false,
+            const bool *use_constant_weight_ = nullptr
+        );
 
-        ScaledReservoirResult scale_randomized_weights_near_bifurcation(s32 input_period = 1, f32 scale = 1.2, bool freeze_learning = false);
+        ScaledReservoirResult scale_randomized_weights_near_bifurcation(
+            s32 input_period = 1, 
+            f32 scale = 1.2, 
+            bool freeze_learning = false
+        );
 
         void shutdown();
     };
