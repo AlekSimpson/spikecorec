@@ -8,6 +8,7 @@
 #include "spikecorec/core/units.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 using namespace std;
@@ -30,13 +31,20 @@ void NML_Node::add_attribute(const String &name, String value) {
 }
 
 void NML_Node::nest(NML_Node component) {
-    body.push_back(component);
+    body.push_back(std::move(component));
 }
 
 String NML_Node::get_attribute(const String &name) const {
     auto entry = attributes.find(name);
     if (entry == attributes.end()) return "";
     return entry->second;
+}
+
+const NML_Node *NML_Node::find_child(const String &child_tag_name) const {
+    for (const NML_Node &child : body) {
+        if (child.tag_name == child_tag_name) return &child;
+    }
+    return nullptr;
 }
 
 NML_Declaration NML_Node::to_declaration() const {
@@ -65,18 +73,158 @@ String NML_Declaration::get_value(const String &key) const {
     return entry->second;
 }
 
+String NML_Declaration::value_or(const String &key, const String &fallback) const {
+    auto entry = datavalues.find(key);
+    if (entry == datavalues.end()) return fallback;
+    return entry->second;
+}
+
+String NML_Declaration::namespace_key() const {
+    // The namespaces a ComponentType keeps names unique within, per
+    // docs/nml_general_notes.md. Seven tags share `variables`, so a subtype declaring
+    // StateVariable "tau" overrides an inherited Parameter "tau".
+    switch (tag_type) {
+        case NML_DeclarationType::Parameter:
+        case NML_DeclarationType::DerivedParameter:
+        case NML_DeclarationType::Constant:
+        case NML_DeclarationType::Requirement:
+        case NML_DeclarationType::Property:
+        case NML_DeclarationType::Text:
+        case NML_DeclarationType::StateVariable:
+        case NML_DeclarationType::DerivedVariable:
+        case NML_DeclarationType::ConditionalDerivedVariable:
+            return "var:" + value_or("name");
+
+        case NML_DeclarationType::Exposure:
+            return "exposure:" + value_or("name");
+
+        case NML_DeclarationType::EventPort:
+            return "port:" + value_or("name");
+
+        case NML_DeclarationType::Child:
+        case NML_DeclarationType::Children:
+        case NML_DeclarationType::Attachment:
+        case NML_DeclarationType::ComponentReference:
+        case NML_DeclarationType::Link:
+        case NML_DeclarationType::Path:
+            return "pathsegment:" + value_or("name");
+
+        case NML_DeclarationType::Regime:
+            return "regime:" + value_or("name");
+
+        // A subtype restating a derivative for the same variable replaces it rather than
+        // integrating the variable twice.
+        case NML_DeclarationType::TimeDerivative:
+            return "derivative:" + value_or("variable");
+
+        // Everything else accumulates: a subtype adding an OnCondition adds a condition,
+        // it does not replace the parent's.
+        default:
+            return "";
+    }
+}
+
 void DeclarationList::insert(const NML_Declaration &declaration) {
     ordered_declaration_type_counts[declaration.tag_type] += 1;
 
     auto comparator = [](const NML_Declaration &current, const NML_Declaration &next) {
         return current.tag_type < next.tag_type;
     };
-    auto index = std::lower_bound(
+    // upper_bound, not lower_bound: lower_bound returns the first element of an equal
+    // tag_type group, so inserting there puts each new declaration ahead of its
+    // predecessors and reverses source order within the group. Parameter order is the
+    // column order of the exported starting-parameter rows, so that ordering is
+    // load-bearing.
+    auto index = std::upper_bound(
             declarations.begin(), declarations.end(),
             declaration,
             comparator);
 
     declarations.insert(index, declaration);
+}
+
+void DeclarationList::overlay(const NML_Declaration &declaration) {
+    String key = declaration.namespace_key();
+
+    // An empty key means this tag accumulates rather than overrides.
+    if (key.empty()) {
+        insert(declaration);
+        return;
+    }
+
+    for (usize index = 0; index < declarations.size(); index += 1) {
+        if (declarations[index].namespace_key() != key) continue;
+
+        // Same tag_type keeps the list's grouping intact, so the entry is replaced where
+        // it sits and the ancestor's position in declaration order is inherited. A
+        // different tag_type (a StateVariable overriding a Parameter) has to move groups.
+        if (declarations[index].tag_type == declaration.tag_type) {
+            declarations[index] = declaration;
+            return;
+        }
+
+        ordered_declaration_type_counts[declarations[index].tag_type] -= 1;
+        declarations.erase(declarations.begin() + static_cast<s64>(index));
+        insert(declaration);
+        return;
+    }
+
+    insert(declaration);
+}
+
+const NML_Declaration *DeclarationList::find(NML_DeclarationType type,
+                                             const String &name) const {
+    for (const NML_Declaration &declaration : declarations) {
+        if (declaration.tag_type != type) continue;
+        if (declaration.value_or("name") == name) return &declaration;
+    }
+    return nullptr;
+}
+
+Vector<const NML_Declaration *> DeclarationList::find_all(NML_DeclarationType type) const {
+    Vector<const NML_Declaration *> matches;
+    for (const NML_Declaration &declaration : declarations) {
+        if (declaration.tag_type != type) continue;
+        matches.push_back(&declaration);
+    }
+    return matches;
+}
+
+bool is_declaration_type(s32 raw_type_value) {
+    return raw_type_value >= 0 &&
+           raw_type_value < static_cast<s32>(NML_DeclarationType::NOT_A_TYPE);
+}
+
+bool is_dynamic_type(NML_DeclarationType type) {
+    return DYNAMICS_TYPES.find(type) != DYNAMICS_TYPES.end();
+}
+
+Vector<String> ComponentType::ordered_parameter_names() const {
+    Vector<String> names;
+
+    // Parameter and Property only. Text carries metadata strings ("synapses",
+    // "TIME_ID"), and DerivedParameter is computed from other parameters rather than
+    // supplied per instance, so neither belongs in a numeric starting-parameter row.
+    for (const NML_Declaration &declaration : declarations.for_all()) {
+        if (declaration.tag_type != NML_DeclarationType::Parameter &&
+            declaration.tag_type != NML_DeclarationType::Property) {
+            continue;
+        }
+        if (!declaration.has_value("name")) continue;
+        names.push_back(declaration.get_value("name"));
+    }
+
+    return names;
+}
+
+Vector<String> ComponentType::ordered_state_variable_names() const {
+    Vector<String> names;
+    for (const NML_Declaration &declaration : declarations.for_all()) {
+        if (declaration.tag_type != NML_DeclarationType::StateVariable) continue;
+        if (!declaration.has_value("name")) continue;
+        names.push_back(declaration.get_value("name"));
+    }
+    return names;
 }
 
 
@@ -117,9 +265,10 @@ void NML_Parser::bind_instance_data(
 }
 
 
-// "-60mV" -> -0.06. Splits the numeric prefix from the unit suffix and scales to SI.
-f64 parse_quantity(const String &value) {
-    if (value.empty()) return 0.0;
+// Splits "-60mV" into its numeric magnitude and its unit suffix. Shared by parse_quantity
+// and NML_Parser::resolve_quantity so both scan numbers identically.
+Pair<f64, String> split_quantity(const String &value) {
+    if (value.empty()) return {0.0, ""};
 
     usize cursor = 0;
     while (cursor < value.size() && isspace(static_cast<unsigned char>(value[cursor]))) cursor += 1;
@@ -146,18 +295,41 @@ f64 parse_quantity(const String &value) {
         }
     }
 
-    if (cursor == number_start) return 0.0;
+    if (cursor == number_start) return {0.0, ""};
 
     f64 magnitude = 0.0;
     try {
         magnitude = std::stod(value.substr(number_start, cursor - number_start));
     } catch (const std::exception &) {
-        return 0.0;
+        return {0.0, ""};
     }
 
     while (cursor < value.size() && isspace(static_cast<unsigned char>(value[cursor]))) cursor += 1;
 
-    return magnitude * units::unit_suffix_scale(value.substr(cursor));
+    String suffix = value.substr(cursor);
+    while (!suffix.empty() && isspace(static_cast<unsigned char>(suffix.back()))) suffix.pop_back();
+
+    return {magnitude, suffix};
+}
+
+// "-60mV" -> -0.06 against the built-in table only.
+f64 parse_quantity(const String &value) {
+    auto [magnitude, suffix] = split_quantity(value);
+    return magnitude * units::unit_suffix_scale(suffix);
+}
+
+f64 NML_Parser::resolve_quantity(const String &value) const {
+    auto [magnitude, suffix] = split_quantity(value);
+    if (suffix.empty()) return magnitude;
+
+    // A <Unit> the document declared wins: it is authoritative for this model, and it is
+    // the only source that can express an offset (degC -> K).
+    auto declared = declared_units.find(suffix);
+    if (declared != declared_units.end()) {
+        return magnitude * declared->second.scale + declared->second.offset;
+    }
+
+    return magnitude * units::unit_suffix_scale(suffix);
 }
 
 
@@ -191,12 +363,24 @@ static void collect_dynamics_instructions(
     const NML_Declaration &declaration,
     const String &regime_name,
     const String &condition,
+    Optional<DynamicsStage> handler_stage,
     Vector<DynamicsInstruction> &return_value
 ) {
     if (!is_dynamic_type(declaration.tag_type)) return;
 
-    DynamicsInstruction instruction(
-            stage_for_declaration(declaration.tag_type), declaration.tag_type);
+    // A StateAssignment's stage is decided by the handler it sits in, not by its own tag.
+    // The same <StateAssignment variable="v"> means "initialise v" under OnStart and
+    // "reset v" under OnCondition; iafCell contains both. Tagging the OnStart one as
+    // Reset would have the assembled tick re-run it every tick, pinning v to its initial
+    // value forever.
+    DynamicsStage stage = stage_for_declaration(declaration.tag_type);
+    if (handler_stage.has_value() &&
+        (declaration.tag_type == NML_DeclarationType::StateAssignment ||
+         declaration.tag_type == NML_DeclarationType::EventOut)) {
+        stage = *handler_stage;
+    }
+
+    DynamicsInstruction instruction(stage, declaration.tag_type);
 
     // The written name lives under a different attribute per tag: `variable` on
     // TimeDerivative/StateAssignment, `name` on DerivedVariable/Regime, `port` on
@@ -216,54 +400,54 @@ static void collect_dynamics_instructions(
         child_regime_name = instruction.target;
     }
 
+    // What gates the children. An OnCondition gates on its test; an OnEvent gates on the
+    // arrival of an event at its port, so the port name is the gate. OnStart and OnEntry
+    // are unconditional -- they are located by stage instead.
     String child_condition = condition;
-    if (declaration.tag_type == NML_DeclarationType::OnCondition ||
-        declaration.tag_type == NML_DeclarationType::OnEvent ||
-        declaration.tag_type == NML_DeclarationType::OnStart ||
-        declaration.tag_type == NML_DeclarationType::OnEntry) {
-        child_condition = instruction.expression;
+    Optional<DynamicsStage> child_handler_stage = handler_stage;
+
+    switch (declaration.tag_type) {
+        case NML_DeclarationType::OnCondition:
+            child_condition = instruction.expression;
+            child_handler_stage = std::nullopt;
+            break;
+        case NML_DeclarationType::OnEvent:
+            child_condition = instruction.target;
+            child_handler_stage = DynamicsStage::Arrival;
+            break;
+        case NML_DeclarationType::OnStart:
+            child_condition = "";
+            child_handler_stage = DynamicsStage::Initialize;
+            break;
+        case NML_DeclarationType::OnEntry:
+            child_condition = "";
+            child_handler_stage = DynamicsStage::RegimeEntry;
+            break;
+        default:
+            break;
     }
 
     for (const NML_Declaration &child : declaration.children) {
-        collect_dynamics_instructions(child, child_regime_name, child_condition, return_value);
+        collect_dynamics_instructions(
+                child, child_regime_name, child_condition, child_handler_stage, return_value);
     }
 }
 
 static Vector<DynamicsInstruction> extract_dynamics_program(const ComponentType &component_type) {
     Vector<DynamicsInstruction> program;
     for (const auto &declaration : component_type.declarations.for_all()) {
-        collect_dynamics_instructions(declaration, "", "", program);
+        collect_dynamics_instructions(declaration, "", "", std::nullopt, program);
     }
     return program;
-}
-
-static Vector<String> extract_state_variable_names(const ComponentType &component_type) {
-    Vector<String> names;
-    for (const auto &declaration : component_type.declarations.for_all()) {
-        if (declaration.tag_type != NML_DeclarationType::StateVariable) continue;
-        if (!declaration.has_value("name")) continue;
-        names.push_back(declaration.get_value("name"));
-    }
-    return names;
 }
 
 // Conductance-based synapses carry a driving force g*(erev - v), so they need the
 // postsynaptic voltage; current-based ones do not.
 static bool is_conductance_based(const ComponentType &component_type) {
-    bool declares_erev = false;
-    bool requires_voltage = false;
-
-    for (const auto &declaration : component_type.declarations.for_all()) {
-        if (!declaration.has_value("name")) continue;
-        String name = declaration.get_value("name");
-
-        if (declaration.tag_type == NML_DeclarationType::Parameter && name == "erev") {
-            declares_erev = true;
-        }
-        if (declaration.tag_type == NML_DeclarationType::Requirement && name == "v") {
-            requires_voltage = true;
-        }
-    }
+    bool declares_erev =
+            component_type.declarations.find(NML_DeclarationType::Parameter, "erev") != nullptr;
+    bool requires_voltage =
+            component_type.declarations.find(NML_DeclarationType::Requirement, "v") != nullptr;
 
     return declares_erev && requires_voltage;
 }
@@ -304,23 +488,12 @@ static OutputFileFormat output_format_for_filename(const String &filename) {
     return OutputFileFormat::NML_STANDARD;
 }
 
-// Every <Constant> a ComponentType declares, namespaced by its owning type so that
-// hindmarshRose1984Cell's MSEC and fitzHughNagumoCell's SEC cannot collide.
-static void collect_component_type_constants(
-    const NML_Declaration &declaration,
-    const String &component_type_name,
-    UnorderedMap<String, Real> &return_value
-) {
-    if (declaration.tag_type == NML_DeclarationType::Constant &&
-        declaration.has_value("name") && declaration.has_value("value")) {
-        Real resolved;
-        resolved.float64 = parse_quantity(declaration.get_value("value"));
-        return_value[component_type_name + "." + declaration.get_value("name")] = resolved;
-    }
-
-    for (const NML_Declaration &child : declaration.children) {
-        collect_component_type_constants(child, component_type_name, return_value);
-    }
+// Seconds -> ticks. Rounded, never truncated: dt is a binary-inexact decimal, so a
+// delay that is an exact multiple of dt still lands just under it -- 10ms / 0.01ms
+// evaluates to 999.9999999999999, which truncation turns into 999 ticks.
+static s64 tick_count_from_seconds(f64 seconds, f64 step_dt) {
+    if (step_dt <= 0.0) return 0;
+    return static_cast<s64>(std::llround(seconds / step_dt));
 }
 
 // Instance ids are scoped by parent ("net1.pop1"); model paths name the bare id.
@@ -330,657 +503,100 @@ static String leaf_id(const String &scoped_id) {
     return scoped_id.substr(separator + 1);
 }
 
-// Resolves a connection endpoint to a global neuron index. Three spellings occur:
-// "../pre[0]" and "pre[0]" on connection/synapticConnection, and "../pre/0/cell1" when
-// the population was declared as a populationList. Returns -1 if unresolvable.
-static s64 resolve_cell_path(
-    const String &path,
-    const UnorderedMap<String, s64> &population_first_neuron_index,
-    const UnorderedMap<String, s64> &population_size
-) {
+
+// ── path resolution ──────────────────────────────────────────────────────────────
+//
+// One routine for every cell-addressing spelling NeuroML uses, so connections, inputs and
+// recording quantities all resolve identically:
+//
+//     ../pop1[0]        connection preCellId / postCellId
+//     pop1[0]           synapticConnection from / to, explicitInput target
+//     ../pop1/0/cell1   populationList form, naming the component type
+//     pop1[0]/v         OutputColumn quantity, with a trailing variable
+struct ResolvedCellPath {
+    s64 neuron_index = -1;
+    String population_name;
+    s64 local_index = -1;
+    String trailing; // whatever followed the cell selector, e.g. "v"
+};
+
+static bool text_is_integer(const String &text) {
+    if (text.empty()) return false;
+    for (usize index = 0; index < text.size(); index += 1) {
+        if (!isdigit(static_cast<unsigned char>(text[index]))) return false;
+    }
+    return true;
+}
+
+static Vector<String> split_on_slash(const String &text) {
+    Vector<String> segments;
+    usize start = 0;
+    while (start <= text.size()) {
+        usize next = text.find('/', start);
+        if (next == String::npos) {
+            segments.push_back(text.substr(start));
+            break;
+        }
+        segments.push_back(text.substr(start, next - start));
+        start = next + 1;
+    }
+    return segments;
+}
+
+// `population_cell_type_name` disambiguates "pop1/0/x": x is the component type name in
+// the populationList spelling, and a trailing variable otherwise. Empty when unknown, in
+// which case a single trailing segment is read as a variable.
+static ResolvedCellPath parse_cell_path(const String &path,
+                                        const String &population_cell_type_name) {
+    ResolvedCellPath resolved;
+
     String remaining = path;
     while (remaining.rfind("../", 0) == 0) remaining = remaining.substr(3);
-
-    String population_name;
-    String index_text;
+    if (remaining.rfind("./", 0) == 0) remaining = remaining.substr(2);
 
     usize bracket = remaining.find('[');
     if (bracket != String::npos) {
         usize closing = remaining.find(']', bracket);
-        if (closing == String::npos) return -1;
+        if (closing == String::npos) return resolved;
 
-        population_name = remaining.substr(0, bracket);
-        index_text = remaining.substr(bracket + 1, closing - bracket - 1);
-    } else {
-        usize first_slash = remaining.find('/');
-        if (first_slash == String::npos) return -1;
+        resolved.population_name = remaining.substr(0, bracket);
+        String index_text = remaining.substr(bracket + 1, closing - bracket - 1);
+        if (!text_is_integer(index_text)) return resolved;
+        resolved.local_index = static_cast<s64>(std::stoll(index_text));
 
-        population_name = remaining.substr(0, first_slash);
-
-        usize second_slash = remaining.find('/', first_slash + 1);
-        index_text = (second_slash == String::npos)
-                ? remaining.substr(first_slash + 1)
-                : remaining.substr(first_slash + 1, second_slash - first_slash - 1);
+        String rest = remaining.substr(closing + 1);
+        if (!rest.empty() && rest.front() == '/') rest = rest.substr(1);
+        resolved.trailing = rest;
+        return resolved;
     }
 
-    auto base_index = population_first_neuron_index.find(population_name);
-    if (base_index == population_first_neuron_index.end()) return -1;
+    Vector<String> segments = split_on_slash(remaining);
+    if (segments.size() < 2) return resolved;
+    if (!text_is_integer(segments[1])) return resolved;
 
-    s64 local_index = 0;
-    try {
-        local_index = static_cast<s64>(std::stoll(index_text));
-    } catch (const std::exception &) {
-        return -1;
+    resolved.population_name = segments[0];
+    resolved.local_index = static_cast<s64>(std::stoll(segments[1]));
+
+    usize trailing_start = 2;
+    if (segments.size() > 2 && !population_cell_type_name.empty() &&
+        segments[2] == population_cell_type_name) {
+        trailing_start = 3;
     }
 
-    auto size = population_size.find(population_name);
-    if (size != population_size.end() && local_index >= size->second) return -1;
+    for (usize index = trailing_start; index < segments.size(); index += 1) {
+        if (!resolved.trailing.empty()) resolved.trailing += "/";
+        resolved.trailing += segments[index];
+    }
 
-    return base_index->second + local_index;
+    return resolved;
 }
 
 
-// Reads a Simulation instance: run length, dt, seed, and the recording selections its
-// Display/OutputFile/EventOutputFile children describe.
-static void apply_simulation_node(const NML_Node &simulation_node, NML_ParseResult &return_value) {
-    if (simulation_node.has_attribute("step")) {
-        return_value.step_dt = parse_quantity(simulation_node.get_attribute("step"));
-    }
-    if (simulation_node.has_attribute("length")) {
-        return_value.simulation_duration = parse_quantity(simulation_node.get_attribute("length"));
-    }
-    if (return_value.step_dt > 0.0) {
-        return_value.total_tick_count =
-                static_cast<s64>(return_value.simulation_duration / return_value.step_dt);
-    }
-
-    if (simulation_node.has_attribute("seed")) {
-        try {
-            return_value.random_seed =
-                    static_cast<u64>(std::stoull(simulation_node.get_attribute("seed")));
-        } catch (const std::exception &) {
-            // A non-numeric seed is not worth failing the whole parse over.
-        }
-    }
-
-    for (const NML_Node &child : simulation_node.body) {
-        // OutputFile/EventOutputFile name a destination; Display is on-screen only and
-        // carries no file, so it contributes no recording profile.
-        if (child.tag_name != "OutputFile" && child.tag_name != "EventOutputFile") continue;
-
-        String filename = child.get_attribute("fileName");
-        if (filename.empty()) continue;
-
-        RecordingConfig recording_profile{};
-        recording_profile.output_filenames.push_back(filename);
-        recording_profile.file_output_format.push_back(
-                child.tag_name == "EventOutputFile"
-                        ? OutputFileFormat::SPIKE_EVENTS
-                        : output_format_for_filename(filename));
-
-        // One column / event selection per recorded quantity.
-        recording_profile.recordings_count = 0;
-        for (const NML_Node &selection : child.body) {
-            if (selection.tag_name == "OutputColumn" ||
-                selection.tag_name == "EventSelection") {
-                recording_profile.recordings_count += 1;
-            }
-        }
-
-        return_value.recording_profiles.push_back(std::move(recording_profile));
-    }
-}
-
-
-// parser code
-
-NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) {
-    NML_ParseResult return_value;
-
-    // four categories of things that need to be allocated:
-    // 1. cell specific state and metadata about the cells
-    // 2. synapse specific state + connections
-    // 3. network input buffer
-    // 4. general network constants
-    //
-    // additionally we will also need the parse result to carry with it info on the units specified
-    //
-    // then we also need to extract information related to dynamics
-    // and kernel compilation
-    // Pass 0 -- document scope. Runs first because dt has to be known before the input
-    // pass can express delays in ticks.
-    if (lems_root) {
-        for (const NML_Node &child : lems_root->body) {
-            if (child.tag_name == "Constant") {
-                if (!child.has_attribute("name")) continue;
-
-                Real resolved;
-                resolved.float64 = parse_quantity(child.get_attribute("value"));
-                return_value.global_constants[child.get_attribute("name")] = resolved;
-                continue;
-            }
-
-            // The Simulation instance is a component instance at document scope, not a
-            // language element -- matched here by the ComponentType it instantiates.
-            if (child.tag_name == "Simulation") {
-                apply_simulation_node(child, return_value);
-            }
-        }
-    }
-
-    // Every ComponentType-scoped <Constant>, namespaced by its owning type.
-    for (const auto &[type_name, component_type] : declared_component_types) {
-        for (const auto &declaration : component_type.declarations.for_all()) {
-            collect_component_type_constants(
-                    declaration, type_name, return_value.global_constants);
-        }
-    }
-
-    // Pass 1 -- bucket every instance by category. A single unordered walk cannot do the
-    // whole export: the adjacency list needs population index ranges, which are only known
-    // once every population has been assigned one.
-    Vector<String> cell_instance_ids;
-    Vector<String> synapse_instance_ids;
-    Vector<String> input_instance_ids;
-    Vector<String> graph_instance_ids;
-    Vector<String> general_instance_ids;
-
-    for (const auto &[id, instance] : instance_table) {
-        if (!instance.component_type) continue;
-
-        switch (instance.component_type->runtime_category) {
-            case RuntimeCategory::Cell:
-                cell_instance_ids.push_back(id);
-                break;
-            case RuntimeCategory::Synapse:
-                synapse_instance_ids.push_back(id);
-                break;
-            case RuntimeCategory::InputScheme:
-                input_instance_ids.push_back(id);
-                break;
-            case RuntimeCategory::Graph:
-                graph_instance_ids.push_back(id);
-                break;
-            case RuntimeCategory::General:
-            default:
-                general_instance_ids.push_back(id);
-                break;
-        }
-    }
-
-    // General -- everything that is neither dynamics nor graph. Any scalar an instance
-    // here carries is model-wide, so it lands in global_constants namespaced by instance
-    // id; the Simulation instance additionally supplies dt / length / seed if the
-    // document-scope pass did not already find it.
-    for (const String &instance_id : general_instance_ids) {
-        const ComponentInstance &instance = instance_table.at(instance_id);
-
-        if (instance.component_type->name == "Simulation") {
-            if (return_value.step_dt <= 0.0) {
-                auto step = instance.instance_data.find("step");
-                if (step != instance.instance_data.end()) {
-                    return_value.step_dt = parse_quantity(step->second);
-                }
-
-                auto length = instance.instance_data.find("length");
-                if (length != instance.instance_data.end()) {
-                    return_value.simulation_duration = parse_quantity(length->second);
-                }
-
-                if (return_value.step_dt > 0.0) {
-                    return_value.total_tick_count = static_cast<s64>(
-                            return_value.simulation_duration / return_value.step_dt);
-                }
-            }
-
-            if (!return_value.random_seed.has_value()) {
-                auto seed = instance.instance_data.find("seed");
-                if (seed != instance.instance_data.end()) {
-                    try {
-                        return_value.random_seed =
-                                static_cast<u64>(std::stoull(seed->second));
-                    } catch (const std::exception &) {
-                        // Non-numeric seed; leave unset rather than failing the parse.
-                    }
-                }
-            }
-            continue;
-        }
-
-        for (const auto &[value_name, value_text] : instance.instance_data) {
-            Real resolved;
-            resolved.float64 = parse_quantity(value_text);
-            return_value.global_constants[leaf_id(instance.id) + "." + value_name] = resolved;
-        }
-    }
-
-    // Pass 2 -- cell types: state vector shape, starting parameters, dynamics program.
-    UnorderedMap<String, s64> cell_type_indices;
-
-    for (const String &instance_id : cell_instance_ids) {
-        const ComponentInstance &instance = instance_table.at(instance_id);
-        const ComponentType &component_type = *instance.component_type;
-
-        if (cell_type_indices.find(component_type.name) == cell_type_indices.end()) {
-            s64 type_index = static_cast<s64>(cell_type_indices.size());
-            cell_type_indices[component_type.name] = type_index;
-
-            Vector<String> state_variable_names = extract_state_variable_names(component_type);
-
-            return_value.cell_state_offsets[component_type.name] = static_cast<s32>(type_index);
-            return_value.cell_state_size.push_back(
-                    static_cast<s64>(state_variable_names.size()));
-            return_value.cell_state_variable_names[component_type.name] =
-                    std::move(state_variable_names);
-            return_value.cell_dynamics[component_type.name] =
-                    extract_dynamics_program(component_type);
-        }
-
-        Vector<Real> starting_parameters;
-        for (const auto &[parameter_name, parameter_value] : instance.instance_data) {
-            (void)parameter_name;
-            Real resolved;
-            resolved.float64 = parse_quantity(parameter_value);
-            starting_parameters.push_back(resolved);
-        }
-        return_value.cell_starting_parameters.push_back(std::move(starting_parameters));
-    }
-
-    return_value.cell_type_count = static_cast<s64>(cell_type_indices.size());
-
-    // Pass 3 -- synapse types: same shape as cells, plus the two storage classifications
-    // the engine needs before it can size the weight matrix.
-    UnorderedMap<String, s64> synapse_type_indices;
-
-    for (const String &instance_id : synapse_instance_ids) {
-        const ComponentInstance &instance = instance_table.at(instance_id);
-        const ComponentType &component_type = *instance.component_type;
-
-        if (synapse_type_indices.find(component_type.name) == synapse_type_indices.end()) {
-            s64 type_index = static_cast<s64>(synapse_type_indices.size());
-            synapse_type_indices[component_type.name] = type_index;
-
-            return_value.synapse_state_size.push_back(
-                    static_cast<s64>(extract_state_variable_names(component_type).size()));
-            return_value.synapse_dynamics[component_type.name] =
-                    extract_dynamics_program(component_type);
-
-            if (is_conductance_based(component_type)) {
-                return_value.conductance_based_synapse_types.insert(type_index);
-            }
-            if (requires_per_edge_state(component_type)) {
-                return_value.per_edge_synapse_projection_types.insert(type_index);
-            }
-        }
-
-        Vector<Real> starting_parameters;
-        for (const auto &[parameter_name, parameter_value] : instance.instance_data) {
-            (void)parameter_name;
-            Real resolved;
-            resolved.float64 = parse_quantity(parameter_value);
-            starting_parameters.push_back(resolved);
-        }
-        return_value.synapse_starting_parameters.push_back(std::move(starting_parameters));
-    }
-
-    return_value.synapse_type_count = static_cast<s64>(synapse_type_indices.size());
-
-    // Pass 4 -- graph: populations first, so each gets a contiguous global neuron range,
-    // then projections whose endpoints resolve against those ranges.
-    UnorderedMap<String, s64> population_first_neuron_index;
-    UnorderedMap<String, s64> population_size;
-
-    for (const String &instance_id : graph_instance_ids) {
-        const ComponentInstance &instance = instance_table.at(instance_id);
-
-        // networkWithTemperature carries a model-wide temperature that every
-        // temperature-dependent channel reads.
-        auto temperature = instance.instance_data.find("temperature");
-        if (temperature != instance.instance_data.end()) {
-            Real resolved;
-            resolved.float64 = parse_quantity(temperature->second);
-            return_value.global_constants[leaf_id(instance.id) + ".temperature"] = resolved;
-        }
-
-        if (instance.component_type->name != "population" &&
-            instance.component_type->name != "populationList") {
-            continue;
-        }
-
-        // A sized population is one instance covering `size` neurons; a populationList
-        // instead enumerates them as child instances.
-        s64 size = static_cast<s64>(instance.structured_instance_data.size());
-        auto size_attribute = instance.instance_data.find("size");
-        if (size == 0 && size_attribute != instance.instance_data.end()) {
-            size = static_cast<s64>(parse_quantity(size_attribute->second));
-        }
-
-        // Keyed on the bare id, since that is what connection paths name.
-        String population_name = leaf_id(instance.id);
-        population_first_neuron_index[population_name] = return_value.total_cell_count;
-        population_size[population_name] = size;
-        return_value.total_cell_count += size;
-    }
-
-    return_value.network_adjacency_list.assign(
-            static_cast<usize>(return_value.total_cell_count), Vector<s64>());
-
-    for (const String &instance_id : graph_instance_ids) {
-        const ComponentInstance &instance = instance_table.at(instance_id);
-        const String &type_name = instance.component_type->name;
-
-        if (type_name != "connection" && type_name != "connectionWD" &&
-            type_name != "synapticConnection") {
-            continue;
-        }
-
-        auto pre_endpoint = instance.instance_data.find(
-                type_name == "synapticConnection" ? "from" : "preCellId");
-        auto post_endpoint = instance.instance_data.find(
-                type_name == "synapticConnection" ? "to" : "postCellId");
-
-        if (pre_endpoint == instance.instance_data.end()) continue;
-        if (post_endpoint == instance.instance_data.end()) continue;
-
-        s64 pre_neuron_index = resolve_cell_path(
-                pre_endpoint->second, population_first_neuron_index, population_size);
-        s64 post_neuron_index = resolve_cell_path(
-                post_endpoint->second, population_first_neuron_index, population_size);
-
-        if (pre_neuron_index < 0 || post_neuron_index < 0) continue;
-
-        return_value.network_adjacency_list[static_cast<usize>(pre_neuron_index)]
-                .push_back(post_neuron_index);
-    }
-
-    // Pass 5 -- inputs.
-    for (const String &instance_id : input_instance_ids) {
-        const ComponentInstance &instance = instance_table.at(instance_id);
-
-        SimulationInputConfig input_profile{};
-        input_profile.continuous_current_injection =
-                instance.instance_data.find("amplitude") != instance.instance_data.end();
-
-        auto amplitude = instance.instance_data.find("amplitude");
-        if (amplitude != instance.instance_data.end()) {
-            input_profile.amplitude = parse_quantity(amplitude->second);
-        }
-
-        auto rate = instance.instance_data.find("rate");
-        if (rate != instance.instance_data.end()) {
-            input_profile.rate = parse_quantity(rate->second);
-        }
-
-        // Times are held in ticks so the engine never converts; dt has to be known first.
-        if (return_value.step_dt > 0.0) {
-            auto delay = instance.instance_data.find("delay");
-            if (delay != instance.instance_data.end()) {
-                input_profile.start_tick =
-                        static_cast<s64>(parse_quantity(delay->second) / return_value.step_dt);
-            }
-
-            auto duration = instance.instance_data.find("duration");
-            if (duration != instance.instance_data.end()) {
-                input_profile.end_tick =
-                        input_profile.start_tick +
-                        static_cast<s64>(parse_quantity(duration->second) / return_value.step_dt);
-            }
-        }
-
-        return_value.input_profiles.push_back(input_profile);
-    }
-
-    return return_value;
-}
-
-RuntimeCategory get_component_runtime_category(const String &component_name, UnorderedMap<String, Vector<String>> &dependency_map) {
-    static const Vector<Pair<String, RuntimeCategory>> category_roots = {
-        {"baseCell",              RuntimeCategory::Cell},
-        {"baseSynapse",           RuntimeCategory::Synapse},
-        {"baseGradedSynapse",     RuntimeCategory::Synapse},
-        {"basePointCurrent",      RuntimeCategory::InputScheme},
-        {"baseSpikeSource",       RuntimeCategory::InputScheme},
-        {"network",               RuntimeCategory::Graph},
-        {"basePopulation",        RuntimeCategory::Graph},
-        {"projection",            RuntimeCategory::Graph},
-        {"electricalProjection",  RuntimeCategory::Graph},
-        {"continuousProjection",  RuntimeCategory::Graph},
-        {"explicitConnection",    RuntimeCategory::Graph},
-        {"inputList",             RuntimeCategory::Graph},
-        {"explicitInput",         RuntimeCategory::Graph},
-    };
-
-    for (const auto &[root_name, category] : category_roots) {
-        if (component_name == root_name) return category;
-
-        Vector<String> search_frontier = {root_name};
-        Set<String> visited;
-
-        while (!search_frontier.empty()) {
-            String current_type = search_frontier.back();
-            search_frontier.pop_back();
-
-            if (!visited.insert(current_type).second) continue;
-
-            auto entry = dependency_map.find(current_type);
-            if (entry == dependency_map.end()) continue;
-
-            for (const String &descendant : entry->second) {
-                if (descendant == component_name) return category;
-                search_frontier.push_back(descendant);
-            }
-        }
-    }
-
-    return RuntimeCategory::General;
-}
-
-void NML_Parser::load_component_types_in_file(NML_Node *file_root) {
-    // 1. figure out dependency order
-    UnorderedMap<String, NML_Node *> node_catalogue;
-    UnorderedMap<String, Vector<String>> component_type_dependencies; // parent type -> child types
-    NML_Node *current_node;
-    Vector<NML_Node *> nodes;
-    nodes.push_back(file_root);
-
-    while (!nodes.empty()) {
-        current_node = nodes.back();
-        nodes.pop_back();
-
-        for (NML_Node child_node : current_node->body) {
-            nodes.push_back(&child_node);
-        }
-
-        if (current_node->tag_name != "ComponentType") continue;
-
-        String component_type_name = current_node->get_attribute("name");
-
-        if (node_catalogue.find(component_type_name) != node_catalogue.end()) {
-            throw runtime_error(
-                    "Invalid redefintion of componenet type: " + component_type_name);
-        }
-
-        node_catalogue[component_type_name] = current_node;
-
-        if (component_type_dependencies.find(component_type_name) == component_type_dependencies.end()) {
-            // add new type entry to map
-            component_type_dependencies[component_type_name];
-        } 
-
-        if (current_node->has_attribute("extends")) {
-            // this node is a child of a parent type
-            String parent_type_name = current_node->get_attribute("extends");
-            component_type_dependencies[parent_type_name].push_back(component_type_name);
-        }
-    }
-
-    // 2. instantiate all component types in order of extensions
-    auto instantiation_order = Vector<Pair<String, Vector<String>>>(
-        component_type_dependencies.begin(), component_type_dependencies.end()
-    );
-    sort(instantiation_order.begin(), instantiation_order.end(),
-         [](const auto& extension_list_a, const auto& extension_list_b) {
-        return extension_list_a.second.size() < extension_list_b.second.size();
-    });
-    for (const auto &mapping_pair : instantiation_order) {
-        const String &parent_type_name = mapping_pair.first;
-        const Vector<String> &child_type_names = mapping_pair.second;
-
-        NML_Node *current_node = node_catalogue[parent_type_name];
-
-        DeclarationList component_declarations;
-        extract_all_declarations_nested_in_node(current_node, component_declarations);
-
-        if (declared_component_types.find(parent_type_name) != declared_component_types.end()) {
-            RuntimeCategory category = get_component_runtime_category(parent_type_name, component_type_dependencies);
-            declared_component_types[parent_type_name] = ComponentType(parent_type_name, component_declarations, category);
-        }
-
-        ComponentType &parent_component_type = declared_component_types[parent_type_name];
-        for (const auto &child_name : child_type_names) {
-            NML_Node *child_node = node_catalogue[child_name];
-
-            DeclarationList child_declarations = parent_component_type.declarations;
-            extract_all_declarations_nested_in_node(child_node, child_declarations);
-            RuntimeCategory category = get_component_runtime_category(child_name, component_type_dependencies);
-            declared_component_types[child_name] = ComponentType(child_name, child_declarations, category);
-        }
-    }
-}
-
-NML_ParseResult NML_Parser::parse_lems(const String &lems_main_file) {
-    if (!exists(STANDARD_LIBRARY_PATH)) {
-        log::logger().error("NML standard library path does not exist: {}", STANDARD_LIBRARY_PATH);
-        return NML_ParseResult{};
-    }
-
-    // load all base neuroml component types
-    for (const auto &entry : directory_iterator(STANDARD_LIBRARY_PATH)) {
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().extension() != ".xml" && entry.path().extension() != ".nml") continue;
-        
-        String filepath = entry.path().string();
-        parse_neuroml(filepath);
-    }
-
-    xmlNodePtr lems_root_xml = get_xml_root(lems_main_file);
-    NML_Node main_file_root = xml_node_to_nml_node(lems_root_xml);
-
-    Set<String> parsed_lems_files;
-    for (NML_Node &child : main_file_root.body) {
-        if (child.tag_name == "Target") {} // note: only one target can be found
-        else if (child.tag_name == "Include") {
-            // can include another LEMS file 
-            // OR can include a neuroml file, 
-            // parse dispatch will be condtional on this
-        }
-        else if (child.tag_name == "Dimension") {}
-        else if (child.tag_name == "Unit") {}
-        else if (child.tag_name == "Constant") {}
-        else if (child.tag_name == "ComponentType") {}
-        else if (child.tag_name == "Component") {}
-        else {} // its an instance?
-                // note: we find "Simulation tags" as a Simulation instance here
-    }
-
-    return export_model_details_to_engine(&main_file_root);
-}
-
-void NML_Parser::parse_neuroml(const String &nml_file_path) {
-    if (parsed_neuroml_files.find(nml_file_path) != parsed_neuroml_files.end()) {
-        return;
-    }
-
-    xmlNodePtr root = get_xml_root(nml_file_path);
-
-    // todo: validate against xsd
-
-    NML_Node neuroml_root = xml_node_to_nml_node(root);
-
-    // 1. parse all included files
-    Vector<NML_Node *> found_instance_nodes;
-    for (auto &child : neuroml_root.body) {
-        if (child.tag_name == "include") {
-            String included_filepath = child.get_attribute("href");
-            parse_neuroml(included_filepath);
-            continue;
-        }
-
-        if (child.tag_name == "ComponentType") continue;
-
-        // then this must be a component instance
-        found_instance_nodes.push_back(&child);
-    }
-
-    // 2. load all component types defined in the file
-    load_component_types_in_file(&neuroml_root);
-
-    // 3. instantiate all ComponentType instances in file
-    for (auto &child : neuroml_root.body) {
-        if (child.tag_name == "include" || child.tag_name == "ComponentType") continue;
-        if (declared_component_types.find(child.tag_name) == declared_component_types.end()) {
-            continue;
-        }
-
-        instantiate(&child);
-    }
-
-    parsed_neuroml_files.insert(nml_file_path);
-}
-
-void NML_Parser::instantiate(NML_Node *instance_node) {
-    String component_type_name = instance_node->tag_name;
-    Vector<NML_Node> &instance_body = instance_node->body;
-
-    auto type_entry = declared_component_types.find(component_type_name);
-    if (type_entry == declared_component_types.end()) return;
-    const ComponentType &component_to_instantiate = type_entry->second;
-
-    String instance_id = instance_node->get_attribute("id");
-
-    instance_table[instance_id];
-    ComponentInstance &instance = instance_table[instance_id];
-    instance.id = instance_id;
-    instance.component_type = &component_to_instantiate;
-
-    bind_instance_data(instance_node, component_to_instantiate, instance);
-
-    if (instance_body.empty()) return;
-
-    // instantiate all child instances
-    for (auto &child_instance_node : instance_body) {
-        instantiate(&child_instance_node, instance_id);
-    }
-}
-
-void NML_Parser::instantiate(NML_Node *instance_node, String &parent_instance_id) {
-    String component_type_name = instance_node->tag_name;
-    Vector<NML_Node> &instance_body = instance_node->body;
-
-    auto type_entry = declared_component_types.find(component_type_name);
-    if (type_entry == declared_component_types.end()) return;
-    const ComponentType &component_to_instantiate = type_entry->second;
-
-    String instance_id = parent_instance_id + "." + instance_node->get_attribute("id");
-
-    instance_table[instance_id];
-    ComponentInstance &instance = instance_table[instance_id];
-    instance.id = instance_id;
-    instance.component_type = &component_to_instantiate;
-
-    bind_instance_data(instance_node, component_to_instantiate, instance);
-
-    if (instance_body.empty()) return;
-
-    // instantiate all child instances
-    for (auto &child_instance_node : instance_body) {
-        instantiate(&child_instance_node, instance_id);
-    }
-
-    instance_table[parent_instance_id].structured_instance_data.push_back(instance_id);
-}
-
-NML_Node NML_Parser::xml_node_to_nml_node(xmlNodePtr node) {
+// ── ingest ───────────────────────────────────────────────────────────────────────
+
+// The conversion reads nothing but the libxml node, so it is a free function; the
+// NML_Parser method of the same name delegates here.
+static NML_Node convert_xml_node(xmlNodePtr node) {
     String tag_name = reinterpret_cast<const char *>(node->name);
     auto component = NML_Node(tag_name);
 
@@ -995,38 +611,1115 @@ NML_Node NML_Parser::xml_node_to_nml_node(xmlNodePtr node) {
 
     for (xmlNodePtr child = node->children; child; child = child->next) {
         if (child->type != XML_ELEMENT_NODE) continue;
-        component.nest(xml_node_to_nml_node(child));
+        component.nest(convert_xml_node(child));
     }
 
     return component;
+}
+
+// Reads and converts a document, freeing the libxml document once the tree has been
+// copied into NML_Nodes. Returns false when the file could not be read.
+static bool read_document_root(const String &filepath, NML_Node &return_value) {
+    xmlDocPtr document = xmlReadFile(filepath.c_str(), nullptr, XML_PARSE_NOBLANKS);
+    if (!document) {
+        log::logger().error("Could not parse NML/LEMS file {}", filepath);
+        return false;
+    }
+
+    xmlNodePtr root = xmlDocGetRootElement(document);
+    if (!root) {
+        log::logger().error("NML/LEMS file {} has no root element", filepath);
+        xmlFreeDoc(document);
+        return false;
+    }
+
+    // convert_xml_node deep-copies into owned Strings, so the document can be freed as
+    // soon as the conversion returns -- unlike get_xml_root, which hands back a pointer
+    // into a document it never frees.
+    return_value = convert_xml_node(root);
+    xmlFreeDoc(document);
+    return true;
+}
+
+void NML_Parser::ingest_document(const String &file_path) {
+    // Dedupe on the canonical path, not the raw href: Cells.xml and Synapses.xml both
+    // include NeuroMLCoreDimensions.xml, and LEMS makes includes idempotent. Deduping on
+    // the spelling would let the same file through twice and turn every type it declares
+    // into a spurious redefinition.
+    std::error_code path_error;
+    path canonical = weakly_canonical(path(file_path), path_error);
+    String canonical_text = path_error ? file_path : canonical.string();
+
+    if (parsed_neuroml_files.find(canonical_text) != parsed_neuroml_files.end()) return;
+
+    // Marked before recursing, so an include cycle terminates instead of recursing until
+    // the stack runs out.
+    parsed_neuroml_files.insert(canonical_text);
+
+    NML_Node root;
+    if (!read_document_root(canonical_text, root)) return;
+
+    path containing_directory = path(canonical_text).parent_path();
+
+    for (NML_Node &child : root.body) {
+        // LEMS spells it <Include file="..."/>; NeuroML spells it <include href="..."/>.
+        if (child.tag_name == "Include" || child.tag_name == "include") {
+            String reference = child.has_attribute("file")
+                    ? child.get_attribute("file")
+                    : child.get_attribute("href");
+            if (reference.empty()) continue;
+
+            // Relative to the including file's own directory, not the process cwd.
+            path included = path(reference);
+            if (included.is_relative()) included = containing_directory / included;
+
+            ingest_document(included.string());
+            continue;
+        }
+
+        if (child.tag_name == "ComponentType") {
+            String type_name = child.get_attribute("name");
+            if (type_name.empty()) {
+                log::logger().warn("Ignoring <ComponentType> with no name in {}", canonical_text);
+                continue;
+            }
+
+            auto existing = component_type_source_files.find(type_name);
+            if (existing != component_type_source_files.end() &&
+                existing->second != canonical_text) {
+                // Survived canonical-path deduping, so this is a genuine redefinition
+                // across two different files. Silently letting one win would make the
+                // model depend on filesystem iteration order.
+                throw runtime_error(
+                        "Duplicate ComponentType '" + type_name + "' declared in both " +
+                        existing->second + " and " + canonical_text);
+            }
+
+            // Moved, not copied: `root` is a local that dies when this call returns, and
+            // a ComponentType node carries its whole declaration subtree.
+            component_type_catalogue[type_name] = std::move(child);
+            component_type_source_files[type_name] = canonical_text;
+            continue;
+        }
+
+        if (child.tag_name == "Unit") {
+            String symbol = child.get_attribute("symbol");
+            if (symbol.empty()) continue;
+
+            // LEMS: si = raw * scale * 10^power + offset. power is folded into scale here
+            // so resolution stays a single multiply-add.
+            UnitDefinition definition;
+            definition.scale = 1.0;
+            definition.offset = 0.0;
+
+            if (child.has_attribute("scale")) {
+                auto [scale_magnitude, scale_suffix] = split_quantity(child.get_attribute("scale"));
+                (void)scale_suffix;
+                if (scale_magnitude != 0.0) definition.scale = scale_magnitude;
+            }
+            if (child.has_attribute("power")) {
+                auto [power_magnitude, power_suffix] = split_quantity(child.get_attribute("power"));
+                (void)power_suffix;
+                definition.scale *= std::pow(10.0, power_magnitude);
+            }
+            if (child.has_attribute("offset")) {
+                auto [offset_magnitude, offset_suffix] =
+                        split_quantity(child.get_attribute("offset"));
+                (void)offset_suffix;
+                definition.offset = offset_magnitude;
+            }
+
+            declared_units[symbol] = definition;
+            continue;
+        }
+
+        if (child.tag_name == "Dimension") continue; // dimensional analysis is not modelled
+
+        if (child.tag_name == "Constant") {
+            String constant_name = child.get_attribute("name");
+            if (constant_name.empty()) continue;
+
+            Real resolved;
+            resolved.float64 = resolve_quantity(child.get_attribute("value"));
+            document_constants[constant_name] = resolved;
+            continue;
+        }
+
+        if (child.tag_name == "Target") {
+            target_component_id = child.get_attribute("component");
+            continue;
+        }
+
+        // Anything else is a component instance. It cannot be instantiated yet: the type
+        // it names may live in a file not read so far.
+        document_instance_nodes.push_back(std::move(child));
+    }
+}
+
+
+// ── ComponentType resolution ─────────────────────────────────────────────────────
+
+// Collects a node's declarations in source order. Replaces a LIFO-stack walk, which
+// reversed siblings and so destroyed the Parameter order the export depends on.
+static void collect_declarations_in_source_order(const NML_Node &node,
+                                                 Vector<NML_Declaration> &return_value) {
+    for (const NML_Node &child : node.body) {
+        if (child.is_declaration_type()) {
+            // to_declaration() consumes the whole subtree (a Regime brings its
+            // TimeDerivatives with it), so the body must not be walked again here.
+            return_value.push_back(child.to_declaration());
+            continue;
+        }
+
+        // Not a declaration (Dynamics, Structure, Simulation, ...) -- descend looking for
+        // the declarations underneath.
+        collect_declarations_in_source_order(child, return_value);
+    }
 }
 
 void NML_Parser::extract_all_declarations_nested_in_node(
     NML_Node *node,
     DeclarationList &return_value
 ) {
-    Vector<NML_Node> nodes_to_extract;
-    nodes_to_extract.push_back(*node);
+    if (!node) return;
 
-    while (!nodes_to_extract.empty()) {
-        // Taken by value and popped first: appending current_node's body below would
-        // otherwise read from the same vector it grows, and a reallocation mid-insert
-        // would leave the source range dangling.
-        NML_Node current_node = nodes_to_extract.back();
-        nodes_to_extract.pop_back();
+    Vector<NML_Declaration> collected;
+    collect_declarations_in_source_order(*node, collected);
 
-        // to_declaration() recurses into nested declarations itself, so a declaration
-        // node is consumed whole -- its body must not be walked again here.
-        if (current_node.is_declaration_type()) {
-            return_value.insert(current_node.to_declaration());
+    for (const NML_Declaration &declaration : collected) {
+        return_value.insert(declaration);
+    }
+}
+
+RuntimeCategory NML_Parser::category_for_component_type(const String &type_name) const {
+    // Roots of each runtime category. The walk is upward from the type through its
+    // `extends` chain, so a type is categorised by its nearest categorised ancestor.
+    // connection, input, instance and location have no `extends` at all and so have to
+    // appear here in their own right.
+    static const UnorderedMap<String, RuntimeCategory> category_roots = {
+        {"baseCell",                     RuntimeCategory::Cell},
+        {"baseSynapse",                  RuntimeCategory::Synapse},
+        {"baseGradedSynapse",            RuntimeCategory::Synapse},
+        {"basePointCurrent",             RuntimeCategory::InputScheme},
+        {"baseSpikeSource",              RuntimeCategory::InputScheme},
+        {"network",                      RuntimeCategory::Graph},
+        {"networkWithTemperature",       RuntimeCategory::Graph},
+        {"basePopulation",               RuntimeCategory::Graph},
+        {"population",                   RuntimeCategory::Graph},
+        {"populationList",               RuntimeCategory::Graph},
+        {"instance",                     RuntimeCategory::Graph},
+        {"location",                     RuntimeCategory::Graph},
+        {"projection",                   RuntimeCategory::Graph},
+        {"electricalProjection",         RuntimeCategory::Graph},
+        {"continuousProjection",         RuntimeCategory::Graph},
+        {"explicitConnection",           RuntimeCategory::Graph},
+        {"connection",                   RuntimeCategory::Graph},
+        {"inputList",                    RuntimeCategory::Graph},
+        {"input",                        RuntimeCategory::Graph},
+        {"explicitInput",                RuntimeCategory::Graph},
+    };
+
+    String current = type_name;
+    Set<String> visited;
+
+    while (!current.empty()) {
+        if (!visited.insert(current).second) break; // cycle; resolution reports it
+
+        auto root = category_roots.find(current);
+        if (root != category_roots.end()) return root->second;
+
+        auto catalogued = component_type_catalogue.find(current);
+        if (catalogued == component_type_catalogue.end()) break;
+
+        current = catalogued->second.get_attribute("extends");
+    }
+
+    return RuntimeCategory::General;
+}
+
+const ComponentType &NML_Parser::resolve_component_type(const String &type_name,
+                                                        Vector<String> &resolution_stack) {
+    auto already_resolved = declared_component_types.find(type_name);
+    if (already_resolved != declared_component_types.end()) return already_resolved->second;
+
+    auto catalogued = component_type_catalogue.find(type_name);
+    if (catalogued == component_type_catalogue.end()) {
+        String chain;
+        for (const String &entry : resolution_stack) chain += entry + " -> ";
+        throw runtime_error(
+                "Unresolved ComponentType '" + type_name +
+                "' referenced from extends chain: " + chain + type_name);
+    }
+
+    for (const String &entry : resolution_stack) {
+        if (entry != type_name) continue;
+
+        String chain;
+        for (const String &stack_entry : resolution_stack) chain += stack_entry + " -> ";
+        throw runtime_error("Cyclic ComponentType extends chain: " + chain + type_name);
+    }
+
+    resolution_stack.push_back(type_name);
+
+    // A reference, not a copy: resolution only ever writes to declared_component_types,
+    // never to the catalogue, so this stays valid across the recursive parent resolve.
+    const NML_Node &type_node = catalogued->second;
+    String parent_name = type_node.get_attribute("extends");
+
+    DeclarationList declarations;
+    if (!parent_name.empty()) {
+        // Ancestors first: the parent's declarations form the base that this type's own
+        // declarations overlay, so most-derived wins.
+        const ComponentType &parent = resolve_component_type(parent_name, resolution_stack);
+        declarations = parent.declarations;
+    }
+
+    Vector<NML_Declaration> own_declarations;
+    collect_declarations_in_source_order(type_node, own_declarations);
+    for (const NML_Declaration &declaration : own_declarations) {
+        declarations.overlay(declaration);
+    }
+
+    // <Fixed parameter="tau" value="10ms"/> pins an inherited Parameter to a constant.
+    // Applied after the overlay so it can reach a Parameter this type never declared.
+    for (const NML_Declaration &declaration : declarations.for_all()) {
+        if (declaration.tag_type != NML_DeclarationType::Fixed) continue;
+
+        String parameter_name = declaration.value_or("parameter");
+        if (parameter_name.empty()) continue;
+
+        for (NML_Declaration &target : declarations.declarations) {
+            if (target.tag_type != NML_DeclarationType::Parameter) continue;
+            if (target.value_or("name") != parameter_name) continue;
+
+            target.datavalues["value"] = declaration.value_or("value");
+            break;
+        }
+    }
+
+    resolution_stack.pop_back();
+
+    ComponentType resolved(type_name, std::move(declarations),
+                           category_for_component_type(type_name));
+    resolved.extends = parent_name;
+
+    declared_component_types[type_name] = std::move(resolved);
+    return declared_component_types[type_name];
+}
+
+void NML_Parser::resolve_all_component_types() {
+    // Sorted so resolution order -- and therefore any error surfaced by it -- does not
+    // depend on hash iteration order.
+    Vector<String> type_names;
+    type_names.reserve(component_type_catalogue.size());
+    for (const auto &[type_name, node] : component_type_catalogue) {
+        (void)node;
+        type_names.push_back(type_name);
+    }
+    std::sort(type_names.begin(), type_names.end());
+
+    for (const String &type_name : type_names) {
+        Vector<String> resolution_stack;
+        resolve_component_type(type_name, resolution_stack);
+    }
+}
+
+void NML_Parser::load_component_types_in_file(NML_Node *file_root) {
+    if (!file_root) return;
+
+    for (NML_Node &child : file_root->body) {
+        if (child.tag_name != "ComponentType") continue;
+
+        String type_name = child.get_attribute("name");
+        if (type_name.empty()) continue;
+
+        component_type_catalogue[type_name] = child;
+    }
+
+    resolve_all_component_types();
+}
+
+
+// ── instantiation ────────────────────────────────────────────────────────────────
+
+void NML_Parser::instantiate(NML_Node *instance_node) {
+    String no_parent;
+    instantiate(instance_node, no_parent);
+}
+
+void NML_Parser::instantiate(NML_Node *instance_node, String &parent_instance_id) {
+    if (!instance_node) return;
+
+    String component_type_name = instance_node->tag_name;
+
+    auto type_entry = declared_component_types.find(component_type_name);
+    if (type_entry == declared_component_types.end()) {
+        // Not a declared ComponentType. Documents are full of metadata that is not
+        // modelled -- notes, annotation, and the ~50 RDF/Dublin Core wrappers -- and none
+        // of it affects the simulation, so this warns rather than failing the parse.
+        // References that genuinely cannot resolve (a population's component, a
+        // connection endpoint) are thrown on where they are read.
+        log::logger().warn("Ignoring <{}>: no such ComponentType is declared",
+                           component_type_name);
+        return;
+    }
+    const ComponentType &component_to_instantiate = type_entry->second;
+
+    String own_id = instance_node->get_attribute("id");
+    if (own_id.empty()) {
+        // A <connection> inside a projection routinely carries no id. Without a synthetic
+        // one every such child collapses onto the same empty key and all but the last is
+        // lost.
+        usize ordinal = 0;
+        if (!parent_instance_id.empty()) {
+            auto parent = instance_table.find(parent_instance_id);
+            if (parent != instance_table.end()) {
+                ordinal = parent->second.structured_instance_data.size();
+            }
+        }
+        own_id = component_type_name + "[" + std::to_string(ordinal) + "]";
+    }
+
+    String instance_id = parent_instance_id.empty()
+            ? own_id
+            : parent_instance_id + "." + own_id;
+
+    if (instance_table.find(instance_id) != instance_table.end()) {
+        log::logger().warn("Duplicate component instance id '{}'; the later one wins",
+                           instance_id);
+    }
+
+    ComponentInstance &instance = instance_table[instance_id];
+    instance.id = instance_id;
+    instance.component_type_name = component_type_name;
+    instance.parent_instance_id = parent_instance_id;
+    instance.component_type = &component_to_instantiate;
+
+    bind_instance_data(instance_node, component_to_instantiate, instance);
+
+    // Registered on the parent before recursing, so structured_instance_data lists
+    // children in document order.
+    if (!parent_instance_id.empty()) {
+        instance_table[parent_instance_id].structured_instance_data.push_back(instance_id);
+    }
+
+    for (NML_Node &child_instance_node : instance_node->body) {
+        instantiate(&child_instance_node, instance_id);
+    }
+}
+
+
+// ── entry points ─────────────────────────────────────────────────────────────────
+
+NML_ParseResult NML_Parser::parse_lems(const String &lems_main_file) {
+    if (!STANDARD_LIBRARY_PATH.empty() && exists(STANDARD_LIBRARY_PATH)) {
+        // Sorted: directory_iterator order is unspecified, and ingest order decides which
+        // file a duplicate ComponentType is blamed on.
+        Vector<String> standard_library_files;
+        for (const auto &entry : directory_iterator(STANDARD_LIBRARY_PATH)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".xml" && entry.path().extension() != ".nml") continue;
+
+            standard_library_files.push_back(entry.path().string());
+        }
+        std::sort(standard_library_files.begin(), standard_library_files.end());
+
+        for (const String &filepath : standard_library_files) {
+            ingest_document(filepath);
+        }
+    } else {
+        log::logger().error("NML standard library path does not exist: {}",
+                            STANDARD_LIBRARY_PATH);
+    }
+
+    ingest_document(lems_main_file);
+
+    // Every document is in, so `extends` can finally be resolved by name across all of
+    // them, and only then can instances be bound to their types.
+    resolve_all_component_types();
+
+    // Rebuilt from scratch rather than added to. instantiate() appends each child onto
+    // its parent's structured_instance_data, so instantiating twice over the same nodes
+    // would duplicate every population and connection in the network.
+    instance_table.clear();
+    for (NML_Node &instance_node : document_instance_nodes) {
+        instantiate(&instance_node);
+    }
+
+    std::error_code path_error;
+    path canonical = weakly_canonical(path(lems_main_file), path_error);
+    read_document_root(path_error ? lems_main_file : canonical.string(), main_document_root);
+
+    return export_model_details_to_engine(&main_document_root);
+}
+
+void NML_Parser::parse_neuroml(const String &nml_file_path) {
+    ingest_document(nml_file_path);
+    resolve_all_component_types();
+
+    // As in parse_lems: rebuilt, not appended to, so calling this more than once (or
+    // after parse_lems) cannot duplicate a network's children.
+    instance_table.clear();
+    for (NML_Node &instance_node : document_instance_nodes) {
+        instantiate(&instance_node);
+    }
+}
+
+
+// ── export ───────────────────────────────────────────────────────────────────────
+
+// Every <Constant> a ComponentType declares, namespaced by its owning type so that
+// hindmarshRose1984Cell's MSEC and fitzHughNagumoCell's SEC cannot collide.
+static void collect_component_type_constants(
+    const NML_Parser &parser,
+    const NML_Declaration &declaration,
+    const String &component_type_name,
+    UnorderedMap<String, Real> &return_value
+) {
+    if (declaration.tag_type == NML_DeclarationType::Constant &&
+        declaration.has_value("name") && declaration.has_value("value")) {
+        Real resolved;
+        resolved.float64 = parser.resolve_quantity(declaration.get_value("value"));
+        return_value[component_type_name + "." + declaration.get_value("name")] = resolved;
+    }
+
+    for (const NML_Declaration &child : declaration.children) {
+        collect_component_type_constants(parser, child, component_type_name, return_value);
+    }
+}
+
+NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) {
+    NML_ParseResult return_value;
+
+    // ── Pass 0: document scope ───────────────────────────────────────────────────
+    // dt has to be known before anything else, because delays are converted to ticks.
+    for (const auto &[constant_name, constant_value] : document_constants) {
+        return_value.global_constants[constant_name] = constant_value;
+    }
+
+    for (const auto &[type_name, component_type] : declared_component_types) {
+        for (const auto &declaration : component_type.declarations.for_all()) {
+            collect_component_type_constants(
+                    *this, declaration, type_name, return_value.global_constants);
+        }
+    }
+
+    // The Simulation is a component instance, not a language element. <Target> names it;
+    // failing that, the first Simulation instance in document order is used.
+    const ComponentInstance *simulation = nullptr;
+    if (!target_component_id.empty()) {
+        auto targeted = instance_table.find(target_component_id);
+        if (targeted != instance_table.end()) simulation = &targeted->second;
+    }
+    if (!simulation) {
+        for (const NML_Node &node : document_instance_nodes) {
+            auto candidate = instance_table.find(node.get_attribute("id"));
+            if (candidate == instance_table.end()) continue;
+            if (candidate->second.component_type_name != "Simulation") continue;
+
+            simulation = &candidate->second;
+            break;
+        }
+    }
+
+    if (simulation) {
+        return_value.simulation_component_id = simulation->id;
+        return_value.target_network_id = simulation->value_or("target");
+
+        if (simulation->has_value("step")) {
+            return_value.step_dt = resolve_quantity(simulation->value_or("step"));
+        }
+        if (simulation->has_value("length")) {
+            return_value.simulation_duration = resolve_quantity(simulation->value_or("length"));
+        }
+        return_value.total_tick_count = tick_count_from_seconds(
+                return_value.simulation_duration, return_value.step_dt);
+
+        if (simulation->has_value("seed")) {
+            try {
+                return_value.random_seed =
+                        static_cast<u64>(std::stoull(simulation->value_or("seed")));
+            } catch (const std::exception &) {
+                log::logger().warn("Simulation '{}' has a non-numeric seed '{}'; ignoring",
+                                   simulation->id, simulation->value_or("seed"));
+            }
+        }
+    } else if (lems_root) {
+        log::logger().warn("No Simulation instance found in {}", lems_root->tag_name);
+    }
+
+    // ── Pass 1: cell and synapse types ───────────────────────────────────────────
+    // Dense indices are assigned in document order, so the same document always produces
+    // the same numbering.
+    auto register_type =
+        [&](const ComponentInstance &instance, bool is_cell) {
+            const ComponentType &component_type = *instance.component_type;
+
+            UnorderedMap<String, s64> &indices = is_cell
+                    ? return_value.cell_type_indices
+                    : return_value.synapse_type_indices;
+
+            if (indices.find(component_type.name) != indices.end()) return;
+
+            s64 type_index = static_cast<s64>(indices.size());
+            indices[component_type.name] = type_index;
+
+            Vector<String> state_variable_names = component_type.ordered_state_variable_names();
+            Vector<String> parameter_names = component_type.ordered_parameter_names();
+
+            // The prototype's values, in the type's declared parameter order. An absent
+            // attribute falls back to the declaration's own value -- a Fixed pin or a
+            // Property defaultValue -- and only then to zero.
+            Vector<Real> starting_parameters;
+            starting_parameters.reserve(parameter_names.size());
+            for (const String &parameter_name : parameter_names) {
+                String text = instance.value_or(parameter_name);
+                if (text.empty()) {
+                    const NML_Declaration *declared =
+                            component_type.declarations.find(
+                                    NML_DeclarationType::Parameter, parameter_name);
+                    if (!declared) {
+                        declared = component_type.declarations.find(
+                                NML_DeclarationType::Property, parameter_name);
+                    }
+                    if (declared) {
+                        text = declared->value_or("value", declared->value_or("defaultValue"));
+                    }
+                }
+
+                Real resolved;
+                resolved.float64 = text.empty() ? 0.0 : resolve_quantity(text);
+                starting_parameters.push_back(resolved);
+            }
+
+            if (is_cell) {
+                return_value.cell_type_names.push_back(component_type.name);
+                return_value.cell_state_size.push_back(
+                        static_cast<s64>(state_variable_names.size()));
+                return_value.cell_state_variable_names[component_type.name] = state_variable_names;
+                return_value.cell_type_parameter_names[component_type.name] = parameter_names;
+                return_value.cell_starting_parameters.push_back(std::move(starting_parameters));
+                return_value.cell_dynamics[component_type.name] =
+                        extract_dynamics_program(component_type);
+                return;
+            }
+
+            return_value.synapse_type_names.push_back(component_type.name);
+            return_value.synapse_state_size.push_back(
+                    static_cast<s64>(state_variable_names.size()));
+            return_value.synapse_state_variable_names[component_type.name] = state_variable_names;
+            return_value.synapse_type_parameter_names[component_type.name] = parameter_names;
+            return_value.synapse_starting_parameters.push_back(std::move(starting_parameters));
+            return_value.synapse_dynamics[component_type.name] =
+                    extract_dynamics_program(component_type);
+
+            if (is_conductance_based(component_type)) {
+                return_value.conductance_based_synapse_types.insert(type_index);
+            }
+            if (requires_per_edge_state(component_type)) {
+                return_value.per_edge_synapse_projection_types.insert(type_index);
+            }
+        };
+
+    // Prototype divergence is worth a warning: per-type starting parameters mean a second
+    // instance of the same type with different values silently loses them. Within-
+    // population heterogeneity is Phase 2 (ticket #65).
+    auto warn_on_prototype_divergence =
+        [&](const ComponentInstance &instance, const Vector<String> &parameter_names,
+            const Vector<Real> &prototype_row) {
+            for (usize index = 0; index < parameter_names.size(); index += 1) {
+                String text = instance.value_or(parameter_names[index]);
+                if (text.empty()) continue;
+
+                f64 value = resolve_quantity(text);
+                if (value == prototype_row[index].float64) continue;
+
+                log::logger().warn(
+                        "Instance '{}' sets {}={} but type '{}' already took its starting "
+                        "parameters from an earlier instance; the difference is dropped",
+                        instance.id, parameter_names[index], text,
+                        instance.component_type_name);
+                return;
+            }
+        };
+
+    for (const NML_Node &node : document_instance_nodes) {
+        auto entry = instance_table.find(node.get_attribute("id"));
+        if (entry == instance_table.end()) continue;
+
+        const ComponentInstance &instance = entry->second;
+        if (!instance.component_type) continue;
+
+        RuntimeCategory category = instance.component_type->runtime_category;
+        if (category != RuntimeCategory::Cell && category != RuntimeCategory::Synapse) continue;
+
+        bool is_cell = category == RuntimeCategory::Cell;
+        const UnorderedMap<String, s64> &indices = is_cell
+                ? return_value.cell_type_indices
+                : return_value.synapse_type_indices;
+
+        auto known = indices.find(instance.component_type->name);
+        if (known == indices.end()) {
+            register_type(instance, is_cell);
             continue;
         }
 
-        // Not a declaration (Dynamics, Structure, the ComponentType itself, ...) --
-        // descend into it looking for the declarations underneath.
-        nodes_to_extract.insert(
-                nodes_to_extract.end(), current_node.body.begin(), current_node.body.end());
+        const auto &parameter_names = is_cell
+                ? return_value.cell_type_parameter_names[instance.component_type->name]
+                : return_value.synapse_type_parameter_names[instance.component_type->name];
+        const auto &prototype_row = is_cell
+                ? return_value.cell_starting_parameters[static_cast<usize>(known->second)]
+                : return_value.synapse_starting_parameters[static_cast<usize>(known->second)];
+
+        warn_on_prototype_divergence(instance, parameter_names, prototype_row);
     }
+
+    return_value.cell_type_count = static_cast<s64>(return_value.cell_type_indices.size());
+    return_value.synapse_type_count = static_cast<s64>(return_value.synapse_type_indices.size());
+
+    // cell_state_offsets: where each type's state begins in the engine's cell-state
+    // buffer, as the running sum of the preceding types' state sizes.
+    s32 running_state_offset = 0;
+    for (usize type_index = 0; type_index < return_value.cell_type_names.size(); type_index += 1) {
+        return_value.cell_state_offsets[return_value.cell_type_names[type_index]] =
+                running_state_offset;
+        running_state_offset += static_cast<s32>(return_value.cell_state_size[type_index]);
+    }
+
+    // ── Pass 2: graph ────────────────────────────────────────────────────────────
+    // Walked from the target network through structured_instance_data, so populations are
+    // numbered in the order the document declares them.
+    const ComponentInstance *network = nullptr;
+    if (!return_value.target_network_id.empty()) {
+        auto targeted = instance_table.find(return_value.target_network_id);
+        if (targeted != instance_table.end()) network = &targeted->second;
+    }
+    if (!network) {
+        for (const NML_Node &node : document_instance_nodes) {
+            auto candidate = instance_table.find(node.get_attribute("id"));
+            if (candidate == instance_table.end()) continue;
+            if (candidate->second.component_type_name != "network" &&
+                candidate->second.component_type_name != "networkWithTemperature") {
+                continue;
+            }
+
+            network = &candidate->second;
+            return_value.target_network_id = candidate->second.id;
+            break;
+        }
+    }
+
+    UnorderedMap<String, const PopulationLayout *> population_by_name;
+
+    if (network) {
+        auto temperature = network->instance_data.find("temperature");
+        if (temperature != network->instance_data.end()) {
+            Real resolved;
+            resolved.float64 = resolve_quantity(temperature->second);
+            return_value.global_constants[leaf_id(network->id) + ".temperature"] = resolved;
+        }
+
+        for (const String &child_id : network->structured_instance_data) {
+            auto child_entry = instance_table.find(child_id);
+            if (child_entry == instance_table.end()) continue;
+
+            const ComponentInstance &child = child_entry->second;
+            if (child.component_type_name != "population" &&
+                child.component_type_name != "populationList") {
+                continue;
+            }
+
+            // A populationList enumerates its members as <instance> children; a sized
+            // population states a count.
+            s64 size = 0;
+            for (const String &member_id : child.structured_instance_data) {
+                auto member = instance_table.find(member_id);
+                if (member == instance_table.end()) continue;
+                if (member->second.component_type_name != "instance") continue;
+                size += 1;
+            }
+            if (size == 0 && child.has_value("size")) {
+                size = static_cast<s64>(std::llround(resolve_quantity(child.value_or("size"))));
+            }
+
+            String component_reference = child.value_or("component");
+            if (component_reference.empty()) {
+                throw runtime_error(
+                        "Population '" + child.id + "' names no component to instantiate");
+            }
+
+            auto cell_instance = instance_table.find(component_reference);
+            if (cell_instance == instance_table.end()) {
+                throw runtime_error(
+                        "Population '" + child.id + "' references component '" +
+                        component_reference + "', which no instance declares");
+            }
+            if (!cell_instance->second.component_type) {
+                throw runtime_error(
+                        "Population '" + child.id + "' references component '" +
+                        component_reference + "', which resolved to no ComponentType");
+            }
+
+            const String &cell_type_name = cell_instance->second.component_type->name;
+            auto cell_type_index = return_value.cell_type_indices.find(cell_type_name);
+            if (cell_type_index == return_value.cell_type_indices.end()) {
+                throw runtime_error(
+                        "Population '" + child.id + "' references component '" +
+                        component_reference + "' of type '" + cell_type_name +
+                        "', which is not classified as a cell");
+            }
+
+            PopulationLayout layout;
+            layout.population_name = leaf_id(child.id);
+            layout.instance_id = child.id;
+            layout.first_neuron_index = return_value.total_cell_count;
+            layout.neuron_count = size;
+            layout.cell_type_index = cell_type_index->second;
+
+            return_value.population_layouts.push_back(std::move(layout));
+            return_value.total_cell_count += size;
+
+            for (s64 member = 0; member < size; member += 1) {
+                return_value.neuron_cell_type_indices.push_back(cell_type_index->second);
+            }
+        }
+    }
+
+    for (const PopulationLayout &layout : return_value.population_layouts) {
+        population_by_name[layout.population_name] = &layout;
+    }
+
+    // Resolves a path against the population layout, or -1. The population's own cell type
+    // name disambiguates the populationList spelling "pop/0/cellType".
+    auto resolve_neuron_index = [&](const String &path) -> s64 {
+        ResolvedCellPath partial = parse_cell_path(path, "");
+        if (partial.population_name.empty()) return -1;
+
+        auto population = population_by_name.find(partial.population_name);
+        if (population == population_by_name.end()) return -1;
+
+        String cell_type_name;
+        s64 cell_type_index = population->second->cell_type_index;
+        if (cell_type_index >= 0 &&
+            cell_type_index < static_cast<s64>(return_value.cell_type_names.size())) {
+            cell_type_name = return_value.cell_type_names[static_cast<usize>(cell_type_index)];
+        }
+
+        ResolvedCellPath resolved = parse_cell_path(path, cell_type_name);
+        if (resolved.local_index < 0) return -1;
+        if (resolved.local_index >= population->second->neuron_count) return -1;
+
+        return population->second->first_neuron_index + resolved.local_index;
+    };
+
+    return_value.network_adjacency_list.assign(
+            static_cast<usize>(return_value.total_cell_count), Vector<s64>());
+    return_value.network_edges.assign(
+            static_cast<usize>(return_value.total_cell_count), Vector<NetworkEdge>());
+
+    static const Set<String> connection_tags = {
+        "connection", "connectionWD",
+        "synapticConnection", "synapticConnectionWD",
+        "explicitConnection"
+    };
+
+    if (network) {
+        for (const String &child_id : network->structured_instance_data) {
+            auto projection_entry = instance_table.find(child_id);
+            if (projection_entry == instance_table.end()) continue;
+
+            const ComponentInstance &projection = projection_entry->second;
+            if (projection.component_type_name != "projection") continue;
+
+            // The projection names the synapse prototype every one of its edges uses.
+            s64 projection_synapse_type = -1;
+            String synapse_reference = projection.value_or("synapse");
+            if (!synapse_reference.empty()) {
+                auto synapse_instance = instance_table.find(synapse_reference);
+                if (synapse_instance == instance_table.end() ||
+                    !synapse_instance->second.component_type) {
+                    throw runtime_error(
+                            "Projection '" + projection.id + "' references synapse '" +
+                            synapse_reference + "', which no instance declares");
+                }
+
+                auto synapse_type_index = return_value.synapse_type_indices.find(
+                        synapse_instance->second.component_type->name);
+                if (synapse_type_index == return_value.synapse_type_indices.end()) {
+                    throw runtime_error(
+                            "Projection '" + projection.id + "' references synapse '" +
+                            synapse_reference + "' of type '" +
+                            synapse_instance->second.component_type->name +
+                            "', which is not classified as a synapse");
+                }
+                projection_synapse_type = synapse_type_index->second;
+            }
+
+            for (const String &connection_id : projection.structured_instance_data) {
+                auto connection_entry = instance_table.find(connection_id);
+                if (connection_entry == instance_table.end()) continue;
+
+                const ComponentInstance &connection = connection_entry->second;
+                if (connection_tags.find(connection.component_type_name) ==
+                    connection_tags.end()) {
+                    continue;
+                }
+
+                // connection/connectionWD spell their endpoints preCellId/postCellId; the
+                // explicitConnection family spells them from/to.
+                String pre_path = connection.value_or("preCellId",
+                                                      connection.value_or("from"));
+                String post_path = connection.value_or("postCellId",
+                                                       connection.value_or("to"));
+
+                s64 pre_neuron_index = resolve_neuron_index(pre_path);
+                s64 post_neuron_index = resolve_neuron_index(post_path);
+
+                if (pre_neuron_index < 0 || post_neuron_index < 0) {
+                    throw runtime_error(
+                            "Connection '" + connection.id + "' in projection '" +
+                            projection.id + "' has an endpoint that resolves to no neuron: "
+                            "pre='" + pre_path + "' post='" + post_path + "'");
+                }
+
+                NetworkEdge edge;
+                edge.target_neuron_index = post_neuron_index;
+                edge.synapse_type_index = projection_synapse_type;
+
+                // A connection may name its own synapse, overriding the projection's.
+                String own_synapse = connection.value_or("synapse");
+                if (!own_synapse.empty()) {
+                    auto synapse_instance = instance_table.find(own_synapse);
+                    if (synapse_instance != instance_table.end() &&
+                        synapse_instance->second.component_type) {
+                        auto synapse_type_index = return_value.synapse_type_indices.find(
+                                synapse_instance->second.component_type->name);
+                        if (synapse_type_index != return_value.synapse_type_indices.end()) {
+                            edge.synapse_type_index = synapse_type_index->second;
+                        }
+                    }
+                }
+
+                if (connection.has_value("weight")) {
+                    edge.weight = resolve_quantity(connection.value_or("weight"));
+                }
+                if (connection.has_value("delay")) {
+                    edge.delay_tick_count = tick_count_from_seconds(
+                            resolve_quantity(connection.value_or("delay")),
+                            return_value.step_dt);
+                }
+
+                return_value.network_adjacency_list[static_cast<usize>(pre_neuron_index)]
+                        .push_back(post_neuron_index);
+                return_value.network_edges[static_cast<usize>(pre_neuron_index)]
+                        .push_back(edge);
+            }
+        }
+    }
+
+    // ── Pass 3: inputs ───────────────────────────────────────────────────────────
+    // One profile per input component that is actually wired to a target. The wiring
+    // lives on explicitInput / inputList; the amplitudes and rates live on the input
+    // component the wiring names.
+    auto build_input_profile =
+        [&](const String &input_component_id, const Vector<s64> &neuron_indices,
+            const Vector<f64> &weights) {
+            auto input_instance = instance_table.find(input_component_id);
+            if (input_instance == instance_table.end()) {
+                throw runtime_error(
+                        "Input wiring references component '" + input_component_id +
+                        "', which no instance declares");
+            }
+
+            const ComponentInstance &input = input_instance->second;
+
+            SimulationInputConfig profile{};
+            profile.amplitude = 0.0;
+            profile.rate = 0.0;
+            profile.start_tick = 0;
+            profile.end_tick = 0;
+            profile.max_delay_time = 0;
+            profile.continuous_current_injection = input.has_value("amplitude");
+            profile.input_component_id = input.id;
+            profile.input_component_type_name = input.component_type_name;
+            profile.input_neuron_indices = neuron_indices;
+            profile.input_weights = weights;
+
+            if (input.has_value("amplitude")) {
+                profile.amplitude = resolve_quantity(input.value_or("amplitude"));
+            }
+            if (input.has_value("rate")) {
+                profile.rate = resolve_quantity(input.value_or("rate"));
+            }
+
+            // Times are held in ticks so the engine never converts.
+            if (return_value.step_dt > 0.0) {
+                if (input.has_value("delay")) {
+                    profile.start_tick = tick_count_from_seconds(
+                            resolve_quantity(input.value_or("delay")), return_value.step_dt);
+                }
+                if (input.has_value("duration")) {
+                    profile.end_tick = profile.start_tick + tick_count_from_seconds(
+                            resolve_quantity(input.value_or("duration")), return_value.step_dt);
+                }
+
+                // A spikeArray carries its train as <spike time="..."/> children. One
+                // tick list per target, since every target receives the same train.
+                Vector<s32> spike_ticks;
+                for (const String &spike_id : input.structured_instance_data) {
+                    auto spike = instance_table.find(spike_id);
+                    if (spike == instance_table.end()) continue;
+                    if (spike->second.component_type_name != "spike") continue;
+                    if (!spike->second.has_value("time")) continue;
+
+                    spike_ticks.push_back(static_cast<s32>(tick_count_from_seconds(
+                            resolve_quantity(spike->second.value_or("time")),
+                            return_value.step_dt)));
+                }
+                std::sort(spike_ticks.begin(), spike_ticks.end());
+
+                if (!spike_ticks.empty()) {
+                    profile.max_delay_time = spike_ticks.back();
+                    for (usize target = 0; target < neuron_indices.size(); target += 1) {
+                        profile.simulation_input_events.push_back(spike_ticks);
+                    }
+                }
+            }
+
+            return_value.input_profiles.push_back(std::move(profile));
+        };
+
+    if (network) {
+        for (const String &child_id : network->structured_instance_data) {
+            auto child_entry = instance_table.find(child_id);
+            if (child_entry == instance_table.end()) continue;
+
+            const ComponentInstance &child = child_entry->second;
+
+            if (child.component_type_name == "explicitInput") {
+                String target_path = child.value_or("target");
+                s64 neuron_index = resolve_neuron_index(target_path);
+                if (neuron_index < 0) {
+                    throw runtime_error(
+                            "explicitInput '" + child.id + "' targets '" + target_path +
+                            "', which resolves to no neuron");
+                }
+
+                build_input_profile(child.value_or("input"), {neuron_index}, {1.0});
+                continue;
+            }
+
+            if (child.component_type_name != "inputList") continue;
+
+            Vector<s64> neuron_indices;
+            Vector<f64> weights;
+
+            for (const String &input_id : child.structured_instance_data) {
+                auto input_entry = instance_table.find(input_id);
+                if (input_entry == instance_table.end()) continue;
+
+                const ComponentInstance &input = input_entry->second;
+                if (input.component_type_name != "input" &&
+                    input.component_type_name != "inputW") {
+                    continue;
+                }
+
+                String target_path = input.value_or("target");
+                s64 neuron_index = resolve_neuron_index(target_path);
+                if (neuron_index < 0) {
+                    throw runtime_error(
+                            "Input '" + input.id + "' in inputList '" + child.id +
+                            "' targets '" + target_path + "', which resolves to no neuron");
+                }
+
+                neuron_indices.push_back(neuron_index);
+                weights.push_back(input.has_value("weight")
+                        ? resolve_quantity(input.value_or("weight"))
+                        : 1.0);
+            }
+
+            if (neuron_indices.empty()) continue;
+
+            build_input_profile(child.value_or("component"), neuron_indices, weights);
+        }
+    }
+
+    // ── Pass 4: recordings ───────────────────────────────────────────────────────
+    if (simulation) {
+        for (const String &output_id : simulation->structured_instance_data) {
+            auto output_entry = instance_table.find(output_id);
+            if (output_entry == instance_table.end()) continue;
+
+            const ComponentInstance &output = output_entry->second;
+
+            // Display is on-screen only and names no file, so it contributes no profile.
+            bool is_event_file = output.component_type_name == "EventOutputFile";
+            if (output.component_type_name != "OutputFile" && !is_event_file) continue;
+
+            String filename = output.value_or("fileName");
+            if (filename.empty()) continue;
+
+            RecordingConfig recording_profile{};
+            recording_profile.output_filenames.push_back(filename);
+            recording_profile.file_output_format.push_back(
+                    is_event_file ? OutputFileFormat::SPIKE_EVENTS
+                                  : output_format_for_filename(filename));
+            recording_profile.recordings_count = 0;
+
+            for (const String &selection_id : output.structured_instance_data) {
+                auto selection_entry = instance_table.find(selection_id);
+                if (selection_entry == instance_table.end()) continue;
+
+                const ComponentInstance &selection = selection_entry->second;
+
+                RecordingSelection recorded;
+                if (selection.component_type_name == "OutputColumn") {
+                    recorded.quantity_path = selection.value_or("quantity");
+                } else if (selection.component_type_name == "EventSelection") {
+                    recorded.quantity_path = selection.value_or("select");
+                    recorded.event_port = selection.value_or("eventPort");
+                } else {
+                    continue;
+                }
+
+                recorded.neuron_index = resolve_neuron_index(recorded.quantity_path);
+                if (recorded.neuron_index < 0) {
+                    log::logger().warn(
+                            "Recording '{}' in {} resolves to no neuron; recorded with "
+                            "index -1", recorded.quantity_path, filename);
+                } else {
+                    String cell_type_name;
+                    ResolvedCellPath partial = parse_cell_path(recorded.quantity_path, "");
+                    auto population = population_by_name.find(partial.population_name);
+                    if (population != population_by_name.end()) {
+                        s64 cell_type_index = population->second->cell_type_index;
+                        if (cell_type_index >= 0 &&
+                            cell_type_index <
+                                    static_cast<s64>(return_value.cell_type_names.size())) {
+                            cell_type_name = return_value.cell_type_names[
+                                    static_cast<usize>(cell_type_index)];
+                        }
+                    }
+                    recorded.variable_name =
+                            parse_cell_path(recorded.quantity_path, cell_type_name).trailing;
+                }
+
+                recording_profile.selections.push_back(std::move(recorded));
+                recording_profile.recordings_count += 1;
+            }
+
+            return_value.recording_profiles.push_back(std::move(recording_profile));
+        }
+    }
+
+    return return_value;
+}
+
+
+// ── libxml plumbing ──────────────────────────────────────────────────────────────
+
+NML_Node NML_Parser::xml_node_to_nml_node(xmlNodePtr node) {
+    return convert_xml_node(node);
 }
 
 // Accumulates each schema validation error's line number and message (libxml2's messages
@@ -1034,7 +1727,14 @@ void NML_Parser::extract_all_declarations_nested_in_node(
 // matching global declaration available for the validation root.") into `*user_data`,
 // joined by " | " -- see validate_against_schema's own comment for why this replaces
 // libxml2's default, stderr-only error handler.
+// libxml2 2.12 made xmlStructuredErrorFunc take a `const xmlError *`; before that it took
+// a mutable xmlErrorPtr. This machine has both 2.9 (pkg-config, what the Makefile picks)
+// and 2.13 (xml2-config) installed, so the signature is selected rather than assumed.
+#if LIBXML_VERSION >= 21200
+void collect_schema_validation_error(void *user_data, const xmlError *error) {
+#else
 void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
+#endif
     if (!error || !error->message) return;
 
     String message(error->message);
@@ -1104,8 +1804,7 @@ xmlNodePtr NML_Parser::get_xml_root(const String &filepath) {
 }
 
 
-
-
+// ── ComponentInstance ────────────────────────────────────────────────────────────
 
 String &ComponentInstance::get_value(String &key) {
     // Static so the miss case can still hand back a reference; a literal would dangle.
@@ -1118,11 +1817,18 @@ String &ComponentInstance::get_value(String &key) {
     return instance_data[key];
 }
 
+bool ComponentInstance::has_value(const String &key) const {
+    return instance_data.find(key) != instance_data.end();
+}
+
+String ComponentInstance::value_or(const String &key, const String &fallback) const {
+    auto entry = instance_data.find(key);
+    if (entry == instance_data.end()) return fallback;
+    return entry->second;
+}
+
 RuntimeCategory ComponentInstance::get_runtime_category() {
     return component_type->runtime_category;
 }
-
-
-
 
 }

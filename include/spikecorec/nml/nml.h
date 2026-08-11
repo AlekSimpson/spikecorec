@@ -30,12 +30,17 @@ struct NML_Node {
     UnorderedMap<String, String> attributes;
     Vector<NML_Node> body;
 
-    NML_Node(String tag_name) : tag_name(tag_name) {};
+    // Default-constructible and movable because the parser holds nodes by value: the
+    // ComponentType catalogue keeps every declaration node alive from ingest until
+    // resolution, long after the document that produced it goes out of scope.
+    NML_Node() = default;
+    NML_Node(String tag_name) : tag_name(std::move(tag_name)) {};
 
-    NML_Node(const NML_Node &other) :
-        tag_name(other.tag_name), attributes(other.attributes), body(other.body) {};
-
+    NML_Node(const NML_Node &other) = default;
     NML_Node &operator=(const NML_Node &other) = default;
+
+    NML_Node(NML_Node &&other) noexcept = default;
+    NML_Node &operator=(NML_Node &&other) noexcept = default;
 
     bool has_attribute(const String &name) const;
     void add_attribute(const String &name, String value);
@@ -43,6 +48,9 @@ struct NML_Node {
     void nest(NML_Node component);
     NML_Declaration to_declaration() const;
     bool is_declaration_type() const;
+
+    // First direct child carrying `child_tag_name`, or nullptr.
+    const NML_Node *find_child(const String &child_tag_name) const;
 };
 
 
@@ -159,6 +167,18 @@ struct NML_Declaration {
 
     String get_value(const String &key) const;
     bool has_value(const String &key) const;
+
+    // get_value throws on a missing key. This is the "absent is legal" form, used
+    // wherever an attribute is genuinely optional (a Parameter with no Fixed value, a
+    // connection with no explicit weight).
+    String value_or(const String &key, const String &fallback = "") const;
+
+    // Identity of this declaration within its ComponentType, as "<namespace>:<name>".
+    // Returns "" for declarations that accumulate rather than override (OnCondition,
+    // OnStart, ...). See docs/nml_general_notes.md "What can share a name": seven tags
+    // feed one `variables` namespace, so Parameter "tau" and StateVariable "tau" collide,
+    // and a subtype redeclaring either overrides the ancestor's.
+    String namespace_key() const;
 };
 
 // Which tick stage an instruction belongs to (arch doc section 2's 9-stage scaffold).
@@ -181,7 +201,10 @@ struct DynamicsInstruction {
     String target;       // variable written, or exposure / port name
     String expression;   // value= / test= source expression, verbatim
     String regime_name;  // owning Regime, empty when the instruction is regime-free
-    String condition;    // for Reset/Emit: the OnCondition test that gates it
+    // What gates this instruction: the OnCondition test for a Reset/Emit, or the port
+    // name for anything an OnEvent handles. Empty when nothing gates it -- which is the
+    // case for OnStart and OnEntry bodies, located by `stage` instead.
+    String condition;
 
     DynamicsInstruction(DynamicsStage stage, NML_DeclarationType source_tag)
         : stage(stage), source_tag(source_tag) {};
@@ -205,12 +228,26 @@ struct DeclarationList {
 
     const Vector<NML_Declaration> &for_all() const { return declarations; }
 
+    // Appends, keeping `declarations` grouped by tag_type and preserving source order
+    // within each group.
     void insert(const NML_Declaration &declaration);
+
+    // Inheritance overlay: replaces the declaration sharing `declaration`'s
+    // namespace_key() if one is present, otherwise inserts. This is what makes a subtype
+    // redeclaring an ancestor's Parameter an override rather than a duplicate.
+    void overlay(const NML_Declaration &declaration);
+
+    // First declaration of `type` named `name`, or nullptr.
+    const NML_Declaration *find(NML_DeclarationType type, const String &name) const;
+
+    // Every declaration of `type`, in source order.
+    Vector<const NML_Declaration *> find_all(NML_DeclarationType type) const;
 };
 
 struct ComponentType {
     DeclarationList declarations;
     String name;
+    String extends; // parent type name, empty for a root type
     RuntimeCategory runtime_category = RuntimeCategory::General;
 
     ComponentType() = default;
@@ -230,18 +267,40 @@ struct ComponentType {
         : declarations(std::move(list)),
           name(std::move(name)),
           runtime_category(runtime_category) {};
+
+    // Parameter and Property names in declaration order. This is the column order of
+    // NML_ParseResult::cell_starting_parameters / synapse_starting_parameters. Text is
+    // excluded (it carries metadata strings, not scalars) and DerivedParameter too (it is
+    // computed from other parameters rather than supplied by an instance).
+    Vector<String> ordered_parameter_names() const;
+
+    // StateVariable names in declaration order; the index is the variable's slot within
+    // this type's state chunk.
+    Vector<String> ordered_state_variable_names() const;
 };
 
 struct ComponentInstance {
     UnorderedMap<String, String> instance_data;
-    Vector<String> structured_instance_data; // list of child instance ids
+    Vector<String> structured_instance_data; // list of child instance ids, in source order
     String id;
-    const ComponentType *component_type;
+    String component_type_name;
+    String parent_instance_id; // empty for a document-scope instance
+    const ComponentType *component_type = nullptr;
 
-    // todo: the five constructors (most new structs have this as todo)
+    ComponentInstance() = default;
+    ~ComponentInstance() = default;
+
+    ComponentInstance(const ComponentInstance &other) = default;
+    ComponentInstance &operator=(const ComponentInstance &other) = default;
+
+    ComponentInstance(ComponentInstance &&other) noexcept = default;
+    ComponentInstance &operator=(ComponentInstance &&other) noexcept = default;
 
     String &get_value(String &key);
     RuntimeCategory get_runtime_category();
+
+    bool has_value(const String &key) const;
+    String value_or(const String &key, const String &fallback = "") const;
 };
 
 struct ComponentInstanceVisitorContext {
@@ -263,6 +322,33 @@ union Real {
     f64 float64;
 };
 
+// A <Unit> declaration: the affine map from a written magnitude onto its dimension's SI
+// unit. LEMS defines it as `si = raw * scale * 10^power + offset`; `power` is folded into
+// `scale` at ingest, and `offset` is non-zero only for degC.
+struct UnitDefinition {
+    f64 scale = 1.0;
+    f64 offset = 0.0;
+};
+
+// One outgoing edge. Grouped rather than spread across parallel arrays so a source's
+// edge list carries its full per-edge record in one place.
+struct NetworkEdge {
+    s64 target_neuron_index = -1;
+    s64 synapse_type_index = -1; // -1 when the projection names no synapse
+    f64 weight = 1.0;            // 1.0 when the connection carries no weight
+    s64 delay_tick_count = 0;    // 0 when the connection carries no delay
+};
+
+// Where a population's neurons sit in the global neuron numbering. Populations occupy
+// contiguous ranges assigned in document order.
+struct PopulationLayout {
+    String population_name;
+    String instance_id;
+    s64 first_neuron_index = 0;
+    s64 neuron_count = 0;
+    s64 cell_type_index = -1;
+};
+
 struct SimulationInputConfig {
     Vector<Vector<s32>> simulation_input_events;
     Vector<s64> input_neuron_indices;
@@ -272,6 +358,15 @@ struct SimulationInputConfig {
     s64 end_tick;
     s64 max_delay_time;
     bool continuous_current_injection;
+
+    // Which input component produced this profile, so a caller can tell a pulseGenerator
+    // from a spikeArray without re-reading the document.
+    String input_component_id;
+    String input_component_type_name;
+
+    // Per-target scaling from <inputW weight="..."/>, parallel to input_neuron_indices.
+    // 1.0 wherever the input carries no weight.
+    Vector<f64> input_weights;
 };
 
 struct NML_ParseResult {
@@ -282,6 +377,10 @@ struct NML_ParseResult {
     UnorderedMap<String, Real> global_constants;
 
     // Cell state info
+    //
+    // cell_state_offsets: where a cell type's state variables begin inside the single
+    // engine-allocated cell-state buffer (the successor to v1's `membrane_potentials`).
+    // It is the running sum of cell_state_size over the preceding cell types.
     UnorderedMap<String, s32> cell_state_offsets;
     Vector<Vector<Real>> cell_starting_parameters;
     Vector<s64> cell_state_size;
@@ -316,14 +415,74 @@ struct NML_ParseResult {
     // Simulation I/O
     Vector<SimulationInputConfig> input_profiles;
     Vector<RecordingConfig> recording_profiles;
+
+    // ── the indirection the fields above assume but never supplied ────────────────
+
+    // Dense type indices, keyed by ComponentType name. cell_state_size,
+    // cell_starting_parameters, cell_type_parameter_names and the two synapse
+    // classification sets are all indexed by these.
+    UnorderedMap<String, s64> cell_type_indices;
+    UnorderedMap<String, s64> synapse_type_indices;
+
+    // Reverse of the above: the type name at each dense index, so a consumer holding an
+    // index can reach cell_dynamics / cell_state_variable_names without searching.
+    Vector<String> cell_type_names;
+    Vector<String> synapse_type_names;
+
+    // Column order of cell_starting_parameters[type_index] and its synapse counterpart.
+    UnorderedMap<String, Vector<String>> cell_type_parameter_names;
+    UnorderedMap<String, Vector<String>> synapse_type_parameter_names;
+
+    // Mirror of cell_state_variable_names for synapses.
+    UnorderedMap<String, Vector<String>> synapse_state_variable_names;
+
+    // Which cell type each global neuron index belongs to. Sized total_cell_count; this
+    // is the cell-type boundary the master kernel dispatches on.
+    Vector<s64> neuron_cell_type_indices;
+
+    // Population ranges in global neuron index order.
+    Vector<PopulationLayout> population_layouts;
+
+    // Identical in shape to network_adjacency_list: network_edges[source][k] describes
+    // the edge to network_adjacency_list[source][k].
+    Vector<Vector<NetworkEdge>> network_edges;
+
+    // The network instance the LEMS <Target>/Simulation selects, and the Simulation
+    // instance id itself.
+    String target_network_id;
+    String simulation_component_id;
 };
 
 struct NML_Parser {
     UnorderedMap<String, ComponentType> declared_component_types;
 
+    // Pure id -> instance lookup. Every ordering the export needs comes from the document
+    // tree instead: document order from document_instance_nodes, child order from each
+    // instance's structured_instance_data.
     UnorderedMap<String, ComponentInstance> instance_table;
 
     Set<String> parsed_neuroml_files;
+
+    // Catalog phase. `extends` resolves by name, and forward + cross-file references are
+    // both normal (docs/nml_general_notes.md), so every ComponentType across every
+    // included file is collected here first and resolved only once ingest completes.
+    UnorderedMap<String, NML_Node> component_type_catalogue;
+    UnorderedMap<String, String> component_type_source_files;
+
+    // Instance nodes in document order, stashed during ingest. They cannot be
+    // instantiated inline: an instance may name a ComponentType declared in a file that
+    // has not been read yet.
+    Vector<NML_Node> document_instance_nodes;
+
+    // <Unit> symbols declared by the parsed documents, consulted before falling back to
+    // units::unit_suffix_scale so a model defining its own units resolves correctly.
+    UnorderedMap<String, UnitDefinition> declared_units;
+
+    // Document-scope <Constant>s and the <Target component="..."/> selection.
+    UnorderedMap<String, Real> document_constants;
+    String target_component_id;
+
+    NML_Node main_document_root;
 
     const String STANDARD_LIBRARY_PATH = SPIKECOREC_NML_STD_LIB_DIR;
     const String NML_SCHEMA_PATH = SPIKECOREC_NML_SCHEMA_PATH;
@@ -337,6 +496,27 @@ struct NML_Parser {
     NML_ParseResult parse_lems(const String &lems_main_file);
 
     void parse_neuroml(const String &nml_file_path);
+
+    // Reads one document and folds its ComponentTypes, Units, Constants and instance
+    // nodes into the parser. Recurses through <Include file="..."/> (LEMS) and
+    // <include href="..."/> (NeuroML), resolving both against the including file's own
+    // directory and deduping by canonical path.
+    void ingest_document(const String &file_path);
+
+    // Two-phase resolution, run once every document is ingested: walks each catalogued
+    // type's `extends` chain, overlays ancestors' declarations under the type's own
+    // (most-derived wins), applies <Fixed>, and assigns the runtime category.
+    void resolve_all_component_types();
+    const ComponentType &resolve_component_type(const String &type_name,
+                                                Vector<String> &resolution_stack);
+
+    // Runtime category from the `extends` chain, walking upward from `type_name` to the
+    // first ancestor that is a known category root.
+    RuntimeCategory category_for_component_type(const String &type_name) const;
+
+    // "-60mV" -> -0.06, resolved against the <Unit>s this parser ingested and falling
+    // back to units::unit_suffix_scale for symbols no document declared.
+    f64 resolve_quantity(const String &value) const;
 
     void load_component_types_in_file(NML_Node *file_root);
 
@@ -358,5 +538,13 @@ struct NML_Parser {
     // and the recording selections.
     NML_ParseResult export_model_details_to_engine(NML_Node *lems_root);
 };
+
+// "-60mV" -> -0.06 using only the built-in unit table. NML_Parser::resolve_quantity is
+// the document-aware form, and is what the parser itself uses.
+f64 parse_quantity(const String &value);
+
+// Splits "-60mV" into its numeric magnitude and unit suffix, so parse_quantity and
+// resolve_quantity share one number scanner.
+Pair<f64, String> split_quantity(const String &value);
 
 }

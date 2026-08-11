@@ -43,14 +43,28 @@ namespace spikecorec {
         s32 int32;
     };
     
+    // One recorded quantity, as named by a LEMS <OutputColumn quantity="pop1[0]/v"/> or
+    // <EventSelection select="pop1[0]" eventPort="spike"/>. recordings_count counts these;
+    // this is what each one actually selects.
+    struct RecordingSelection {
+        String quantity_path;   // verbatim LEMS path, e.g. "pop1[0]/v"
+        String variable_name;   // trailing variable, e.g. "v"; "" for an event selection
+        String event_port;      // EventSelection's port, e.g. "spike"; "" for a column
+        s64 neuron_index = -1;  // global neuron index, -1 when the path names no cell
+    };
+
     struct RecordingConfig {
         Vector<String> output_filenames;
         Vector<OutputFileFormat> file_output_format;
         Vector<RecordedValue> recored_data;
-    
+
+        // What recordings_count counts; parallel to nothing, one entry per selected
+        // quantity across this config's output files.
+        Vector<RecordingSelection> selections;
+
         static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1014;
         s32 recordings_count;
-    
+
         void add_output(String &filename);
     };
 
