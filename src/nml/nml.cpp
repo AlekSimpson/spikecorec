@@ -1148,18 +1148,20 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         log::logger().warn("No Simulation instance found in {}", lems_root->tag_name);
     }
 
-    // ── Pass 1: cell and synapse types ───────────────────────────────────────────
-    // Dense indices are assigned in document order, so the same document always produces
-    // the same numbering.
+    // ── Pass 1: cell and synapse types, and their prototype parameter rows ───────
+    // Two things are registered here and they are deliberately keyed differently.
+    // Everything structural -- state size, state variable names, the dynamics program,
+    // the parameter column order -- is a property of the ComponentType. The parameter
+    // VALUES are a property of the instance: a population names "component=cellA", and
+    // cellA and cellB may both be iafCell yet differ in leakReversal.
     auto register_type =
-        [&](const ComponentInstance &instance, bool is_cell) {
-            const ComponentType &component_type = *instance.component_type;
-
+        [&](const ComponentType &component_type, bool is_cell) -> s64 {
             UnorderedMap<String, s64> &indices = is_cell
                     ? return_value.cell_type_indices
                     : return_value.synapse_type_indices;
 
-            if (indices.find(component_type.name) != indices.end()) return;
+            auto known = indices.find(component_type.name);
+            if (known != indices.end()) return known->second;
 
             s64 type_index = static_cast<s64>(indices.size());
             indices[component_type.name] = type_index;
@@ -1167,7 +1169,55 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             Vector<String> state_variable_names = component_type.ordered_state_variable_names();
             Vector<String> parameter_names = component_type.ordered_parameter_names();
 
-            // The prototype's values, in the type's declared parameter order. An absent
+            if (is_cell) {
+                return_value.cell_type_names.push_back(component_type.name);
+                return_value.cell_state_size.push_back(
+                        static_cast<s64>(state_variable_names.size()));
+                return_value.cell_state_variable_names[component_type.name] =
+                        std::move(state_variable_names);
+                return_value.cell_type_parameter_names[component_type.name] =
+                        std::move(parameter_names);
+                return_value.cell_dynamics[component_type.name] =
+                        extract_dynamics_program(component_type);
+                return type_index;
+            }
+
+            return_value.synapse_type_names.push_back(component_type.name);
+            return_value.synapse_state_size.push_back(
+                    static_cast<s64>(state_variable_names.size()));
+            return_value.synapse_state_variable_names[component_type.name] =
+                    std::move(state_variable_names);
+            return_value.synapse_type_parameter_names[component_type.name] =
+                    std::move(parameter_names);
+            return_value.synapse_dynamics[component_type.name] =
+                    extract_dynamics_program(component_type);
+
+            if (is_conductance_based(component_type)) {
+                return_value.conductance_based_synapse_types.insert(type_index);
+            }
+            if (requires_per_edge_state(component_type)) {
+                return_value.per_edge_synapse_projection_types.insert(type_index);
+            }
+            return type_index;
+        };
+
+    auto register_parameter_row =
+        [&](const ComponentInstance &instance, bool is_cell) -> s64 {
+            UnorderedMap<String, s64> &rows = is_cell
+                    ? return_value.cell_parameter_row_indices
+                    : return_value.synapse_parameter_row_indices;
+
+            auto known = rows.find(instance.id);
+            if (known != rows.end()) return known->second;
+
+            const ComponentType &component_type = *instance.component_type;
+            s64 type_index = register_type(component_type, is_cell);
+
+            const Vector<String> &parameter_names = is_cell
+                    ? return_value.cell_type_parameter_names[component_type.name]
+                    : return_value.synapse_type_parameter_names[component_type.name];
+
+            // This instance's values, in the type's declared parameter order. An absent
             // attribute falls back to the declaration's own value -- a Fixed pin or a
             // Property defaultValue -- and only then to zero.
             Vector<Real> starting_parameters;
@@ -1175,9 +1225,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             for (const String &parameter_name : parameter_names) {
                 String text = instance.value_or(parameter_name);
                 if (text.empty()) {
-                    const NML_Declaration *declared =
-                            component_type.declarations.find(
-                                    NML_DeclarationType::Parameter, parameter_name);
+                    const NML_Declaration *declared = component_type.declarations.find(
+                            NML_DeclarationType::Parameter, parameter_name);
                     if (!declared) {
                         declared = component_type.declarations.find(
                                 NML_DeclarationType::Property, parameter_name);
@@ -1192,55 +1241,23 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 starting_parameters.push_back(resolved);
             }
 
+            s64 row_index = is_cell
+                    ? static_cast<s64>(return_value.cell_starting_parameters.size())
+                    : static_cast<s64>(return_value.synapse_starting_parameters.size());
+            rows[instance.id] = row_index;
+
             if (is_cell) {
-                return_value.cell_type_names.push_back(component_type.name);
-                return_value.cell_state_size.push_back(
-                        static_cast<s64>(state_variable_names.size()));
-                return_value.cell_state_variable_names[component_type.name] = state_variable_names;
-                return_value.cell_type_parameter_names[component_type.name] = parameter_names;
                 return_value.cell_starting_parameters.push_back(std::move(starting_parameters));
-                return_value.cell_dynamics[component_type.name] =
-                        extract_dynamics_program(component_type);
-                return;
+                return_value.cell_parameter_row_instance_ids.push_back(instance.id);
+                return_value.cell_parameter_row_type_indices.push_back(type_index);
+            } else {
+                return_value.synapse_starting_parameters.push_back(
+                        std::move(starting_parameters));
+                return_value.synapse_parameter_row_instance_ids.push_back(instance.id);
+                return_value.synapse_parameter_row_type_indices.push_back(type_index);
             }
 
-            return_value.synapse_type_names.push_back(component_type.name);
-            return_value.synapse_state_size.push_back(
-                    static_cast<s64>(state_variable_names.size()));
-            return_value.synapse_state_variable_names[component_type.name] = state_variable_names;
-            return_value.synapse_type_parameter_names[component_type.name] = parameter_names;
-            return_value.synapse_starting_parameters.push_back(std::move(starting_parameters));
-            return_value.synapse_dynamics[component_type.name] =
-                    extract_dynamics_program(component_type);
-
-            if (is_conductance_based(component_type)) {
-                return_value.conductance_based_synapse_types.insert(type_index);
-            }
-            if (requires_per_edge_state(component_type)) {
-                return_value.per_edge_synapse_projection_types.insert(type_index);
-            }
-        };
-
-    // Prototype divergence is worth a warning: per-type starting parameters mean a second
-    // instance of the same type with different values silently loses them. Within-
-    // population heterogeneity is Phase 2 (ticket #65).
-    auto warn_on_prototype_divergence =
-        [&](const ComponentInstance &instance, const Vector<String> &parameter_names,
-            const Vector<Real> &prototype_row) {
-            for (usize index = 0; index < parameter_names.size(); index += 1) {
-                String text = instance.value_or(parameter_names[index]);
-                if (text.empty()) continue;
-
-                f64 value = resolve_quantity(text);
-                if (value == prototype_row[index].float64) continue;
-
-                log::logger().warn(
-                        "Instance '{}' sets {}={} but type '{}' already took its starting "
-                        "parameters from an earlier instance; the difference is dropped",
-                        instance.id, parameter_names[index], text,
-                        instance.component_type_name);
-                return;
-            }
+            return row_index;
         };
 
     for (const NML_Node &node : document_instance_nodes) {
@@ -1253,25 +1270,7 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         RuntimeCategory category = instance.component_type->runtime_category;
         if (category != RuntimeCategory::Cell && category != RuntimeCategory::Synapse) continue;
 
-        bool is_cell = category == RuntimeCategory::Cell;
-        const UnorderedMap<String, s64> &indices = is_cell
-                ? return_value.cell_type_indices
-                : return_value.synapse_type_indices;
-
-        auto known = indices.find(instance.component_type->name);
-        if (known == indices.end()) {
-            register_type(instance, is_cell);
-            continue;
-        }
-
-        const auto &parameter_names = is_cell
-                ? return_value.cell_type_parameter_names[instance.component_type->name]
-                : return_value.synapse_type_parameter_names[instance.component_type->name];
-        const auto &prototype_row = is_cell
-                ? return_value.cell_starting_parameters[static_cast<usize>(known->second)]
-                : return_value.synapse_starting_parameters[static_cast<usize>(known->second)];
-
-        warn_on_prototype_divergence(instance, parameter_names, prototype_row);
+        register_parameter_row(instance, category == RuntimeCategory::Cell);
     }
 
     return_value.cell_type_count = static_cast<s64>(return_value.cell_type_indices.size());
@@ -1361,26 +1360,33 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             }
 
             const String &cell_type_name = cell_instance->second.component_type->name;
-            auto cell_type_index = return_value.cell_type_indices.find(cell_type_name);
-            if (cell_type_index == return_value.cell_type_indices.end()) {
+            if (cell_instance->second.component_type->runtime_category != RuntimeCategory::Cell) {
                 throw runtime_error(
                         "Population '" + child.id + "' references component '" +
                         component_reference + "' of type '" + cell_type_name +
                         "', which is not classified as a cell");
             }
 
+            // The population names an instance, so the parameter row is that instance's.
+            // Registered on demand: a prototype declared inside the network rather than
+            // at document scope has not been walked yet.
+            s64 parameter_row_index = register_parameter_row(cell_instance->second, true);
+            s64 cell_type_index = return_value.cell_type_indices.at(cell_type_name);
+
             PopulationLayout layout;
             layout.population_name = leaf_id(child.id);
             layout.instance_id = child.id;
+            layout.component_instance_id = cell_instance->second.id;
             layout.first_neuron_index = return_value.total_cell_count;
             layout.neuron_count = size;
-            layout.cell_type_index = cell_type_index->second;
+            layout.cell_type_index = cell_type_index;
+            layout.parameter_row_index = parameter_row_index;
 
             return_value.population_layouts.push_back(std::move(layout));
             return_value.total_cell_count += size;
 
             for (s64 member = 0; member < size; member += 1) {
-                return_value.neuron_cell_type_indices.push_back(cell_type_index->second);
+                return_value.neuron_cell_type_indices.push_back(cell_type_index);
             }
         }
     }
@@ -1432,27 +1438,36 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             if (projection.component_type_name != "projection") continue;
 
             // The projection names the synapse prototype every one of its edges uses.
-            s64 projection_synapse_type = -1;
-            String synapse_reference = projection.value_or("synapse");
-            if (!synapse_reference.empty()) {
-                auto synapse_instance = instance_table.find(synapse_reference);
+            // Resolves to a parameter row as well as a type, since two projections may
+            // share a synapse ComponentType with different parameter values.
+            auto resolve_synapse = [&](const String &reference, const String &owner_id,
+                                       s64 &type_index, s64 &row_index) {
+                auto synapse_instance = instance_table.find(reference);
                 if (synapse_instance == instance_table.end() ||
                     !synapse_instance->second.component_type) {
                     throw runtime_error(
-                            "Projection '" + projection.id + "' references synapse '" +
-                            synapse_reference + "', which no instance declares");
+                            "Projection '" + owner_id + "' references synapse '" +
+                            reference + "', which no instance declares");
                 }
-
-                auto synapse_type_index = return_value.synapse_type_indices.find(
-                        synapse_instance->second.component_type->name);
-                if (synapse_type_index == return_value.synapse_type_indices.end()) {
+                if (synapse_instance->second.component_type->runtime_category !=
+                    RuntimeCategory::Synapse) {
                     throw runtime_error(
-                            "Projection '" + projection.id + "' references synapse '" +
-                            synapse_reference + "' of type '" +
-                            synapse_instance->second.component_type->name +
+                            "Projection '" + owner_id + "' references synapse '" + reference +
+                            "' of type '" + synapse_instance->second.component_type->name +
                             "', which is not classified as a synapse");
                 }
-                projection_synapse_type = synapse_type_index->second;
+
+                row_index = register_parameter_row(synapse_instance->second, false);
+                type_index = return_value.synapse_type_indices.at(
+                        synapse_instance->second.component_type->name);
+            };
+
+            s64 projection_synapse_type = -1;
+            s64 projection_synapse_row = -1;
+            String synapse_reference = projection.value_or("synapse");
+            if (!synapse_reference.empty()) {
+                resolve_synapse(synapse_reference, projection.id,
+                                projection_synapse_type, projection_synapse_row);
             }
 
             for (const String &connection_id : projection.structured_instance_data) {
@@ -1485,19 +1500,13 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 NetworkEdge edge;
                 edge.target_neuron_index = post_neuron_index;
                 edge.synapse_type_index = projection_synapse_type;
+                edge.synapse_parameter_row_index = projection_synapse_row;
 
-                // A connection may name its own synapse, overriding the projection's.
+                // A synapticConnection names its own synapse, overriding the projection's.
                 String own_synapse = connection.value_or("synapse");
                 if (!own_synapse.empty()) {
-                    auto synapse_instance = instance_table.find(own_synapse);
-                    if (synapse_instance != instance_table.end() &&
-                        synapse_instance->second.component_type) {
-                        auto synapse_type_index = return_value.synapse_type_indices.find(
-                                synapse_instance->second.component_type->name);
-                        if (synapse_type_index != return_value.synapse_type_indices.end()) {
-                            edge.synapse_type_index = synapse_type_index->second;
-                        }
-                    }
+                    resolve_synapse(own_synapse, connection.id,
+                                    edge.synapse_type_index, edge.synapse_parameter_row_index);
                 }
 
                 if (connection.has_value("weight")) {

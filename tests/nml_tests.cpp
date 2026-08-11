@@ -827,8 +827,8 @@ TEST(Export, cell_type_tables_are_consistent_and_indexable) {
     ASSERT_EQ(result.cell_type_count, 2);
     ASSERT_EQ(result.cell_type_names.size(), 2u);
     ASSERT_EQ(result.cell_state_size.size(), 2u);
-    ASSERT_EQ(result.cell_starting_parameters.size(), 2u);
 
+    // Type-keyed tables: one entry per ComponentType.
     for (usize type_index = 0; type_index < result.cell_type_names.size(); type_index += 1) {
         const String &type_name = result.cell_type_names[type_index];
 
@@ -836,18 +836,149 @@ TEST(Export, cell_type_tables_are_consistent_and_indexable) {
         ASSERT_EQ(result.cell_type_indices.count(type_name), 1u);
         EXPECT_EQ(result.cell_type_indices.at(type_name), static_cast<s64>(type_index));
 
-        // A starting-parameter row is only interpretable alongside its column names.
-        ASSERT_EQ(result.cell_type_parameter_names.count(type_name), 1u);
-        EXPECT_EQ(result.cell_starting_parameters[type_index].size(),
-                  result.cell_type_parameter_names.at(type_name).size());
-
         // state_size must match the named state variables.
         ASSERT_EQ(result.cell_state_variable_names.count(type_name), 1u);
         EXPECT_EQ(static_cast<usize>(result.cell_state_size[type_index]),
                   result.cell_state_variable_names.at(type_name).size());
 
+        ASSERT_EQ(result.cell_type_parameter_names.count(type_name), 1u);
         EXPECT_EQ(result.cell_dynamics.count(type_name), 1u);
     }
+
+    // Instance-keyed tables: one row per prototype, each carrying its own type index and
+    // a width matching that type's column names.
+    ASSERT_EQ(result.cell_parameter_row_instance_ids.size(),
+              result.cell_starting_parameters.size());
+    ASSERT_EQ(result.cell_parameter_row_type_indices.size(),
+              result.cell_starting_parameters.size());
+
+    for (usize row = 0; row < result.cell_starting_parameters.size(); row += 1) {
+        const String &instance_id = result.cell_parameter_row_instance_ids[row];
+        ASSERT_EQ(result.cell_parameter_row_indices.count(instance_id), 1u);
+        EXPECT_EQ(result.cell_parameter_row_indices.at(instance_id), static_cast<s64>(row));
+
+        s64 type_index = result.cell_parameter_row_type_indices[row];
+        ASSERT_GE(type_index, 0);
+        ASSERT_LT(type_index, static_cast<s64>(result.cell_type_names.size()));
+
+        // A row is only interpretable alongside its column names.
+        const String &type_name = result.cell_type_names[static_cast<usize>(type_index)];
+        EXPECT_EQ(result.cell_starting_parameters[row].size(),
+                  result.cell_type_parameter_names.at(type_name).size());
+    }
+
+    // Every population points at a real row.
+    for (const PopulationLayout &layout : result.population_layouts) {
+        ASSERT_GE(layout.parameter_row_index, 0);
+        ASSERT_LT(layout.parameter_row_index,
+                  static_cast<s64>(result.cell_starting_parameters.size()));
+        EXPECT_EQ(result.cell_parameter_row_type_indices[
+                          static_cast<usize>(layout.parameter_row_index)],
+                  layout.cell_type_index);
+    }
+}
+
+TEST(Export, populations_sharing_a_component_type_keep_their_own_parameter_values) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("shared_type_distinct_values");
+    // Both populations are iafCell, but they name different prototypes and differ in
+    // leakReversal -- an excitatory/inhibitory pair built from one cell type. Keying
+    // starting parameters by type would collapse these onto one row and silently
+    // simulate two populations with identical parameters.
+    fixture.write("net.nml", R"(<neuroml id="sharednet">
+    <iafCell id="cellA" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <iafCell id="cellB" leakReversal="-90mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <network id="net1">
+        <population id="pop1" component="cellA" size="2"/>
+        <population id="pop2" component="cellB" size="2"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    // One ComponentType, because that is genuinely what both populations instantiate.
+    EXPECT_EQ(result.cell_type_count, 1);
+    ASSERT_EQ(result.population_layouts.size(), 2u);
+    EXPECT_EQ(result.population_layouts[0].cell_type_index,
+              result.population_layouts[1].cell_type_index);
+
+    // Two prototype rows, because the two populations are parameterised differently.
+    ASSERT_EQ(result.cell_starting_parameters.size(), 2u);
+    EXPECT_EQ(result.population_layouts[0].component_instance_id, "cellA");
+    EXPECT_EQ(result.population_layouts[1].component_instance_id, "cellB");
+    EXPECT_NE(result.population_layouts[0].parameter_row_index,
+              result.population_layouts[1].parameter_row_index);
+
+    const Vector<String> &columns = result.cell_type_parameter_names.at("iafCell");
+    auto leak_reversal = std::find(columns.begin(), columns.end(), "leakReversal");
+    ASSERT_NE(leak_reversal, columns.end());
+    usize column = static_cast<usize>(leak_reversal - columns.begin());
+
+    auto row_of = [&](usize population_index) {
+        return static_cast<usize>(
+                result.population_layouts[population_index].parameter_row_index);
+    };
+
+    EXPECT_DOUBLE_EQ(result.cell_starting_parameters[row_of(0)][column].float64, -0.05);
+    EXPECT_DOUBLE_EQ(result.cell_starting_parameters[row_of(1)][column].float64, -0.09);
+}
+
+TEST(Export, projections_sharing_a_synapse_type_keep_their_own_parameter_values) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("shared_synapse_type");
+    fixture.write("net.nml", R"(<neuroml id="synnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <expOneSynapse id="synFast" gbase="0.5nS" erev="0mV" tauDecay="1ms"/>
+    <expOneSynapse id="synSlow" gbase="0.5nS" erev="0mV" tauDecay="50ms"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="3"/>
+        <projection id="projFast" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="synFast">
+            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[1]"/>
+        </projection>
+        <projection id="projSlow" presynapticPopulation="pop1"
+                    postsynapticPopulation="pop1" synapse="synSlow">
+            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[2]"/>
+        </projection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    EXPECT_EQ(result.synapse_type_count, 1);
+    ASSERT_EQ(result.synapse_starting_parameters.size(), 2u);
+
+    // Neuron 0 has one edge from each projection; they share a type but not a row.
+    ASSERT_EQ(result.network_edges[0].size(), 2u);
+    const NetworkEdge &fast = result.network_edges[0][0];
+    const NetworkEdge &slow = result.network_edges[0][1];
+    EXPECT_EQ(fast.synapse_type_index, slow.synapse_type_index);
+    EXPECT_NE(fast.synapse_parameter_row_index, slow.synapse_parameter_row_index);
+
+    const Vector<String> &columns = result.synapse_type_parameter_names.at("expOneSynapse");
+    auto tau_decay = std::find(columns.begin(), columns.end(), "tauDecay");
+    ASSERT_NE(tau_decay, columns.end());
+    usize column = static_cast<usize>(tau_decay - columns.begin());
+
+    EXPECT_DOUBLE_EQ(
+            result.synapse_starting_parameters[
+                    static_cast<usize>(fast.synapse_parameter_row_index)][column].float64,
+            0.001);
+    EXPECT_DOUBLE_EQ(
+            result.synapse_starting_parameters[
+                    static_cast<usize>(slow.synapse_parameter_row_index)][column].float64,
+            0.05);
 }
 
 TEST(Export, parameters_are_converted_to_si_in_declared_column_order) {
@@ -860,11 +991,12 @@ TEST(Export, parameters_are_converted_to_si_in_declared_column_order) {
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
 
-    ASSERT_EQ(result.cell_type_indices.count("iafCell"), 1u);
-    usize iaf_index = static_cast<usize>(result.cell_type_indices.at("iafCell"));
+    // cell0 is pop1's prototype; its row is the one to read.
+    ASSERT_EQ(result.cell_parameter_row_indices.count("cell0"), 1u);
+    usize cell0_row = static_cast<usize>(result.cell_parameter_row_indices.at("cell0"));
 
     const Vector<String> &columns = result.cell_type_parameter_names.at("iafCell");
-    const Vector<Real> &values = result.cell_starting_parameters[iaf_index];
+    const Vector<Real> &values = result.cell_starting_parameters[cell0_row];
     ASSERT_EQ(columns.size(), values.size());
 
     auto value_of = [&](const String &parameter_name) {
@@ -1112,9 +1244,25 @@ TEST(Export, is_deterministic_across_parses) {
                   second.population_layouts[index].cell_type_index);
     }
 
+    // Parameter rows must land in the same order, so a row index means the same thing
+    // across parses.
+    EXPECT_EQ(first.cell_parameter_row_instance_ids, second.cell_parameter_row_instance_ids);
+    EXPECT_EQ(first.cell_parameter_row_type_indices, second.cell_parameter_row_type_indices);
+    EXPECT_EQ(first.synapse_parameter_row_instance_ids,
+              second.synapse_parameter_row_instance_ids);
+
     ASSERT_EQ(first.cell_starting_parameters.size(), second.cell_starting_parameters.size());
-    for (usize type_index = 0; type_index < first.cell_starting_parameters.size();
-         type_index += 1) {
+    for (usize row = 0; row < first.cell_starting_parameters.size(); row += 1) {
+        ASSERT_EQ(first.cell_starting_parameters[row].size(),
+                  second.cell_starting_parameters[row].size());
+        for (usize column = 0; column < first.cell_starting_parameters[row].size();
+             column += 1) {
+            EXPECT_DOUBLE_EQ(first.cell_starting_parameters[row][column].float64,
+                             second.cell_starting_parameters[row][column].float64);
+        }
+    }
+
+    for (usize type_index = 0; type_index < first.cell_type_names.size(); type_index += 1) {
         EXPECT_EQ(first.cell_type_parameter_names.at(first.cell_type_names[type_index]),
                   second.cell_type_parameter_names.at(second.cell_type_names[type_index]));
     }

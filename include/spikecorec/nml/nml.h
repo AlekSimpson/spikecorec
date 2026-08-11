@@ -335,6 +335,9 @@ struct UnitDefinition {
 struct NetworkEdge {
     s64 target_neuron_index = -1;
     s64 synapse_type_index = -1; // -1 when the projection names no synapse
+    // Row in synapse_starting_parameters. Two projections may use the same synapse
+    // ComponentType with different values, so the type index alone does not fix them.
+    s64 synapse_parameter_row_index = -1;
     f64 weight = 1.0;            // 1.0 when the connection carries no weight
     s64 delay_tick_count = 0;    // 0 when the connection carries no delay
 };
@@ -344,9 +347,11 @@ struct NetworkEdge {
 struct PopulationLayout {
     String population_name;
     String instance_id;
+    String component_instance_id; // the prototype this population instantiates
     s64 first_neuron_index = 0;
     s64 neuron_count = 0;
     s64 cell_type_index = -1;
+    s64 parameter_row_index = -1; // row in cell_starting_parameters
 };
 
 struct SimulationInputConfig {
@@ -382,10 +387,18 @@ struct NML_ParseResult {
     // engine-allocated cell-state buffer (the successor to v1's `membrane_potentials`).
     // It is the running sum of cell_state_size over the preceding cell types.
     UnorderedMap<String, s32> cell_state_offsets;
+
+    // Indexed by PROTOTYPE INSTANCE, not by cell type -- see cell_parameter_row_indices.
+    // Two populations may instantiate the same ComponentType with different values (an
+    // excitatory and an inhibitory iafCell population differing only in leakReversal),
+    // which a per-type row cannot represent.
     Vector<Vector<Real>> cell_starting_parameters;
+
+    // Indexed by cell type index.
     Vector<s64> cell_state_size;
 
-    // Synapse state info
+    // Synapse state info. starting_parameters is per prototype instance, state_size per
+    // synapse type, exactly as on the cell side.
     Vector<Vector<Real>> synapse_starting_parameters;
     Vector<s64> synapse_state_size;
 
@@ -429,9 +442,24 @@ struct NML_ParseResult {
     Vector<String> cell_type_names;
     Vector<String> synapse_type_names;
 
-    // Column order of cell_starting_parameters[type_index] and its synapse counterpart.
+    // Column order of a starting-parameter row, keyed by the row's ComponentType name.
     UnorderedMap<String, Vector<String>> cell_type_parameter_names;
     UnorderedMap<String, Vector<String>> synapse_type_parameter_names;
+
+    // Starting-parameter rows are per prototype instance: a population names an instance
+    // ("component=cellA"), not a type, and two instances of one type may differ. Row k of
+    // cell_starting_parameters describes cell_parameter_row_instance_ids[k], and its
+    // columns are named by
+    //   cell_type_parameter_names[cell_type_names[cell_parameter_row_type_indices[k]]].
+    // PopulationLayout::parameter_row_index points at the row; cell type dispatch still
+    // goes through neuron_cell_type_indices, which is unaffected.
+    UnorderedMap<String, s64> cell_parameter_row_indices; // prototype instance id -> row
+    Vector<String> cell_parameter_row_instance_ids;       // row -> prototype instance id
+    Vector<s64> cell_parameter_row_type_indices;          // row -> cell type index
+
+    UnorderedMap<String, s64> synapse_parameter_row_indices;
+    Vector<String> synapse_parameter_row_instance_ids;
+    Vector<s64> synapse_parameter_row_type_indices;
 
     // Mirror of cell_state_variable_names for synapses.
     UnorderedMap<String, Vector<String>> synapse_state_variable_names;
