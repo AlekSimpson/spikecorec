@@ -1091,6 +1091,13 @@ static void collect_component_type_constants(
 NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) {
     NML_ParseResult return_value;
 
+    // Name -> index and instance -> prototype lookups are parser bookkeeping, so they
+    // stay local. The result carries entities, not the indices used to assemble them.
+    UnorderedMap<String, s64> cell_type_indices;
+    UnorderedMap<String, s64> synapse_type_indices;
+    UnorderedMap<String, s64> cell_prototype_indices;
+    UnorderedMap<String, s64> synapse_prototype_indices;
+
     // ── Pass 0: document scope ───────────────────────────────────────────────────
     // dt has to be known before anything else, because delays are converted to ticks.
     for (const auto &[constant_name, constant_value] : document_constants) {
@@ -1148,80 +1155,80 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         log::logger().warn("No Simulation instance found in {}", lems_root->tag_name);
     }
 
-    // ── Pass 1: cell and synapse types, and their prototype parameter rows ───────
-    // Two things are registered here and they are deliberately keyed differently.
-    // Everything structural -- state size, state variable names, the dynamics program,
-    // the parameter column order -- is a property of the ComponentType. The parameter
-    // VALUES are a property of the instance: a population names "component=cellA", and
-    // cellA and cellB may both be iafCell yet differ in leakReversal.
+    // ── Pass 1: types and prototypes ─────────────────────────────────────────────
+    // Two things are registered here and they are deliberately separate. Everything
+    // structural -- state variables, dynamics, parameter column order -- is a property of
+    // the ComponentType. The parameter VALUES are a property of the instance: a population
+    // names "component=cellA", and cellA and cellB may both be iafCell yet differ.
     auto register_type =
         [&](const ComponentType &component_type, bool is_cell) -> s64 {
-            UnorderedMap<String, s64> &indices = is_cell
-                    ? return_value.cell_type_indices
-                    : return_value.synapse_type_indices;
+            UnorderedMap<String, s64> &indices = is_cell ? cell_type_indices
+                                                         : synapse_type_indices;
 
             auto known = indices.find(component_type.name);
             if (known != indices.end()) return known->second;
 
-            s64 type_index = static_cast<s64>(indices.size());
-            indices[component_type.name] = type_index;
-
-            Vector<String> state_variable_names = component_type.ordered_state_variable_names();
-            Vector<String> parameter_names = component_type.ordered_parameter_names();
-
             if (is_cell) {
-                return_value.cell_type_names.push_back(component_type.name);
-                return_value.cell_state_size.push_back(
-                        static_cast<s64>(state_variable_names.size()));
-                return_value.cell_state_variable_names[component_type.name] =
-                        std::move(state_variable_names);
-                return_value.cell_type_parameter_names[component_type.name] =
-                        std::move(parameter_names);
-                return_value.cell_dynamics[component_type.name] =
-                        extract_dynamics_program(component_type);
+                s64 type_index = static_cast<s64>(return_value.cell_types.size());
+                indices[component_type.name] = type_index;
+
+                CellTypeSpecification specification;
+                specification.name = component_type.name;
+                specification.state_variable_names =
+                        component_type.ordered_state_variable_names();
+                specification.parameter_names = component_type.ordered_parameter_names();
+                specification.dynamics = extract_dynamics_program(component_type);
+
+                // Where this type's state begins in the engine's cell-state buffer: the
+                // running sum of the preceding types' state variable counts.
+                specification.state_offset = 0;
+                for (const CellTypeSpecification &preceding : return_value.cell_types) {
+                    specification.state_offset +=
+                            static_cast<s32>(preceding.state_variable_names.size());
+                }
+
+                return_value.cell_types.push_back(std::move(specification));
                 return type_index;
             }
 
-            return_value.synapse_type_names.push_back(component_type.name);
-            return_value.synapse_state_size.push_back(
-                    static_cast<s64>(state_variable_names.size()));
-            return_value.synapse_state_variable_names[component_type.name] =
-                    std::move(state_variable_names);
-            return_value.synapse_type_parameter_names[component_type.name] =
-                    std::move(parameter_names);
-            return_value.synapse_dynamics[component_type.name] =
-                    extract_dynamics_program(component_type);
+            s64 type_index = static_cast<s64>(return_value.synapse_types.size());
+            indices[component_type.name] = type_index;
 
-            if (is_conductance_based(component_type)) {
-                return_value.conductance_based_synapse_types.insert(type_index);
-            }
-            if (requires_per_edge_state(component_type)) {
-                return_value.per_edge_synapse_projection_types.insert(type_index);
-            }
+            SynapseTypeSpecification specification;
+            specification.name = component_type.name;
+            specification.state_variable_names = component_type.ordered_state_variable_names();
+            specification.parameter_names = component_type.ordered_parameter_names();
+            specification.dynamics = extract_dynamics_program(component_type);
+            specification.is_conductance_based = is_conductance_based(component_type);
+            specification.requires_per_edge_state = requires_per_edge_state(component_type);
+
+            return_value.synapse_types.push_back(std::move(specification));
             return type_index;
         };
 
-    auto register_parameter_row =
+    auto register_prototype =
         [&](const ComponentInstance &instance, bool is_cell) -> s64 {
-            UnorderedMap<String, s64> &rows = is_cell
-                    ? return_value.cell_parameter_row_indices
-                    : return_value.synapse_parameter_row_indices;
+            UnorderedMap<String, s64> &prototypes = is_cell ? cell_prototype_indices
+                                                            : synapse_prototype_indices;
 
-            auto known = rows.find(instance.id);
-            if (known != rows.end()) return known->second;
+            auto known = prototypes.find(instance.id);
+            if (known != prototypes.end()) return known->second;
 
             const ComponentType &component_type = *instance.component_type;
             s64 type_index = register_type(component_type, is_cell);
 
             const Vector<String> &parameter_names = is_cell
-                    ? return_value.cell_type_parameter_names[component_type.name]
-                    : return_value.synapse_type_parameter_names[component_type.name];
+                    ? return_value.cell_types[static_cast<usize>(type_index)].parameter_names
+                    : return_value.synapse_types[static_cast<usize>(type_index)].parameter_names;
 
             // This instance's values, in the type's declared parameter order. An absent
             // attribute falls back to the declaration's own value -- a Fixed pin or a
             // Property defaultValue -- and only then to zero.
-            Vector<Real> starting_parameters;
-            starting_parameters.reserve(parameter_names.size());
+            ComponentPrototype prototype;
+            prototype.instance_id = instance.id;
+            prototype.type_index = type_index;
+            prototype.starting_parameters.reserve(parameter_names.size());
+
             for (const String &parameter_name : parameter_names) {
                 String text = instance.value_or(parameter_name);
                 if (text.empty()) {
@@ -1238,26 +1245,18 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
 
                 Real resolved;
                 resolved.float64 = text.empty() ? 0.0 : resolve_quantity(text);
-                starting_parameters.push_back(resolved);
+                prototype.starting_parameters.push_back(resolved);
             }
 
-            s64 row_index = is_cell
-                    ? static_cast<s64>(return_value.cell_starting_parameters.size())
-                    : static_cast<s64>(return_value.synapse_starting_parameters.size());
-            rows[instance.id] = row_index;
+            Vector<ComponentPrototype> &destination = is_cell
+                    ? return_value.cell_prototypes
+                    : return_value.synapse_prototypes;
 
-            if (is_cell) {
-                return_value.cell_starting_parameters.push_back(std::move(starting_parameters));
-                return_value.cell_parameter_row_instance_ids.push_back(instance.id);
-                return_value.cell_parameter_row_type_indices.push_back(type_index);
-            } else {
-                return_value.synapse_starting_parameters.push_back(
-                        std::move(starting_parameters));
-                return_value.synapse_parameter_row_instance_ids.push_back(instance.id);
-                return_value.synapse_parameter_row_type_indices.push_back(type_index);
-            }
+            s64 prototype_index = static_cast<s64>(destination.size());
+            prototypes[instance.id] = prototype_index;
+            destination.push_back(std::move(prototype));
 
-            return row_index;
+            return prototype_index;
         };
 
     for (const NML_Node &node : document_instance_nodes) {
@@ -1270,22 +1269,10 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         RuntimeCategory category = instance.component_type->runtime_category;
         if (category != RuntimeCategory::Cell && category != RuntimeCategory::Synapse) continue;
 
-        register_parameter_row(instance, category == RuntimeCategory::Cell);
+        register_prototype(instance, category == RuntimeCategory::Cell);
     }
 
-    return_value.cell_type_count = static_cast<s64>(return_value.cell_type_indices.size());
-    return_value.synapse_type_count = static_cast<s64>(return_value.synapse_type_indices.size());
-
-    // cell_state_offsets: where each type's state begins in the engine's cell-state
-    // buffer, as the running sum of the preceding types' state sizes.
-    s32 running_state_offset = 0;
-    for (usize type_index = 0; type_index < return_value.cell_type_names.size(); type_index += 1) {
-        return_value.cell_state_offsets[return_value.cell_type_names[type_index]] =
-                running_state_offset;
-        running_state_offset += static_cast<s32>(return_value.cell_state_size[type_index]);
-    }
-
-    // ── Pass 2: graph ────────────────────────────────────────────────────────────
+    // ── Pass 2: populations and neurons ──────────────────────────────────────────
     // Walked from the target network through structured_instance_data, so populations are
     // numbered in the order the document declares them.
     const ComponentInstance *network = nullptr;
@@ -1307,8 +1294,6 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             break;
         }
     }
-
-    UnorderedMap<String, const PopulationLayout *> population_by_name;
 
     if (network) {
         auto temperature = network->instance_data.find("temperature");
@@ -1367,31 +1352,36 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                         "', which is not classified as a cell");
             }
 
-            // The population names an instance, so the parameter row is that instance's.
+            // The population names an instance, so the parameters are that instance's.
             // Registered on demand: a prototype declared inside the network rather than
             // at document scope has not been walked yet.
-            s64 parameter_row_index = register_parameter_row(cell_instance->second, true);
-            s64 cell_type_index = return_value.cell_type_indices.at(cell_type_name);
+            s64 prototype_index = register_prototype(cell_instance->second, true);
+            s64 cell_type_index = cell_type_indices.at(cell_type_name);
+            s64 population_index = static_cast<s64>(return_value.populations.size());
 
             PopulationLayout layout;
             layout.population_name = leaf_id(child.id);
             layout.instance_id = child.id;
             layout.component_instance_id = cell_instance->second.id;
-            layout.first_neuron_index = return_value.total_cell_count;
+            layout.first_neuron_index = static_cast<s64>(return_value.neurons.size());
             layout.neuron_count = size;
             layout.cell_type_index = cell_type_index;
-            layout.parameter_row_index = parameter_row_index;
+            layout.prototype_index = prototype_index;
 
-            return_value.population_layouts.push_back(std::move(layout));
-            return_value.total_cell_count += size;
+            return_value.populations.push_back(std::move(layout));
 
             for (s64 member = 0; member < size; member += 1) {
-                return_value.neuron_cell_type_indices.push_back(cell_type_index);
+                Neuron neuron;
+                neuron.cell_type_index = cell_type_index;
+                neuron.prototype_index = prototype_index;
+                neuron.population_index = population_index;
+                return_value.neurons.push_back(std::move(neuron));
             }
         }
     }
 
-    for (const PopulationLayout &layout : return_value.population_layouts) {
+    UnorderedMap<String, const PopulationLayout *> population_by_name;
+    for (const PopulationLayout &layout : return_value.populations) {
         population_by_name[layout.population_name] = &layout;
     }
 
@@ -1407,8 +1397,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         String cell_type_name;
         s64 cell_type_index = population->second->cell_type_index;
         if (cell_type_index >= 0 &&
-            cell_type_index < static_cast<s64>(return_value.cell_type_names.size())) {
-            cell_type_name = return_value.cell_type_names[static_cast<usize>(cell_type_index)];
+            cell_type_index < static_cast<s64>(return_value.cell_types.size())) {
+            cell_type_name = return_value.cell_types[static_cast<usize>(cell_type_index)].name;
         }
 
         ResolvedCellPath resolved = parse_cell_path(path, cell_type_name);
@@ -1418,11 +1408,7 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         return population->second->first_neuron_index + resolved.local_index;
     };
 
-    return_value.network_adjacency_list.assign(
-            static_cast<usize>(return_value.total_cell_count), Vector<s64>());
-    return_value.network_edges.assign(
-            static_cast<usize>(return_value.total_cell_count), Vector<NetworkEdge>());
-
+    // ── Pass 3: connections ──────────────────────────────────────────────────────
     static const Set<String> connection_tags = {
         "connection", "connectionWD",
         "synapticConnection", "synapticConnectionWD",
@@ -1438,10 +1424,10 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             if (projection.component_type_name != "projection") continue;
 
             // The projection names the synapse prototype every one of its edges uses.
-            // Resolves to a parameter row as well as a type, since two projections may
-            // share a synapse ComponentType with different parameter values.
+            // Resolves to a prototype as well as a type, since two projections may share
+            // a synapse ComponentType with different parameter values.
             auto resolve_synapse = [&](const String &reference, const String &owner_id,
-                                       s64 &type_index, s64 &row_index) {
+                                       s64 &type_index, s64 &prototype_index) {
                 auto synapse_instance = instance_table.find(reference);
                 if (synapse_instance == instance_table.end() ||
                     !synapse_instance->second.component_type) {
@@ -1457,17 +1443,17 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                             "', which is not classified as a synapse");
                 }
 
-                row_index = register_parameter_row(synapse_instance->second, false);
-                type_index = return_value.synapse_type_indices.at(
+                prototype_index = register_prototype(synapse_instance->second, false);
+                type_index = synapse_type_indices.at(
                         synapse_instance->second.component_type->name);
             };
 
             s64 projection_synapse_type = -1;
-            s64 projection_synapse_row = -1;
+            s64 projection_synapse_prototype = -1;
             String synapse_reference = projection.value_or("synapse");
             if (!synapse_reference.empty()) {
                 resolve_synapse(synapse_reference, projection.id,
-                                projection_synapse_type, projection_synapse_row);
+                                projection_synapse_type, projection_synapse_prototype);
             }
 
             for (const String &connection_id : projection.structured_instance_data) {
@@ -1500,13 +1486,13 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 NetworkEdge edge;
                 edge.target_neuron_index = post_neuron_index;
                 edge.synapse_type_index = projection_synapse_type;
-                edge.synapse_parameter_row_index = projection_synapse_row;
+                edge.synapse_prototype_index = projection_synapse_prototype;
 
                 // A synapticConnection names its own synapse, overriding the projection's.
                 String own_synapse = connection.value_or("synapse");
                 if (!own_synapse.empty()) {
                     resolve_synapse(own_synapse, connection.id,
-                                    edge.synapse_type_index, edge.synapse_parameter_row_index);
+                                    edge.synapse_type_index, edge.synapse_prototype_index);
                 }
 
                 if (connection.has_value("weight")) {
@@ -1518,21 +1504,18 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                             return_value.step_dt);
                 }
 
-                return_value.network_adjacency_list[static_cast<usize>(pre_neuron_index)]
-                        .push_back(post_neuron_index);
-                return_value.network_edges[static_cast<usize>(pre_neuron_index)]
-                        .push_back(edge);
+                return_value.neurons[static_cast<usize>(pre_neuron_index)]
+                        .outgoing_edges.push_back(edge);
             }
         }
     }
 
-    // ── Pass 3: inputs ───────────────────────────────────────────────────────────
+    // ── Pass 4: inputs ───────────────────────────────────────────────────────────
     // One profile per input component that is actually wired to a target. The wiring
     // lives on explicitInput / inputList; the amplitudes and rates live on the input
     // component the wiring names.
     auto build_input_profile =
-        [&](const String &input_component_id, const Vector<s64> &neuron_indices,
-            const Vector<f64> &weights) {
+        [&](const String &input_component_id, Vector<InputTarget> targets) {
             auto input_instance = instance_table.find(input_component_id);
             if (input_instance == instance_table.end()) {
                 throw runtime_error(
@@ -1542,17 +1525,10 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
 
             const ComponentInstance &input = input_instance->second;
 
-            SimulationInputConfig profile{};
-            profile.amplitude = 0.0;
-            profile.rate = 0.0;
-            profile.start_tick = 0;
-            profile.end_tick = 0;
-            profile.max_delay_time = 0;
+            SimulationInputConfig profile;
             profile.continuous_current_injection = input.has_value("amplitude");
             profile.input_component_id = input.id;
             profile.input_component_type_name = input.component_type_name;
-            profile.input_neuron_indices = neuron_indices;
-            profile.input_weights = weights;
 
             if (input.has_value("amplitude")) {
                 profile.amplitude = resolve_quantity(input.value_or("amplitude"));
@@ -1572,8 +1548,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                             resolve_quantity(input.value_or("duration")), return_value.step_dt);
                 }
 
-                // A spikeArray carries its train as <spike time="..."/> children. One
-                // tick list per target, since every target receives the same train.
+                // A spikeArray carries its train as <spike time="..."/> children. Every
+                // target receives the same train.
                 Vector<s32> spike_ticks;
                 for (const String &spike_id : input.structured_instance_data) {
                     auto spike = instance_table.find(spike_id);
@@ -1589,12 +1565,11 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
 
                 if (!spike_ticks.empty()) {
                     profile.max_delay_time = spike_ticks.back();
-                    for (usize target = 0; target < neuron_indices.size(); target += 1) {
-                        profile.simulation_input_events.push_back(spike_ticks);
-                    }
+                    for (InputTarget &target : targets) target.event_ticks = spike_ticks;
                 }
             }
 
+            profile.targets = std::move(targets);
             return_value.input_profiles.push_back(std::move(profile));
         };
 
@@ -1614,15 +1589,15 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                             "', which resolves to no neuron");
                 }
 
-                build_input_profile(child.value_or("input"), {neuron_index}, {1.0});
+                InputTarget target;
+                target.neuron_index = neuron_index;
+                build_input_profile(child.value_or("input"), {target});
                 continue;
             }
 
             if (child.component_type_name != "inputList") continue;
 
-            Vector<s64> neuron_indices;
-            Vector<f64> weights;
-
+            Vector<InputTarget> targets;
             for (const String &input_id : child.structured_instance_data) {
                 auto input_entry = instance_table.find(input_id);
                 if (input_entry == instance_table.end()) continue;
@@ -1641,19 +1616,21 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                             "' targets '" + target_path + "', which resolves to no neuron");
                 }
 
-                neuron_indices.push_back(neuron_index);
-                weights.push_back(input.has_value("weight")
-                        ? resolve_quantity(input.value_or("weight"))
-                        : 1.0);
+                InputTarget target;
+                target.neuron_index = neuron_index;
+                if (input.has_value("weight")) {
+                    target.weight = resolve_quantity(input.value_or("weight"));
+                }
+                targets.push_back(std::move(target));
             }
 
-            if (neuron_indices.empty()) continue;
+            if (targets.empty()) continue;
 
-            build_input_profile(child.value_or("component"), neuron_indices, weights);
+            build_input_profile(child.value_or("component"), std::move(targets));
         }
     }
 
-    // ── Pass 4: recordings ───────────────────────────────────────────────────────
+    // ── Pass 5: recordings ───────────────────────────────────────────────────────
     if (simulation) {
         for (const String &output_id : simulation->structured_instance_data) {
             auto output_entry = instance_table.find(output_id);
@@ -1704,9 +1681,9 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                         s64 cell_type_index = population->second->cell_type_index;
                         if (cell_type_index >= 0 &&
                             cell_type_index <
-                                    static_cast<s64>(return_value.cell_type_names.size())) {
-                            cell_type_name = return_value.cell_type_names[
-                                    static_cast<usize>(cell_type_index)];
+                                    static_cast<s64>(return_value.cell_types.size())) {
+                            cell_type_name = return_value.cell_types[
+                                    static_cast<usize>(cell_type_index)].name;
                         }
                     }
                     recorded.variable_name =
@@ -1722,6 +1699,21 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
     }
 
     return return_value;
+}
+
+Vector<Vector<s64>> build_adjacency_list(const NML_ParseResult &parse_result) {
+    Vector<Vector<s64>> adjacency(parse_result.neurons.size());
+
+    for (usize source = 0; source < parse_result.neurons.size(); source += 1) {
+        const Vector<NetworkEdge> &edges = parse_result.neurons[source].outgoing_edges;
+        adjacency[source].reserve(edges.size());
+
+        for (const NetworkEdge &edge : edges) {
+            adjacency[source].push_back(edge.target_neuron_index);
+        }
+    }
+
+    return adjacency;
 }
 
 
