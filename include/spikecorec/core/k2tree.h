@@ -85,8 +85,8 @@ namespace spikecorec {
         // factory: deserialize from file
         static K2Tree load(const char *path);
 
-        // single edge query: returns 1 if edge (u,v) exists, 0 otherwise
-        [[nodiscard]] s32 adjacent(s32 u, s32 v) const;
+        // single edge query: returns 1 if the edge source_node -> target_node exists, 0 otherwise
+        [[nodiscard]] s32 adjacent(s32 source_node, s32 target_node) const;
 
         // row enumeration: writes up to max_neighbor_count neighbor indices of `node_index`
         // into output_buffer (caller-allocated, at least max_neighbor_count elements), in
@@ -110,8 +110,9 @@ namespace spikecorec {
             s32 query_count
         ) const;
 
-        // debug: prints the full tree traversal path for (u,v) and returns the result
-        [[nodiscard]] s32 trace(s32 u, s32 v) const;
+        // debug: prints the full tree traversal path for the edge source_node -> target_node
+        // and returns the result
+        [[nodiscard]] s32 trace(s32 source_node, s32 target_node) const;
 
         // serialize to file
         void save(const char *path) const;

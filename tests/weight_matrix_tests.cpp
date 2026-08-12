@@ -324,9 +324,21 @@ TEST(WeightMatrix, rank_equals_node_count) {
     }
 }
 
+TEST(WeightMatrix, node_count_one_with_self_loop_throws) {
+    // A single-node graph whose only possible edge is a self-loop must be
+    // rejected, not silently accepted -- self-loops are not supported (see
+    // K2Tree's self-loop validation in build_tree_arrays, which every
+    // WeightMatrix construction funnels through). square_torus(1) no longer
+    // produces this network itself (it now omits the degenerate wraparound
+    // self-loop rather than reporting it -- see Topologies.square_torus_edge_cases),
+    // so this network is declared explicitly here to exercise the rejection.
+    vector<vector<s32>> network_with_self_loop = {{0}};
+    EXPECT_THROW({ WeightMatrix weight_matrix(network_with_self_loop); }, std::invalid_argument);
+}
+
 TEST(WeightMatrix, node_count_one_with_no_edges) {
-    // A single, edge-free node constructs normally: get() is a bounds-checked
-    // matrix lookup, not edge-gated (see
+    // A single, edge-free node (what square_torus(1) now produces) constructs
+    // normally: get() is a bounds-checked matrix lookup, not edge-gated (see
     // get_ignores_edge_existence_bounds_checked_only below), so it returns a
     // finite, deterministic value for (0,0) regardless of there being no edge.
     vector<vector<s32>> network(1); // one node, no outgoing edges
@@ -747,6 +759,33 @@ TEST(WeightMatrix, no_edges_at_all_graph) {
     // neighbor_weights() on a zero-sized output is documented to be a no-op, not a crash
     vector<f32> empty_output;
     weight_matrix.neighbor_weights(empty_output.data());
+}
+
+TEST(WeightMatrix, construction_rejects_self_loop_even_mixed_with_normal_edges) {
+    // Self-loops are never supported -- not silently accepted, not silently
+    // dropped -- even when the self-loop is just one edge among otherwise normal
+    // edges in a larger network (see K2Tree's self-loop validation in
+    // build_tree_arrays, which every WeightMatrix construction funnels through).
+    vector<vector<s32>> network_with_self_loop = {
+        {1, 2},
+        {1, 2}, // node 1: self-loop + normal edge
+        {0}
+    };
+    EXPECT_THROW({ WeightMatrix weight_matrix(network_with_self_loop, /*rank=*/4); }, std::invalid_argument);
+
+    // The same network with the self-loop removed constructs normally.
+    vector<vector<s32>> network_without_self_loop = {
+        {1, 2},
+        {2}, // node 1: self-loop removed, normal edge kept
+        {0}
+    };
+    WeightMatrix weight_matrix(network_without_self_loop, /*rank=*/4);
+    EXPECT_FALSE(weight_matrix.k2tree.adjacent(1, 1));
+    EXPECT_TRUE(weight_matrix.k2tree.adjacent(1, 2));
+    vector<s32> buffer(2);
+    s64 degree = weight_matrix.get_neighbors(1, buffer.data());
+    unordered_set<s32> neighbors(buffer.begin(), buffer.begin() + degree);
+    EXPECT_EQ(neighbors, (unordered_set<s32>{2}));
 }
 
 TEST(WeightMatrix, get_ignores_edge_existence_bounds_checked_only) {

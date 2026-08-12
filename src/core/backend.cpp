@@ -376,7 +376,26 @@ void metal_dispatch(
     u32 arg_count,
     MetalCommandBatch *batch
 ) {
-#ifdef SPIKECOREC_METAL
+#ifndef SPIKECOREC_METAL
+    // There is no generic positional-argument launcher on CUDA yet: the CUDA backend only
+    // launches its own fixed, precompiled kernels. Returning here instead would be far worse
+    // than not compiling -- every other signal says the path works (kernel_codegen emits valid
+    // CUDA and compile_kernel really does NVRTC-compile it), so step_simulation would add its
+    // stimulus, clear the spike flags, record a frame of unchanged state and report success
+    // while running no dynamics at all. The generic launcher is ticket #56 (C4), cuda_dispatch.
+    (void)handle;
+    (void)args;
+    (void)arg_sizes;
+    (void)batch;
+    log::logger().critical("metal_dispatch: no generic kernel launcher on this backend "
+                           "(grid_size={} block_size={} arg_count={})",
+                           config.grid_size, config.block_size, arg_count);
+    throw runtime_error(
+            "spikecorec: dispatching a generated kernel needs a generic positional-argument "
+            "launcher, which only the Metal backend provides. The CUDA equivalent, "
+            "cuda_dispatch(CUfunction, grid, block, void **params), is ticket #56 (C4) and is "
+            "not implemented, so no simulation can run on this backend.");
+#else
     log::logger().trace("metal dispatch: grid_size={} block_size={} arg_count={} batched={}",
                         config.grid_size, config.block_size, arg_count, batch != nullptr);
 

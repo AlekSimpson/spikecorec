@@ -34,6 +34,21 @@ struct KernelArgumentBinding {
     usize byte_size = 0;
 };
 
+// Releases a compiled kernel however its scope is left. The one-shot initialize kernel is
+// compiled, dispatched and released inside the constructor, and dispatch_master_kernel
+// throws when the generated kernel names an argument the engine does not supply -- a bare
+// release_kernel call after the dispatch is skipped on exactly that path and leaks the
+// pipeline state.
+struct KernelHandleGuard {
+    KernelHandle handle;
+
+    explicit KernelHandleGuard(KernelHandle compiled_kernel) : handle(compiled_kernel) {}
+    ~KernelHandleGuard() { release_kernel(handle); }
+
+    KernelHandleGuard(const KernelHandleGuard &) = delete;
+    KernelHandleGuard &operator=(const KernelHandleGuard &) = delete;
+};
+
 // What one sub-range of `byte_count` bytes actually costs in the arena. EngineAllocator
 // starts every sub-range on a 16-byte boundary, so rounding each request up to that
 // boundary and summing gives the exact pool size: the cursor then lands aligned after
@@ -322,6 +337,24 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
             for (s64 slot = 0; slot < degree; ++slot) {
                 const s32 delay_tick_count = weights.get_edge_delay_ticks(
                         (s32)source_node, neighbor_indices[(usize)slot]);
+
+                // The whole delay-ring scheme rests on this: with every delay at least one
+                // tick, nothing writes row `tick % ring_depth` while that tick's kernel is
+                // running, which is what lets a cell read its slot with a plain load and lets
+                // the row be zeroed as a whole row once the dispatch has finished. A zero
+                // delay would have a spike land in the row being read and cleared around it.
+                // get_edge_delay_ticks already floors at 1 and constant_delay_ticks defaults
+                // to 1, so this is a guard against a future change, not a live case.
+                if (delay_tick_count < 1) {
+                    log::throw_runtime_error(
+                            *logger,
+                            fmt::format("SpikeEngine: edge {} -> {} has a delay of {} ticks; the "
+                                        "network_inputs ring requires every delay to be at least "
+                                        "one tick",
+                                        source_node, neighbor_indices[(usize)slot],
+                                        delay_tick_count));
+                }
+
                 staged_edge_delay_ticks[(usize)(source_node * weights.max_neighbor_count + slot)] =
                         delay_tick_count;
                 maximum_edge_delay_ticks = std::max(maximum_edge_delay_ticks, delay_tick_count);
@@ -330,7 +363,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     }
 
     // Strictly greater than the largest delay, so an arrival scheduled this tick never lands
-    // in the row being drained this tick. Two rows minimum: delay is always at least one
+    // in the row being read this tick. Two rows minimum: delay is always at least one
     // tick, so a single-row ring could not represent even the shortest edge.
     network_input_ring_depth = std::max(maximum_edge_delay_ticks + 1, 2);
     const s64 network_input_element_count =
@@ -442,10 +475,16 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     // The OnStart bodies, run once. Compiled, dispatched and released here: nothing after
     // initialisation ever runs them again.
     const GeneratedKernel initialize_kernel_source = generate_initialize_kernel(network_details);
-    KernelHandle initialize_kernel = compile_kernel(initialize_kernel_source.source.c_str(),
-                                                    initialize_kernel_source.function_name.c_str());
-    dispatch_master_kernel(initialize_kernel, initialize_kernel_source.argument_names, /*tick=*/0);
-    release_kernel(initialize_kernel);
+    {
+        // Guarded rather than released on the line after the dispatch: dispatch_master_kernel
+        // throws when the generated kernel asks for an argument the engine does not provide,
+        // and the pipeline state has to be released on that path too.
+        KernelHandleGuard initialize_kernel(
+                compile_kernel(initialize_kernel_source.source.c_str(),
+                               initialize_kernel_source.function_name.c_str()));
+        dispatch_master_kernel(initialize_kernel.handle,
+                               initialize_kernel_source.argument_names, /*tick=*/0);
+    }
 
     // ── 7. input event streams ───────────────────────────────────────────────
     for (const SimulationInputConfig &input_profile : network_details.input_profiles) {
@@ -473,15 +512,26 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     }
 
     // ── 9. the per-tick master kernel ────────────────────────────────────────
+    auto compile_and_own = [](const GeneratedKernel &generated) {
+        return SharedPointer<KernelHandle>(
+                new KernelHandle(compile_kernel(generated.source.c_str(),
+                                                generated.function_name.c_str())),
+                [](KernelHandle *compiled_kernel) {
+                    release_kernel(*compiled_kernel);
+                    delete compiled_kernel;
+                });
+    };
+
     const GeneratedKernel tick_kernel_source = generate_tick_kernel(network_details);
     tick_kernel_argument_names = tick_kernel_source.argument_names;
-    tick_kernel = SharedPointer<KernelHandle>(
-            new KernelHandle(compile_kernel(tick_kernel_source.source.c_str(),
-                                            tick_kernel_source.function_name.c_str())),
-            [](KernelHandle *compiled_kernel) {
-                release_kernel(*compiled_kernel);
-                delete compiled_kernel;
-            });
+    tick_kernel = compile_and_own(tick_kernel_source);
+
+    // The end-of-tick ring clear, dispatched behind the master kernel every tick. Model
+    // independent -- it zeroes one row of network_inputs and reads none of the dynamics --
+    // so it is generated from nothing but the backend.
+    const GeneratedKernel ring_row_clear_kernel_source = generate_ring_row_clear_kernel();
+    ring_row_clear_kernel_argument_names = ring_row_clear_kernel_source.argument_names;
+    ring_row_clear_kernel = compile_and_own(ring_row_clear_kernel_source);
 
     // ── 10. recorders ────────────────────────────────────────────────────────
     recording_profiles = network_details.recording_profiles;
@@ -536,6 +586,21 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
                 }
             }
 
+            // A ComponentType with no <StateVariable> makes cell_state a zero-element
+            // buffer, which the arena answers with a null handle. A stream gathering from it
+            // would dereference that null once per tick, in the recorder rather than
+            // anywhere near the model that caused it, so it is refused here with the reason
+            // named. A spike-event stream reads spike_flags instead and is unaffected.
+            if (!gathers_spike_flags && !gathered_indices.empty() &&
+                cell_state_element_count == 0) {
+                log::throw_runtime_error(
+                        *logger,
+                        fmt::format("SpikeEngine: recording profile writes '{}' from cell "
+                                    "state, but no cell type in this model declares a "
+                                    "StateVariable, so there is no cell state to record",
+                                    recording_profile.output_filenames[output_index]));
+            }
+
             RecordingStream stream;
             stream.gathers_spike_flags = gathers_spike_flags;
             stream.frame_values.assign(gathered_indices.size(), 0.0f);
@@ -567,7 +632,8 @@ SpikeEngine::~SpikeEngine() {
 void SpikeEngine::dispatch_master_kernel(
     const KernelHandle &kernel,
     const Vector<String> &argument_names,
-    s64 tick
+    s64 tick,
+    MetalCommandBatch *batch
 ) {
     // Every binding below points at one of these locals, so they all have to outlive the
     // metal_dispatch call at the bottom of this function.
@@ -678,13 +744,13 @@ void SpikeEngine::dispatch_master_kernel(
 
     metal_dispatch(kernel, LaunchConfig{(u32)block_count, (u32)thread_count_per_block},
                    argument_storage.data(), argument_byte_sizes.data(),
-                   (u32)argument_storage.size());
+                   (u32)argument_storage.size(), batch);
 }
 
 // ── per-tick loop ─────────────────────────────────────────────────────────────
 
 void SpikeEngine::step_simulation(s64 tick) {
-    if (!alive || !tick_kernel) {
+    if (!alive || !tick_kernel || !ring_row_clear_kernel) {
         log::throw_runtime_error(
                 *logger, fmt::format("step_simulation: engine is not running (tick={})", tick));
     }
@@ -696,7 +762,7 @@ void SpikeEngine::step_simulation(s64 tick) {
     // `tick`. A stream shorter than the simulation has already finished.
     //
     // External stimulus carries no synaptic delay, so it goes straight into the row the
-    // kernel is about to drain -- this tick's.
+    // kernel is about to read -- this tick's.
     f32 *network_input_values = buffer_contents_or_null(network_inputs);
     const s64 current_ring_row_base =
             (tick % (s64)network_input_ring_depth) * total_neuron_count;
@@ -707,18 +773,23 @@ void SpikeEngine::step_simulation(s64 tick) {
                 (f32)input_stream.values[(usize)tick];
     }
 
-    // Stage 4, Emit, is a per-tick flag: the generated kernel raises it and nothing lowers
-    // it, so it is cleared here or a neuron reads as spiking forever after it fires once.
-    zero_fill_engine_buffer(spike_flags, total_neuron_count);
-
-    // Stages 2 through 5 -- Integrate, Detect, Emit, Reset -- are the generated dynamics.
-    dispatch_master_kernel(*tick_kernel, tick_kernel_argument_names, tick);
-
-    // Stage 6, Propagate, is emitted into every generated cell device function as identical
-    // boilerplate, so it already ran inside the kernel above and must NOT be dispatched
-    // here. network_inputs is likewise never cleared here: each cell clears its own slot of
-    // the ring row it drains, and clearing engine-side would erase arrivals that
-    // propagation has already scheduled for later ticks.
+    // Stages 2 through 5 -- Integrate, Detect, Emit, Reset -- are the generated dynamics, and
+    // stage 6, Propagate, is emitted into every generated cell device function as identical
+    // boilerplate, so it runs inside the same kernel and must NOT be dispatched separately.
+    // The generated kernel also lowers each neuron's spike flag itself, at the top of the
+    // master kernel, so no host write lands between two launches.
+    //
+    // Behind it, in the same command batch, the ring clear zeroes row tick % ring_depth of
+    // network_inputs: the row this tick's cells just read, and only that row. Batched rather
+    // than dispatched separately because two encodes in one Metal command buffer execute in
+    // order, and the whole point is that the clear happens after every cell has read the row
+    // and after propagation has finished scheduling into the OTHER rows, which it must not
+    // touch -- those hold arrivals not yet due.
+    MetalCommandBatch *tick_batch = begin_command_batch();
+    dispatch_master_kernel(*tick_kernel, tick_kernel_argument_names, tick, tick_batch);
+    dispatch_master_kernel(*ring_row_clear_kernel, ring_row_clear_kernel_argument_names, tick,
+                           tick_batch);
+    commit_command_batch(tick_batch);
 
     // Stage 8, Record.
     record_tick_frames();
@@ -727,10 +798,27 @@ void SpikeEngine::step_simulation(s64 tick) {
 void SpikeEngine::record_tick_frames() {
     if (recording_streams.empty()) return;
 
+    // Asked for rather than read: a zero-element buffer is a null handle, which get_contents()
+    // would dereference.
     const f32 *cell_state_values = buffer_contents_or_null(cell_state);
     const s32 *spike_flag_values = buffer_contents_or_null(spike_flags);
 
     for (RecordingStream &stream : recording_streams) {
+        if (stream.gathered_indices.empty()) continue;
+
+        // The constructor refuses to build a stream over a buffer this model does not have,
+        // so this reports the two having drifted apart rather than gathering from a null.
+        const bool source_buffer_exists = stream.gathers_spike_flags
+                                                  ? spike_flag_values != nullptr
+                                                  : cell_state_values != nullptr;
+        if (!source_buffer_exists) {
+            log::throw_runtime_error(
+                    *logger,
+                    fmt::format("record_tick_frames: a stream gathers {} values, which this "
+                                "model allocated no buffer for",
+                                stream.gathers_spike_flags ? "spike flag" : "cell state"));
+        }
+
         for (usize slot = 0; slot < stream.gathered_indices.size(); ++slot) {
             const usize gathered_index = (usize)stream.gathered_indices[slot];
             stream.frame_values[slot] = stream.gathers_spike_flags
@@ -746,7 +834,7 @@ void SpikeEngine::record_tick_frames() {
 void SpikeEngine::shutdown() {
     if (!alive) return;
 
-    logger->info("shutdown: closing recorders and releasing the compiled kernel");
+    logger->info("shutdown: closing recorders and releasing the compiled kernels");
 
     for (RecordingStream &stream : recording_streams) {
         if (stream.recorder) stream.recorder->finish();
@@ -754,6 +842,7 @@ void SpikeEngine::shutdown() {
 
     // Runs the deleter installed at compile time, which releases the pipeline state.
     tick_kernel.reset();
+    ring_row_clear_kernel.reset();
 
     // Nothing else is released here on purpose. Every engine buffer is an EngineAllocator
     // sub-range that aliases the arena's slab and owns nothing; passing one to deallocate()

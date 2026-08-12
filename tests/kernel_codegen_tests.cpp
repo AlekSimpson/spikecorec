@@ -159,6 +159,41 @@ NML_ParseResult make_two_cell_type_model() {
     return parse_result;
 }
 
+// A cell whose threshold is a DerivedVariable OF the state variable being integrated, and
+// whose one handler swaps its two state variables. Both halves of the threshold comparison
+// therefore move within a tick, and the handler's two assignments read what the other writes
+// -- which is what separates a per-statement lowering from LEMS's own semantics.
+CellTypeSpecification make_derived_threshold_cell_type() {
+    CellTypeSpecification cell_type;
+    cell_type.name = "derivedThresholdCell";
+    cell_type.state_variable_names = {"v", "u"};
+    cell_type.parameter_names = {"tau", "thresholdScale"};
+
+    const String threshold_test = "v .gt. scaledThreshold";
+
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "scaledThreshold",
+            "thresholdScale * v"));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "0 - v / tau"));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Detect, NML_DeclarationType::OnCondition, "", threshold_test));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Reset, NML_DeclarationType::StateAssignment, "v", "u", threshold_test));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Reset, NML_DeclarationType::StateAssignment, "u", "v", threshold_test));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Emit, NML_DeclarationType::EventOut, "spike", "", threshold_test));
+
+    return cell_type;
+}
+
+NML_ParseResult make_derived_threshold_model() {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_derived_threshold_cell_type());
+    return parse_result;
+}
+
 // ── Metal compilation ────────────────────────────────────────────────────────
 // Guarded on the Metal build rather than on the host OS: shelling out to xcrun from a CUDA
 // build is exactly the defect tracked as issue #117.
@@ -566,6 +601,148 @@ TEST(KernelCodegenKernel, ConditionGatesItsResetsAndEmit) {
     EXPECT_LT(last_spiked_position, block_end_position);
 }
 
+TEST(KernelCodegenKernel, DerivedVariablesAreReevaluatedBeforeDetectReadsThem) {
+    // Detect and Reset read the state this tick's Integrate just produced. A DerivedVariable
+    // they name has to be re-evaluated against that same state, or one half of the comparison
+    // is post-integrate (the cell_state read inside the test) and the other is a local
+    // computed a whole dt earlier -- which is exactly wrong the moment a threshold is itself
+    // derived from the variable being integrated, as it is here.
+    const String source = generate_tick_kernel(make_derived_threshold_model()).source;
+
+    const String declaration = "float derived_scaledThreshold = ";
+    const String write_back = "cell_state[state_base + 0] = next_v;";
+    const String reevaluation = "\n    derived_scaledThreshold = ";
+    const String threshold_test = "if ((cell_state[state_base + 0] > derived_scaledThreshold))";
+
+    const usize declaration_position = source.find(declaration);
+    const usize write_back_position = source.find(write_back);
+    const usize reevaluation_position = source.find(reevaluation);
+    const usize test_position = source.find(threshold_test);
+
+    ASSERT_NE(declaration_position, String::npos);
+    ASSERT_NE(write_back_position, String::npos);
+    ASSERT_NE(reevaluation_position, String::npos) << "the derived threshold is never "
+                                                      "recomputed after the integrate step";
+    ASSERT_NE(test_position, String::npos);
+
+    // Declared before the Euler step (the TimeDerivative reads it), re-evaluated after the
+    // write-back, and only then compared against.
+    EXPECT_LT(declaration_position, write_back_position);
+    EXPECT_LT(write_back_position, reevaluation_position);
+    EXPECT_LT(reevaluation_position, test_position);
+
+    // The re-evaluation is an assignment to the existing local, not a second declaration:
+    // every expression written against the derived variable keeps reading the one name.
+    EXPECT_EQ(source.find(declaration, declaration_position + 1), String::npos);
+}
+
+TEST(KernelCodegenKernel, DerivedVariablesAreNotReevaluatedWhenNothingIntegrates) {
+    // A type with no TimeDerivative writes no state between the declaration and the
+    // conditionals, so there is nothing for a re-evaluation to see. Emitting one anyway would
+    // be dead code in every generated kernel for a type shaped like this.
+    CellTypeSpecification cell_type = make_derived_threshold_cell_type();
+    cell_type.dynamics.erase(cell_type.dynamics.begin() + 1); // the one TimeDerivative
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("float derived_scaledThreshold = "), String::npos);
+    EXPECT_EQ(source.find("\n    derived_scaledThreshold = "), String::npos);
+}
+
+TEST(KernelCodegenKernel, StateAssignmentsInOneHandlerAreSimultaneous) {
+    // LEMS evaluates a handler's assignments against the state as it stood when the handler
+    // fired. Lowered one statement at a time, "v = u; u = v" assigns u to itself instead of
+    // swapping -- and it is the document's ordering, not the model's, that decides.
+    const String source = generate_tick_kernel(make_derived_threshold_model()).source;
+
+    const usize first_temporary = source.find("float assigned_v = cell_state[state_base + 1];");
+    const usize second_temporary = source.find("float assigned_u = cell_state[state_base + 0];");
+    const usize first_write = source.find("cell_state[state_base + 0] = assigned_v;");
+    const usize second_write = source.find("cell_state[state_base + 1] = assigned_u;");
+
+    ASSERT_NE(first_temporary, String::npos);
+    ASSERT_NE(second_temporary, String::npos);
+    ASSERT_NE(first_write, String::npos);
+    ASSERT_NE(second_write, String::npos);
+
+    // Both right-hand sides are read before either is written back.
+    EXPECT_LT(second_temporary, first_write);
+    EXPECT_LT(first_temporary, second_write);
+}
+
+TEST(KernelCodegenKernel, ALoneStateAssignmentSkipsTheTemporary) {
+    // A single assignment cannot observe its own write, so it goes straight to storage --
+    // which is every handler in GLIF, and the initialize kernel's OnStart bodies. Scoped to
+    // iafCell, whose OnCondition assigns once; izhikevichCell assigns twice in the same model
+    // and does get the temporaries.
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+
+    const usize iaf_position = source.find("inline void cell_type_step_iafCell(");
+    const usize izhikevich_position = source.find("inline void cell_type_step_izhikevichCell(");
+    ASSERT_NE(iaf_position, String::npos);
+    ASSERT_NE(izhikevich_position, String::npos);
+    const String iaf_body = source.substr(iaf_position, izhikevich_position - iaf_position);
+
+    EXPECT_NE(iaf_body.find("cell_state[state_base + 0] = cell_parameters[parameter_base + 4];"),
+              String::npos);
+    EXPECT_EQ(iaf_body.find("float assigned_"), String::npos);
+
+    // The initialize kernel's one-assignment OnStart bodies are direct too.
+    const String initialize_source =
+            generate_initialize_kernel(make_two_cell_type_model()).source;
+    EXPECT_NE(initialize_source.find(
+                      "cell_state[state_base + 0] = cell_parameters[parameter_base + 1];"),
+              String::npos);
+    EXPECT_EQ(initialize_source.find("float assigned_"), String::npos);
+}
+
+TEST(KernelCodegenKernel, UngatedResetAndEmitFollowTheDetectBlocks) {
+    // Stage order is Detect, then Emit, then Reset. An ungated reset emitted ahead of the
+    // Detect blocks would be overwritten by whatever this tick's conditions wrote, instead of
+    // overriding it. Well-formed LEMS never produces one, but if it ever does it must run in
+    // the documented order rather than in whichever order is convenient to emit.
+    CellTypeSpecification cell_type = make_integrate_and_fire_cell_type();
+    cell_type.dynamics.push_back(make_instruction(DynamicsStage::Reset,
+                                                  NML_DeclarationType::StateAssignment, "v",
+                                                  "leakReversal"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    const String source = generate_tick_kernel(parse_result).source;
+
+    const usize detect_position =
+            source.find("if ((cell_state[state_base + 0] > cell_parameters[parameter_base + 3]))");
+    const usize ungated_reset_position =
+            source.find("\n    cell_state[state_base + 0] = cell_parameters[parameter_base + 1];");
+
+    ASSERT_NE(detect_position, String::npos);
+    ASSERT_NE(ungated_reset_position, String::npos);
+    EXPECT_LT(detect_position, ungated_reset_position);
+}
+
+TEST(KernelCodegenKernel, TheTickKernelLowersEachNeuronsSpikeFlagItself) {
+    // The flag is raised by the dynamics and nothing else lowers it, so the kernel clears it
+    // for the neuron the thread owns. Clearing it from the host between two launches instead
+    // needs an explicit synchronisation on CUDA managed memory with concurrentManagedAccess
+    // == 0, and clearing it after the dispatch would destroy the tick's own output.
+    const NML_ParseResult parse_result = make_two_cell_type_model();
+    const String source = generate_tick_kernel(parse_result).source;
+
+    const usize clear_position = source.find("spike_flags[neuron_index] = 0;");
+    const usize switch_position = source.find("switch (cell_type_index[neuron_index])");
+    ASSERT_NE(clear_position, String::npos);
+    ASSERT_NE(switch_position, String::npos);
+    EXPECT_LT(clear_position, switch_position) << "the flag is lowered after the dynamics that "
+                                                  "raise it";
+
+    // The initialize kernel raises no flags, so it lowers none either.
+    EXPECT_EQ(generate_initialize_kernel(parse_result).source.find("spike_flags[neuron_index] = 0;"),
+              String::npos);
+}
+
 TEST(KernelCodegenKernel, InitializeKernelCarriesOnStartOnly) {
     const NML_ParseResult parse_result = make_two_cell_type_model();
     const String source = generate_initialize_kernel(parse_result).source;
@@ -604,14 +781,21 @@ TEST(KernelCodegenSelectPath, SelectionOverSynapsesReadsTheInputAccumulator) {
 
     const String source = generate_tick_kernel(parse_result).source;
 
-    // The path binds to the one drained local, and the drain reads this tick's ring row and
-    // empties it in a single atomic exchange.
+    // The path binds to the one local the ring row is loaded into, and that load is PLAIN:
+    // nothing writes this tick's row while this tick's kernel runs, and the row is emptied
+    // afterwards by the engine's clear kernel rather than by the reader.
     EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
     EXPECT_NE(source.find("int synaptic_input_index = network_input_ring_index(\n"
                           "            tick, ring_depth, neuron_count, neuron_index);"),
               String::npos);
-    EXPECT_NE(source.find("float synaptic_input_accumulator = atomic_exchange_explicit("),
+    EXPECT_NE(source.find("float synaptic_input_accumulator = "
+                          "network_inputs[synaptic_input_index];"),
               String::npos);
+
+    // No read-and-clear anywhere: a reader that emptied its own slot is exactly what left the
+    // slots of every non-reading cell type accumulating for the whole run.
+    EXPECT_EQ(source.find("atomic_exchange_explicit"), String::npos);
+    EXPECT_EQ(source.find("atomicExch"), String::npos);
 }
 
 TEST(KernelCodegenSelectPath, SelectedMemberNameDoesNotChangeTheBinding) {
@@ -625,9 +809,9 @@ TEST(KernelCodegenSelectPath, SelectedMemberNameDoesNotChangeTheBinding) {
     EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
 }
 
-TEST(KernelCodegenSelectPath, TwoSelectionsShareOneDrainOfTheRingRow) {
-    // A second reduction over the synapses must not drain the slot again: the first read
-    // already emptied it, so a second exchange would hand the model a zero.
+TEST(KernelCodegenSelectPath, TwoSelectionsShareOneLoadOfTheRingRow) {
+    // Two reductions over the synapses read one consistent value, from a single load, rather
+    // than loading the slot once per selection.
     CellTypeSpecification cell_type = make_synaptic_input_cell_type("synapses[*]/i");
     cell_type.dynamics.insert(
             cell_type.dynamics.begin() + 1,
@@ -640,14 +824,17 @@ TEST(KernelCodegenSelectPath, TwoSelectionsShareOneDrainOfTheRingRow) {
     const String source = generate_tick_kernel(parse_result).source;
     EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
     EXPECT_NE(source.find("float derived_iSynAgain = synaptic_input_accumulator;"), String::npos);
-    EXPECT_EQ(source.find("atomic_exchange_explicit",
-                          source.find("atomic_exchange_explicit") + 1),
-              String::npos);
+
+    const String load = "float synaptic_input_accumulator = ";
+    const usize first_load = source.find(load);
+    ASSERT_NE(first_load, String::npos);
+    EXPECT_EQ(source.find(load, first_load + 1), String::npos);
 }
 
-TEST(KernelCodegenSelectPath, ACellWithNoSynapticSelectionDrainsNothing) {
-    // A type that never reduces over its synapses must leave the ring row alone; clearing a
-    // row nothing reads would silently discard another type's arrivals.
+TEST(KernelCodegenSelectPath, ACellWithNoSynapticSelectionReadsNoRingRow) {
+    // A type that never reduces over its synapses reads nothing from the ring. Its neurons'
+    // slots are still emptied every tick -- the engine clears the whole row behind the tick
+    // kernel -- so nothing accumulates there either.
     const String source = generate_tick_kernel(make_two_cell_type_model()).source;
     EXPECT_EQ(source.find("synaptic_input_accumulator"), String::npos);
 }
@@ -780,6 +967,42 @@ TEST(KernelCodegenPropagation, InitializeKernelNeitherPropagatesNorDrains) {
     // It still declares the identical argument list, so the engine binds one set for both.
     EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(28) ]]"), String::npos);
 }
+
+// ── the end-of-tick ring row clear ───────────────────────────────────────────
+
+TEST(KernelCodegenRingClear, ClearsExactlyThisTicksRowAndNothingElse) {
+    const GeneratedKernel clear_kernel = generate_ring_row_clear_kernel();
+
+    EXPECT_EQ(clear_kernel.function_name, "clear_network_input_ring_row");
+    EXPECT_EQ(clear_kernel.argument_names,
+              (Vector<String>{"network_inputs", "neuron_count", "tick", "ring_depth"}));
+
+    // One row -- this tick's -- and within it only the slot belonging to the thread's neuron.
+    // Clearing more would discard arrivals already scheduled into later rows, which is the
+    // one thing the ring exists to hold.
+    EXPECT_NE(clear_kernel.source.find("int ring_row = (int)(tick % (long)ring_depth);"),
+              String::npos);
+    EXPECT_NE(clear_kernel.source.find(
+                      "network_inputs[ring_row * neuron_count + neuron_index] = 0.0f;"),
+              String::npos);
+    EXPECT_EQ(clear_kernel.source.find("for ("), String::npos);
+
+    // Bounds-checked like every other entry point, and it touches nothing but the ring.
+    EXPECT_NE(clear_kernel.source.find("if (neuron_index >= neuron_count) return;"), String::npos);
+    EXPECT_EQ(clear_kernel.source.find("cell_state"), String::npos);
+    EXPECT_EQ(clear_kernel.source.find("spike_flags"), String::npos);
+}
+
+#ifdef SPIKECOREC_METAL
+TEST(KernelCodegenRingClear, GeneratedRingClearKernelCompilesAsMetal) {
+    if (!metal_compiler_is_available()) GTEST_SKIP() << "the Metal shader compiler is unavailable";
+
+    String compiler_output;
+    ASSERT_TRUE(compile_as_metal(generate_ring_row_clear_kernel().source, "ring_row_clear",
+                                 compiler_output))
+            << compiler_output;
+}
+#endif
 
 // ── Unsupported constructs ───────────────────────────────────────────────────
 

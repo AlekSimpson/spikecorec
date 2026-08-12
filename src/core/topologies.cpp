@@ -38,10 +38,19 @@ namespace spikecorec {
             s64 left  = row * side_length + ((column - 1) + side_length) % side_length;
             s64 down  = ((row + 1) % side_length) * side_length + column;
             s64 up    = (((row - 1) + side_length) % side_length) * side_length + column;
-            result[static_cast<usize>(i)] = {
-                static_cast<s32>(right), static_cast<s32>(left),
-                static_cast<s32>(down), static_cast<s32>(up)
-            };
+
+            // side_length==1 wraps every direction back onto the single cell itself
+            // (right==left==down==up==i); that's not a genuine edge -- self-loops
+            // are not supported -- so it's omitted rather than reported as a
+            // neighbor. For side_length>=2 none of these ever equal i, so this
+            // filtering is a no-op there.
+            vector<s32> neighbors;
+            for (s64 candidate : {right, left, down, up}) {
+                if (candidate != i) {
+                    neighbors.push_back(static_cast<s32>(candidate));
+                }
+            }
+            result[static_cast<usize>(i)] = std::move(neighbors);
         }
         logger().debug("square_torus: cell_count={}", cell_count);
         return result;

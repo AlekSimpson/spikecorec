@@ -26,6 +26,10 @@ All signatures below reflect the actual pybind11 bindings
 4-neighbor wraparound `k * k` grid. Every node has exactly 4 outgoing
 neighbors (right, left, down, up). Deterministic — no seed.
 
+`k == 1` is the one exception: all four directions wrap back onto the single
+node, and self-loops are not supported, so that node is returned with no
+neighbors at all rather than with four self-loops.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `k` | `int` | required | Grid side length; produces `k * k` nodes indexed `0 .. k*k - 1` |
