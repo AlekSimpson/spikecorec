@@ -254,18 +254,33 @@ test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
 	$(BUILD_DIR)/test_runner_metal
 
 # ── Examples ─────────────────────────────────────────────────
+# One binary per examples/*.cpp, into build/examples/. Programs under
+# examples/unsupported/ are deliberately NOT picked up by EX_SRCS' wildcard — each
+# needs an engine capability that does not exist yet, and each says which in its own
+# header comment. See examples/README.md.
+EX_BINS := $(patsubst $(EX_DIR)/%.cpp, $(BUILD_DIR)/examples/%, $(EX_SRCS))
+EX_HDRS := $(wildcard $(EX_DIR)/*.h)
+
 examples: examples-$(BACKEND)
+	@echo "[spikecorec] examples built → $(BUILD_DIR)/examples/"
 
-examples-cuda: check-cuda $(CUDA_LIB)
-	$(NVCC) $(NVCCFLAGS) $(EX_DIR)/cuda_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda \
-	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/cuda_example
+examples-cuda: check-cuda $(CUDA_LIB) $(EX_BINS)
 
-examples-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) $(EX_DIR)/metal_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/metal_example
+examples-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(EX_BINS)
+
+ifeq ($(BACKEND),cuda)
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) | $(CUDA_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) \
+	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
+else
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) | $(METAL_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
+	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
+endif
 
 # ── Utilities ────────────────────────────────────────────────
 info:
