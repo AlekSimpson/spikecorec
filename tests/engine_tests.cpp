@@ -9,6 +9,7 @@
 #include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -71,10 +72,10 @@ bool standard_library_available() {
 // Two cell types, deliberately of different widths, so the type-sectioned cell_state /
 // cell_parameters layout is observable rather than degenerate.
 //
-// The ComponentTypes are declared inline: the vendored standard library has no GLIF type,
-// and every standard-library cell that would otherwise fit (iafCell and friends) reduces
-// its synaptic input through a `select="synapses[*]/i"` path, which the kernel generator
-// does not yet lower.
+// The ComponentTypes are declared inline because the vendored standard library has no GLIF
+// type. Neither of these reduces over its synapses, which is deliberate: this fixture is
+// about the type-sectioned layout, and the synaptic path has fixtures of its own below
+// (synaptic_input_lems_xml).
 String two_cell_type_lems_xml(const String &network_file, const String &recording_file) {
     return R"(<Lems>
     <Target component="sim1"/>
@@ -167,6 +168,145 @@ String write_two_cell_type_model(const FixtureDirectory &fixture) {
     return fixture.write("model.xml",
                          two_cell_type_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
+
+// ── synaptic input fixtures ────────────────────────────────────────────────────
+//
+// Two cell types built to make the synaptic path observable tick by tick:
+//
+//  - oneShotCell fires exactly once, at the first tick past its fireTime, so the tick a
+//    spike is propagated on is a fact of the model rather than something the test has to
+//    infer from an integrator crossing a threshold.
+//  - latchCell reduces over its synapses and, on any tick that reduction is non-zero,
+//    records the delivered value and counts the delivery. That makes both "how much arrived"
+//    and "on how many ticks did anything arrive" plain reads of cell_state.
+String synaptic_input_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="oneShotCell" extends="baseSpikingCell"
+                   description="Emits exactly one spike, on the first tick past fireTime.">
+        <Parameter name="fireTime" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="hasFired" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="hasFired" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. fireTime .and. hasFired .lt. 0.5">
+                <StateAssignment variable="hasFired" value="1"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="latchCell" extends="baseCell"
+                   description="Drains its synaptic input, keeping the last delivered value
+                                and the number of ticks anything was delivered on.">
+        <Dynamics>
+            <StateVariable name="delivered" dimension="none"/>
+            <StateVariable name="deliveryCount" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="delivered" value="0"/>
+                <StateAssignment variable="deliveryCount" value="0"/>
+            </OnStart>
+
+            <OnCondition test="iSyn .neq. 0">
+                <StateAssignment variable="delivered" value="iSyn"/>
+                <StateAssignment variable="deliveryCount" value="deliveryCount + 1"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="2ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popTarget[0]/delivered"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+// One source, one target, and `connection_count` parallel connections between them, each
+// carrying `connection_weight` and `connection_delay`.
+String two_neuron_network_nml(const String &connection_weight, const String &connection_delay,
+                              usize connection_count) {
+    String projections;
+    for (usize connection_index = 0; connection_index < connection_count; ++connection_index) {
+        projections += R"(
+        <projection id="proj)" + to_string(connection_index) + R"(" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="syn0">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight=")" + connection_weight + R"(" delay=")" + connection_delay + R"("/>
+        </projection>)";
+    }
+
+    return R"(<neuroml id="propagationnet">
+    <oneShotCell id="source0" fireTime="0.25ms"/>
+    <latchCell id="target0"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+)" + projections + R"(
+    </network>
+</neuroml>
+)";
+}
+
+String write_two_neuron_model(const FixtureDirectory &fixture, const String &connection_weight,
+                              const String &connection_delay, usize connection_count = 1) {
+    fixture.write("net.nml",
+                  two_neuron_network_nml(connection_weight, connection_delay, connection_count));
+    return fixture.write("model.xml",
+                         synaptic_input_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// A single latchCell driven by a continuous current injector and nothing else. No edges at
+// all, so it also covers an edge-free network reaching the propagation apparatus.
+String stimulus_only_network_nml() {
+    return R"(<neuroml id="stimulusnet">
+    <latchCell id="target0"/>
+    <pulseGenerator id="pg0" delay="0.2ms" duration="0.5ms" amplitude="0.5nA"/>
+
+    <network id="net1">
+        <population id="popTarget" component="target0" size="1"/>
+
+        <explicitInput target="popTarget[0]" input="pg0"/>
+    </network>
+</neuroml>
+)";
+}
+
+String write_stimulus_only_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", stimulus_only_network_nml());
+    return fixture.write("model.xml",
+                         synaptic_input_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// Where a latchCell's two state variables sit in the flat cell_state array.
+struct LatchCellReader {
+    const f32 *cell_state = nullptr;
+    s64 delivered_index = 0;
+    s64 delivery_count_index = 0;
+
+    LatchCellReader(const SpikeEngine &engine, s64 neuron_index) {
+        cell_state = engine.cell_state.get_contents();
+        const s64 state_base = engine.cell_state_base.get_contents()[neuron_index];
+        delivered_index = state_base + 0;
+        delivery_count_index = state_base + 1;
+    }
+
+    f32 delivered() const { return cell_state[delivered_index]; }
+    s32 delivery_count() const { return (s32)cell_state[delivery_count_index]; }
+};
 
 } // namespace
 
@@ -476,6 +616,280 @@ TEST(SpikeEngine, step_simulation_after_shutdown_throws) {
     engine.shutdown();
 
     EXPECT_THROW(engine.step_simulation(0), std::runtime_error);
+}
+
+// ── stage 1, Deliver: draining the ring ────────────────────────────────────────
+
+TEST(SpikeEngine, injected_current_is_delivered_at_constant_amplitude_not_as_a_ramp) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_constant_injection");
+    String model_path = write_stimulus_only_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    const LatchCellReader target(engine, /*neuron_index=*/0);
+
+    // The injector's window is [0.2ms, 0.7ms] at 0.1ms per tick, so ticks 2 through 7 each
+    // deliver one tick's worth of the same current.
+    spikecorec::Vector<f32> delivered_per_tick;
+    for (s64 tick = 0; tick < 12; ++tick) {
+        engine.step_simulation(tick);
+        delivered_per_tick.push_back(target.delivered());
+    }
+
+    ASSERT_GT(delivered_per_tick[2], 0.0f) << "the injector's window never opened";
+
+    // Every tick of the window delivers the SAME amount. A slot that is read without being
+    // cleared accumulates instead, turning a constant current into a linear ramp -- which
+    // still rises, still looks plausible, and is wrong at every steady state.
+    for (usize tick = 3; tick <= 7; ++tick) {
+        EXPECT_FLOAT_EQ(delivered_per_tick[tick], delivered_per_tick[2])
+                << "delivered current changed at tick " << tick
+                << "; the ring row is not being cleared after it is read";
+    }
+
+    // Delivered on exactly the six ticks of the window and on no others: past the window the
+    // row is empty, which is only true if each read cleared it.
+    EXPECT_EQ(target.delivery_count(), 6);
+
+    engine.shutdown();
+}
+
+// ── stage 6, Propagate ─────────────────────────────────────────────────────────
+
+// Runs the two-neuron model to completion and reports the tick the source fired on and the
+// tick its spike was delivered to the target.
+struct PropagationObservation {
+    s64 source_spike_tick = -1;
+    s64 source_spike_count = 0;
+    s64 delivery_tick = -1;
+    s32 final_delivery_count = 0;
+    f32 delivered_value = 0.0f;
+};
+
+static PropagationObservation observe_propagation(SpikeEngine &engine, s64 tick_count) {
+    const LatchCellReader target(engine, /*neuron_index=*/1);
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+
+    PropagationObservation observation;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        const s32 previous_delivery_count = target.delivery_count();
+        engine.step_simulation(tick);
+
+        if (spike_flags[0] != 0) {
+            if (observation.source_spike_tick < 0) observation.source_spike_tick = tick;
+            observation.source_spike_count += 1;
+        }
+        if (target.delivery_count() != previous_delivery_count &&
+            observation.delivery_tick < 0) {
+            observation.delivery_tick = tick;
+            observation.delivered_value = target.delivered();
+        }
+    }
+
+    observation.final_delivery_count = target.delivery_count();
+    return observation;
+}
+
+TEST(SpikeEngine, a_spike_reaches_its_target_one_tick_later_carrying_the_edge_weight) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_propagation_one_tick");
+    String model_path = write_two_neuron_model(fixture, /*connection_weight=*/"2.5",
+                                               /*connection_delay=*/"0.1ms");
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    // One tick of delay needs two ring rows: the row an arrival is scheduled into must not
+    // be the row being drained on the tick it is scheduled.
+    EXPECT_EQ(engine.network_input_ring_depth, 2);
+
+    const PropagationObservation observation = observe_propagation(engine, /*tick_count=*/20);
+
+    ASSERT_EQ(observation.source_spike_count, 1) << "oneShotCell must fire exactly once";
+    ASSERT_GE(observation.delivery_tick, 0) << "the spike was never delivered";
+    EXPECT_EQ(observation.delivery_tick, observation.source_spike_tick + 1);
+
+    // What arrived is the edge's own weight, reconstructed on the GPU out of the shared U/V
+    // basis and its sparse delta -- the same number WeightMatrix reports on the host.
+    EXPECT_NEAR(observation.delivered_value, 2.5f, 1e-3f);
+    EXPECT_NEAR(engine.weights.get(0, 1), 2.5f, 1e-3f);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, a_delayed_spike_arrives_on_its_own_tick_and_not_before) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_propagation_three_ticks");
+    String model_path = write_two_neuron_model(fixture, /*connection_weight=*/"2.5",
+                                               /*connection_delay=*/"0.3ms");
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    EXPECT_EQ(engine.network_input_ring_depth, 4) << "one row per delay, plus the row "
+                                                     "being drained";
+
+    const LatchCellReader target(engine, /*neuron_index=*/1);
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+
+    s64 source_spike_tick = -1;
+    s64 delivery_tick = -1;
+    for (s64 tick = 0; tick < 20; ++tick) {
+        engine.step_simulation(tick);
+
+        if (spike_flags[0] != 0 && source_spike_tick < 0) source_spike_tick = tick;
+
+        if (target.delivery_count() == 0 && source_spike_tick >= 0) {
+            // Nothing has arrived yet, so this tick must be inside the delay window.
+            EXPECT_LT(tick, source_spike_tick + 3)
+                    << "the spike was still undelivered past its arrival tick";
+        }
+        if (target.delivery_count() != 0 && delivery_tick < 0) delivery_tick = tick;
+    }
+
+    ASSERT_GE(source_spike_tick, 0) << "oneShotCell never fired";
+    ASSERT_GE(delivery_tick, 0) << "the spike was never delivered";
+
+    // The whole point: three ticks of delay means three ticks of delay. Arriving early is a
+    // worse failure than not arriving, because it still produces a plausible-looking run.
+    EXPECT_EQ(delivery_tick, source_spike_tick + 3);
+    EXPECT_NEAR(target.delivered(), 2.5f, 1e-3f);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, a_delivered_spike_is_not_redelivered_when_the_ring_wraps) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_ring_wrap");
+    String model_path = write_two_neuron_model(fixture, /*connection_weight=*/"2.5",
+                                               /*connection_delay=*/"0.3ms");
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    ASSERT_EQ(engine.network_input_ring_depth, 4);
+
+    // Twenty ticks is five full turns of a four-row ring, so a row left uncleared by its
+    // reader would hand the same 2.5 back four more times.
+    const PropagationObservation observation = observe_propagation(engine, /*tick_count=*/20);
+
+    ASSERT_EQ(observation.source_spike_count, 1);
+    EXPECT_EQ(observation.final_delivery_count, 1)
+            << "the spike was delivered more than once: the ring row was not cleared after "
+               "being read";
+
+    // Nothing is left pending anywhere in the ring either.
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    const s64 ring_element_count =
+            (s64)engine.network_input_ring_depth * engine.total_neuron_count;
+    for (s64 element = 0; element < ring_element_count; ++element) {
+        EXPECT_FLOAT_EQ(network_inputs[element], 0.0f)
+                << "network_inputs[" << element << "] still holds an undelivered arrival";
+    }
+
+    engine.shutdown();
+}
+
+// ── parallel edges between one ordered pair ────────────────────────────────────
+
+namespace {
+
+nml::NML_ParseResult make_parallel_edge_model(s64 first_delay_tick_count,
+                                              s64 second_delay_tick_count) {
+    nml::NML_ParseResult parse_result;
+    parse_result.neurons.resize(3);
+
+    nml::NetworkEdge first_edge;
+    first_edge.target_neuron_index = 2;
+    first_edge.weight = 1.5;
+    first_edge.delay_tick_count = first_delay_tick_count;
+
+    nml::NetworkEdge second_edge;
+    second_edge.target_neuron_index = 2;
+    second_edge.weight = 4.0;
+    second_edge.delay_tick_count = second_delay_tick_count;
+
+    parse_result.neurons[0].outgoing_edges.push_back(first_edge);
+    parse_result.neurons[0].outgoing_edges.push_back(second_edge);
+    return parse_result;
+}
+
+} // namespace
+
+TEST(AggregateNetworkEdges, parallel_edges_between_one_pair_sum_their_weights) {
+    // Two projections between one cell pair -- an AMPA and an NMDA, say -- is an ordinary
+    // NeuroML shape, and the adjacency holds one slot for the pair. Both synapses deliver,
+    // so the total is the only faithful collapse; keeping the last one declared would drop
+    // half the drive with no diagnostic.
+    const nml::NML_ParseResult parse_result = make_parallel_edge_model(3, 3);
+
+    const spikecorec::Vector<AggregatedNetworkEdge> aggregated =
+            aggregate_network_edges(parse_result, /*default_delay_tick_count=*/1, log::logger());
+
+    ASSERT_EQ(aggregated.size(), 1u);
+    EXPECT_EQ(aggregated[0].source_node, 0);
+    EXPECT_EQ(aggregated[0].target_node, 2);
+    EXPECT_FLOAT_EQ(aggregated[0].summed_weight, 5.5f);
+    EXPECT_EQ(aggregated[0].delay_tick_count, 3);
+}
+
+TEST(AggregateNetworkEdges, an_undeclared_delay_reads_as_the_default_rather_than_a_conflict) {
+    const nml::NML_ParseResult parse_result = make_parallel_edge_model(0, 1);
+
+    const spikecorec::Vector<AggregatedNetworkEdge> aggregated =
+            aggregate_network_edges(parse_result, /*default_delay_tick_count=*/1, log::logger());
+
+    ASSERT_EQ(aggregated.size(), 1u);
+    EXPECT_FLOAT_EQ(aggregated[0].summed_weight, 5.5f);
+    EXPECT_EQ(aggregated[0].delay_tick_count, 1);
+}
+
+TEST(AggregateNetworkEdges, parallel_edges_with_different_delays_throw_naming_both) {
+    // One slot cannot carry two conduction delays, and picking either one silently moves
+    // when every downstream spike lands. There is no right answer to guess, so it is
+    // reported instead.
+    const nml::NML_ParseResult parse_result = make_parallel_edge_model(3, 7);
+
+    try {
+        aggregate_network_edges(parse_result, /*default_delay_tick_count=*/1, log::logger());
+        FAIL() << "expected conflicting parallel delays to be rejected";
+    } catch (const std::runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("3"), String::npos) << message;
+        EXPECT_NE(message.find("7"), String::npos) << message;
+    }
+}
+
+TEST(SpikeEngine, two_projections_between_one_pair_deliver_their_summed_weight) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_parallel_projections");
+    String model_path = write_two_neuron_model(fixture, /*connection_weight=*/"2.5",
+                                               /*connection_delay=*/"0.3ms",
+                                               /*connection_count=*/2);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    EXPECT_NEAR(engine.weights.get(0, 1), 5.0f, 1e-3f);
+
+    const PropagationObservation observation = observe_propagation(engine, /*tick_count=*/20);
+
+    ASSERT_EQ(observation.final_delivery_count, 1) << "one slot, so one arrival";
+    EXPECT_NEAR(observation.delivered_value, 5.0f, 1e-3f);
+
+    engine.shutdown();
+}
+
+// ── value semantics ────────────────────────────────────────────────────────────
+
+TEST(SpikeEngine, is_neither_copyable_nor_movable) {
+    // A defaulted move left the source `alive` with a null logger, so the moved-from
+    // engine's destructor dereferenced it and then ran the whole shutdown body; the
+    // defaulted move assignment tripped GpuPointer's "destination must be null" assertion
+    // once per buffer. Neither operation has a caller, so both are gone rather than
+    // hand-written -- anything needing to relocate an engine holds a unique_ptr to one.
+    EXPECT_FALSE(std::is_copy_constructible<SpikeEngine>::value);
+    EXPECT_FALSE(std::is_copy_assignable<SpikeEngine>::value);
+    EXPECT_FALSE(std::is_move_constructible<SpikeEngine>::value);
+    EXPECT_FALSE(std::is_move_assignable<SpikeEngine>::value);
 }
 
 // ── kernel argument binding ────────────────────────────────────────────────────

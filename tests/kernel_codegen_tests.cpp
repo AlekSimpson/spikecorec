@@ -468,9 +468,16 @@ TEST(KernelCodegenSymbolResolution, UnresolvableIdentifierInAModelThrows) {
 TEST(KernelCodegenKernel, ArgumentNamesAreTheDocumentedBindingOrder) {
     const NML_ParseResult parse_result = make_two_cell_type_model();
     const Vector<String> expected_argument_names = {
-        "cell_state",      "cell_parameters", "network_inputs",      "last_spiked",
-        "spike_flags",     "cell_state_base", "cell_parameter_base", "cell_type_index",
-        "neuron_count",    "dt",              "tick",
+        "cell_state",           "cell_parameters",       "network_inputs",
+        "last_spiked",          "spike_flags",           "cell_state_base",
+        "cell_parameter_base",  "cell_type_index",       "neuron_count",
+        "dt",                   "tick",                  "internal_node_words",
+        "leaf_node_words",      "rank_superblock_table", "rank_subblock_table",
+        "U_matrix",             "V_matrix",              "edge_weight_coefficients",
+        "edge_weight_deltas",   "edge_delay_ticks",      "branching_factor",
+        "superblock_size_words","padded_node_count",     "tree_height",
+        "internal_bit_count",   "rank_float4_stride",    "constant_weight",
+        "max_neighbor_count",   "ring_depth",
     };
 
     const GeneratedKernel tick_kernel = generate_tick_kernel(parse_result);
@@ -596,7 +603,15 @@ TEST(KernelCodegenSelectPath, SelectionOverSynapsesReadsTheInputAccumulator) {
     parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
 
     const String source = generate_tick_kernel(parse_result).source;
-    EXPECT_NE(source.find("float derived_iSyn = network_inputs[neuron_index];"), String::npos);
+
+    // The path binds to the one drained local, and the drain reads this tick's ring row and
+    // empties it in a single atomic exchange.
+    EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
+    EXPECT_NE(source.find("int synaptic_input_index = network_input_ring_index(\n"
+                          "            tick, ring_depth, neuron_count, neuron_index);"),
+              String::npos);
+    EXPECT_NE(source.find("float synaptic_input_accumulator = atomic_exchange_explicit("),
+              String::npos);
 }
 
 TEST(KernelCodegenSelectPath, SelectedMemberNameDoesNotChangeTheBinding) {
@@ -607,7 +622,34 @@ TEST(KernelCodegenSelectPath, SelectedMemberNameDoesNotChangeTheBinding) {
     parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/I"));
 
     const String source = generate_tick_kernel(parse_result).source;
-    EXPECT_NE(source.find("float derived_iSyn = network_inputs[neuron_index];"), String::npos);
+    EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
+}
+
+TEST(KernelCodegenSelectPath, TwoSelectionsShareOneDrainOfTheRingRow) {
+    // A second reduction over the synapses must not drain the slot again: the first read
+    // already emptied it, so a second exchange would hand the model a zero.
+    CellTypeSpecification cell_type = make_synaptic_input_cell_type("synapses[*]/i");
+    cell_type.dynamics.insert(
+            cell_type.dynamics.begin() + 1,
+            make_instruction(DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable,
+                             "iSynAgain", "synapses[*]/i"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
+    EXPECT_NE(source.find("float derived_iSynAgain = synaptic_input_accumulator;"), String::npos);
+    EXPECT_EQ(source.find("atomic_exchange_explicit",
+                          source.find("atomic_exchange_explicit") + 1),
+              String::npos);
+}
+
+TEST(KernelCodegenSelectPath, ACellWithNoSynapticSelectionDrainsNothing) {
+    // A type that never reduces over its synapses must leave the ring row alone; clearing a
+    // row nothing reads would silently discard another type's arrivals.
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+    EXPECT_EQ(source.find("synaptic_input_accumulator"), String::npos);
 }
 
 TEST(KernelCodegenSelectPath, BoundNameResolvesInALaterTimeDerivative) {
@@ -665,6 +707,78 @@ TEST(KernelCodegenSelectPath, DivisionOfTwoBareNamesStaysADivision) {
     EXPECT_NE(source.find("float derived_rate = (cell_parameters[parameter_base + 0] / "
                           "cell_parameters[parameter_base + 1]);"),
               String::npos);
+}
+
+// ── Stage 6, Propagate ───────────────────────────────────────────────────────
+
+TEST(KernelCodegenPropagation, EveryCellDeviceFunctionEndsWithTheSpikeGuardedEpilogue) {
+    // Boilerplate, identical for every cell type -- including one that declares no EventOut
+    // at all, which simply never raises the flag the guard tests.
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+
+    usize search_position = 0;
+    usize epilogue_count = 0;
+    while ((search_position = source.find("if (spike_flags[neuron_index] != 0) {",
+                                          search_position)) != String::npos) {
+        epilogue_count += 1;
+        search_position += 1;
+    }
+    EXPECT_EQ(epilogue_count, 2u) << "one epilogue per cell device function";
+
+    // It is an epilogue: the guard sits after the dynamics of the type it belongs to.
+    const usize iaf_position = source.find("inline void cell_type_step_iafCell(");
+    const usize izhikevich_position = source.find("inline void cell_type_step_izhikevichCell(");
+    ASSERT_NE(iaf_position, String::npos);
+    ASSERT_NE(izhikevich_position, String::npos);
+    const String iaf_body = source.substr(iaf_position, izhikevich_position - iaf_position);
+    EXPECT_LT(iaf_body.find("float next_v ="), iaf_body.find("propagate_spike("));
+}
+
+TEST(KernelCodegenPropagation, ArrivalsAreRingIndexedByDelayAndAddedAtomically) {
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+
+    // The arrival row is this tick plus the edge's own delay, and many sources converge on
+    // one target in a tick, so the add has to be atomic.
+    EXPECT_NE(source.find("tick + (long)edge_delay_ticks[edge_slot], ring_depth,"), String::npos);
+    EXPECT_NE(source.find("atomic_fetch_add_explicit(arrival_slot, edge_weight, "
+                          "memory_order_relaxed);"),
+              String::npos);
+
+    // The per-edge slot is the source's row of the flat per-edge arrays plus this
+    // neighbour's position in the walk -- the convention WeightMatrix indexes by.
+    EXPECT_NE(source.find("int edge_slot = neuron_index * max_neighbor_count + neighbor_slot;"),
+              String::npos);
+    // Walking past max_neighbor_count would read into the next source's row.
+    EXPECT_NE(source.find("while (neighbor_slot < max_neighbor_count &&"), String::npos);
+}
+
+TEST(KernelCodegenPropagation, EdgeWeightIsTheLowRankReconstructionPlusItsSparseDelta) {
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+
+    // Sigma U[i,r] * Ck[r] * V[j,r], then the sparse delta that carries the reconstruction
+    // onto the model's exact edge weight -- together, what WeightMatrix::get() reports.
+    EXPECT_NE(source.find("reconstructed_weight += U_matrix[source_lane_base + lane] *"),
+              String::npos);
+    EXPECT_NE(source.find("(edge_weight_coefficients[lane] * V_matrix[target_lane_base + lane])"),
+              String::npos);
+    EXPECT_NE(source.find("edge_weight = reconstructed_weight + edge_weight_deltas[edge_slot];"),
+              String::npos);
+
+    // rank_float4_stride counts float4 elements; a row is four times that many lanes.
+    EXPECT_NE(source.find("long row_lane_count = rank_float4_stride * 4;"), String::npos);
+}
+
+TEST(KernelCodegenPropagation, InitializeKernelNeitherPropagatesNorDrains) {
+    // OnStart runs before any tick, so scattering a spike or emptying a ring row out of it
+    // would deliver current the simulation never generated.
+    const String source = generate_initialize_kernel(make_two_cell_type_model()).source;
+
+    EXPECT_EQ(source.find("propagate_spike"), String::npos);
+    EXPECT_EQ(source.find("k2tree_next_neighbor"), String::npos);
+    EXPECT_EQ(source.find("network_input_ring_index"), String::npos);
+
+    // It still declares the identical argument list, so the engine binds one set for both.
+    EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(28) ]]"), String::npos);
 }
 
 // ── Unsupported constructs ───────────────────────────────────────────────────
@@ -821,6 +935,26 @@ TEST(KernelCodegenMetal, CellConsumingSynapticInputCompilesAsMetal) {
     String compiler_output;
     const String source = generate_tick_kernel(parse_result).source;
     EXPECT_TRUE(compile_as_metal(source, "synaptic_input", compiler_output))
+            << "generated Metal source failed to compile:\n"
+            << compiler_output << "\n--- source ---\n"
+            << source;
+}
+
+TEST(KernelCodegenMetal, PropagatingCellCompilesAsMetal) {
+    // The propagation epilogue brings the whole k^2-tree walk, the low-rank reconstruction
+    // and two flavours of device atomic into the generated source. None of that is checked
+    // by a substring search; only the real shader compiler settles whether the walk's
+    // thread-address-space stack, the atomic casts and the ring arithmetic are well formed.
+    ASSERT_TRUE(metal_compiler_is_available())
+            << "xcrun metal is unavailable, so the generated source was never compiled";
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+    parse_result.cell_types.push_back(make_izhikevich_cell_type());
+
+    String compiler_output;
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_TRUE(compile_as_metal(source, "propagation", compiler_output))
             << "generated Metal source failed to compile:\n"
             << compiler_output << "\n--- source ---\n"
             << source;

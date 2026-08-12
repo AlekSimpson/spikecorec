@@ -189,9 +189,17 @@ namespace spikecorec {
     void synchronize_gpu_work();
 
     // --- kernel lifecycle ---
-    // opaque — MTLComputePipelineState* on Metal,
-    // CUfunction on CUDA
-    struct KernelHandle;
+    // MTLComputePipelineState* on Metal, CUfunction on CUDA. Defined here rather than in
+    // backend.cpp because compile_kernel / release_kernel / metal_dispatch all take it by
+    // value, so every translation unit that calls one of them needs the complete type.
+    struct KernelHandle {
+    #ifdef SPIKECOREC_CUDA
+        CUfunction cuda_kernel_function{};
+        CUmodule   cuda_module{};
+    #elif defined(SPIKECOREC_METAL)
+        MTL::ComputePipelineState *pipeline_state = nullptr;
+    #endif
+    };
 
     KernelHandle compile_kernel(const char *source, const char *function_name);
 

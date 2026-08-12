@@ -66,41 +66,78 @@ struct SymbolTable {
 // remember. The engine binds positionally against it, so the two cannot silently drift.
 // Both generators currently emit this order, and both emit the same list:
 //
-//   0  cell_state           device float *
-//   1  cell_parameters      device const float *
-//   2  network_inputs       device float *
-//   3  last_spiked          device long *
-//   4  spike_flags          device int *
-//   5  cell_state_base      device const int *
-//   6  cell_parameter_base  device const int *
-//   7  cell_type_index      device const int *
-//   8  neuron_count         constant int &
-//   9  dt                   constant float &
-//   10 tick                 constant long &
+//   0  cell_state               device float *
+//   1  cell_parameters          device const float *
+//   2  network_inputs           device float *        -- the delay ring, see below
+//   3  last_spiked              device long *
+//   4  spike_flags              device int *
+//   5  cell_state_base          device const int *
+//   6  cell_parameter_base      device const int *
+//   7  cell_type_index          device const int *
+//   8  neuron_count             constant int &
+//   9  dt                       constant float &
+//   10 tick                     constant long &
+//   11 internal_node_words      device const uint *
+//   12 leaf_node_words          device const uint *
+//   13 rank_superblock_table    device const uint *
+//   14 rank_subblock_table      device const ushort *
+//   15 U_matrix                 device const float *
+//   16 V_matrix                 device const float *
+//   17 edge_weight_coefficients device const float *  -- the weight matrix's Ck
+//   18 edge_weight_deltas       device const float *  -- the weight matrix's Sk
+//   19 edge_delay_ticks         device const int *    -- per-edge delay, whole ticks
+//   20 branching_factor         constant int &
+//   21 superblock_size_words    constant int &
+//   22 padded_node_count        constant int &
+//   23 tree_height              constant int &
+//   24 internal_bit_count       constant int &
+//   25 rank_float4_stride       constant long &
+//   26 constant_weight          constant float &
+//   27 max_neighbor_count       constant int &
+//   28 ring_depth               constant int &
 //
-// Arguments 0-7 are buffers; 8-10 are scalars bound by value. The initialize kernel takes
-// the identical list so the engine binds one argument set for both entry points.
+// Arguments 11-19 are the adjacency and per-edge state stage 6 (Propagate) walks; 20-28
+// describe their shape. The initialize kernel takes the identical list so the engine binds
+// one argument set for both entry points, and simply never reads the propagation half.
+//
+// U_matrix / V_matrix are the host's float4 buffers declared as plain floats -- identical
+// bytes, and scalar lanes make the on-device reconstruction the same arithmetic
+// WeightMatrix performs on the CPU. `rank_float4_stride` still counts float4 elements, so a
+// row is four times that many lanes.
 struct GeneratedKernel {
     String source;
     String function_name;
     Vector<String> argument_names;
 };
 
-// Per-tick dynamics: Integrate, then Detect, then the Reset and Emit bodies each
-// OnCondition gates.
+// Per-tick dynamics: Deliver, then Integrate, then Detect, then the Reset and Emit bodies
+// each OnCondition gates, then Propagate.
 //
 // Every TimeDerivative is evaluated against the state as it stood at entry and written
 // back only once all of them have been computed, so two variables that reference each
 // other integrate consistently instead of one seeing the other's updated value.
 //
 // A DerivedVariable written as a `select=` path over the attached synapses
-// ("synapses[*]/i" on iafCell, "synapses[*]/I" on izhikevichCell) lowers to a read of
-// `network_inputs`, the per-neuron synaptic input accumulator, and binds under its own name
-// like any other DerivedVariable. Every other path -- "ionChannel/g", "populations[*]/i",
+// ("synapses[*]/i" on iafCell, "synapses[*]/I" on izhikevichCell) lowers to a read of this
+// tick's `network_inputs` ring row, and binds under its own name like any other
+// DerivedVariable. Every other path -- "ionChannel/g", "populations[*]/i",
 // "concentrationModels[species='ca']/concentration" -- reaches into a child structure with
 // no engine buffer behind it and throws naming the path. Paths and arithmetic arrive in the
 // same field, so they are separated by shape: see select_path_head_name in the
 // implementation for why "iMemb/C" stays a division.
+//
+// ── Stage 6, Propagate ───────────────────────────────────────────────────────
+// Every cell device function ends with the same generated epilogue: if this neuron raised
+// its spike flag this tick, walk its row of the k^2-tree and add each edge's weight into
+// the target's slot of `network_inputs`. It is emitted rather than dispatched because the
+// supporting engine infrastructure is identical for every cell type, and the engine must
+// therefore NOT dispatch a propagation kernel of its own.
+//
+// `network_inputs` is a delay ring: one flat allocation of ring_depth * neuron_count floats
+// indexed as [row][neuron]. An arrival lands in row (tick + edge delay) % ring_depth; a cell
+// reads row tick % ring_depth and clears it, so the row is empty when the ring wraps back
+// onto it. `ring_depth` exceeds the model's largest per-edge delay -- the engine computes it
+// -- so an arrival can never land in the row being drained this tick.
 //
 // Throws, naming the construct and the ComponentType, on anything below.
 GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result);
