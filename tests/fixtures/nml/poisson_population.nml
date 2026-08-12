@@ -1,0 +1,161 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/master/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="PoissonPopulationExitModel">
+
+  <!--
+    Phase-2 exit model #3 (ticket #67 [H2], arch §5 Phase 2): a
+    Poisson-driven population generated on device (ticket #65 [F4]'s own
+    `SpikeSourcePoisson` on-device generator, include/spikecorec/nml/
+    inputs_lowering.h). 100 independent, unconnected
+    `SpikeSourcePoisson` instances (a REAL vendored NeuroML ComponentType,
+    third_party/neuroml2/std_lib/PyNN.xml - not a custom inline
+    declaration), each firing at rate=10Hz.
+
+    jLEMS genuinely simulates SpikeSourcePoisson (its own real, exponential-
+    ISI renewal-process implementation - `isi = -log(random(1))/rate`,
+    PyNN.xml's own Dynamics, driven by jLEMS's own PRNG, seeded via this
+    file's own <Simulation seed="..."> for a reproducible checked-in
+    capture), so a REAL reference spike raster IS captured here (not
+    fabricated) - but per this ticket's own scope note, an exact,
+    spike-for-spike comparison against spikecorec's own run is NOT a
+    meaningful validation target: jLEMS's own renewal-process algorithm and
+    spikecorec's own per-tick Bernoulli-style `rand`-driven algorithm
+    (gpu_source.h's own `spikecorec_rand_uniform`, xorshift32) are two
+    DIFFERENT ways of generating a rate-`rate` Poisson process, over two
+    ENTIRELY DIFFERENT PRNG streams - neither is "the same random numbers"
+    as the other, so no tick-by-tick or event-by-event correspondence
+    between the two traces exists even in principle. What IS a genuine,
+    meaningful cross-simulator comparison target - and what this exit
+    model's own DISABLED_ comparison test
+    (tests/exit_model_validation_tests.cpp) checks - is AGGREGATE spike
+    statistics (total spike count / rate over the recorded window): both
+    algorithms are valid samples of the SAME rate-`rate` Poisson process, so
+    both should independently converge to the SAME expected count
+    (population_size * rate * duration) within ordinary Poisson-process
+    sampling variance (a chi-square-style, not exact, tolerance) -
+    precisely the statistical self-consistency approach ticket #65's own
+    inputs_lowering_tests.cpp already established for spikecorec's own run
+    in isolation, now ALSO validated against a real, independently-generated
+    jLEMS reference sample at a larger (100-neuron,
+    8s) population scale than that ticket's own
+    50-neuron/5s unit test, and framed explicitly as this ticket's own
+    validation exit model (not merely unit coverage).
+  -->
+  <!-- rate uses "per_s" rather than the equivalent "Hz" - spikecorec's own unit table
+       (src/core/time_utilities.cpp) does not recognize "Hz" as a unit symbol (only "per_s"/
+       "per_ms", a narrowly-scoped, pre-existing front-end gap out of this ticket's own scope to
+       widen); "per_s" is an equally real, NeuroML-declared unit for the identical physical
+       quantity (NeuroMLCoreDimensions.xml's own per_time dimension), so this is a like-for-like
+       substitution, not an approximation. -->
+  <SpikeSourcePoisson id="poissonInstance" start="0ms" duration="1000s" rate="10per_s"/>
+
+  <network id="PoissonNet">
+    <population id="PoissonPop" component="poissonInstance" size="100"/>
+  </network>
+
+  <Simulation id="sim1" length="8s" step="1ms" target="PoissonNet" seed="17">
+    <EventOutputFile id="spikesFile" fileName="poisson_population_spikes.dat" format="TIME_ID">
+      <EventSelection id="sel0" select="PoissonPop[0]" eventPort="spike"/>
+      <EventSelection id="sel1" select="PoissonPop[1]" eventPort="spike"/>
+      <EventSelection id="sel2" select="PoissonPop[2]" eventPort="spike"/>
+      <EventSelection id="sel3" select="PoissonPop[3]" eventPort="spike"/>
+      <EventSelection id="sel4" select="PoissonPop[4]" eventPort="spike"/>
+      <EventSelection id="sel5" select="PoissonPop[5]" eventPort="spike"/>
+      <EventSelection id="sel6" select="PoissonPop[6]" eventPort="spike"/>
+      <EventSelection id="sel7" select="PoissonPop[7]" eventPort="spike"/>
+      <EventSelection id="sel8" select="PoissonPop[8]" eventPort="spike"/>
+      <EventSelection id="sel9" select="PoissonPop[9]" eventPort="spike"/>
+      <EventSelection id="sel10" select="PoissonPop[10]" eventPort="spike"/>
+      <EventSelection id="sel11" select="PoissonPop[11]" eventPort="spike"/>
+      <EventSelection id="sel12" select="PoissonPop[12]" eventPort="spike"/>
+      <EventSelection id="sel13" select="PoissonPop[13]" eventPort="spike"/>
+      <EventSelection id="sel14" select="PoissonPop[14]" eventPort="spike"/>
+      <EventSelection id="sel15" select="PoissonPop[15]" eventPort="spike"/>
+      <EventSelection id="sel16" select="PoissonPop[16]" eventPort="spike"/>
+      <EventSelection id="sel17" select="PoissonPop[17]" eventPort="spike"/>
+      <EventSelection id="sel18" select="PoissonPop[18]" eventPort="spike"/>
+      <EventSelection id="sel19" select="PoissonPop[19]" eventPort="spike"/>
+      <EventSelection id="sel20" select="PoissonPop[20]" eventPort="spike"/>
+      <EventSelection id="sel21" select="PoissonPop[21]" eventPort="spike"/>
+      <EventSelection id="sel22" select="PoissonPop[22]" eventPort="spike"/>
+      <EventSelection id="sel23" select="PoissonPop[23]" eventPort="spike"/>
+      <EventSelection id="sel24" select="PoissonPop[24]" eventPort="spike"/>
+      <EventSelection id="sel25" select="PoissonPop[25]" eventPort="spike"/>
+      <EventSelection id="sel26" select="PoissonPop[26]" eventPort="spike"/>
+      <EventSelection id="sel27" select="PoissonPop[27]" eventPort="spike"/>
+      <EventSelection id="sel28" select="PoissonPop[28]" eventPort="spike"/>
+      <EventSelection id="sel29" select="PoissonPop[29]" eventPort="spike"/>
+      <EventSelection id="sel30" select="PoissonPop[30]" eventPort="spike"/>
+      <EventSelection id="sel31" select="PoissonPop[31]" eventPort="spike"/>
+      <EventSelection id="sel32" select="PoissonPop[32]" eventPort="spike"/>
+      <EventSelection id="sel33" select="PoissonPop[33]" eventPort="spike"/>
+      <EventSelection id="sel34" select="PoissonPop[34]" eventPort="spike"/>
+      <EventSelection id="sel35" select="PoissonPop[35]" eventPort="spike"/>
+      <EventSelection id="sel36" select="PoissonPop[36]" eventPort="spike"/>
+      <EventSelection id="sel37" select="PoissonPop[37]" eventPort="spike"/>
+      <EventSelection id="sel38" select="PoissonPop[38]" eventPort="spike"/>
+      <EventSelection id="sel39" select="PoissonPop[39]" eventPort="spike"/>
+      <EventSelection id="sel40" select="PoissonPop[40]" eventPort="spike"/>
+      <EventSelection id="sel41" select="PoissonPop[41]" eventPort="spike"/>
+      <EventSelection id="sel42" select="PoissonPop[42]" eventPort="spike"/>
+      <EventSelection id="sel43" select="PoissonPop[43]" eventPort="spike"/>
+      <EventSelection id="sel44" select="PoissonPop[44]" eventPort="spike"/>
+      <EventSelection id="sel45" select="PoissonPop[45]" eventPort="spike"/>
+      <EventSelection id="sel46" select="PoissonPop[46]" eventPort="spike"/>
+      <EventSelection id="sel47" select="PoissonPop[47]" eventPort="spike"/>
+      <EventSelection id="sel48" select="PoissonPop[48]" eventPort="spike"/>
+      <EventSelection id="sel49" select="PoissonPop[49]" eventPort="spike"/>
+      <EventSelection id="sel50" select="PoissonPop[50]" eventPort="spike"/>
+      <EventSelection id="sel51" select="PoissonPop[51]" eventPort="spike"/>
+      <EventSelection id="sel52" select="PoissonPop[52]" eventPort="spike"/>
+      <EventSelection id="sel53" select="PoissonPop[53]" eventPort="spike"/>
+      <EventSelection id="sel54" select="PoissonPop[54]" eventPort="spike"/>
+      <EventSelection id="sel55" select="PoissonPop[55]" eventPort="spike"/>
+      <EventSelection id="sel56" select="PoissonPop[56]" eventPort="spike"/>
+      <EventSelection id="sel57" select="PoissonPop[57]" eventPort="spike"/>
+      <EventSelection id="sel58" select="PoissonPop[58]" eventPort="spike"/>
+      <EventSelection id="sel59" select="PoissonPop[59]" eventPort="spike"/>
+      <EventSelection id="sel60" select="PoissonPop[60]" eventPort="spike"/>
+      <EventSelection id="sel61" select="PoissonPop[61]" eventPort="spike"/>
+      <EventSelection id="sel62" select="PoissonPop[62]" eventPort="spike"/>
+      <EventSelection id="sel63" select="PoissonPop[63]" eventPort="spike"/>
+      <EventSelection id="sel64" select="PoissonPop[64]" eventPort="spike"/>
+      <EventSelection id="sel65" select="PoissonPop[65]" eventPort="spike"/>
+      <EventSelection id="sel66" select="PoissonPop[66]" eventPort="spike"/>
+      <EventSelection id="sel67" select="PoissonPop[67]" eventPort="spike"/>
+      <EventSelection id="sel68" select="PoissonPop[68]" eventPort="spike"/>
+      <EventSelection id="sel69" select="PoissonPop[69]" eventPort="spike"/>
+      <EventSelection id="sel70" select="PoissonPop[70]" eventPort="spike"/>
+      <EventSelection id="sel71" select="PoissonPop[71]" eventPort="spike"/>
+      <EventSelection id="sel72" select="PoissonPop[72]" eventPort="spike"/>
+      <EventSelection id="sel73" select="PoissonPop[73]" eventPort="spike"/>
+      <EventSelection id="sel74" select="PoissonPop[74]" eventPort="spike"/>
+      <EventSelection id="sel75" select="PoissonPop[75]" eventPort="spike"/>
+      <EventSelection id="sel76" select="PoissonPop[76]" eventPort="spike"/>
+      <EventSelection id="sel77" select="PoissonPop[77]" eventPort="spike"/>
+      <EventSelection id="sel78" select="PoissonPop[78]" eventPort="spike"/>
+      <EventSelection id="sel79" select="PoissonPop[79]" eventPort="spike"/>
+      <EventSelection id="sel80" select="PoissonPop[80]" eventPort="spike"/>
+      <EventSelection id="sel81" select="PoissonPop[81]" eventPort="spike"/>
+      <EventSelection id="sel82" select="PoissonPop[82]" eventPort="spike"/>
+      <EventSelection id="sel83" select="PoissonPop[83]" eventPort="spike"/>
+      <EventSelection id="sel84" select="PoissonPop[84]" eventPort="spike"/>
+      <EventSelection id="sel85" select="PoissonPop[85]" eventPort="spike"/>
+      <EventSelection id="sel86" select="PoissonPop[86]" eventPort="spike"/>
+      <EventSelection id="sel87" select="PoissonPop[87]" eventPort="spike"/>
+      <EventSelection id="sel88" select="PoissonPop[88]" eventPort="spike"/>
+      <EventSelection id="sel89" select="PoissonPop[89]" eventPort="spike"/>
+      <EventSelection id="sel90" select="PoissonPop[90]" eventPort="spike"/>
+      <EventSelection id="sel91" select="PoissonPop[91]" eventPort="spike"/>
+      <EventSelection id="sel92" select="PoissonPop[92]" eventPort="spike"/>
+      <EventSelection id="sel93" select="PoissonPop[93]" eventPort="spike"/>
+      <EventSelection id="sel94" select="PoissonPop[94]" eventPort="spike"/>
+      <EventSelection id="sel95" select="PoissonPop[95]" eventPort="spike"/>
+      <EventSelection id="sel96" select="PoissonPop[96]" eventPort="spike"/>
+      <EventSelection id="sel97" select="PoissonPop[97]" eventPort="spike"/>
+      <EventSelection id="sel98" select="PoissonPop[98]" eventPort="spike"/>
+      <EventSelection id="sel99" select="PoissonPop[99]" eventPort="spike"/>
+    </EventOutputFile>
+  </Simulation>
+</neuroml>

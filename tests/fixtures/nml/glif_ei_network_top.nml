@@ -1,0 +1,11 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="GlifEiNetworkTop">
+  <!--
+    A thin <include>-only wrapper so spikecorec's own front-end
+    (tests/exit_model_validation_tests.cpp) parses glif_ei_network.nml
+    without XSD-validating it as a TOP-LEVEL file - see
+    glif3_single_cell_top.nml's own header comment for why. jNeuroML/jLEMS
+    never sees this file - it consumes glif_ei_network.nml directly via
+    LEMS_glif_ei_network.xml.
+  -->
+  <include href="glif_ei_network.nml"/>
+</neuroml>

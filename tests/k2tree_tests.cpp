@@ -64,31 +64,49 @@ TEST(K2Tree, adjacent_and_neighbors) {
     }
 }
 
-TEST(K2Tree, get_predecessors) {
+TEST(K2Tree, adjacent_and_predecessors) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;
     K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
 
-    // Reference column set: every `u` with an edge u -> target.
+    // Ground-truth predecessor lists = the TRANSPOSE of the reference adjacency: node u is a
+    // predecessor of node v iff the edge u -> v exists in the forward adjacency. Derived from
+    // the fixture rather than from tree.adjacent(), so a wrong `adjacent` cannot make this
+    // pass by agreeing with itself.
+    vector<vector<s32>> predecessors((usize)node_count);
+    for (s32 source = 0; source < node_count; ++source)
+        for (s32 target : adjacency[(usize)source])
+            predecessors[(usize)target].push_back(source);
+
     vector<s32> buffer(node_count);
     for (s32 target = 0; target < node_count; ++target) {
-        vector<s32> expected;
-        for (s32 source = 0; source < node_count; ++source) {
-            if (tree.adjacent(source, target)) expected.push_back(source);
-        }
         s64 count = tree.get_predecessors(target, buffer.data(), node_count);
-        vector<s32> predecessors(buffer.begin(), buffer.begin() + count);
-        std::sort(predecessors.begin(), predecessors.end());
-        EXPECT_EQ(predecessors, expected) << "target=" << target;
+        vector<s32> found(buffer.begin(), buffer.begin() + count);
+        std::sort(found.begin(), found.end());
+        vector<s32> expected = predecessors[(usize)target];
+        std::sort(expected.begin(), expected.end());
+        EXPECT_EQ(found, expected) << "target=" << target;
     }
+}
 
-    // Same bounds contract as get_neighbors.
-    EXPECT_EQ(tree.get_predecessors(-1, buffer.data(), node_count), 0);
-    EXPECT_EQ(tree.get_predecessors(node_count, buffer.data(), node_count), 0);
+TEST(K2Tree, predecessors_bounds_and_degenerate) {
+    // Out-of-range / degenerate queries return 0 written, mirroring get_neighbors' own bounds checks.
+    K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
+    vector<s32> buffer(8);
+    EXPECT_EQ(tree.get_predecessors(-1, buffer.data(), 8), 0);
+    EXPECT_EQ(tree.get_predecessors(8, buffer.data(), 8), 0);
     EXPECT_EQ(tree.get_predecessors(0, buffer.data(), 0), 0);
 
-    // Truncates at max_neighbor_count rather than overrunning the buffer.
-    EXPECT_EQ(tree.get_predecessors(6, buffer.data(), 1), 1);
+    vector<vector<s32>> single_isolated = {{}};
+    K2Tree isolated = *K2Tree::from_adjacency_list(single_isolated, 1);
+    EXPECT_EQ(isolated.get_predecessors(0, buffer.data(), 8), 0);
+
+    // max_neighbor_count truncation: node 3 has two predecessors (2 and 7); asking for at most 1
+    // must write exactly 1 (and only a real predecessor).
+    unordered_set<s32> node3_predecessors = {2, 7};
+    s64 truncated = tree.get_predecessors(3, buffer.data(), 1);
+    EXPECT_EQ(truncated, 1);
+    EXPECT_TRUE(node3_predecessors.count(buffer[0])) << "wrote a non-predecessor: " << buffer[0];
 }
 
 TEST(K2Tree, adjacent_batch) {

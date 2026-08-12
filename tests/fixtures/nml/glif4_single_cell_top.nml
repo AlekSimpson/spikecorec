@@ -1,0 +1,15 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif4SingleCellTop">
+  <!--
+    A thin <include>-only wrapper so spikecorec's own front-end
+    (tests/exit_model_validation_tests.cpp) parses glif4_single_cell.nml
+    without XSD-validating it as a TOP-LEVEL file - NML_Parser::parse only
+    schema-validates the top-level file it's given (ingest_file's own header
+    comment: "included files are frequently raw LEMS... validation there
+    would be a false positive"), the same convention every other *_tests.cpp
+    fixture in this tree already relies on (a minimal top.nml <include>-ing a
+    content.nml), mirroring glif3_single_cell_top.nml exactly.
+    jNeuroML/jLEMS never sees this file - it consumes glif4_single_cell.nml
+    directly via LEMS_glif4_single_cell.xml.
+  -->
+  <include href="glif4_single_cell.nml"/>
+</neuroml>

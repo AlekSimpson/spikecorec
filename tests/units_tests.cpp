@@ -199,3 +199,88 @@ TEST(TickToSeconds, invalid_negative_tick) {
 TEST(TickToSeconds, invalid_negative_total_seconds) {
     EXPECT_THROW(tick_to_seconds(0, -1.0, 1000), invalid_argument);
 }
+
+// ── unit_suffix_scale ─────────────────────────────────────────────────────────
+//
+// Ported from nightly's own UnitValueToSi suite, which exercised a
+// `unit_value_to_si("-70mV")` helper that parsed a leading number AND applied
+// the suffix scale. This tree exposes only the scale half of that
+// (unit_suffix_scale), so the same unit table is covered here suffix by suffix
+// instead of through parsed literals. The one behavioral difference worth
+// noting: unit_suffix_scale returns 1.0 for an unrecognized suffix, where
+// unit_value_to_si threw — see unknown_suffix_scales_by_one below.
+
+TEST(UnitSuffixScale, voltage_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("V"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("mV"), 1e-3));
+}
+
+TEST(UnitSuffixScale, current_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("A"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("mA"), 1e-3));
+    EXPECT_TRUE(approx(unit_suffix_scale("uA"), 1e-6));
+    EXPECT_TRUE(approx(unit_suffix_scale("nA"), 1e-9));
+    EXPECT_TRUE(approx(unit_suffix_scale("pA"), 1e-12));
+}
+
+TEST(UnitSuffixScale, conductance_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("S"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("mS"), 1e-3));
+    EXPECT_TRUE(approx(unit_suffix_scale("uS"), 1e-6));
+    EXPECT_TRUE(approx(unit_suffix_scale("nS"), 1e-9));
+    EXPECT_TRUE(approx(unit_suffix_scale("pS"), 1e-12));
+}
+
+TEST(UnitSuffixScale, capacitance_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("F"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("mF"), 1e-3));
+    EXPECT_TRUE(approx(unit_suffix_scale("uF"), 1e-6));
+    EXPECT_TRUE(approx(unit_suffix_scale("nF"), 1e-9));
+    EXPECT_TRUE(approx(unit_suffix_scale("pF"), 1e-12));
+}
+
+TEST(UnitSuffixScale, time_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("s"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("ms"), 1e-3));
+    EXPECT_TRUE(approx(unit_suffix_scale("us"), 1e-6));
+}
+
+TEST(UnitSuffixScale, rate_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("Hz"),     1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("per_s"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("per_ms"), 1e3));
+}
+
+TEST(UnitSuffixScale, length_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("m"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("cm"), 1e-2));
+    EXPECT_TRUE(approx(unit_suffix_scale("um"), 1e-6));
+}
+
+TEST(UnitSuffixScale, resistance_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("ohm"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("kohm"), 1e3));
+    EXPECT_TRUE(approx(unit_suffix_scale("Mohm"), 1e6));
+}
+
+TEST(UnitSuffixScale, concentration_and_temperature_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("M"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("mM"), 1e-3));
+    EXPECT_TRUE(approx(unit_suffix_scale("degC"), 1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("K"),    1.0));
+}
+
+TEST(UnitSuffixScale, dimensionless_suffixes_scale_by_one) {
+    EXPECT_TRUE(approx(unit_suffix_scale(""),     1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("none"), 1.0));
+}
+
+TEST(UnitSuffixScale, unknown_suffix_scales_by_one) {
+    // Documented fallback: an unrecognized suffix is treated as dimensionless
+    // rather than rejected. "min" is genuinely absent from this tree's table
+    // (nightly's unit_value_to_si carried min=60/hour=3600 entries), so it takes
+    // the same fallback path as an outright bogus suffix.
+    EXPECT_TRUE(approx(unit_suffix_scale("zz"),   1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("min"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("hour"), 1.0));
+}

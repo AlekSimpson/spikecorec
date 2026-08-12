@@ -1,0 +1,22 @@
+<Lems>
+    <!--
+      LEMS wrapper used only to drive poisson_population.nml through
+      jNeuroML/jLEMS (ticket #67 [H2]) - NOT parsed by spikecorec's own
+      front-end (which reads poisson_population.nml directly). Regenerate
+      the checked-in reference data under
+      tests/fixtures/reference_data/poisson_population/ with, from this
+      directory:
+
+        python3 -m pyneuroml.pynml LEMS_poisson_population.xml -nogui
+
+      (pyneuroml bundles its own jNeuroML jar, so this runs entirely offline
+      once pyneuroml itself is installed: `pip3 install pyneuroml`.) The
+      Simulation element's own `seed="17"` (poisson_population.nml) makes
+      jLEMS's own PRNG draws reproducible across regenerations.
+    -->
+    <Include file="PyNN.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="poisson_population.nml"/>
+    <Target component="sim1"/>
+</Lems>

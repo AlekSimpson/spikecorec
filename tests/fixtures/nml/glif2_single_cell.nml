@@ -1,0 +1,92 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/master/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="Glif2SingleCellExitModel">
+
+  <!--
+    Ticket #125 [T4] exit model: a GLIF2 single cell reproducing SCALED
+    RESET dynamics (`v <- vreset + resetScale * (v - vth)`, not a flat
+    `vreset`) under a current step. The ComponentType below is the SAME
+    GLIF2Cell declaration tests/cell_lowering_tests.cpp's own
+    GLIF2_COMPONENT_TYPE fixture uses, reused verbatim here so the SAME .nml
+    file drives BOTH pyneuroml/jNeuroML (real reference trace/spike capture)
+    and spikecorec's own parse->resolve->lower->IR->AssembledModel pipeline
+    (see tests/exit_model_validation_tests.cpp), mirroring
+    glif3_single_cell.nml's own established convention exactly (ticket #61
+    [H1]). Parameters/Simulation window are identical to glif3_single_cell.nml's
+    own (C/gL/EL/vth/vreset/t_ref, 350ms/0.1ms run); the pulseGenerator
+    amplitude is 0.22nA rather than glif3_single_cell.nml's own 0.6nA; GLIF2
+    has no after-spike currents or adapting threshold to slow its firing rate
+    down, so a much stronger drive fires far more rapidly than GLIF3's own
+    adaptation-slowed rate, which does not leave enough margin between
+    spikes for cross-simulator forward-Euler discretization drift (see this
+    file's own tests/exit_model_validation_tests.cpp header comment on ticket
+    #125) to stay within the same 1ms spike-time tolerance ticket #61 already
+    established; the drift grows by roughly one tick per spike, so it is the
+    TOTAL spike count over the run (not the drive strength itself) that has to
+    stay bounded; 0.22nA (a drive just barely above the steady-state deflection
+    needed to reach vth at all, so each cycle's own approach to threshold is
+    slow) keeps GLIF2's own spike count/rate in the same ballpark as GLIF3's
+    (10 spikes here vs. GLIF3's 13). resetScale=0.3
+    (unlike resetScale=0, which would degenerate to a flat GLIF1-style reset)
+    so every post-reset `v` lands measurably above `vreset`, the real
+    GLIF2-specific behavior this exit model exists to validate.
+  -->
+  <ComponentType name="GLIF2Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="resetScale" dimension="none"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Exposure name="iSyn" dimension="current"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
+        <OnCondition test="v .gt. vth">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset + resetScale * (v - vth)"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF2Cell id="glif2CellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             resetScale="0.3" t_ref="5ms"/>
+
+  <pulseGenerator id="pulseGen1" delay="20ms" duration="300ms" amplitude="0.22nA"/>
+
+  <network id="Glif2Net">
+    <population id="Glif2Pop" component="glif2CellInstance" size="1"/>
+    <explicitInput target="Glif2Pop[0]" input="pulseGen1"/>
+  </network>
+
+  <Simulation id="sim1" length="350ms" step="0.1ms" target="Glif2Net">
+    <OutputFile id="membraneTrace" fileName="glif2_membrane_trace.dat">
+      <OutputColumn id="v" quantity="Glif2Pop[0]/v"/>
+    </OutputFile>
+    <EventOutputFile id="spikesFile" fileName="glif2_spikes.dat" format="TIME_ID">
+      <EventSelection id="sel0" select="Glif2Pop[0]" eventPort="spike"/>
+    </EventOutputFile>
+  </Simulation>
+</neuroml>
