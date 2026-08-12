@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <gtest/gtest.h>
 
 #include "spikecorec/core/types.h"
+#include "spikecorec/core/backend.h"
 #include "spikecorec/core/k2tree.h"
 
 using namespace std;
@@ -225,4 +228,31 @@ TEST(K2Tree, from_edges_invalid_branching_factor) {
     result = K2Tree::from_edges(source_nodes.data(), target_nodes.data(),
                                 (s32)source_nodes.size(), node_count, -1);
     EXPECT_FALSE(result.has_value());
+}
+
+// A k^2-tree's bit arrays and rank tables live in GPU-visible memory, so building one
+// without initialize_gpu_context() used to hand back a null buffer and fault inside
+// _platform_memmove, for a graph of any size and with no diagnostic at all. Deliberately
+// last in this file: the test main initializes the context once, so observing the
+// un-initialized path means taking it back down, and nothing GPU-resident may be alive
+// across the gap -- a GpuPointer held over it would name a released buffer.
+TEST(K2Tree, building_without_a_gpu_context_reports_a_clear_error) {
+    // Restores the context however the test exits, including through a failed assertion:
+    // every later test allocates.
+    struct GpuContextRestorer {
+        ~GpuContextRestorer() { initialize_gpu_context(); }
+    };
+
+    auto adjacency = k2_reference_adjacency(); // host memory, built before the gap
+    release_gpu_resources();
+    GpuContextRestorer restorer;
+
+    ASSERT_FALSE(gpu_context_is_initialized());
+    try {
+        auto tree = K2Tree::from_adjacency_list(adjacency, 8);
+        ADD_FAILURE() << "building a k^2-tree with no GPU context must not be silent";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(string(error.what()).find("initialize_gpu_context"), string::npos)
+            << "the error must name the call the caller is missing: " << error.what();
+    }
 }

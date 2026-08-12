@@ -309,13 +309,13 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
             aggregate_network_edges(network_details, weights.constant_delay_ticks, *logger);
 
     for (const AggregatedNetworkEdge &edge : aggregated_edges) {
-        // WeightMatrix has no per-edge weight setter: U/V is one shared low-rank plane, so
-        // an exact per-edge value is expressed as the sparse delta that carries the
-        // reconstruction onto it (arch section 4.3's Sk), which is what get() reads back.
-        const f32 reconstructed_weight = weights.get(edge.source_node, edge.target_node);
-        weights.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, edge.source_node,
-                                      edge.target_node,
-                                      edge.summed_weight - reconstructed_weight);
+        // set_edge_weight, not a delta against the current reconstruction: U/V are seeded
+        // from N(0,1), so that reconstruction is of order 1, and a NeuroML weight is
+        // routinely 1e-9 or smaller in SI. The difference between the two rounds, in f32,
+        // to the reconstruction itself, and the weight reads back as 0 -- a network that
+        // looks mis-modelled rather than mis-rounded. set_edge_weight stores the value
+        // itself, exact at every magnitude (WeightMatrix::using_exact_edge_weights).
+        weights.set_edge_weight(edge.source_node, edge.target_node, edge.summed_weight);
 
         weights.set_edge_delay_ticks(edge.source_node, edge.target_node, edge.delay_tick_count);
     }

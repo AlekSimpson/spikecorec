@@ -295,6 +295,18 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
 }
 
 static K2Tree make_k2tree_from_arrays(TreeArrays &arrays, s32 node_count, s32 branching_factor, s32 superblock_size) {
+    // Every k^2-tree entry point funnels its allocations through here, so this is the one
+    // place that can catch a missing initialize_gpu_context() before it becomes a crash.
+    // Without a context the Metal allocator hands back a null buffer, and the memcpy just
+    // below then faults inside _platform_memmove with no diagnostic whatsoever, for a graph
+    // of any size — an error message costs one branch per tree construction.
+    if (!gpu_context_is_initialized()) {
+        throw_runtime_error(logger(),
+            "K2Tree: the GPU context is not initialized — call "
+            "spikecorec::initialize_gpu_context() before building a k^2-tree (its bit arrays "
+            "and rank tables are allocated in GPU-visible memory)");
+    }
+
     usize internal_node_words_length = arrays.internal_node_words.size();
     usize leaf_node_words_length = arrays.leaf_node_words.size();
     usize rank_superblock_length = arrays.rank_superblock_table.size();

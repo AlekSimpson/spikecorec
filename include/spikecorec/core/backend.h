@@ -10,6 +10,12 @@ namespace spikecorec {
     // Called once at program shutdown to release GPU resources.
     void release_gpu_resources();
 
+    // True once initialize_gpu_context() has run and the backend's device/context is live.
+    // Every allocate() call needs it: the Metal path hands back a null buffer without one
+    // and the first write through the resulting pointer segfaults with no diagnostic at all,
+    // so construction paths that allocate check this first and fail by name instead.
+    bool gpu_context_is_initialized();
+
     // Both backends obey one rule: get_contents() is the first byte of the range the handle
     // stands for, and every allocator hands out handles that are already positioned there —
     // EngineAllocator's sub-ranges included, so nothing downstream has to carry an offset

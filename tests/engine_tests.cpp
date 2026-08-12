@@ -331,6 +331,127 @@ String write_stimulated_two_neuron_model(const FixtureDirectory &fixture,
                          synaptic_input_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
 
+// ── realistic-magnitude weight fixtures ────────────────────────────────────────
+//
+// The same oneShotCell/latchCell pair as above, plus a relay cell that FIRES off its
+// synaptic input rather than merely recording it, so a weight has to survive storage,
+// GPU reconstruction and delivery accurately enough to cross a threshold. Every weight
+// here is at the SI magnitude NeuroML models actually specify (1e-9), which is where
+// storing a weight as a delta against the order-1 random U/V reconstruction rounds it away
+// to nothing.
+String realistic_weight_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="oneShotCell" extends="baseSpikingCell"
+                   description="Emits exactly one spike, on the first tick past fireTime.">
+        <Parameter name="fireTime" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="hasFired" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="hasFired" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. fireTime .and. hasFired .lt. 0.5">
+                <StateAssignment variable="hasFired" value="1"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="relayCell" extends="baseSpikingCell"
+                   description="Fires on any tick its synaptic input exceeds spikeThreshold,
+                                keeping the value that crossed it.">
+        <Parameter name="spikeThreshold" dimension="none"/>
+
+        <Dynamics>
+            <StateVariable name="lastInput" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="lastInput" value="0"/>
+            </OnStart>
+
+            <OnCondition test="iSyn .gt. spikeThreshold">
+                <StateAssignment variable="lastInput" value="iSyn"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="latchCell" extends="baseCell"
+                   description="Drains its synaptic input, keeping the last delivered value
+                                and the number of ticks anything was delivered on.">
+        <Dynamics>
+            <StateVariable name="delivered" dimension="none"/>
+            <StateVariable name="deliveryCount" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="delivered" value="0"/>
+                <StateAssignment variable="deliveryCount" value="0"/>
+            </OnStart>
+
+            <OnCondition test="iSyn .neq. 0">
+                <StateAssignment variable="delivered" value="iSyn"/>
+                <StateAssignment variable="deliveryCount" value="deliveryCount + 1"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="2ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popRelay[0]/lastInput"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+// source -> two relays -> sink. Neuron indices follow population declaration order:
+// 0 popSource[0], 1 popRelay[0], 2 popRelay[1], 3 popSink[0].
+String realistic_weight_network_nml() {
+    return R"(<neuroml id="realisticweightnet">
+    <oneShotCell id="source0" fireTime="0.25ms"/>
+    <relayCell id="relay0" spikeThreshold="1e-9"/>
+    <latchCell id="sink0"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popRelay" component="relay0" size="2"/>
+        <population id="popSink" component="sink0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popRelay" synapse="syn0">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popRelay[0]"
+                          weight="2.5e-9" delay="0.1ms"/>
+            <connectionWD id="1" preCellId="../popSource[0]" postCellId="../popRelay[1]"
+                          weight="7.5e-9" delay="0.1ms"/>
+        </projection>
+
+        <projection id="proj1" presynapticPopulation="popRelay"
+                    postsynapticPopulation="popSink" synapse="syn0">
+            <connectionWD id="0" preCellId="../popRelay[0]" postCellId="../popSink[0]"
+                          weight="4e-9" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+String write_realistic_weight_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", realistic_weight_network_nml());
+    return fixture.write("model.xml",
+                         realistic_weight_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
 // Where a latchCell's two state variables sit in the flat cell_state array.
 struct LatchCellReader {
     const f32 *cell_state = nullptr;
@@ -1018,6 +1139,53 @@ TEST(SpikeEngine, two_projections_between_one_pair_deliver_their_summed_weight) 
 }
 
 // ── value semantics ────────────────────────────────────────────────────────────
+
+// The test that would have caught the weight-annihilation bug. Storing a weight as a delta
+// against the order-1 random U/V reconstruction rounds any realistic SI weight (1e-9 here)
+// to nothing in f32, so every one of these edges used to deliver exactly 0.0f: the relays
+// never crossed their threshold, nothing propagated past them, and the failure read as a
+// mis-specified model rather than as a rounding error.
+TEST(SpikeEngine, weights_at_realistic_si_magnitudes_propagate_and_make_targets_fire) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_realistic_weight_magnitudes");
+    String model_path = write_realistic_weight_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    // Stored exactly, not approximately -- these are the values the model asked for.
+    EXPECT_EQ(engine.weights.get(0, 1), 2.5e-9f);
+    EXPECT_EQ(engine.weights.get(0, 2), 7.5e-9f);
+    EXPECT_EQ(engine.weights.get(1, 3), 4e-9f);
+
+    const LatchCellReader sink(engine, /*neuron_index=*/3);
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+
+    s64 source_spike_tick = -1;
+    s64 first_relay_spike_tick = -1;
+    s64 second_relay_spike_tick = -1;
+    for (s64 tick = 0; tick < 20; ++tick) {
+        engine.step_simulation(tick);
+        if (spike_flags[0] != 0 && source_spike_tick < 0) source_spike_tick = tick;
+        if (spike_flags[1] != 0 && first_relay_spike_tick < 0) first_relay_spike_tick = tick;
+        if (spike_flags[2] != 0 && second_relay_spike_tick < 0) second_relay_spike_tick = tick;
+    }
+
+    ASSERT_GE(source_spike_tick, 0) << "oneShotCell never fired";
+    ASSERT_GE(first_relay_spike_tick, 0)
+            << "the 2.5e-9 weight never carried its target over threshold";
+    ASSERT_GE(second_relay_spike_tick, 0)
+            << "the 7.5e-9 weight never carried its target over threshold";
+    EXPECT_EQ(first_relay_spike_tick, source_spike_tick + 1);
+    EXPECT_EQ(second_relay_spike_tick, source_spike_tick + 1);
+
+    // A relay's own spike then carries ITS edge's weight onward, so the whole path -- store,
+    // reconstruct on the GPU, deliver, fire, propagate again -- ran at 1e-9 magnitudes.
+    ASSERT_EQ(sink.delivery_count(), 1) << "the relay's spike never reached the sink";
+    EXPECT_NEAR(sink.delivered(), 4e-9f, 1e-12f);
+
+    engine.shutdown();
+}
 
 TEST(SpikeEngine, is_neither_copyable_nor_movable) {
     // A defaulted move left the source `alive` with a null logger, so the moved-from

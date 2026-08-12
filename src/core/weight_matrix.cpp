@@ -61,6 +61,7 @@ WeightMatrix::WeightMatrix(
     , constant_weight(0.0f)
     , check_indexing(check_indexing)
     , using_constant_weight(false)
+    , using_exact_edge_weights(false)
     , constant_delay_ticks(1)
     , using_constant_delay_ticks(true)
     , total_edge_count(0)
@@ -213,6 +214,7 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     constant_weight = other.constant_weight;
     check_indexing = other.check_indexing;
     using_constant_weight = other.using_constant_weight;
+    using_exact_edge_weights = other.using_exact_edge_weights;
     constant_delay_ticks = other.constant_delay_ticks;
     using_constant_delay_ticks = other.using_constant_delay_ticks;
     total_edge_count = other.total_edge_count;
@@ -377,6 +379,103 @@ void WeightMatrix::ensure_delay_matrix_registered() {
         delay_coefficients[lane_index] = 0.0f;
     }
     log::logger().debug("ensure_delay_matrix_registered: delay_matrix_index={}", delay_matrix_index);
+}
+
+void WeightMatrix::enable_exact_edge_weights() {
+    if (using_exact_edge_weights) {
+        return;
+    }
+
+    // ---- Step 1: materialize every real edge's CURRENT value into its Sk slot, read
+    // through exactly the reconstruction get() uses, so the value stored is the same f32
+    // get() was already returning and the mode change is invisible to every edge the
+    // caller has not explicitly written. Done BEFORE the Ck below is zeroed, or the
+    // reconstruction being captured would already be gone. Skipped entirely when there
+    // are no representable neighbor slots at all (an edge-free network), where the Sk
+    // buffer is never allocated in the first place.
+    s64 delta_buffer_element_count = node_count * max_neighbor_count;
+    if (delta_buffer_element_count > 0) {
+        const f32 *default_coefficients =
+            coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents();
+        f32 *delta_data = sparse_delta_buffers[(usize)DEFAULT_MATRIX_INDEX].get_contents();
+        vector<s32> neighbor_buffer((usize)max_neighbor_count);
+        for (s64 node_index = 0; node_index < node_count; ++node_index) {
+            s64 degree = get_neighbors(node_index, neighbor_buffer.data());
+            for (s64 slot = 0; slot < degree; ++slot) {
+                s64 delta_index = node_index * max_neighbor_count + slot;
+                delta_data[(usize)delta_index] =
+                    reconstruct_entry((s32)node_index, neighbor_buffer[(usize)slot],
+                                      default_coefficients) + delta_data[(usize)delta_index];
+            }
+        }
+        // Every real edge now carries its value in Sk, so Sk must actually be read from
+        // here on -- the untouched fast path in lookup_sparse_delta/apply_sparse_delta_overlay
+        // would otherwise report 0.0f for all of them.
+        sparse_delta_touched[(usize)DEFAULT_MATRIX_INDEX] = true;
+    }
+
+    // ---- Step 2: pin the default matrix's Ck to all-zero, padding lanes included (the
+    // constructor fills those with the neutral 1.0f -- see allocate_coefficient_vector --
+    // which would leave a nonzero low-rank term whenever rank is not a multiple of 4).
+    // With every lane zero, reconstruct_entry sums u * (0.0f * v) terms and returns
+    // exactly 0.0f, so an edge reads back as exactly its Sk entry no matter what U and V
+    // hold now or after any later refit. Identical in shape and purpose to
+    // ensure_delay_matrix_registered's own zeroing.
+    s64 effective_lane_count = rank_float4_stride * 4;
+    f32 *default_coefficient_data =
+        coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents();
+    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+        default_coefficient_data[lane_index] = 0.0f;
+    }
+
+    using_exact_edge_weights = true;
+    log::logger().debug("enable_exact_edge_weights: default matrix pinned to its sparse "
+                        "delta buffer (node_count={} total_edge_count={})",
+                        node_count, total_edge_count);
+}
+
+void WeightMatrix::set_edge_weight(s32 source_node, s32 target_node, f32 weight) {
+    log::logger().trace("set_edge_weight: source_node={} target_node={} weight={}",
+                        source_node, target_node, weight);
+
+    // Deliberately does not reuse check_index_inbounds()/check_indexing here -- same
+    // reasoning accumulate_edge_delta's own comment gives: this is a deliberately
+    // edge-scoped operation with its own contract, independent of that pre-existing knob.
+    bool in_bounds = source_node >= 0 && source_node < node_count &&
+                      target_node >= 0 && target_node < node_count;
+    if (!in_bounds) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_weight: (source_node={}, target_node={}) "
+                        "out of bounds for node_count={}", source_node, target_node, node_count));
+    }
+    if (!k2tree.adjacent(source_node, target_node)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_weight: (source_node={}, target_node={}) "
+                        "is not a real edge", source_node, target_node));
+    }
+
+    // See accumulate_edge_delta's own comment: a real edge is normally representable
+    // within max_neighbor_count, except under an explicit max_neighbor_count override
+    // smaller than a node's true degree.
+    optional<s64> slot = find_neighbor_slot(source_node, target_node);
+    if (!slot.has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_weight: (source_node={}, target_node={}) "
+                        "is a real edge but not representable within max_neighbor_count={}",
+                        source_node, target_node, max_neighbor_count));
+    }
+
+    // Only now that the edge is known good, so a rejected call leaves the matrix in
+    // exactly the state it was in (the same ordering set_edge_delay_ticks uses).
+    enable_exact_edge_weights();
+
+    // An absolute write, not an accumulate: the low-rank term is now identically 0.0f, so
+    // this slot IS the weight and get() returns `0.0f + weight`, which is `weight` itself
+    // for every finite f32. Nothing is subtracted off a reconstruction, so nothing can be
+    // rounded away.
+    f32 *delta_data = sparse_delta_buffers[(usize)DEFAULT_MATRIX_INDEX].get_contents();
+    delta_data[source_node * max_neighbor_count + *slot] = weight;
+    sparse_delta_touched[(usize)DEFAULT_MATRIX_INDEX] = true;
 }
 
 optional<s64> WeightMatrix::find_neighbor_slot(s32 source_node, s32 target_node) const {
@@ -705,6 +804,20 @@ ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
                         "must be non-negative (got {})", target_root_mean_square));
     }
 
+    // Scaling works on U/V, whose contribution to the weights is identically zero in exact
+    // mode (see using_exact_edge_weights) -- the call would report a scale factor and change
+    // nothing. Refused loudly rather than silently: a caller asking for this on a
+    // model-driven matrix is asking for something that cannot be delivered without
+    // rewriting every stored weight, which is the caller's decision to make, not this
+    // method's.
+    if (using_exact_edge_weights) {
+        log::throw_invalid_argument(log::logger(),
+            "WeightMatrix::scale_neighbor_weights_to_root_mean_square: this matrix holds "
+            "exact per-edge weights, whose value does not come from U/V at all, so scaling "
+            "the basis would not change a single weight -- rewrite the weights with "
+            "set_edge_weight() instead");
+    }
+
     WeightStats stats_before = neighbor_weight_stats();
     f32 current_root_mean_square = max(stats_before.root_mean_square, epsilon);
     f32 scale_factor = (target_root_mean_square > 0.0f)
@@ -885,6 +998,13 @@ f32 WeightMatrix::max_sparse_delta_occupancy_fraction() const {
         if (matrix_index == delay_matrix_index) {
             continue;
         }
+        // In exact mode the default matrix's Sk holds the weights themselves, permanently
+        // and by design (see using_exact_edge_weights) -- not drift awaiting a refit. It is
+        // exempt from refit's clear for that reason, so counting it here would pin this
+        // fraction at ~100% forever and make the occupancy trigger fire on every tick.
+        if (matrix_index == DEFAULT_MATRIX_INDEX && using_exact_edge_weights) {
+            continue;
+        }
         const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
         s64 occupied_slot_count = 0;
         for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
@@ -942,6 +1062,9 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
         for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
             if (matrix_index == delay_matrix_index) {
                 continue; // see the delay-matrix exemption comment on the main clear below
+            }
+            if (matrix_index == DEFAULT_MATRIX_INDEX && using_exact_edge_weights) {
+                continue; // see the exact-weight exemption comment on the main clear below
             }
             if (delta_buffer_element_count > 0) {
                 memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
@@ -1167,9 +1290,20 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     // delay that reconstructs as 3.4 ticks instead of 3 is simply wrong. Keeping
     // delays in Sk forever costs only memory, so delay is excluded from the fit
     // (above) and from this clear, and stays exact for the lifetime of the matrix.
+    //
+    // The default matrix is exempt on exactly the same grounds once it is in exact mode
+    // (see using_exact_edge_weights): its Sk is not pending drift, it is where the model's
+    // per-edge weights live, and folding a 2.5e-9 weight into the lossy low-rank plane
+    // would round it away entirely. Its Ck is already skipped by the sweeps above (it is
+    // never re-fit for any WeightMatrix), and being all-zero in this mode it also
+    // contributes nothing to the U/V updates -- so nothing but this clear had to be
+    // taught about the mode.
     s64 delta_buffer_element_count = node_count * max_neighbor_count;
     for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
         if (matrix_index == delay_matrix_index) {
+            continue;
+        }
+        if (matrix_index == DEFAULT_MATRIX_INDEX && using_exact_edge_weights) {
             continue;
         }
         if (delta_buffer_element_count > 0) {
@@ -1259,6 +1393,12 @@ void WeightMatrix::load_from_disk(const char *filepath) {
         sparse_delta_touched.clear();
         sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
         sparse_delta_touched.push_back(false);
+
+        // The default matrix above is a fresh all-ones Ck over an empty Sk -- i.e. exactly
+        // the reservoir matrix a constructor hands back -- so exact mode is no longer in
+        // effect and the flag must not claim otherwise. Left as it was when the dimensions
+        // match, since nothing is reset in that case.
+        using_exact_edge_weights = false;
     }
 
     file.read(reinterpret_cast<char*>(U_matrix.get_contents()),

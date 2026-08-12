@@ -126,6 +126,44 @@ namespace spikecorec {
         bool check_indexing;
         bool using_constant_weight;
 
+        // True once set_edge_weight() has switched the DEFAULT_MATRIX_INDEX weight matrix
+        // into EXACT mode: its Ck is pinned to all-zero in every lane (padding included), so
+        // its low-rank term is identically 0.0f and an edge's weight reads back as exactly
+        // its Sk entry — the same device get_edge_delay_ticks/delay_matrix_index already
+        // relies on, and for the same reason.
+        //
+        // Why a mode rather than just writing a delta: U/V are seeded from N(0,1), so the
+        // reconstruction at any edge is of order 1. Expressing an exact weight `w` as the
+        // delta `w - reconstruction` cannot survive f32 when |w| << |reconstruction| — the
+        // sum reconstruction + Sk carries only ulp(reconstruction) ≈ 6e-8·|reconstruction|
+        // of absolute resolution, so a realistic synaptic weight (NeuroML routinely
+        // specifies conductances and currents at 1e-9 to 1e-12 in SI) is rounded away
+        // entirely and reads back as 0. Pinning the low-rank term to zero is what removes
+        // that error term: the stored value IS the weight, exact at every magnitude, and
+        // the GPU propagate kernel reproduces it bit-for-bit because it reconstructs from
+        // this same Ck and Sk pair.
+        //
+        // This is a REPRESENTATION change, not new storage (see CLAUDE.md's U/V
+        // factorization note): Sk for the default matrix is already allocated at
+        // construction, so exact weights cost no memory beyond what an ordinary
+        // WeightMatrix already pays, and the k^2-tree still compresses the adjacency
+        // itself. What it gives up is the low-rank plane's ability to summarize the weights
+        // — which is exactly the trade the delay matrix already makes, and which is only
+        // ever made by a caller that has real per-edge values to store.
+        //
+        // Consequences worth knowing, all documented on the methods concerned:
+        //   - get() returns 0.0f for a pair that is not a real edge (there is no Sk slot
+        //     for one), instead of the pre-exact-mode random reconstruction.
+        //   - update()/scale_neighbor_weights_to_root_mean_square(), which move U/V, no
+        //     longer move the weights. Per-edge updates (plasticity) go through
+        //     accumulate_edge_delta, which stays exact in this mode because it adds
+        //     directly onto the stored weight.
+        //   - refit() leaves the default matrix's Sk alone, the same way it leaves the
+        //     delay matrix's alone.
+        // Never set on a WeightMatrix that is only ever used as a random reservoir: nothing
+        // turns this on but set_edge_weight().
+        bool using_exact_edge_weights;
+
         // Delay (in whole ticks) every edge uses when using_constant_delay_ticks is
         // true. Defaults to 1 — the engine's existing implicit one-tick
         // network_inputs latency (CLAUDE.md's engine execution model) — so an
@@ -264,6 +302,18 @@ namespace spikecorec {
         // fills with the neutral 1.0f) to exactly 0.0f. Idempotent.
         void ensure_delay_matrix_registered();
 
+        // Switches the default matrix into exact mode (see using_exact_edge_weights), in
+        // two steps that together leave every real edge reading back EXACTLY what it read
+        // back before the call: first each real edge's current value (its low-rank
+        // reconstruction plus whatever its Sk slot already held) is written into that Sk
+        // slot, then every lane of the default matrix's Ck — padding lanes included — is
+        // forced to 0.0f. The migration is what makes turning the mode on a lossless
+        // change of representation rather than a silent reset of every edge the caller
+        // has not written yet: the value materialized into Sk is the same f32 get()
+        // already returned, so it round-trips bit-for-bit. Costs one reconstruction per
+        // real edge, once, and is idempotent.
+        void enable_exact_edge_weights();
+
         // Host-side-only slot search: returns target_node's position within
         // source_node's neighbor list (the same order k2tree.get_neighbors
         // enumerates it, and the same slot convention sparse_delta_buffers/
@@ -309,6 +359,27 @@ namespace spikecorec {
         [[nodiscard]] s64 get_predecessors(s64 node_index, s32 *output_buffer) const;
 
         void set_constant_weight(f32 value);
+
+        // Per-edge point-setter for the connection weight (the mirror of
+        // set_edge_delay_ticks below): stores `weight` for the real k^2-tree edge
+        // (source_node, target_node) so that get(source_node, target_node) returns it back
+        // to within f32 representation error, at ANY magnitude — 1e-12 and 1e3 alike.
+        // Throws std::invalid_argument if (source_node, target_node) is not a real edge, or
+        // is a real edge with no slot within max_neighbor_count, on the same edge-scoped
+        // contract accumulate_edge_delta documents.
+        //
+        // This is an absolute SET, not an accumulate: it writes the value into the edge's
+        // Sk slot directly rather than adding `weight - get(...)` on top of a reconstruction
+        // that may be many orders of magnitude larger, which is precisely the subtraction
+        // that silently annihilates realistic synaptic weights (see using_exact_edge_weights
+        // for the arithmetic). Callers with a real per-edge weight must use this rather than
+        // building a delta themselves.
+        //
+        // The first call switches this WeightMatrix into exact mode (see
+        // using_exact_edge_weights and enable_exact_edge_weights) — value-preservingly, so
+        // every OTHER edge still reads back exactly what it did before. Subsequent calls
+        // just overwrite one slot.
+        void set_edge_weight(s32 source_node, s32 target_node, f32 weight);
 
         // Sets constant_delay_ticks to `ticks` and using_constant_delay_ticks to
         // true (mirroring set_constant_weight()'s using_constant_weight side

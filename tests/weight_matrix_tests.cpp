@@ -1757,3 +1757,294 @@ TEST(WeightMatrix, refit_occupancy_threshold_triggers_early_when_enabled) {
 
     EXPECT_TRUE(weight_matrix.is_refit_due()); // occupancy trigger fired, even with 0 ticks elapsed
 }
+
+// ── exact per-edge weights ────────────────────────────────────────────────────
+//
+// U and V are seeded from N(0,1), so an edge's low-rank reconstruction is of order 1
+// whatever the model's weights are. Expressing a weight as a delta against that
+// reconstruction is what these tests exist to rule out: for a realistic synaptic weight
+// (NeuroML specifies conductances and currents at 1e-9 to 1e-12 in SI), `weight -
+// reconstruction` rounds in f32 to `-reconstruction` exactly, and the weight reads back
+// as 0. set_edge_weight pins the default matrix's low-rank term to zero and stores the
+// value itself, so the round trip is exact at every magnitude.
+
+namespace {
+
+// Every real edge's current weight, in the row-major-by-source-node, get_neighbors slot
+// order neighbor_weights()/sparse_delta_buffers share.
+struct EdgeWeightSnapshot {
+    vector<s32> source_nodes;
+    vector<s32> target_nodes;
+    vector<f32> values;
+};
+
+EdgeWeightSnapshot snapshot_every_edge_weight(const WeightMatrix &weight_matrix) {
+    EdgeWeightSnapshot snapshot;
+    vector<s32> neighbor_buffer((usize)max((s64)1, weight_matrix.max_neighbor_count));
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            snapshot.source_nodes.push_back((s32)node_index);
+            snapshot.target_nodes.push_back(neighbor_buffer[(usize)slot]);
+            snapshot.values.push_back(
+                weight_matrix.get((s32)node_index, neighbor_buffer[(usize)slot]));
+        }
+    }
+    return snapshot;
+}
+
+} // namespace
+
+TEST(WeightMatrix, set_edge_weight_round_trips_exactly_across_the_full_magnitude_range) {
+    // 64 nodes, 4 out-edges each: big enough that the reconstruction at every edge below is
+    // a real order-1 number rather than a degenerate near-zero.
+    auto network = square_torus(8);
+    WeightMatrix weight_matrix(network, /*rank=*/32, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/42);
+
+    const vector<f32> weights_to_store = {
+        2.5e-8f,   // the weight this ticket started from: 2.5e-8 - 0.7 rounds to -0.7 in f32
+        1e-12f, -4.5e-12f, 1e-9f, -3.75e-9f, 1.5e-6f, -2.5e-3f, 1.0f, -7.25f, 1e3f, 0.0f,
+    };
+    ASSERT_LE(weights_to_store.size(), (usize)weight_matrix.node_count);
+
+    // The fixture only proves anything if the values being displaced are non-trivial.
+    for (usize index = 0; index < weights_to_store.size(); ++index) {
+        EXPECT_GT(std::fabs(weight_matrix.get((s32)index, network[index][0])), 1e-2f)
+            << "index=" << index << ": the reservoir reconstruction at this edge is too "
+               "small for the test to prove anything";
+    }
+
+    for (usize index = 0; index < weights_to_store.size(); ++index) {
+        weight_matrix.set_edge_weight((s32)index, network[index][0], weights_to_store[index]);
+    }
+
+    // Bit-for-bit, not approximately: the stored value IS the weight, so there is no
+    // rounding left to tolerate.
+    for (usize index = 0; index < weights_to_store.size(); ++index) {
+        EXPECT_EQ(float_bit_pattern(weight_matrix.get((s32)index, network[index][0])),
+                  float_bit_pattern(weights_to_store[index]))
+            << "index=" << index << " weight=" << weights_to_store[index];
+    }
+
+    // The GPU-side bulk read reconstructs from the same Ck/Sk pair the propagate kernel
+    // uses, so it has to agree bit-for-bit too -- a host-only fix would leave the
+    // simulation itself running on the annihilated values.
+    vector<f32> bulk_weights(
+        (usize)(weight_matrix.node_count * weight_matrix.max_neighbor_count));
+    weight_matrix.neighbor_weights(bulk_weights.data());
+    for (usize index = 0; index < weights_to_store.size(); ++index) {
+        // network[index][0] is the first neighbor get_neighbors enumerates only if the
+        // adjacency is already sorted, so locate the slot rather than assuming it.
+        vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+        s64 degree = weight_matrix.get_neighbors((s64)index, neighbor_buffer.data());
+        s64 written_slot = -1;
+        for (s64 slot = 0; slot < degree; ++slot) {
+            if (neighbor_buffer[(usize)slot] == network[index][0]) written_slot = slot;
+        }
+        ASSERT_GE(written_slot, 0) << "index=" << index;
+        EXPECT_EQ(float_bit_pattern(bulk_weights[(usize)((s64)index * weight_matrix.max_neighbor_count
+                                                          + written_slot)]),
+                  float_bit_pattern(weights_to_store[index]))
+            << "index=" << index;
+    }
+
+    EXPECT_TRUE(weight_matrix.using_exact_edge_weights);
+    // No new matrix and no new buffer: the weights live in the default matrix's own Sk,
+    // which is allocated at construction whether or not anything is ever written into it.
+    EXPECT_EQ(weight_matrix.matrix_count(), 1);
+}
+
+TEST(WeightMatrix, set_edge_weight_leaves_every_other_edge_bit_identical) {
+    auto network = square_torus(6);
+    WeightMatrix weight_matrix(network, /*rank=*/16, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/9);
+
+    const EdgeWeightSnapshot before = snapshot_every_edge_weight(weight_matrix);
+    ASSERT_GT(before.values.size(), 0u);
+
+    const s32 written_source = 3;
+    const s32 written_target = network[3][1];
+    weight_matrix.set_edge_weight(written_source, written_target, 2.5e-8f);
+
+    const EdgeWeightSnapshot after = snapshot_every_edge_weight(weight_matrix);
+    ASSERT_EQ(after.values.size(), before.values.size());
+
+    // Switching into exact mode rewrites how every edge is STORED (its value moves out of
+    // the low-rank plane and into Sk), so the guarantee that matters is that it changes
+    // what no edge but the written one READS BACK as.
+    for (usize edge_index = 0; edge_index < before.values.size(); ++edge_index) {
+        if (before.source_nodes[edge_index] == written_source &&
+            before.target_nodes[edge_index] == written_target) {
+            EXPECT_EQ(float_bit_pattern(after.values[edge_index]),
+                      float_bit_pattern(2.5e-8f));
+            continue;
+        }
+        EXPECT_EQ(float_bit_pattern(after.values[edge_index]),
+                  float_bit_pattern(before.values[edge_index]))
+            << "edge " << before.source_nodes[edge_index] << " -> "
+            << before.target_nodes[edge_index] << " moved";
+    }
+}
+
+TEST(WeightMatrix, exact_edge_weights_survive_refit) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/11);
+
+    // Realistic SI magnitudes on every edge, so the fit has a full point cloud to work on.
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    vector<f32> expected_weights;
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            f32 weight = 2.5e-9f * (f32)(1 + node_index) - 1e-11f * (f32)slot;
+            weight_matrix.set_edge_weight((s32)node_index, neighbor_buffer[(usize)slot], weight);
+            expected_weights.push_back(weight);
+        }
+    }
+
+    // An ordinary per-edge matrix with a pending delta, so refit has real work to do and
+    // genuinely moves the shared U/V basis under the weights.
+    s64 ordinary_matrix_index =
+        weight_matrix.add_coefficient_vector(vector<f32>((usize)weight_matrix.rank, 0.5f));
+    weight_matrix.accumulate_edge_delta(ordinary_matrix_index, 0, network[0][0], 0.25f);
+
+    f32 basis_value_before = weight_matrix.U_matrix.get_contents()[0].x;
+    weight_matrix.refit(/*sweep_count=*/2);
+    EXPECT_NE(float_bit_pattern(basis_value_before),
+              float_bit_pattern(weight_matrix.U_matrix.get_contents()[0].x));
+
+    usize expected_index = 0;
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            EXPECT_EQ(float_bit_pattern(
+                          weight_matrix.get((s32)node_index, neighbor_buffer[(usize)slot])),
+                      float_bit_pattern(expected_weights[expected_index]))
+                << "edge " << node_index << " -> " << neighbor_buffer[(usize)slot];
+            ++expected_index;
+        }
+    }
+
+    // The ordinary matrix's Sk was folded into the basis and cleared; the weights were
+    // deliberately left alone, which is what keeps them exact.
+    EXPECT_FALSE(weight_matrix.sparse_delta_touched[(usize)ordinary_matrix_index]);
+    EXPECT_TRUE(weight_matrix.sparse_delta_touched[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX]);
+}
+
+TEST(WeightMatrix, exact_edge_weights_are_excluded_from_the_refit_occupancy_trigger) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/4);
+    weight_matrix.refit_occupancy_threshold_fraction = 0.1f; // opt in
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            weight_matrix.set_edge_weight((s32)node_index, neighbor_buffer[(usize)slot], 2.5e-9f);
+        }
+    }
+
+    // Every edge now holds a weight in the default matrix's Sk. Counted as drift, that is
+    // permanent 100% occupancy, and the trigger would demand a refit on every single tick.
+    EXPECT_EQ(weight_matrix.max_sparse_delta_occupancy_fraction(), 0.0f);
+    EXPECT_FALSE(weight_matrix.is_refit_due());
+
+    // An ordinary matrix's Sk still counts, so the trigger is exempted, not disabled.
+    s64 ordinary_matrix_index =
+        weight_matrix.add_coefficient_vector(vector<f32>((usize)weight_matrix.rank, 1.0f));
+    s64 target_bump_count = (s64)(weight_matrix.total_edge_count * 0.15) + 1;
+    s64 bumped_count = 0;
+    for (s64 node_index = 0;
+         node_index < weight_matrix.node_count && bumped_count < target_bump_count; ++node_index) {
+        s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree && bumped_count < target_bump_count; ++slot) {
+            weight_matrix.accumulate_edge_delta(ordinary_matrix_index, (s32)node_index,
+                                                neighbor_buffer[(usize)slot], 1.0f);
+            ++bumped_count;
+        }
+    }
+    EXPECT_TRUE(weight_matrix.is_refit_due());
+}
+
+TEST(WeightMatrix, accumulate_edge_delta_stays_exact_on_top_of_an_exact_weight) {
+    // The plasticity shape: a small per-edge update against a small weight. With the weight
+    // stored as itself rather than as a delta against an order-1 reconstruction, the sum is
+    // accurate to the weight's own scale instead of to the reconstruction's.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/5);
+
+    const s32 source_node = 1;
+    const s32 target_node = network[1][0];
+    weight_matrix.set_edge_weight(source_node, target_node, 2.5e-9f);
+    weight_matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX,
+                                        source_node, target_node, 1e-10f);
+
+    EXPECT_EQ(float_bit_pattern(weight_matrix.get(source_node, target_node)),
+              float_bit_pattern(2.5e-9f + 1e-10f));
+}
+
+TEST(WeightMatrix, set_edge_weight_rejects_non_edges_and_out_of_bounds_indices) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+
+    const s32 source_node = 0;
+    s32 non_neighbor = find_non_neighbor(weight_matrix, source_node);
+    ASSERT_GE(non_neighbor, 0);
+
+    EXPECT_THROW(weight_matrix.set_edge_weight(source_node, non_neighbor, 1e-9f),
+                 std::invalid_argument);
+    EXPECT_THROW(weight_matrix.set_edge_weight(source_node, 4590, 1e-9f), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.set_edge_weight(-1, 0, 1e-9f), std::invalid_argument);
+
+    // A rejected call leaves the matrix exactly as it was -- including not having switched
+    // into exact mode behind the caller's back.
+    EXPECT_FALSE(weight_matrix.using_exact_edge_weights);
+    EXPECT_TRUE(sparse_delta_buffer_contents_are_all_zero(weight_matrix,
+                                                          WeightMatrix::DEFAULT_MATRIX_INDEX));
+}
+
+TEST(WeightMatrix, scale_neighbor_weights_refuses_a_matrix_holding_exact_weights) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    weight_matrix.set_edge_weight(0, network[0][0], 2.5e-9f);
+
+    // Scaling moves U/V, which no longer contribute to a weight at all -- the call would
+    // report a scale factor and change nothing.
+    EXPECT_THROW((void)weight_matrix.scale_neighbor_weights_to_root_mean_square(1.0f),
+                 std::invalid_argument);
+    EXPECT_EQ(float_bit_pattern(weight_matrix.get(0, network[0][0])),
+              float_bit_pattern(2.5e-9f));
+}
+
+TEST(WeightMatrix, move_assignment_preserves_exact_edge_weights) {
+    auto network = square_torus(4);
+    WeightMatrix source_matrix(network, /*rank=*/8);
+    source_matrix.set_edge_weight(0, network[0][0], 2.5e-9f);
+
+    WeightMatrix destination_matrix(network, /*rank=*/8);
+    destination_matrix = std::move(source_matrix);
+
+    EXPECT_TRUE(destination_matrix.using_exact_edge_weights);
+    EXPECT_EQ(float_bit_pattern(destination_matrix.get(0, network[0][0])),
+              float_bit_pattern(2.5e-9f));
+}
+
+TEST(WeightMatrix, load_from_disk_leaves_exact_mode_off_after_reallocating) {
+    auto network = square_torus(4);
+    WeightMatrix saved_matrix(network, /*rank=*/4); // rank_float4_stride 1
+    const char *path = "/tmp/spikecorec_test_wm_exact_weight_realloc.bin";
+    saved_matrix.save(path);
+
+    // A different rank_float4_stride forces load_from_disk to reallocate, which resets the
+    // matrix family back to a single fresh all-ones default over an empty Sk -- no longer
+    // exact mode, and the flag must not claim otherwise.
+    WeightMatrix loading_matrix(network, /*rank=*/8); // rank_float4_stride 2
+    loading_matrix.set_edge_weight(0, network[0][0], 2.5e-9f);
+    ASSERT_TRUE(loading_matrix.using_exact_edge_weights);
+
+    loading_matrix.load_from_disk(path);
+    EXPECT_FALSE(loading_matrix.using_exact_edge_weights);
+}

@@ -144,6 +144,18 @@ void initialize_gpu_context() {
     log::logger().debug("initialize_gpu_context: done");
 }
 
+bool gpu_context_is_initialized() {
+#ifdef SPIKECOREC_CUDA
+    return global_context != nullptr;
+#elif defined(SPIKECOREC_METAL)
+    return global_device != nullptr;
+#else
+    // No GPU backend compiled in at all — there is no context to initialize, so callers
+    // guarding an allocation on this must not be blocked by it.
+    return true;
+#endif
+}
+
 void release_gpu_resources() {
 #ifdef SPIKECOREC_CUDA
     log::logger().debug("release_gpu_resources: backend=CUDA");
