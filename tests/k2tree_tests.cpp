@@ -64,6 +64,33 @@ TEST(K2Tree, adjacent_and_neighbors) {
     }
 }
 
+TEST(K2Tree, get_predecessors) {
+    auto adjacency = k2_reference_adjacency();
+    const s32 node_count = 8;
+    K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
+
+    // Reference column set: every `u` with an edge u -> target.
+    vector<s32> buffer(node_count);
+    for (s32 target = 0; target < node_count; ++target) {
+        vector<s32> expected;
+        for (s32 source = 0; source < node_count; ++source) {
+            if (tree.adjacent(source, target)) expected.push_back(source);
+        }
+        s64 count = tree.get_predecessors(target, buffer.data(), node_count);
+        vector<s32> predecessors(buffer.begin(), buffer.begin() + count);
+        std::sort(predecessors.begin(), predecessors.end());
+        EXPECT_EQ(predecessors, expected) << "target=" << target;
+    }
+
+    // Same bounds contract as get_neighbors.
+    EXPECT_EQ(tree.get_predecessors(-1, buffer.data(), node_count), 0);
+    EXPECT_EQ(tree.get_predecessors(node_count, buffer.data(), node_count), 0);
+    EXPECT_EQ(tree.get_predecessors(0, buffer.data(), 0), 0);
+
+    // Truncates at max_neighbor_count rather than overrunning the buffer.
+    EXPECT_EQ(tree.get_predecessors(6, buffer.data(), 1), 1);
+}
+
 TEST(K2Tree, adjacent_batch) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;

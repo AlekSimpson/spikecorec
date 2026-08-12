@@ -129,11 +129,11 @@ WeightMatrix::WeightMatrix(
     sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
     sparse_delta_touched.push_back(false);
 
-    // edge_delay_ticks (ticket #64/F3's future consumer): allocated to
-    // node_count*max_neighbor_count elements, every slot initialized to 1 (the
-    // default single-tick delay — see constant_delay_ticks's header comment),
-    // matching the engine's existing implicit one-tick network_inputs latency.
-    edge_delay_ticks = allocate_edge_delay_ticks();
+    // Per-edge spike delay allocates nothing here: it is a member of the
+    // shared-basis family (delay_matrix_index), registered lazily by the first
+    // set_edge_delay_ticks() call. A WeightMatrix that never sets one reads
+    // constant_delay_ticks everywhere — the engine's existing implicit one-tick
+    // network_inputs latency — at zero per-edge storage cost.
 
     // total_edge_count (ticket #54/D4): computed via the same get_neighbors()
     // walk the refit pass itself uses (not a raw sum of `network`'s row
@@ -166,7 +166,6 @@ WeightMatrix::~WeightMatrix() {
     for (auto &delta_buffer : sparse_delta_buffers) {
         deallocate(std::move(delta_buffer));
     }
-    deallocate(std::move(edge_delay_ticks));
 }
 
 WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
@@ -189,9 +188,6 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
         deallocate(std::move(delta_buffer));
     }
     sparse_delta_buffers.clear();
-    // edge_delay_ticks (ticket #64/F3's future consumer) is GpuPointer-backed —
-    // same deallocate-before-move hazard-avoidance as U_matrix/V_matrix above.
-    deallocate(std::move(edge_delay_ticks));
 
     // k2tree is a K2Tree sub-object (not a pointer), and K2Tree's own defaulted
     // move-assignment operator has the identical GpuPointer-assert problem as
@@ -209,7 +205,7 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     // sparse_delta_touched is plain host memory (vector<bool>) — an ordinary
     // vector move-assignment, no GPU-asserting-move hazard to work around here.
     sparse_delta_touched = std::move(other.sparse_delta_touched);
-    edge_delay_ticks = std::move(other.edge_delay_ticks);
+    delay_matrix_index = other.delay_matrix_index;
     node_count = other.node_count;
     max_neighbor_count = other.max_neighbor_count;
     rank = other.rank;
@@ -361,21 +357,26 @@ GpuPointer<f32> WeightMatrix::allocate_sparse_delta_buffer() const {
     return delta_buffer;
 }
 
-GpuPointer<s32> WeightMatrix::allocate_edge_delay_ticks() const {
-    s64 element_count = node_count * max_neighbor_count;
-    if (element_count <= 0) {
-        // Same zero-byte-avoidance pattern as allocate_sparse_delta_buffer.
-        return GpuPointer<s32>();
+void WeightMatrix::ensure_delay_matrix_registered() {
+    if (delay_matrix_index >= 0) {
+        return;
     }
-    GpuPointer<s32> delay_ticks = allocate<s32>((usize)element_count * sizeof(s32));
-    // allocate<s32> does not zero-initialize — fill every slot (including
-    // padding, whose value is never read by anything edge-scoped) with the
-    // default single-tick delay.
-    s32 *delay_data = delay_ticks.get_contents();
-    for (s64 index = 0; index < element_count; ++index) {
-        delay_data[index] = 1;
+
+    // Registered through the ordinary family path, so per-edge delay is stored by
+    // exactly the same machinery as every other per-edge variable.
+    delay_matrix_index = add_coefficient_vector(vector<f32>((usize)rank, 0.0f));
+
+    // add_coefficient_vector fills the padding lanes beyond the logical `rank` with
+    // the neutral 1.0f (see allocate_coefficient_vector), which would leave a
+    // nonzero low-rank term whenever rank is not a multiple of 4. Delay must
+    // reconstruct as EXACTLY its Sk entry and stay invariant under refit()'s U/V
+    // re-fit, so force every lane — padding included — to 0.0f.
+    s64 effective_lane_count = rank_float4_stride * 4;
+    f32 *delay_coefficients = coefficient_vectors[(usize)delay_matrix_index].get_contents();
+    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+        delay_coefficients[lane_index] = 0.0f;
     }
-    return delay_ticks;
+    log::logger().debug("ensure_delay_matrix_registered: delay_matrix_index={}", delay_matrix_index);
 }
 
 optional<s64> WeightMatrix::find_neighbor_slot(s32 source_node, s32 target_node) const {
@@ -613,8 +614,59 @@ void WeightMatrix::set_edge_delay_ticks(s32 source_node, s32 target_node, s32 de
                         source_node, target_node, max_neighbor_count));
     }
 
-    s32 *delay_data = edge_delay_ticks.get_contents();
-    delay_data[source_node * max_neighbor_count + *slot] = delay_ticks;
+    // Registered only now that the edge is known good, which is what keeps the
+    // "never set a per-edge delay -> allocate nothing for delay" invariant exact.
+    ensure_delay_matrix_registered();
+
+    // accumulate_edge_delta ACCUMULATES, so setting an absolute value means adding
+    // the difference from what is already stored. The delay matrix's Ck is all-zero,
+    // so its stored value is exactly its Sk entry — no low-rank term to subtract off
+    // — and every stored delay is a small whole number, making this difference and
+    // sum exact in f32 (integers below 2^24 are exactly representable).
+    f32 current_delay = lookup_sparse_delta(delay_matrix_index, source_node, target_node);
+    accumulate_edge_delta(delay_matrix_index, source_node, target_node,
+                          (f32)delay_ticks - current_delay);
+}
+
+s32 WeightMatrix::get_edge_delay_ticks(s32 source_node, s32 target_node) const {
+    // Same edge-scoped validation contract as set_edge_delay_ticks above.
+    bool in_bounds = source_node >= 0 && source_node < node_count &&
+                      target_node >= 0 && target_node < node_count;
+    if (!in_bounds) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::get_edge_delay_ticks: (source_node={}, target_node={}) "
+                        "out of bounds for node_count={}", source_node, target_node, node_count));
+    }
+    if (!k2tree.adjacent(source_node, target_node)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::get_edge_delay_ticks: (source_node={}, target_node={}) "
+                        "is not a real edge", source_node, target_node));
+    }
+    if (!find_neighbor_slot(source_node, target_node).has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::get_edge_delay_ticks: (source_node={}, target_node={}) "
+                        "is a real edge but not representable within max_neighbor_count={}",
+                        source_node, target_node, max_neighbor_count));
+    }
+
+    if (delay_matrix_index < 0) {
+        // No per-edge delay has ever been set on this instance at all.
+        return constant_delay_ticks;
+    }
+
+    // The delay matrix's Ck is all-zero, so the low-rank term is identically 0.0f and
+    // the stored value IS the Sk entry — read it directly rather than going through
+    // get_for_matrix()'s reconstruct-then-add. A stored 0.0f means "never set for
+    // this edge" (delays are always >= 1), so it falls back to the constant.
+    f32 stored_delay = lookup_sparse_delta(delay_matrix_index, source_node, target_node);
+    if (stored_delay == 0.0f) {
+        return constant_delay_ticks;
+    }
+
+    // Reconstructed values are f32 — round to the nearest whole tick rather than
+    // truncating, then clamp to the >= 1 delay floor set_edge_delay_ticks enforces.
+    s32 rounded_delay = (s32)lroundf(stored_delay);
+    return max(rounded_delay, 1);
 }
 
 WeightStats WeightMatrix::neighbor_weight_stats() const {
@@ -826,6 +878,13 @@ f32 WeightMatrix::max_sparse_delta_occupancy_fraction() const {
         if (!sparse_delta_touched[(usize)matrix_index]) {
             continue;
         }
+        // The delay matrix's Sk is deliberately never folded into the basis and
+        // never cleared by refit() (see refit's own comment), so its entries are
+        // permanent, not drift. Counting them would pin this fraction above the
+        // threshold forever and make the occupancy trigger fire on every tick.
+        if (matrix_index == delay_matrix_index) {
+            continue;
+        }
         const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
         s64 occupied_slot_count = 0;
         for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
@@ -881,6 +940,9 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     if (total_edge_count == 0) {
         s64 delta_buffer_element_count = node_count * max_neighbor_count;
         for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+            if (matrix_index == delay_matrix_index) {
+                continue; // see the delay-matrix exemption comment on the main clear below
+            }
             if (delta_buffer_element_count > 0) {
                 memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
                        (usize)delta_buffer_element_count * sizeof(f32));
@@ -976,6 +1038,18 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
             // shared across the whole matrix family) -- only THIS Ck update is
             // skipped for DEFAULT_MATRIX_INDEX.
             if (matrix_index == DEFAULT_MATRIX_INDEX) {
+                continue;
+            }
+            // The delay matrix's Ck must likewise stay pinned, but at all-ZERO
+            // rather than all-ones: that is what makes a delay reconstruct as
+            // exactly its Sk entry no matter what the U/V updates below do to the
+            // shared basis. Fitting it here would give delay a nonzero low-rank
+            // term that the very next U/V sweep would then move. Note this also
+            // means the delay matrix contributes exactly nothing to the U and V
+            // updates further down (their feature vectors are Ck-weighted, so an
+            // all-zero Ck zeroes every term), which is why no separate exclusion is
+            // needed there: delay magnitudes never drag the shared basis around.
+            if (matrix_index == delay_matrix_index) {
                 continue;
             }
 
@@ -1086,8 +1160,18 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     // contents (allocate_sparse_delta_buffer's own zero-fill convention) and
     // resetting sparse_delta_touched to false, not calling a (nonexistent)
     // container-clear method. ----
+    //
+    // The delay matrix is exempt. Clearing Sk is safe for an ordinary matrix only
+    // because the sweeps above just folded those exact deltas into the lossy
+    // low-rank U/V/Ck plane; for delay that trade is a correctness bug, since a
+    // delay that reconstructs as 3.4 ticks instead of 3 is simply wrong. Keeping
+    // delays in Sk forever costs only memory, so delay is excluded from the fit
+    // (above) and from this clear, and stays exact for the lifetime of the matrix.
     s64 delta_buffer_element_count = node_count * max_neighbor_count;
     for (s64 matrix_index = 0; matrix_index < (s64)sparse_delta_buffers.size(); ++matrix_index) {
+        if (matrix_index == delay_matrix_index) {
+            continue;
+        }
         if (delta_buffer_element_count > 0) {
             memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
                    (usize)delta_buffer_element_count * sizeof(f32));
