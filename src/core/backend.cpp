@@ -459,22 +459,30 @@ void gpu_neighbor_weights(
     s64 node_count,
     s64 max_neighbor_count,
     s64 rank_float4_stride,
+    const f32 *coefficients,
     f32 *output_weights
 ) {
     s64 total_pairs = node_count * max_neighbor_count;
     if (total_pairs <= 0) return;
-    log::logger().trace("gpu_neighbor_weights: node_count={} max_neighbor_count={} total_pairs={}",
-                        node_count, max_neighbor_count, total_pairs);
+    log::logger().trace("gpu_neighbor_weights: node_count={} max_neighbor_count={} total_pairs={} "
+                        "coefficients_present={}",
+                        node_count, max_neighbor_count, total_pairs, coefficients != nullptr);
+
+    // Whether the kernel should read `coefficients` at all, passed as its own scalar argument
+    // rather than left for the kernel to infer from a null pointer. Metal binds a pointer-typed
+    // argument whose value is null via setBytes (as an 8-byte scalar blob), so the address the
+    // kernel actually sees in that case is a valid-but-unrelated one, not null — the kernel
+    // cannot detect the null itself. CUDA takes the same flag so both kernels stay mirror images.
+    s32 coefficients_present = (coefficients != nullptr) ? 1 : 0;
 
 #ifdef SPIKECOREC_CUDA
-    s64 total_pairs = node_count * max_neighbor_count;
-    if (total_pairs <= 0) return;
     LaunchConfig config = cuda::default_launch_config(static_cast<usize>(total_pairs));
     cuda::neighbor_weights_kernel<<<config.grid, config.block, 0, stream>>>(
         U, V,
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        node_count, max_neighbor_count, rank_float4_stride, output_weights
+        node_count, max_neighbor_count, rank_float4_stride,
+        coefficients, coefficients_present, output_weights
     );
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -491,6 +499,7 @@ void gpu_neighbor_weights(
         &internal_node_words, &leaf_node_words, &rank_superblock_table, &rank_subblock_table,
         &branching_factor, &superblock_size_words, &padded_node_count, &tree_height, &internal_bit_count,
         &node_count, &max_neighbor_count, &rank_float4_stride,
+        &coefficients, &coefficients_present,
         &output_weights
     };
     const usize arg_sizes[] = {
@@ -498,9 +507,10 @@ void gpu_neighbor_weights(
         sizeof(void*), sizeof(void*), sizeof(void*), sizeof(void*),
         sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
         sizeof(s64), sizeof(s64), sizeof(s64),
+        sizeof(void*), sizeof(s32),
         sizeof(void*)
     };
-    metal_dispatch(kernel_handle, config, args, arg_sizes, 15);
+    metal_dispatch(kernel_handle, config, args, arg_sizes, 17);
 
 #endif
 }

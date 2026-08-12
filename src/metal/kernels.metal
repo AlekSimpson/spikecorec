@@ -188,6 +188,14 @@ inline int k2t_next_neighbor(
 // root for their one slot, redoing overlapping work. Restructuring to one thread
 // (or one threadgroup) per source_node — walking the row once and filling all
 // max_neighbor_count slots — would eliminate that redundancy.
+// `coefficients` is the shared-basis Ck vector (rank_float4_stride*4 scalar f32
+// elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r].
+// `coefficients_present` says whether to read it at all: the host passes 0 for a
+// null coefficient vector, and the 0 branch below is the pre-shared-basis dot(U,V)
+// statement preserved verbatim, so a null Ck reproduces the pre-#52 numerics
+// exactly. The flag is a separate argument rather than a null-pointer test because
+// the host binds a null pointer argument via setBytes, so the address this kernel
+// receives in that case is valid-but-unrelated, never null.
 kernel void neighbor_weights_kernel(
     const device float4 *U                      [[ buffer(0) ]],
     const device float4 *V                      [[ buffer(1) ]],
@@ -203,7 +211,9 @@ kernel void neighbor_weights_kernel(
     constant long       &node_count             [[ buffer(11) ]],
     constant long       &max_neighbor_count     [[ buffer(12) ]],
     constant long       &rank_float4_stride     [[ buffer(13) ]],
-    device float        *output_weights         [[ buffer(14) ]],
+    const device float  *coefficients           [[ buffer(14) ]],
+    constant int        &coefficients_present   [[ buffer(15) ]],
+    device float        *output_weights         [[ buffer(16) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
     long pair_index = (long)thread_id;
@@ -226,8 +236,22 @@ kernel void neighbor_weights_kernel(
     const device float4 *v_row = V + (long)target_node * rank_float4_stride;
 
     float dot_product = 0.0f;
-    for (long lane = 0; lane < rank_float4_stride; ++lane) {
-        dot_product += dot(u_row[lane], v_row[lane]);
+    if (coefficients_present != 0) {
+        // Ck folded inline into the same accumulation loop/position as the plain U*V
+        // dot product below, so an all-ones Ck reduces to it bit-for-bit (1.0f * v is
+        // exactly v under IEEE-754, so the float4 handed to dot() is bit-identical to
+        // v_row[lane] itself in that case).
+        for (long lane = 0; lane < rank_float4_stride; ++lane) {
+            float4 lane_coefficients = float4(
+                coefficients[lane * 4 + 0], coefficients[lane * 4 + 1],
+                coefficients[lane * 4 + 2], coefficients[lane * 4 + 3]
+            );
+            dot_product += dot(u_row[lane], lane_coefficients * v_row[lane]);
+        }
+    } else {
+        for (long lane = 0; lane < rank_float4_stride; ++lane) {
+            dot_product += dot(u_row[lane], v_row[lane]);
+        }
     }
     output_weights[pair_index] = dot_product;
 }

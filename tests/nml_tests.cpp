@@ -1070,11 +1070,14 @@ TEST(Export, inputs_resolve_their_targets_and_times) {
     EXPECT_EQ(explicit_input.input_component_type_name, "pulseGenerator");
     EXPECT_TRUE(explicit_input.continuous_current_injection);
     EXPECT_DOUBLE_EQ(explicit_input.amplitude, 0.5e-9); // 0.5nA
-    // 10ms and 10ms + 40ms at dt = 0.01ms. Truncation would give 999 and 4998.
-    EXPECT_EQ(explicit_input.start_tick, 1000);
-    EXPECT_EQ(explicit_input.end_tick, 5000);
     ASSERT_EQ(explicit_input.targets.size(), 1u);
     EXPECT_EQ(explicit_input.targets[0].neuron_index, 0);
+    // A continuous injector reports its span as exactly two event_ticks entries,
+    // {delay, delay + duration}.
+    // 10ms and 10ms + 40ms at dt = 0.01ms. Truncation would give 999 and 4998.
+    ASSERT_EQ(explicit_input.targets[0].event_ticks.size(), 2u);
+    EXPECT_EQ(explicit_input.targets[0].event_ticks.front(), 1000);
+    EXPECT_EQ(explicit_input.targets[0].event_ticks.back(), 5000);
 
     const SimulationInputConfig &input_list = result.input_profiles[1];
     ASSERT_EQ(input_list.targets.size(), 2u);
