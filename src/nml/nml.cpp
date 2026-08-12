@@ -329,6 +329,9 @@ f64 NML_Parser::resolve_quantity(const String &value) const {
         return magnitude * declared->second.scale + declared->second.offset;
     }
 
+    // Only a suffix NEITHER source knows is an error, and it is one: unit_suffix_scale throws
+    // rather than scaling by 1.0, so a misspelled or unsupported unit is reported instead of
+    // silently reinterpreting the value it was attached to.
     return magnitude * units::unit_suffix_scale(suffix);
 }
 

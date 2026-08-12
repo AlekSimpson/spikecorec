@@ -231,6 +231,10 @@ namespace spikecorec {
     // - if batch is non-null, encodes into the batch's already-open command buffer
     //   instead of creating/committing/waiting on one of its own (Metal); the caller
     //   is responsible for calling commit_command_batch() once all encodes are queued
+    // - Metal only. Every other backend THROWS rather than returning: this is the generic
+    //   positional-argument launcher the generated master kernel runs through, and CUDA has
+    //   no equivalent yet (ticket #56, C4, cuda_dispatch). Returning quietly would leave a
+    //   CUDA build reporting successful ticks while running no dynamics at all.
     void metal_dispatch(
         KernelHandle handle,
         LaunchConfig config,

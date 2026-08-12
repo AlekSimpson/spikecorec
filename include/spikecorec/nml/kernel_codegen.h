@@ -111,15 +111,40 @@ struct GeneratedKernel {
 };
 
 // Per-tick dynamics: Deliver, then Integrate, then Detect, then the Reset and Emit bodies
-// each OnCondition gates, then Propagate.
+// each OnCondition gates, then any ungated Emit and Reset, then Propagate. That is the
+// engine's documented stage order (3 Detect, 4 Emit, 5 Reset), and it is the emission order
+// too: an ungated reset emitted ahead of the Detect blocks would be clobbered by the same
+// tick's integrate result instead of overriding it.
 //
 // Every TimeDerivative is evaluated against the state as it stood at entry and written
 // back only once all of them have been computed, so two variables that reference each
 // other integrate consistently instead of one seeing the other's updated value.
 //
+// ── What Detect, Emit and Reset observe: the POST-INTEGRATE state ─────────────
+// Stages 3 to 5 run after Integrate, so everything they read is this tick's integrated
+// state -- the cell_state reads inside an OnCondition's test, the cell_state reads on a
+// StateAssignment's right-hand side, AND the DerivedVariable locals either of them names.
+// DerivedVariables are therefore evaluated twice: once before the Euler step, feeding the
+// TimeDerivative right-hand sides, and again after the write-back, so a threshold or reset
+// value that is itself a DerivedVariable of a state variable is compared against the same
+// state the other half of the comparison came from.
+//
+// LEMS evaluates its derived variables once per tick, before the conditionals, so a
+// consistently PRE-integrate reading would also be defensible -- but it would mean
+// reverting the conditionals' own cell_state reads to pre-integrate temporaries too, which
+// would notice a threshold crossing one tick late and reset a v that has already moved past
+// the threshold. What is not defensible is the mixture: half a comparison pre-integrate and
+// half post. Post-integrate is the half both are made to agree on, because it is what the
+// engine's stage order and the existing reset semantics already imply.
+//
+// A handler's StateAssignments are SIMULTANEOUS, as in LEMS: every right-hand side is
+// evaluated before anything is written back, so "v = u" and "u = v" in one OnCondition swap
+// rather than collapsing onto u's value. This is the same temporaries treatment the
+// TimeDerivative path gets, and it applies to OnStart bodies as well.
+//
 // A DerivedVariable written as a `select=` path over the attached synapses
-// ("synapses[*]/i" on iafCell, "synapses[*]/I" on izhikevichCell) lowers to a read of this
-// tick's `network_inputs` ring row, and binds under its own name like any other
+// ("synapses[*]/i" on iafCell, "synapses[*]/I" on izhikevichCell) lowers to a PLAIN load of
+// this tick's `network_inputs` ring row, and binds under its own name like any other
 // DerivedVariable. Every other path -- "ionChannel/g", "populations[*]/i",
 // "concentrationModels[species='ca']/concentration" -- reaches into a child structure with
 // no engine buffer behind it and throws naming the path. Paths and arithmetic arrive in the
@@ -134,16 +159,46 @@ struct GeneratedKernel {
 // therefore NOT dispatch a propagation kernel of its own.
 //
 // `network_inputs` is a delay ring: one flat allocation of ring_depth * neuron_count floats
-// indexed as [row][neuron]. An arrival lands in row (tick + edge delay) % ring_depth; a cell
-// reads row tick % ring_depth and clears it, so the row is empty when the ring wraps back
-// onto it. `ring_depth` exceeds the model's largest per-edge delay -- the engine computes it
-// -- so an arrival can never land in the row being drained this tick.
+// indexed as [row][neuron]. An arrival lands in row (tick + edge delay) % ring_depth and a
+// cell reads row tick % ring_depth. Arrivals are atomic -- many sources converge on one
+// target -- but the READ is a plain load, and it does not clear anything: the row is zeroed
+// as a whole row after the dispatch, by generate_ring_row_clear_kernel below.
+//
+// `ring_depth` exceeds the model's largest per-edge delay -- the engine computes it -- so an
+// arrival can never land in the row being read this tick.
 //
 // Throws, naming the construct and the ComponentType, on anything below.
 GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result);
 
 // OnStart bodies only, run once at initialisation. Skips every other stage.
 GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result);
+
+// Zeroes row `tick % ring_depth` of `network_inputs`, one thread per neuron. The engine
+// dispatches it immediately behind the tick kernel, in the same command batch, so within
+// tick T the order is: host adds T's stimulus into row T % ring_depth -> the tick kernel
+// reads that row and propagates into rows (T + delay) % ring_depth -> this kernel zeroes row
+// T % ring_depth.
+//
+// The window is the load-bearing part, and there is exactly one correct one:
+//
+//  - It cannot run before or during the tick kernel: that row holds the arrivals the kernel
+//    is about to read.
+//  - It cannot be deferred to just before the row is next used. Delays run from 1 to
+//    ring_depth - 1, so the earliest write back into row T % ring_depth comes from tick T+1
+//    (an edge of delay ring_depth - 1 firing at T+1 arrives at T + ring_depth). Clearing any
+//    later would wipe exactly the delayed arrivals this scheme exists to preserve.
+//
+// Clearing the whole row rather than each cell clearing its own slot as it reads is what
+// makes a cell type that never reduces over its synapses safe: its neurons' slots are still
+// emptied, where under a per-slot drain they accumulated every arrival forever.
+//
+// What makes the plain read and this clear race-free is that every delay is >= 1, so no
+// thread writes row T % ring_depth during tick T's dispatch. The engine asserts that where
+// it flattens the per-edge delays.
+//
+// `argument_names` is a subset of the master kernel's, bound by the same machinery:
+// network_inputs, neuron_count, tick, ring_depth.
+GeneratedKernel generate_ring_row_clear_kernel();
 
 // NML/LEMS expression syntax -> C-family syntax, via a tokenizer and a recursive-descent
 // parser. Textual substitution cannot do this correctly: `^` is exponentiation and

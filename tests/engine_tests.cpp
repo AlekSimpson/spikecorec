@@ -291,6 +291,46 @@ String write_stimulus_only_model(const FixtureDirectory &fixture) {
                          synaptic_input_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
 
+// The same two neurons and the same edge, with a current injector aimed at one of them.
+// `stimulus_target` names the population the pulseGenerator drives: "popSource" makes the
+// stimulus land on the cell type that never reduces over its synapses, "popTarget" on the
+// one that does. The amplitude is deliberately of the same order as the edge weight, so a
+// stale re-delivery shows up as a value that is plainly wrong rather than as rounding.
+String stimulated_two_neuron_network_nml(const String &stimulus_target,
+                                         const String &pulse_delay,
+                                         const String &pulse_duration) {
+    return R"(<neuroml id="stimulatedpropagationnet">
+    <oneShotCell id="source0" fireTime="0.25ms"/>
+    <latchCell id="target0"/>
+    <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+    <pulseGenerator id="pg0" delay=")" + pulse_delay + R"(" duration=")" + pulse_duration +
+           R"(" amplitude="1A"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="syn0">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="2.5" delay="0.3ms"/>
+        </projection>
+
+        <explicitInput target=")" + stimulus_target + R"([0]" input="pg0"/>
+    </network>
+</neuroml>
+)";
+}
+
+String write_stimulated_two_neuron_model(const FixtureDirectory &fixture,
+                                         const String &stimulus_target, const String &pulse_delay,
+                                         const String &pulse_duration) {
+    fixture.write("net.nml",
+                  stimulated_two_neuron_network_nml(stimulus_target, pulse_delay, pulse_duration));
+    return fixture.write("model.xml",
+                         synaptic_input_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
 // Where a latchCell's two state variables sit in the flat cell_state array.
 struct LatchCellReader {
     const f32 *cell_state = nullptr;
@@ -535,12 +575,16 @@ TEST(SpikeEngine, step_simulation_advances_state_and_delivers_input) {
     EXPECT_GT(cell_state[cell_state_base[0]], initial_potential);
     EXPECT_GT(cell_state[cell_state_base[2]], initial_dual_potential);
 
-    // The pulseGenerator's window opens at tick 5, so by tick 9 neuron 0 has accumulated
-    // stimulus and no other neuron has.
-    EXPECT_GT(network_inputs[0], 0.0f);
-    EXPECT_FLOAT_EQ(network_inputs[1], 0.0f);
-    EXPECT_FLOAT_EQ(network_inputs[2], 0.0f);
-    EXPECT_FLOAT_EQ(network_inputs[3], 0.0f);
+    // The pulseGenerator has been firing into neuron 0's slot since tick 5, and neither cell
+    // type in this model reduces over its synapses. Every one of those slots is nonetheless
+    // empty: the ring row is cleared as a whole row at the end of the tick that read it, so
+    // input a type never reads is consumed rather than piling up for the rest of the run.
+    const s64 ring_element_count =
+            (s64)engine.network_input_ring_depth * engine.total_neuron_count;
+    for (s64 element = 0; element < ring_element_count; ++element) {
+        EXPECT_FLOAT_EQ(network_inputs[element], 0.0f)
+                << "network_inputs[" << element << "] accumulated input nothing consumed";
+    }
 
     engine.shutdown();
 }
@@ -789,6 +833,101 @@ TEST(SpikeEngine, a_delivered_spike_is_not_redelivered_when_the_ring_wraps) {
     engine.shutdown();
 }
 
+TEST(SpikeEngine, input_to_a_type_that_never_reads_its_synapses_does_not_accumulate) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The stimulus lands on popSource, whose oneShotCell has no `select=` over its synapses
+    // and so never reads the ring at all. Under a design where each cell empties its own slot
+    // as it reads, nothing would ever empty this one and it would carry the whole run's
+    // injected current, growing every tick. The row clear is what makes emptying a slot
+    // independent of whether any cell type reads it.
+    FixtureDirectory fixture("neuroml_unread_slot");
+    String model_path = write_stimulated_two_neuron_model(fixture, /*stimulus_target=*/"popSource",
+                                                          /*pulse_delay=*/"0ms",
+                                                          /*pulse_duration=*/"1ms");
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    ASSERT_EQ(engine.network_input_ring_depth, 4);
+    ASSERT_EQ(engine.total_neuron_count, 2);
+
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    const LatchCellReader target(engine, /*neuron_index=*/1);
+
+    // Twelve ticks is three full turns of the four-row ring, with the injector firing into
+    // the source on every one of them.
+    for (s64 tick = 0; tick < 12; ++tick) {
+        engine.step_simulation(tick);
+
+        for (s64 row = 0; row < engine.network_input_ring_depth; ++row) {
+            const s64 source_slot = row * engine.total_neuron_count + 0;
+            EXPECT_FLOAT_EQ(network_inputs[source_slot], 0.0f)
+                    << "after tick " << tick << " the source's slot in ring row " << row
+                    << " still holds input no cell type reads";
+        }
+    }
+
+    // The reading type is unaffected: its one spike still arrived, exactly once.
+    EXPECT_EQ(target.delivery_count(), 1);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, clearing_the_current_row_preserves_a_spike_already_in_flight) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // "Clear the past, preserve the future", stated directly. The target is stimulated on the
+    // first three ticks, so the row it reads is non-empty and gets cleared on each of them,
+    // while a spike with a three-tick delay is in flight into a LATER row. Clearing more than
+    // the row just read would lose that spike; clearing less would re-deliver the stimulus
+    // when the four-row ring wrapped back around, four ticks later.
+    FixtureDirectory fixture("neuroml_in_flight_across_clears");
+    String model_path = write_stimulated_two_neuron_model(fixture, /*stimulus_target=*/"popTarget",
+                                                          /*pulse_delay=*/"0ms",
+                                                          /*pulse_duration=*/"0.2ms");
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    ASSERT_EQ(engine.network_input_ring_depth, 4);
+
+    const LatchCellReader target(engine, /*neuron_index=*/1);
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+
+    s64 source_spike_tick = -1;
+    f32 stimulus_magnitude = 0.0f;
+    spikecorec::Vector<f32> delivered_on_tick(12, 0.0f);
+
+    for (s64 tick = 0; tick < 12; ++tick) {
+        const s32 previous_delivery_count = target.delivery_count();
+        engine.step_simulation(tick);
+
+        if (spike_flags[0] != 0 && source_spike_tick < 0) source_spike_tick = tick;
+        if (target.delivery_count() != previous_delivery_count) {
+            delivered_on_tick[(usize)tick] = target.delivered();
+        }
+    }
+
+    ASSERT_GE(source_spike_tick, 0) << "oneShotCell never fired";
+    stimulus_magnitude = delivered_on_tick[0];
+    ASSERT_GT(stimulus_magnitude, 0.01f)
+            << "the injected stimulus is too small for a stale re-delivery to be detectable";
+
+    // Ticks 0 through 2 are the injector's window; ticks 4 and 5 are where the ring wraps
+    // back onto rows 0 and 1, which is when an uncleared row would hand its stimulus back.
+    EXPECT_GT(delivered_on_tick[1], 0.0f);
+    EXPECT_GT(delivered_on_tick[2], 0.0f);
+    EXPECT_FLOAT_EQ(delivered_on_tick[4], 0.0f) << "row 0's stimulus was delivered a second time";
+    EXPECT_FLOAT_EQ(delivered_on_tick[5], 0.0f) << "row 1's stimulus was delivered a second time";
+
+    // The spike survived every one of those clears and arrived on its own tick, carrying the
+    // edge's weight and nothing else -- no stimulus left behind in the row it landed in.
+    const usize arrival_tick = (usize)(source_spike_tick + 3);
+    ASSERT_LT(arrival_tick, delivered_on_tick.size());
+    EXPECT_NEAR(delivered_on_tick[arrival_tick], 2.5f, stimulus_magnitude * 0.1f)
+            << "the arrival carried " << delivered_on_tick[arrival_tick]
+            << " rather than the edge weight alone";
+
+    engine.shutdown();
+}
+
 // ── parallel edges between one ordered pair ────────────────────────────────────
 
 namespace {
@@ -975,4 +1114,51 @@ TEST(SpikeEngine, recording_writes_one_frame_per_tick_for_each_selection) {
     // The recorded quantity is pop1[0]/v, which is climbing towards restingPotential.
     ASSERT_EQ(recording.frames.size(), (usize)recorded_tick_count);
     EXPECT_GT(recording.frames.back(), recording.frames.front());
+}
+
+TEST(SpikeEngine, recording_a_model_with_no_state_variables_is_refused_by_name) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // A ComponentType with no <StateVariable> gives cell_state zero elements, and a
+    // zero-element buffer is a null handle rather than an allocation. Gathering a recording
+    // frame out of it dereferences that null once per tick, far from the model that caused
+    // it, so the mismatch is reported when the stream is built instead.
+    FixtureDirectory fixture("neuroml_stateless_recording");
+    fixture.write("net.nml", R"(<neuroml id="statelessnet">
+    <statelessCell id="cell0" level="1"/>
+
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+    </network>
+</neuroml>
+)");
+    String model_path = fixture.write("model.xml", R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="statelessCell" extends="baseCell"
+                   description="Declares no StateVariable at all, so it has no cell state.">
+        <Parameter name="level" dimension="none"/>
+
+        <Dynamics>
+            <DerivedVariable name="reading" dimension="none" value="level"/>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file="net.nml"/>
+
+    <Simulation id="sim1" length="1ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + fixture.path_of("out.spire") + R"(">
+            <OutputColumn id="c0" quantity="pop1[0]/reading"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)");
+
+    try {
+        SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+        FAIL() << "expected a model with no state variables to be refused a cell-state recorder";
+    } catch (const std::runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("StateVariable"), String::npos) << message;
+    }
 }

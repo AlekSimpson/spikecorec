@@ -11,7 +11,12 @@ f64 seconds_to_ms(f64 seconds);
 f64 tick_to_ms(s64 tick, f64 total_ms, s64 total_ticks);
 f64 tick_to_seconds(s64 tick, f64 total_seconds, s64 total_ticks);
 
-// SI scale for a NeuroML unit suffix, e.g. "mV" -> 1e-3. Unknown suffixes scale by 1.
+// SI scale for a NeuroML unit suffix, e.g. "mV" -> 1e-3. Covers every unit symbol the
+// vendored standard library declares, plus "" and "none" for dimensionless values.
+//
+// THROWS std::invalid_argument on a suffix it does not know, naming it. Scaling an
+// unrecognised suffix by 1.0 instead would read "2min" as 2 seconds and a misspelling as a
+// plausible number, with no diagnostic anywhere.
 f64 unit_suffix_scale(const String &suffix);
 
 } // end namespace

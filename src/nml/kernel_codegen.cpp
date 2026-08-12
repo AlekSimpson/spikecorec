@@ -1,5 +1,6 @@
 #include "spikecorec/nml/kernel_codegen.h"
 
+#include <algorithm>
 #include <cctype>
 #include <iomanip>
 #include <sstream>
@@ -593,14 +594,70 @@ void reject_unsupported_instructions(const CellTypeSpecification &cell_type) {
     }
 }
 
-String emit_state_assignment(const CellTypeSpecification &cell_type,
-                             const NML_ParseResult &parse_result, const SymbolTable &symbols,
-                             const DynamicsInstruction &instruction, usize indent_level) {
-    const usize slot = require_state_variable_slot(cell_type, instruction.target, "StateAssignment");
-    return indent(indent_level) + "cell_state[state_base + " + to_string(slot) + "] = " +
-           translate_expression(instruction.expression,
-                                with_fallback_symbols(symbols, parse_result)) +
-           ";\n";
+// One handler's StateAssignments, emitted with LEMS's simultaneous semantics: every
+// right-hand side is evaluated against the state as it stood when the handler fired, and
+// only then is anything written back. Emitting them sequentially would make "v = u; u = v"
+// inside one OnCondition assign u to itself instead of swapping, and the ordering would be
+// the document's rather than the model's. This is the same treatment the TimeDerivative path
+// already gives its next_* temporaries.
+String emit_state_assignment_group(const CellTypeSpecification &cell_type,
+                                   const NML_ParseResult &parse_result,
+                                   const SymbolTable &symbols,
+                                   const Vector<const DynamicsInstruction *> &assignments,
+                                   usize indent_level) {
+    if (assignments.empty()) return "";
+
+    const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
+
+    // A lone assignment cannot observe its own write, so it goes straight to storage. Every
+    // GLIF handler has exactly one, and a temporary there would be noise in every generated
+    // kernel Phase 1 produces.
+    if (assignments.size() == 1) {
+        const usize slot = require_state_variable_slot(cell_type, assignments.front()->target,
+                                                       "StateAssignment");
+        return indent(indent_level) + "cell_state[state_base + " + to_string(slot) + "] = " +
+               translate_expression(assignments.front()->expression, visible_symbols) + ";\n";
+    }
+
+    ostringstream group;
+    Vector<Pair<usize, String>> pending_state_writes;
+    Set<String> declared_temporaries;
+
+    for (const DynamicsInstruction *assignment : assignments) {
+        const usize slot =
+                require_state_variable_slot(cell_type, assignment->target, "StateAssignment");
+        const String temporary_name = "assigned_" + sanitize_identifier(assignment->target);
+
+        // Two assignments to one variable in a single handler is malformed LEMS, but it must
+        // not turn into a redeclaration the shader compiler rejects: the second one assigns
+        // the existing temporary, so the last writer still wins as it did before.
+        const bool is_first_assignment_to_target = declared_temporaries.insert(temporary_name).second;
+        group << indent(indent_level) << (is_first_assignment_to_target ? "float " : "")
+              << temporary_name << " = "
+              << translate_expression(assignment->expression, visible_symbols) << ";\n";
+
+        if (is_first_assignment_to_target) pending_state_writes.push_back({slot, temporary_name});
+    }
+
+    for (const auto &pending_write : pending_state_writes) {
+        group << indent(indent_level) << "cell_state[state_base + " << pending_write.first
+              << "] = " << pending_write.second << ";\n";
+    }
+
+    return group.str();
+}
+
+// The Reset-stage StateAssignments `condition` gates, in declaration order. An empty
+// `condition` collects the ungated ones.
+Vector<const DynamicsInstruction *> reset_assignments_gated_by(
+        const CellTypeSpecification &cell_type, const String &condition) {
+    Vector<const DynamicsInstruction *> assignments;
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Reset) continue;
+        if (instruction.condition != condition) continue;
+        assignments.push_back(&instruction);
+    }
+    return assignments;
 }
 
 String emit_spike(usize indent_level) {
@@ -671,9 +728,8 @@ Optional<String> select_path_head_name(const String &expression, const SymbolTab
 }
 
 // The one local every select= path over the attached synapses binds to. The ring row is
-// drained exactly once per cell, into this local, so a model that reduces over its synapses
-// more than once reads the same delivered current each time instead of finding the slot
-// already emptied by its own earlier read.
+// loaded into it once per cell, so a model that reduces over its synapses more than once
+// reads one consistent delivered current rather than repeating the load.
 const String synaptic_input_local_name = "synaptic_input_accumulator";
 
 // Refuses a select= path that is not a reduction over the attached synapses.
@@ -951,27 +1007,19 @@ String emit_propagation_helpers(KernelBackend backend) {
     return helpers.str();
 }
 
-// Reads this tick's ring row for this neuron and clears it in one step, so the row is empty
-// when the ring wraps back onto it -- an uncleared row would re-deliver its contents
-// ring_depth ticks later, which reads as a plausible oscillation rather than as a bug.
-String emit_synaptic_input_drain(KernelBackend backend, usize indent_level) {
-    ostringstream drain;
-    drain << indent(indent_level) << "int synaptic_input_index = network_input_ring_index(\n"
-          << indent(indent_level + 2)
-          << "tick, ring_depth, neuron_count, neuron_index);\n";
-
-    if (backend == KernelBackend::Metal) {
-        drain << indent(indent_level) << "float " << synaptic_input_local_name
-              << " = atomic_exchange_explicit(\n"
-              << indent(indent_level + 2)
-              << "(device atomic_float *)(network_inputs + synaptic_input_index), 0.0f,\n"
-              << indent(indent_level + 2) << "memory_order_relaxed);\n";
-    } else {
-        drain << indent(indent_level) << "float " << synaptic_input_local_name
-              << " = atomicExch(network_inputs + synaptic_input_index, 0.0f);\n";
-    }
-
-    return drain.str();
+// Reads this tick's ring row for this neuron. A PLAIN load, not an exchange: nothing writes
+// row `tick % ring_depth` while this tick's kernel is running, because every edge delay is at
+// least one tick (the engine asserts that where the delays are flattened), so the row is
+// read-only for the duration of the dispatch. The row is emptied afterwards, as a whole row,
+// by the clear kernel the engine dispatches behind this one -- see
+// generate_ring_row_clear_kernel.
+String emit_synaptic_input_read(usize indent_level) {
+    ostringstream read;
+    read << indent(indent_level) << "int synaptic_input_index = network_input_ring_index(\n"
+         << indent(indent_level + 2) << "tick, ring_depth, neuron_count, neuron_index);\n"
+         << indent(indent_level) << "float " << synaptic_input_local_name
+         << " = network_inputs[synaptic_input_index];\n";
+    return read.str();
 }
 
 // The fixed epilogue every cell device function ends with.
@@ -996,27 +1044,25 @@ String emit_propagation_epilogue(usize indent_level) {
 
 // ── Per-cell-type bodies ─────────────────────────────────────────────────────
 
-String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseResult &parse_result,
-                      KernelBackend backend) {
+String emit_tick_body(const CellTypeSpecification &cell_type,
+                      const NML_ParseResult &parse_result) {
     reject_unsupported_instructions(cell_type);
 
     ostringstream body;
     SymbolTable symbols = build_base_symbol_table(cell_type);
+    Vector<Pair<String, String>> derived_variable_locals;
 
-    // Integrate, part 1: DerivedVariables become locals in source order, each visible to
-    // the ones after it. A DerivedVariable referencing one declared later resolves to
-    // nothing and throws, rather than emitting a forward reference the shader compiler
-    // would reject far from its cause.
+    // Stage 1, Deliver, and Integrate, part 1: DerivedVariables become locals in source
+    // order, each visible to the ones after it. A DerivedVariable referencing one declared
+    // later resolves to nothing and throws, rather than emitting a forward reference the
+    // shader compiler would reject far from its cause.
     //
-    // A select= path becomes a local the same way, so whatever it binds to is reached by
-    // the name the model gave it and resolves through the ordinary precedence chain. Every
-    // such path binds to the ONE drain emitted ahead of them all, so a model reducing over
-    // its synapses twice reads the same delivered current twice rather than finding the ring
-    // slot already emptied by its own earlier read. The declarations are staged rather than
-    // written straight out because whether the drain is needed is only known once they have
-    // all been walked.
-    ostringstream derived_variable_declarations;
-    bool drains_synaptic_input = false;
+    // A select= path becomes a local the same way, so whatever it binds to is reached by the
+    // name the model gave it and resolves through the ordinary precedence chain. The ring row
+    // is loaded once, just before the first path that needs it, and every path in the type
+    // binds to that one local -- the load is plain and the row is cleared by the engine's own
+    // clear kernel, so this is now consistency rather than correctness.
+    bool has_read_synaptic_input = false;
 
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
@@ -1029,21 +1075,20 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
         String read_expression;
         if (path_head_name.has_value()) {
             require_synaptic_select_path(instruction.expression, *path_head_name, cell_type.name);
-            drains_synaptic_input = true;
+            if (!has_read_synaptic_input) {
+                body << emit_synaptic_input_read(1);
+                has_read_synaptic_input = true;
+            }
             read_expression = synaptic_input_local_name;
         } else {
             read_expression = translate_expression(instruction.expression, visible_symbols);
         }
 
         const String local_name = "derived_" + sanitize_identifier(instruction.target);
-        derived_variable_declarations << indent(1) << "float " << local_name << " = "
-                                      << read_expression << ";\n";
+        body << indent(1) << "float " << local_name << " = " << read_expression << ";\n";
+        derived_variable_locals.push_back({local_name, read_expression});
         symbols.define(instruction.target, local_name);
     }
-
-    // Stage 1, Deliver, for this neuron: its own ring row, read and cleared once.
-    if (drains_synaptic_input) body << emit_synaptic_input_drain(backend, 1);
-    body << derived_variable_declarations.str();
 
     // Integrate, part 2: forward Euler into a temporary per state variable. Nothing is
     // written back until every derivative has been computed, so two variables that
@@ -1069,15 +1114,28 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
              << "] = " << pending_write.second << ";\n";
     }
 
-    // Anything with no gate at all runs unconditionally. Well-formed LEMS puts every
-    // StateAssignment and EventOut inside a handler, so this is close to dead, but
-    // dropping such an instruction would be a silent omission.
-    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
-        if (!instruction.condition.empty()) continue;
-        if (instruction.stage == DynamicsStage::Reset) {
-            body << emit_state_assignment(cell_type, parse_result, symbols, instruction, 1);
-        } else if (instruction.stage == DynamicsStage::Emit) {
-            body << emit_spike(1);
+    // Stages 3 to 5 -- Detect, Emit, Reset -- all read the state this tick's Integrate just
+    // produced, so the DerivedVariable locals they read are re-evaluated here against that
+    // same post-integrate state. Without this one half of a comparison would be post-integrate
+    // (the cell_state reads inside the test) and the other pre-integrate (a derived local), so
+    // a threshold or reset value that is itself a DerivedVariable of a state variable would
+    // compare against a value one dt old. See the header for why post-integrate is the reading
+    // both halves are made to agree on.
+    //
+    // Re-evaluated rather than recomputed into fresh names, so every expression written
+    // against a derived variable keeps reading the one name the model gave it. The
+    // synaptic-input path re-reads the drained local, not the ring row, so the row is still
+    // emptied exactly once.
+    const bool has_post_integrate_reader =
+            any_of(cell_type.dynamics.begin(), cell_type.dynamics.end(),
+                   [](const DynamicsInstruction &instruction) {
+                       return instruction.stage == DynamicsStage::Detect ||
+                              (instruction.stage == DynamicsStage::Reset &&
+                               instruction.condition.empty());
+                   });
+    if (!pending_state_writes.empty() && has_post_integrate_reader) {
+        for (const auto &derived_local : derived_variable_locals) {
+            body << indent(1) << derived_local.first << " = " << derived_local.second << ";\n";
         }
     }
 
@@ -1098,17 +1156,30 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
                                      with_fallback_symbols(symbols, parse_result))
              << ") {\n";
 
+        // Stage 4 before stage 5, and every StateAssignment this condition gates emitted as
+        // one simultaneous group rather than one statement at a time.
         for (const DynamicsInstruction &gated : cell_type.dynamics) {
             if (gated.condition != instruction.expression) continue;
-            if (gated.stage == DynamicsStage::Reset) {
-                body << emit_state_assignment(cell_type, parse_result, symbols, gated, 2);
-            } else if (gated.stage == DynamicsStage::Emit) {
-                body << emit_spike(2);
-            }
+            if (gated.stage == DynamicsStage::Emit) body << emit_spike(2);
         }
+        body << emit_state_assignment_group(
+                cell_type, parse_result, symbols,
+                reset_assignments_gated_by(cell_type, instruction.expression), 2);
 
         body << indent(1) << "}\n";
     }
+
+    // Anything with no gate at all runs unconditionally, and runs HERE: stages 4 and 5 follow
+    // stage 3, so an ungated reset must be able to override what this tick's Detect blocks
+    // wrote rather than be clobbered by them. Well-formed LEMS puts every StateAssignment and
+    // EventOut inside a handler, so this is close to dead, but dropping such an instruction
+    // would be a silent omission and emitting it early would be a silently wrong order.
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (!instruction.condition.empty()) continue;
+        if (instruction.stage == DynamicsStage::Emit) body << emit_spike(1);
+    }
+    body << emit_state_assignment_group(cell_type, parse_result, symbols,
+                                        reset_assignments_gated_by(cell_type, ""), 1);
 
     // A gated instruction whose gate never appeared would silently never run.
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
@@ -1132,19 +1203,20 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
 
 String emit_initialize_body(const CellTypeSpecification &cell_type,
                             const NML_ParseResult &parse_result) {
-    ostringstream body;
     const SymbolTable symbols = build_base_symbol_table(cell_type);
 
+    Vector<const DynamicsInstruction *> assignments;
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Initialize) continue;
         // The OnStart element itself also lands on this stage carrying nothing; only the
         // StateAssignments under it initialise anything.
         if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
 
-        body << emit_state_assignment(cell_type, parse_result, symbols, instruction, 1);
+        assignments.push_back(&instruction);
     }
 
-    return body.str();
+    // One OnStart body, so the same simultaneous semantics as any other handler.
+    return emit_state_assignment_group(cell_type, parse_result, symbols, assignments, 1);
 }
 
 // ── Kernel assembly ──────────────────────────────────────────────────────────
@@ -1252,18 +1324,23 @@ String device_function_name(const String &cell_type_name, KernelPurpose purpose)
     return prefix + sanitize_identifier(cell_type_name);
 }
 
-String source_preamble(KernelBackend backend, KernelPurpose purpose) {
+String source_preamble(KernelBackend backend, const String &generator_name) {
     ostringstream preamble;
-    preamble << "// Generated by spikecorec::nml::"
-             << (purpose == KernelPurpose::Tick ? "generate_tick_kernel"
-                                                : "generate_initialize_kernel")
-             << " -- do not edit.\n";
+    preamble << "// Generated by spikecorec::nml::" << generator_name << " -- do not edit.\n";
     if (backend == KernelBackend::Metal) {
         preamble << "#include <metal_stdlib>\n";
         preamble << "using namespace metal;\n";
     }
     preamble << "\n";
     return preamble.str();
+}
+
+// The one declaration in the argument table that carries `name`.
+const KernelArgumentDeclaration &kernel_argument_declaration_for(const String &name) {
+    for (const KernelArgumentDeclaration &declaration : kernel_argument_declarations()) {
+        if (declaration.name == name) return declaration;
+    }
+    throw runtime_error("kernel_codegen: '" + name + "' names no kernel argument");
 }
 
 // How one device-function parameter is spelled. The three the master kernel resolves itself
@@ -1345,6 +1422,18 @@ String emit_master_kernel(const Vector<String> &device_function_names, KernelBac
                         : "int neuron_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n");
 
     kernel << indent(1) << "if (neuron_index >= neuron_count) return;\n\n";
+
+    // Stage 4, Emit, is a per-tick flag: the dynamics raise it and nothing else lowers it, so
+    // it is cleared here, on the device, by the one thread that owns the slot. Clearing it
+    // from the host between dispatches instead would be a host write between two kernel
+    // launches, which needs an explicit synchronisation on CUDA managed memory with
+    // concurrentManagedAccess == 0. It cannot be cleared after the dispatch either: the flags
+    // are this tick's output, read by the recorder and by callers once step_simulation
+    // returns.
+    if (purpose == KernelPurpose::Tick) {
+        kernel << indent(1) << "spike_flags[neuron_index] = 0;\n\n";
+    }
+
     kernel << indent(1) << "int state_base = cell_state_base[neuron_index];\n";
     kernel << indent(1) << "int parameter_base = cell_parameter_base[neuron_index];\n\n";
     kernel << indent(1) << "switch (cell_type_index[neuron_index]) {\n";
@@ -1370,10 +1459,60 @@ String emit_master_kernel(const Vector<String> &device_function_names, KernelBac
     return kernel.str();
 }
 
+// ── the end-of-tick ring row clear ───────────────────────────────────────────
+
+const String ring_row_clear_function_name = "clear_network_input_ring_row";
+
+const Vector<String> &ring_row_clear_argument_names() {
+    static const Vector<String> names = {"network_inputs", "neuron_count", "tick", "ring_depth"};
+    return names;
+}
+
+GeneratedKernel generate_ring_row_clear(KernelBackend backend) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const Vector<String> &argument_names = ring_row_clear_argument_names();
+
+    ostringstream source;
+    source << source_preamble(backend, "generate_ring_row_clear_kernel");
+    source << (is_metal ? "kernel void " : "extern \"C\" __global__ void ")
+           << ring_row_clear_function_name << "(\n";
+
+    for (usize position = 0; position < argument_names.size(); ++position) {
+        const KernelArgumentDeclaration &declaration =
+                kernel_argument_declaration_for(argument_names[position]);
+        source << indent(1);
+        if (is_metal) {
+            source << declaration.metal_declaration << " [[ buffer(" << position << ") ]],\n";
+        } else {
+            source << declaration.cuda_declaration
+                   << (position + 1 < argument_names.size() ? ",\n" : "\n");
+        }
+    }
+    if (is_metal) source << indent(1) << "uint thread_id [[ thread_position_in_grid ]]\n";
+
+    source << ") {\n"
+           << indent(1)
+           << (is_metal ? "int neuron_index = (int)thread_id;\n"
+                        : "int neuron_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n")
+           << indent(1) << "if (neuron_index >= neuron_count) return;\n\n"
+           << indent(1) << "int ring_row = (int)(tick % (" << (is_metal ? "long" : "long long")
+           << ")ring_depth);\n"
+           << indent(1) << "network_inputs[ring_row * neuron_count + neuron_index] = 0.0f;\n"
+           << "}\n";
+
+    GeneratedKernel generated;
+    generated.source = source.str();
+    generated.function_name = ring_row_clear_function_name;
+    generated.argument_names = argument_names;
+    return generated;
+}
+
 GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBackend backend,
                                 KernelPurpose purpose) {
     ostringstream source;
-    source << source_preamble(backend, purpose);
+    source << source_preamble(backend, purpose == KernelPurpose::Tick
+                                               ? "generate_tick_kernel"
+                                               : "generate_initialize_kernel");
 
     // Only the tick entry point propagates, so only it carries the walk and the ring
     // helpers; emitting them into the initialize kernel would leave dead code behind.
@@ -1394,7 +1533,7 @@ GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBacke
         }
 
         const String body = purpose == KernelPurpose::Tick
-                                    ? emit_tick_body(cell_type, parse_result, backend)
+                                    ? emit_tick_body(cell_type, parse_result)
                                     : emit_initialize_body(cell_type, parse_result);
 
         source << emit_device_function(function_name, body, backend, purpose);
@@ -1430,6 +1569,10 @@ GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result) {
 
 GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result) {
     return generate_kernel(parse_result, active_backend(), KernelPurpose::Initialize);
+}
+
+GeneratedKernel generate_ring_row_clear_kernel() {
+    return generate_ring_row_clear(active_backend());
 }
 
 } // namespace spikecorec::nml

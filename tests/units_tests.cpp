@@ -206,9 +206,8 @@ TEST(TickToSeconds, invalid_negative_total_seconds) {
 // `unit_value_to_si("-70mV")` helper that parsed a leading number AND applied
 // the suffix scale. This tree exposes only the scale half of that
 // (unit_suffix_scale), so the same unit table is covered here suffix by suffix
-// instead of through parsed literals. The one behavioral difference worth
-// noting: unit_suffix_scale returns 1.0 for an unrecognized suffix, where
-// unit_value_to_si threw — see unknown_suffix_scales_by_one below.
+// instead of through parsed literals, and an unrecognized suffix throws in both
+// — see unknown_suffix_throws below.
 
 TEST(UnitSuffixScale, voltage_suffixes) {
     EXPECT_TRUE(approx(unit_suffix_scale("V"),  1.0));
@@ -275,12 +274,43 @@ TEST(UnitSuffixScale, dimensionless_suffixes_scale_by_one) {
     EXPECT_TRUE(approx(unit_suffix_scale("none"), 1.0));
 }
 
-TEST(UnitSuffixScale, unknown_suffix_scales_by_one) {
-    // Documented fallback: an unrecognized suffix is treated as dimensionless
-    // rather than rejected. "min" is genuinely absent from this tree's table
-    // (nightly's unit_value_to_si carried min=60/hour=3600 entries), so it takes
-    // the same fallback path as an outright bogus suffix.
-    EXPECT_TRUE(approx(unit_suffix_scale("zz"),   1.0));
-    EXPECT_TRUE(approx(unit_suffix_scale("min"),  1.0));
-    EXPECT_TRUE(approx(unit_suffix_scale("hour"), 1.0));
+TEST(UnitSuffixScale, longer_time_suffixes) {
+    // Both are declared by the vendored standard library. Absent from the table
+    // they scaled by 1.0, which read "2min" as 2 seconds rather than 120.
+    EXPECT_TRUE(approx(unit_suffix_scale("min"),  60.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("hour"), 3600.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("per_min"),  0.01666666667));
+    EXPECT_TRUE(approx(unit_suffix_scale("per_hour"), 0.00027777777778));
+}
+
+TEST(UnitSuffixScale, standard_library_composite_suffixes) {
+    // The physiological and NEURON-preferred spellings the standard library
+    // declares. A model using any of these used to scale by 1.0 — off by up to
+    // eleven orders of magnitude, and silently.
+    EXPECT_TRUE(approx(unit_suffix_scale("mS_per_cm2"), 10.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("S_per_cm2"),  1e4));
+    EXPECT_TRUE(approx(unit_suffix_scale("uF_per_cm2"), 1e-2));
+    EXPECT_TRUE(approx(unit_suffix_scale("mA_per_cm2"), 10.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("nS_per_mV"),  1e-6));
+    EXPECT_TRUE(approx(unit_suffix_scale("um2"),        1e-12));
+    EXPECT_TRUE(approx(unit_suffix_scale("um3"),        1e-18));
+    EXPECT_TRUE(approx(unit_suffix_scale("litre"),      1e-3));
+    EXPECT_TRUE(approx(unit_suffix_scale("e"),          1.602176634e-19));
+    EXPECT_TRUE(approx(unit_suffix_scale("mol_per_cm_per_uA_per_ms"), 1e11));
+}
+
+TEST(UnitSuffixScale, unknown_suffix_throws) {
+    // A suffix the table cannot place is a misspelling or a unit nobody has
+    // taught this engine. Scaling it by 1.0 turned both into a plausible number
+    // with no diagnostic; it is now an error naming the suffix.
+    EXPECT_THROW(unit_suffix_scale("zz"), invalid_argument);
+    EXPECT_THROW(unit_suffix_scale("mVv"), invalid_argument);
+    EXPECT_THROW(unit_suffix_scale("millivolts"), invalid_argument);
+
+    try {
+        unit_suffix_scale("zz");
+        FAIL() << "expected an unknown suffix to be rejected";
+    } catch (const invalid_argument &error) {
+        EXPECT_NE(string(error.what()).find("zz"), string::npos);
+    }
 }

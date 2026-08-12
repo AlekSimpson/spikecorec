@@ -131,8 +131,15 @@ namespace spikecorec {
         // allocation indexed as [row][neuron]. Propagation, generated into the cell device
         // functions, adds an edge's weight into row (tick + that edge's delay) %
         // network_input_ring_depth; a cell reads row tick % network_input_ring_depth of its
-        // own column and clears it, so the row is empty when the ring wraps onto it again.
-        // External stimulus is added into the current tick's row, arriving with no delay.
+        // own column with a plain load. External stimulus is added into the current tick's
+        // row, arriving with no delay.
+        //
+        // A row is emptied as a WHOLE ROW, by the ring clear kernel dispatched behind the
+        // tick kernel, at the end of the tick that read it -- clearing the input this tick
+        // consumed while leaving every other row, which holds arrivals not yet due,
+        // untouched. Not per slot as each cell reads: a cell type that never reduces over its
+        // synapses would then never clear its neurons' slots, and they would accumulate every
+        // arrival for the whole run.
         GpuPointer<f32> network_inputs;
 
         // [weights.node_count * weights.max_neighbor_count] — each edge's delay in whole
@@ -157,7 +164,7 @@ namespace spikecorec {
 
         // How many tick rows the network_inputs ring holds. Strictly greater than the
         // model's largest per-edge delay, so an arrival scheduled this tick can never land
-        // in the row being drained this tick, and every row is read (and so cleared) before
+        // in the row being read this tick, and every row is read (and then cleared) before
         // the ring wraps back onto it.
         s32 network_input_ring_depth = 1;
 
@@ -170,6 +177,12 @@ namespace spikecorec {
         // against this rather than against a hardcoded order, so codegen adding an
         // argument cannot silently misbind the ones already there.
         Vector<String> tick_kernel_argument_names;
+
+        // Zeroes row tick % network_input_ring_depth of network_inputs, dispatched behind the
+        // tick kernel in the same command batch every tick. Held and bound exactly like the
+        // tick kernel; its argument list is a subset of the same names.
+        SharedPointer<KernelHandle> ring_row_clear_kernel;
+        Vector<String> ring_row_clear_kernel_argument_names;
 
         Vector<NeuronInputStream> input_event_streams;
 
@@ -272,7 +285,7 @@ namespace spikecorec {
         // void reset_state(s64 last_spiked_value = 0, s32 active_gen_value = -1);
 
         // Advances every neuron by exactly one dt: delivers this tick's external stimulus,
-        // runs the generated master kernel, and records.
+        // runs the generated master kernel and the ring clear behind it, and records.
         void step_simulation(s64 tick);
 
         // Binds `kernel`'s arguments positionally against `argument_names` and launches it
@@ -280,10 +293,15 @@ namespace spikecorec {
         // kernel asks for one this engine does not own -- which is what reports that
         // codegen and the engine have drifted apart, rather than binding something
         // arbitrary in its place.
+        //
+        // With a non-null `batch` the launch is encoded into that batch's command buffer
+        // instead of being committed and waited on by itself, which is how the tick kernel
+        // and the ring clear behind it reach the GPU as one ordered pair.
         void dispatch_master_kernel(
             const KernelHandle &kernel,
             const Vector<String> &argument_names,
-            s64 tick
+            s64 tick,
+            MetalCommandBatch *batch = nullptr
         );
 
         // One frame per recording stream, gathered out of the buffers the kernel just
