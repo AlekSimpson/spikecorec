@@ -608,6 +608,91 @@ String emit_spike(usize indent_level) {
            "last_spiked[neuron_index] = tick;\n";
 }
 
+// ── select= paths ────────────────────────────────────────────────────────────
+//
+// A DerivedVariable carries either an arithmetic `value=` or a `select=` path, and
+// nml.cpp's collect_dynamics_instructions folds both attributes into `expression`. Nothing
+// downstream records which one it was, so the two are told apart here, by shape, before the
+// tokenizer runs -- a path is not an expression and would only report as a malformed one.
+
+// Splits on '/'. A "[ion='ca']" qualifier never contains one, so no escaping is involved.
+Vector<String> split_path_segments(const String &path) {
+    Vector<String> segments;
+    usize segment_start = 0;
+
+    while (true) {
+        const usize separator_position = path.find('/', segment_start);
+        if (separator_position == String::npos) {
+            segments.push_back(path.substr(segment_start));
+            return segments;
+        }
+        segments.push_back(path.substr(segment_start, separator_position - segment_start));
+        segment_start = separator_position + 1;
+    }
+}
+
+// The name a segment selects, with any qualifier dropped: "synapses[*]" -> "synapses".
+// nullopt when the text is not shaped like a segment, which is what keeps arithmetic out.
+Optional<String> path_segment_name(const String &segment) {
+    if (segment.empty() || !is_identifier_start(segment.front())) return nullopt;
+
+    usize index = 0;
+    while (index < segment.length() && is_identifier_character(segment[index])) index++;
+    if (index == segment.length()) return segment;
+
+    // The only thing that may follow the name is a qualifier closing at the segment's end:
+    // "[*]", "[ion='ca']". Anything else -- an operator, whitespace -- is arithmetic.
+    if (segment[index] != '[' || segment.back() != ']') return nullopt;
+    return segment.substr(0, index);
+}
+
+// The head segment's name when `expression` is a select= path, nullopt when it is
+// arithmetic to be parsed as usual.
+//
+// Shape alone does not separate the two: "iMemb/C" is a division and "ionChannel/g" is a
+// path, and hindmarshRose1984Cell writes both forms in one Dynamics block. What separates
+// them is what the head names. A path's head is a child or collection -- an Attachments or
+// Child of the ComponentType, never one of its variables -- so a head that resolves to a
+// readable value means the '/' was the division operator. A qualified head ("synapses[*]")
+// settles it on its own, being arithmetic under no reading.
+Optional<String> select_path_head_name(const String &expression, const SymbolTable &symbols) {
+    const Vector<String> segments = split_path_segments(expression);
+    if (segments.size() < 2) return nullopt;
+
+    for (const String &segment : segments) {
+        if (!path_segment_name(segment).has_value()) return nullopt;
+    }
+
+    const String head_name = *path_segment_name(segments.front());
+    const bool head_is_qualified = head_name.length() < segments.front().length();
+    if (!head_is_qualified && symbols.contains(head_name)) return nullopt;
+
+    return head_name;
+}
+
+// Lowers a select= path onto the buffer it denotes.
+//
+// `network_inputs` is the engine's per-neuron synaptic accumulator: a source scatters its
+// weight into network_inputs[target] and the target drains it at its next step. A reduction
+// over the attached synapses is exactly that quantity, so it lowers to a direct read. The
+// selected exposure's name is deliberately not part of the test -- iafCell selects "i" and
+// izhikevichCell selects "I" from the same one scalar per neuron -- and neither is the
+// `reduce` attribute, which DynamicsInstruction does not carry.
+//
+// Every other path reaches into a child structure that has no engine buffer behind it, so
+// it is refused by name rather than bound to the accumulator, which would run and be wrong.
+String emit_select_path_read(const String &path, const String &head_name,
+                             const String &component_type_name) {
+    if (head_name != "synapses") {
+        report_error("unsupported select path \"" + path + "\": '" + head_name +
+                             "' names a child structure with no engine buffer behind it. Only a "
+                             "selection over 'synapses', which is the per-neuron synaptic input "
+                             "accumulator, can be lowered",
+                     component_type_name);
+    }
+    return "network_inputs[neuron_index]";
+}
+
 // ── Per-cell-type bodies ─────────────────────────────────────────────────────
 
 String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseResult &parse_result) {
@@ -620,14 +705,23 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
     // the ones after it. A DerivedVariable referencing one declared later resolves to
     // nothing and throws, rather than emitting a forward reference the shader compiler
     // would reject far from its cause.
+    //
+    // A select= path becomes a local the same way, so whatever it binds to is reached by
+    // the name the model gave it and resolves through the ordinary precedence chain.
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
         if (instruction.source_tag != NML_DeclarationType::DerivedVariable) continue;
 
+        const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
+        const Optional<String> path_head_name =
+                select_path_head_name(instruction.expression, visible_symbols);
+
         const String local_name = "derived_" + sanitize_identifier(instruction.target);
         body << indent(1) << "float " << local_name << " = "
-             << translate_expression(instruction.expression,
-                                     with_fallback_symbols(symbols, parse_result))
+             << (path_head_name.has_value()
+                         ? emit_select_path_read(instruction.expression, *path_head_name,
+                                                 cell_type.name)
+                         : translate_expression(instruction.expression, visible_symbols))
              << ";\n";
         symbols.define(instruction.target, local_name);
     }

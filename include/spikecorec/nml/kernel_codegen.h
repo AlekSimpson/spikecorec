@@ -93,6 +93,15 @@ struct GeneratedKernel {
 // back only once all of them have been computed, so two variables that reference each
 // other integrate consistently instead of one seeing the other's updated value.
 //
+// A DerivedVariable written as a `select=` path over the attached synapses
+// ("synapses[*]/i" on iafCell, "synapses[*]/I" on izhikevichCell) lowers to a read of
+// `network_inputs`, the per-neuron synaptic input accumulator, and binds under its own name
+// like any other DerivedVariable. Every other path -- "ionChannel/g", "populations[*]/i",
+// "concentrationModels[species='ca']/concentration" -- reaches into a child structure with
+// no engine buffer behind it and throws naming the path. Paths and arithmetic arrive in the
+// same field, so they are separated by shape: see select_path_head_name in the
+// implementation for why "iMemb/C" stays a division.
+//
 // Throws, naming the construct and the ComponentType, on anything below.
 GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result);
 
@@ -120,9 +129,7 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
 //    `value` but not its `condition` attribute (nml.cpp's collect_dynamics_instructions
 //    reads only value/test/select), so the per-case tests never reach codegen. Emitting
 //    the cases without their guards would be silently wrong, so it throws instead.
-//  - DerivedVariable written as a `select=` path (e.g. "synapses[*]/i"). The path lands in
-//    `expression` and fails to parse as an expression, which reports as a malformed
-//    expression naming the ComponentType.
+//  - A `select=` path over anything but the attached synapses -- see generate_tick_kernel.
 //  - random(x). A deterministic per-neuron stream needs a seed argument, and adding one
 //    would change the argument order above for a function Phase 1 never calls.
 } // namespace spikecorec::nml

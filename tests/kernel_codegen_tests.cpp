@@ -105,6 +105,52 @@ CellTypeSpecification make_izhikevich_cell_type() {
     return cell_type;
 }
 
+// A cell that drains the synaptic accumulator, shaped like the standard library's iafCell:
+// a `select=` DerivedVariable whose bound name a later TimeDerivative consumes.
+CellTypeSpecification make_synaptic_input_cell_type(const String &select_path) {
+    CellTypeSpecification cell_type;
+    cell_type.name = "iafCell";
+    cell_type.state_variable_names = {"v"};
+    cell_type.parameter_names = {"leakConductance", "leakReversal", "capacitance", "thresh",
+                                 "reset"};
+
+    const String threshold_test = "v .gt. thresh";
+
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "iSyn", select_path));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v",
+            "(leakConductance * (leakReversal - v) + iSyn) / capacitance"));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Detect, NML_DeclarationType::OnCondition, "", threshold_test));
+    cell_type.dynamics.push_back(make_instruction(DynamicsStage::Reset,
+                                                  NML_DeclarationType::StateAssignment, "v",
+                                                  "reset", threshold_test));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Emit, NML_DeclarationType::EventOut, "spike", "", threshold_test));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "v", "leakReversal"));
+
+    return cell_type;
+}
+
+// One cell type whose only DerivedVariable carries `select_path`, for the paths that are
+// expected to be refused.
+NML_ParseResult make_select_path_model(const String &select_path) {
+    CellTypeSpecification cell_type;
+    cell_type.name = "selectCell";
+    cell_type.state_variable_names = {"v"};
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "quantity",
+            select_path));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "quantity"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+    return parse_result;
+}
+
 NML_ParseResult make_two_cell_type_model() {
     NML_ParseResult parse_result;
     parse_result.step_dt = 1e-5;
@@ -543,6 +589,84 @@ TEST(KernelCodegenKernel, ModelWithNoCellTypesStillProducesADispatchableKernel) 
     EXPECT_NE(source.find("default:"), String::npos);
 }
 
+// ── select= paths ────────────────────────────────────────────────────────────
+
+TEST(KernelCodegenSelectPath, SelectionOverSynapsesReadsTheInputAccumulator) {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("float derived_iSyn = network_inputs[neuron_index];"), String::npos);
+}
+
+TEST(KernelCodegenSelectPath, SelectedMemberNameDoesNotChangeTheBinding) {
+    // iafCell selects "i" and izhikevichCell selects "I" from what is, on this engine, the
+    // same one accumulator per neuron. Predicating the binding on the member name would
+    // bind one of them and reject the other.
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/I"));
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("float derived_iSyn = network_inputs[neuron_index];"), String::npos);
+}
+
+TEST(KernelCodegenSelectPath, BoundNameResolvesInALaterTimeDerivative) {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+
+    const String source = generate_tick_kernel(parse_result).source;
+
+    const usize binding_position = source.find("float derived_iSyn =");
+    const usize use_position = source.find("+ derived_iSyn)");
+    ASSERT_NE(binding_position, String::npos);
+    ASSERT_NE(use_position, String::npos);
+    EXPECT_LT(binding_position, use_position);
+}
+
+TEST(KernelCodegenSelectPath, PathsWithNoEngineBufferBehindThemAreRejectedByPath) {
+    // Every one of these appears in the vendored standard library, on a biophysical type.
+    // Binding any of them to the synaptic accumulator would run and be silently wrong.
+    const Vector<String> unsupported_paths = {
+        "ionChannel/g",
+        "populations[*]/i",
+        "concentrationModels[species='ca']/concentration",
+    };
+
+    for (const String &path : unsupported_paths) {
+        try {
+            generate_tick_kernel(make_select_path_model(path));
+            FAIL() << "expected select=\"" << path << "\" to be rejected";
+        } catch (const runtime_error &error) {
+            const String message = error.what();
+            EXPECT_NE(message.find(path), String::npos) << "message did not name the path: "
+                                                        << message;
+            EXPECT_NE(message.find("selectCell"), String::npos) << message;
+        }
+    }
+}
+
+TEST(KernelCodegenSelectPath, DivisionOfTwoBareNamesStaysADivision) {
+    // hindmarshRose1984Cell carries select="synapses[*]/i" and value="iMemb/C" in one
+    // Dynamics block, so "contains a slash" cannot be what marks a path. A head that
+    // resolves to a readable value means the slash was the division operator.
+    CellTypeSpecification cell_type;
+    cell_type.name = "divisionCell";
+    cell_type.state_variable_names = {"v"};
+    cell_type.parameter_names = {"iMemb", "C"};
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "rate", "iMemb/C"));
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "rate"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("float derived_rate = (cell_parameters[parameter_base + 0] / "
+                          "cell_parameters[parameter_base + 1]);"),
+              String::npos);
+}
+
 // ── Unsupported constructs ───────────────────────────────────────────────────
 
 TEST(KernelCodegenUnsupported, EventArrivalIsRejectedByName) {
@@ -679,6 +803,24 @@ TEST(KernelCodegenMetal, GeneratedInitializeKernelCompilesAsMetal) {
     String compiler_output;
     const String source = generate_initialize_kernel(make_two_cell_type_model()).source;
     EXPECT_TRUE(compile_as_metal(source, "initialize", compiler_output))
+            << "generated Metal source failed to compile:\n"
+            << compiler_output << "\n--- source ---\n"
+            << source;
+}
+
+TEST(KernelCodegenMetal, CellConsumingSynapticInputCompilesAsMetal) {
+    // The whole point of binding the select path: a cell that drains the accumulator has to
+    // produce source the shader compiler accepts, not just source containing the right
+    // substring. network_inputs is a kernel argument, so a mis-emitted read is caught here.
+    ASSERT_TRUE(metal_compiler_is_available())
+            << "xcrun metal is unavailable, so the generated source was never compiled";
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+
+    String compiler_output;
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_TRUE(compile_as_metal(source, "synaptic_input", compiler_output))
             << "generated Metal source failed to compile:\n"
             << compiler_output << "\n--- source ---\n"
             << source;
