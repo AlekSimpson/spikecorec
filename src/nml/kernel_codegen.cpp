@@ -670,19 +670,25 @@ Optional<String> select_path_head_name(const String &expression, const SymbolTab
     return head_name;
 }
 
-// Lowers a select= path onto the buffer it denotes.
+// The one local every select= path over the attached synapses binds to. The ring row is
+// drained exactly once per cell, into this local, so a model that reduces over its synapses
+// more than once reads the same delivered current each time instead of finding the slot
+// already emptied by its own earlier read.
+const String synaptic_input_local_name = "synaptic_input_accumulator";
+
+// Refuses a select= path that is not a reduction over the attached synapses.
 //
-// `network_inputs` is the engine's per-neuron synaptic accumulator: a source scatters its
-// weight into network_inputs[target] and the target drains it at its next step. A reduction
-// over the attached synapses is exactly that quantity, so it lowers to a direct read. The
-// selected exposure's name is deliberately not part of the test -- iafCell selects "i" and
-// izhikevichCell selects "I" from the same one scalar per neuron -- and neither is the
-// `reduce` attribute, which DynamicsInstruction does not carry.
+// `network_inputs` is the engine's synaptic accumulator: a source scatters its weight into
+// its target's slot and the target drains it when the delay has elapsed. A reduction over
+// the attached synapses is exactly that quantity, so it lowers to a read of this tick's ring
+// row. The selected exposure's name is deliberately not part of the test -- iafCell selects
+// "i" and izhikevichCell selects "I" from the same one scalar per neuron -- and neither is
+// the `reduce` attribute, which DynamicsInstruction does not carry.
 //
 // Every other path reaches into a child structure that has no engine buffer behind it, so
 // it is refused by name rather than bound to the accumulator, which would run and be wrong.
-String emit_select_path_read(const String &path, const String &head_name,
-                             const String &component_type_name) {
+void require_synaptic_select_path(const String &path, const String &head_name,
+                                  const String &component_type_name) {
     if (head_name != "synapses") {
         report_error("unsupported select path \"" + path + "\": '" + head_name +
                              "' names a child structure with no engine buffer behind it. Only a "
@@ -690,12 +696,308 @@ String emit_select_path_read(const String &path, const String &head_name,
                              "accumulator, can be lowered",
                      component_type_name);
     }
-    return "network_inputs[neuron_index]";
+}
+
+// ── Stage 6, Propagate ───────────────────────────────────────────────────────
+//
+// Propagation is generated into every cell device function as a fixed epilogue rather than
+// dispatched as a kernel of its own: the supporting engine infrastructure -- the k^2-tree
+// adjacency, the shared U/V basis, the delay ring -- is identical for every cell type, so
+// the same boilerplate serves all of them.
+//
+// `network_inputs` is a ring of `ring_depth` rows of `neuron_count` floats. A spiking source
+// adds each edge's weight into row (tick + edge delay) % ring_depth of the target's column;
+// a cell reads and clears row tick % ring_depth of its own column. `ring_depth` exceeds the
+// model's largest per-edge delay (the engine computes it), so an arrival can never land in
+// the row being drained this tick, and every row is cleared by its reader before the ring
+// wraps back onto it.
+//
+// The row walk below is the same iterative DFS kernels.metal's k2t_next_neighbor performs,
+// and enumerates a row's neighbours in exactly the order K2Tree::get_neighbors does on the
+// host (both descend column offsets 0..branching_factor-1 depth first). That is what makes
+// `neighbor_slot` address the same per-edge slot the host indexes the sparse delta and
+// per-edge delay arrays by.
+
+// Reconstruction reads U/V as plain floats rather than as float4: the buffers are the same
+// bytes either way, and scalar lanes make the arithmetic identical to WeightMatrix's own
+// host-side reconstruct_entry, which is what `weights.get()` reports. `rank_float4_stride`
+// keeps its name because that is the argument the engine binds; a row is
+// rank_float4_stride * 4 scalar lanes wide.
+String emit_propagation_helpers(KernelBackend backend) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const String function_prefix = is_metal ? "inline " : "__device__ inline ";
+    const String device_qualifier = is_metal ? "device " : "";
+    const String thread_qualifier = is_metal ? "thread " : "";
+    const String unsigned_integer_type = is_metal ? "uint" : "unsigned int";
+    const String unsigned_short_type = is_metal ? "ushort" : "unsigned short";
+    const String population_count_function = is_metal ? "popcount" : "__popc";
+    const String tick_type = is_metal ? "long" : "long long";
+
+    ostringstream helpers;
+
+    helpers << "#define SPIKECOREC_MAXIMUM_K2TREE_HEIGHT 32\n\n";
+
+    helpers << function_prefix << unsigned_integer_type << " k2tree_read_bit(\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type << " *words,\n"
+            << indent(2) << "int bit_index\n"
+            << ") {\n"
+            << indent(1) << "return (words[bit_index >> 5] >> (" << unsigned_integer_type
+            << ")(bit_index & 31)) & 1u;\n"
+            << "}\n\n";
+
+    helpers << function_prefix << "int k2tree_rank_one_exclusive(\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *internal_node_words,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *rank_superblock_table,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_short_type
+            << " *rank_subblock_table,\n"
+            << indent(2) << "int bit_position,\n"
+            << indent(2) << "int superblock_size_words\n"
+            << ") {\n"
+            << indent(1) << "int word_index = bit_position >> 5;\n"
+            << indent(1) << "int bit_offset = bit_position & 31;\n"
+            << indent(1) << "int superblock_index = word_index / superblock_size_words;\n"
+            << indent(1) << unsigned_integer_type
+            << " superblock_base = rank_superblock_table[superblock_index];\n"
+            << indent(1) << unsigned_integer_type << " subblock_base = ("
+            << unsigned_integer_type << ")rank_subblock_table[word_index];\n"
+            << indent(1) << unsigned_integer_type
+            << " partial_word_mask = (bit_offset == 0) ? 0u : ((1u << ("
+            << unsigned_integer_type << ")bit_offset) - 1u);\n"
+            << indent(1) << unsigned_integer_type << " partial_word_population = "
+            << population_count_function
+            << "(internal_node_words[word_index] & partial_word_mask);\n"
+            << indent(1)
+            << "return (int)(superblock_base + subblock_base + partial_word_population);\n"
+            << "}\n\n";
+
+    // Resumes the caller's DFS and returns the next neighbour of `source_neuron_index`, or
+    // -1 once the row is exhausted. The stack lives in the caller so one walk covers a whole
+    // row -- O(degree * height) instead of one root-to-leaf descent per neighbour.
+    helpers << function_prefix << "int k2tree_next_neighbor(\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *internal_node_words,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *leaf_node_words,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *rank_superblock_table,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_short_type
+            << " *rank_subblock_table,\n"
+            << indent(2) << "int branching_factor,\n"
+            << indent(2) << "int superblock_size_words,\n"
+            << indent(2) << "int neuron_count,\n"
+            << indent(2) << "int tree_height,\n"
+            << indent(2) << "int internal_bit_count,\n"
+            << indent(2) << "int source_neuron_index,\n"
+            << indent(2) << thread_qualifier << "int *stack_row_base,\n"
+            << indent(2) << thread_qualifier << "int *stack_column_base,\n"
+            << indent(2) << thread_qualifier << "int *stack_block_size,\n"
+            << indent(2) << thread_qualifier << "int *stack_bit_offset,\n"
+            << indent(2) << thread_qualifier << "int *stack_next_column,\n"
+            << indent(2) << thread_qualifier << "int &stack_top\n"
+            << ") {\n"
+            << indent(1) << "int branching_factor_squared = branching_factor * branching_factor;\n\n"
+            << indent(1) << "while (stack_top >= 0) {\n"
+            << indent(2) << "int level = stack_top;\n"
+            << indent(2) << "int column_offset = stack_next_column[level];\n"
+            << indent(2) << "if (column_offset >= branching_factor) {\n"
+            << indent(3) << "stack_top -= 1;\n"
+            << indent(3) << "continue;\n"
+            << indent(2) << "}\n"
+            << indent(2) << "stack_next_column[level] = column_offset + 1;\n\n"
+            << indent(2) << "int row_base = stack_row_base[level];\n"
+            << indent(2) << "int column_base = stack_column_base[level];\n"
+            << indent(2) << "int block_size = stack_block_size[level];\n"
+            << indent(2) << "int level_bit_offset = stack_bit_offset[level];\n\n"
+            << indent(2) << "int child_block_size = block_size / branching_factor;\n"
+            << indent(2)
+            << "int row_offset = (source_neuron_index - row_base) / child_block_size;\n"
+            << indent(2)
+            << "int child_flat_index = row_offset * branching_factor + column_offset;\n"
+            << indent(2) << "int bit_position = level_bit_offset + child_flat_index;\n\n"
+            << indent(2) << "if (level == tree_height - 1) {\n"
+            << indent(3) << "if (k2tree_read_bit(leaf_node_words, bit_position)) {\n"
+            << indent(4) << "int target_neuron_index = column_base + column_offset;\n"
+            << indent(4)
+            << "if (target_neuron_index < neuron_count) return target_neuron_index;\n"
+            << indent(3) << "}\n"
+            << indent(2)
+            << "} else if (k2tree_read_bit(internal_node_words, bit_position)) {\n"
+            << indent(3) << "int rank_inclusive = k2tree_rank_one_exclusive(\n"
+            << indent(5) << "internal_node_words, rank_superblock_table, rank_subblock_table,\n"
+            << indent(5) << "bit_position, superblock_size_words) + 1;\n"
+            << indent(3) << "int child_level = stack_top + 1;\n"
+            << indent(3) << "int raw_offset = branching_factor_squared * rank_inclusive;\n"
+            << indent(3)
+            << "stack_row_base[child_level] = row_base + row_offset * child_block_size;\n"
+            << indent(3) << "stack_column_base[child_level] = column_base + column_offset * "
+                            "child_block_size;\n"
+            << indent(3) << "stack_block_size[child_level] = child_block_size;\n"
+            << indent(3) << "stack_bit_offset[child_level] = (child_level == tree_height - 1)\n"
+            << indent(5) << "? (raw_offset - internal_bit_count)\n"
+            << indent(5) << ": raw_offset;\n"
+            << indent(3) << "stack_next_column[child_level] = 0;\n"
+            << indent(3) << "stack_top = child_level;\n"
+            << indent(2) << "}\n"
+            << indent(1) << "}\n"
+            << indent(1) << "return -1;\n"
+            << "}\n\n";
+
+    // The ring is one flat allocation indexed as [row][neuron]; `tick_of_arrival` is the
+    // tick whose row is wanted, which is `tick` for a drain and `tick + delay` for an
+    // arrival.
+    helpers << function_prefix << "int network_input_ring_index(\n"
+            << indent(2) << tick_type << " tick_of_arrival,\n"
+            << indent(2) << "int ring_depth,\n"
+            << indent(2) << "int neuron_count,\n"
+            << indent(2) << "int neuron_index\n"
+            << ") {\n"
+            << indent(1) << "int ring_row = (int)(tick_of_arrival % (" << tick_type
+            << ")ring_depth);\n"
+            << indent(1) << "return ring_row * neuron_count + neuron_index;\n"
+            << "}\n\n";
+
+    helpers << function_prefix << "void propagate_spike(\n"
+            << indent(2) << device_qualifier << "float *network_inputs,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *internal_node_words,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *leaf_node_words,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_integer_type
+            << " *rank_superblock_table,\n"
+            << indent(2) << device_qualifier << "const " << unsigned_short_type
+            << " *rank_subblock_table,\n"
+            << indent(2) << device_qualifier << "const float *U_matrix,\n"
+            << indent(2) << device_qualifier << "const float *V_matrix,\n"
+            << indent(2) << device_qualifier << "const float *edge_weight_coefficients,\n"
+            << indent(2) << device_qualifier << "const float *edge_weight_deltas,\n"
+            << indent(2) << device_qualifier << "const int *edge_delay_ticks,\n"
+            << indent(2) << "int branching_factor,\n"
+            << indent(2) << "int superblock_size_words,\n"
+            << indent(2) << "int padded_node_count,\n"
+            << indent(2) << "int tree_height,\n"
+            << indent(2) << "int internal_bit_count,\n"
+            << indent(2) << tick_type << " rank_float4_stride,\n"
+            << indent(2) << "float constant_weight,\n"
+            << indent(2) << "int max_neighbor_count,\n"
+            << indent(2) << "int ring_depth,\n"
+            << indent(2) << "int neuron_count,\n"
+            << indent(2) << "int neuron_index,\n"
+            << indent(2) << tick_type << " tick\n"
+            << ") {\n"
+            << indent(1) << thread_qualifier
+            << "int stack_row_base[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+            << indent(1) << thread_qualifier
+            << "int stack_column_base[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+            << indent(1) << thread_qualifier
+            << "int stack_block_size[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+            << indent(1) << thread_qualifier
+            << "int stack_bit_offset[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+            << indent(1) << thread_qualifier
+            << "int stack_next_column[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+            << indent(1) << "stack_row_base[0] = 0;\n"
+            << indent(1) << "stack_column_base[0] = 0;\n"
+            << indent(1) << "stack_block_size[0] = padded_node_count;\n"
+            << indent(1) << "stack_bit_offset[0] = 0;\n"
+            << indent(1) << "stack_next_column[0] = 0;\n"
+            << indent(1) << "int stack_top = (tree_height > 0 && neuron_index >= 0 &&\n"
+            << indent(4) << "neuron_index < neuron_count) ? 0 : -1;\n\n"
+            << indent(1) << tick_type << " row_lane_count = rank_float4_stride * 4;\n"
+            << indent(1) << tick_type
+            << " source_lane_base = (" << tick_type << ")neuron_index * row_lane_count;\n"
+            << indent(1) << "int neighbor_slot = 0;\n"
+            << indent(1) << "int target_neuron_index = 0;\n\n"
+            // A degree above max_neighbor_count has no slot in the per-edge arrays at all
+            // (the host cannot address one either), so the walk stops rather than reading
+            // into the next source's row.
+            << indent(1) << "while (neighbor_slot < max_neighbor_count &&\n"
+            << indent(3) << "(target_neuron_index = k2tree_next_neighbor(\n"
+            << indent(5) << "internal_node_words, leaf_node_words, rank_superblock_table,\n"
+            << indent(5) << "rank_subblock_table, branching_factor, superblock_size_words,\n"
+            << indent(5) << "neuron_count, tree_height, internal_bit_count, neuron_index,\n"
+            << indent(5) << "stack_row_base, stack_column_base, stack_block_size,\n"
+            << indent(5) << "stack_bit_offset, stack_next_column, stack_top)) >= 0) {\n"
+            << indent(2) << "int edge_slot = neuron_index * max_neighbor_count + neighbor_slot;\n\n"
+            << indent(2) << "float edge_weight = constant_weight;\n"
+            << indent(2) << "if (constant_weight == 0.0f) {\n"
+            << indent(3) << tick_type << " target_lane_base = (" << tick_type
+            << ")target_neuron_index * row_lane_count;\n"
+            << indent(3) << "float reconstructed_weight = 0.0f;\n"
+            << indent(3) << "for (" << tick_type << " lane = 0; lane < row_lane_count; ++lane) {\n"
+            << indent(4) << "reconstructed_weight += U_matrix[source_lane_base + lane] *\n"
+            << indent(6) << "(edge_weight_coefficients[lane] * V_matrix[target_lane_base + lane]);\n"
+            << indent(3) << "}\n"
+            << indent(3) << "edge_weight = reconstructed_weight + edge_weight_deltas[edge_slot];\n"
+            << indent(2) << "}\n\n"
+            << indent(2) << "int arrival_index = network_input_ring_index(\n"
+            << indent(4) << "tick + (" << tick_type << ")edge_delay_ticks[edge_slot], ring_depth,\n"
+            << indent(4) << "neuron_count, target_neuron_index);\n";
+
+    // Many sources converge on one target in the same tick, so the arrival has to be atomic.
+    if (is_metal) {
+        helpers << indent(2) << "device atomic_float *arrival_slot =\n"
+                << indent(4) << "(device atomic_float *)(network_inputs + arrival_index);\n"
+                << indent(2)
+                << "atomic_fetch_add_explicit(arrival_slot, edge_weight, memory_order_relaxed);\n";
+    } else {
+        helpers << indent(2) << "atomicAdd(network_inputs + arrival_index, edge_weight);\n";
+    }
+
+    helpers << indent(2) << "neighbor_slot += 1;\n"
+            << indent(1) << "}\n"
+            << "}\n\n";
+
+    return helpers.str();
+}
+
+// Reads this tick's ring row for this neuron and clears it in one step, so the row is empty
+// when the ring wraps back onto it -- an uncleared row would re-deliver its contents
+// ring_depth ticks later, which reads as a plausible oscillation rather than as a bug.
+String emit_synaptic_input_drain(KernelBackend backend, usize indent_level) {
+    ostringstream drain;
+    drain << indent(indent_level) << "int synaptic_input_index = network_input_ring_index(\n"
+          << indent(indent_level + 2)
+          << "tick, ring_depth, neuron_count, neuron_index);\n";
+
+    if (backend == KernelBackend::Metal) {
+        drain << indent(indent_level) << "float " << synaptic_input_local_name
+              << " = atomic_exchange_explicit(\n"
+              << indent(indent_level + 2)
+              << "(device atomic_float *)(network_inputs + synaptic_input_index), 0.0f,\n"
+              << indent(indent_level + 2) << "memory_order_relaxed);\n";
+    } else {
+        drain << indent(indent_level) << "float " << synaptic_input_local_name
+              << " = atomicExch(network_inputs + synaptic_input_index, 0.0f);\n";
+    }
+
+    return drain.str();
+}
+
+// The fixed epilogue every cell device function ends with.
+String emit_propagation_epilogue(usize indent_level) {
+    ostringstream epilogue;
+    epilogue << indent(indent_level) << "if (spike_flags[neuron_index] != 0) {\n"
+             << indent(indent_level + 1) << "propagate_spike(\n"
+             << indent(indent_level + 3)
+             << "network_inputs, internal_node_words, leaf_node_words, rank_superblock_table,\n"
+             << indent(indent_level + 3)
+             << "rank_subblock_table, U_matrix, V_matrix, edge_weight_coefficients,\n"
+             << indent(indent_level + 3)
+             << "edge_weight_deltas, edge_delay_ticks, branching_factor, superblock_size_words,\n"
+             << indent(indent_level + 3)
+             << "padded_node_count, tree_height, internal_bit_count, rank_float4_stride,\n"
+             << indent(indent_level + 3)
+             << "constant_weight, max_neighbor_count, ring_depth, neuron_count, neuron_index,\n"
+             << indent(indent_level + 3) << "tick);\n"
+             << indent(indent_level) << "}\n";
+    return epilogue.str();
 }
 
 // ── Per-cell-type bodies ─────────────────────────────────────────────────────
 
-String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseResult &parse_result) {
+String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseResult &parse_result,
+                      KernelBackend backend) {
     reject_unsupported_instructions(cell_type);
 
     ostringstream body;
@@ -707,7 +1009,15 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
     // would reject far from its cause.
     //
     // A select= path becomes a local the same way, so whatever it binds to is reached by
-    // the name the model gave it and resolves through the ordinary precedence chain.
+    // the name the model gave it and resolves through the ordinary precedence chain. Every
+    // such path binds to the ONE drain emitted ahead of them all, so a model reducing over
+    // its synapses twice reads the same delivered current twice rather than finding the ring
+    // slot already emptied by its own earlier read. The declarations are staged rather than
+    // written straight out because whether the drain is needed is only known once they have
+    // all been walked.
+    ostringstream derived_variable_declarations;
+    bool drains_synaptic_input = false;
+
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
         if (instruction.source_tag != NML_DeclarationType::DerivedVariable) continue;
@@ -716,15 +1026,24 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
         const Optional<String> path_head_name =
                 select_path_head_name(instruction.expression, visible_symbols);
 
+        String read_expression;
+        if (path_head_name.has_value()) {
+            require_synaptic_select_path(instruction.expression, *path_head_name, cell_type.name);
+            drains_synaptic_input = true;
+            read_expression = synaptic_input_local_name;
+        } else {
+            read_expression = translate_expression(instruction.expression, visible_symbols);
+        }
+
         const String local_name = "derived_" + sanitize_identifier(instruction.target);
-        body << indent(1) << "float " << local_name << " = "
-             << (path_head_name.has_value()
-                         ? emit_select_path_read(instruction.expression, *path_head_name,
-                                                 cell_type.name)
-                         : translate_expression(instruction.expression, visible_symbols))
-             << ";\n";
+        derived_variable_declarations << indent(1) << "float " << local_name << " = "
+                                      << read_expression << ";\n";
         symbols.define(instruction.target, local_name);
     }
+
+    // Stage 1, Deliver, for this neuron: its own ring row, read and cleared once.
+    if (drains_synaptic_input) body << emit_synaptic_input_drain(backend, 1);
+    body << derived_variable_declarations.str();
 
     // Integrate, part 2: forward Euler into a temporary per state variable. Nothing is
     // written back until every derivative has been computed, so two variables that
@@ -803,6 +1122,11 @@ String emit_tick_body(const CellTypeSpecification &cell_type, const NML_ParseRes
         }
     }
 
+    // Stage 6, Propagate. Unconditional boilerplate: every cell type scatters its spike the
+    // same way, so this is emitted whether or not the type declares an EventOut -- a type
+    // that never raises the flag simply never enters the block.
+    body << emit_propagation_epilogue(1);
+
     return body.str();
 }
 
@@ -825,13 +1149,97 @@ String emit_initialize_body(const CellTypeSpecification &cell_type,
 
 // ── Kernel assembly ──────────────────────────────────────────────────────────
 
-const Vector<String> &kernel_argument_names() {
-    static const Vector<String> names = {
-        "cell_state",      "cell_parameters",     "network_inputs",  "last_spiked",
-        "spike_flags",     "cell_state_base",     "cell_parameter_base", "cell_type_index",
-        "neuron_count",    "dt",                  "tick",
+// One master-kernel parameter: the name the engine binds it by and how each backend spells
+// it. The names the engine sees are derived from this table rather than listed separately,
+// so a parameter cannot be declared in the signature under one name and asked for under
+// another.
+struct KernelArgumentDeclaration {
+    String name;
+    String metal_declaration;
+    String cuda_declaration;
+};
+
+const Vector<KernelArgumentDeclaration> &kernel_argument_declarations() {
+    // U_matrix and V_matrix are float4 buffers on the host and are declared here as plain
+    // floats: identical bytes, and scalar lanes make the reconstruction arithmetic the same
+    // one WeightMatrix performs on the CPU. rank_float4_stride keeps its name (it is what
+    // the engine binds) and counts float4 elements, so a row is four times that many lanes.
+    static const Vector<KernelArgumentDeclaration> declarations = {
+        {"cell_state", "device float       *cell_state", "float *cell_state"},
+        {"cell_parameters", "device const float *cell_parameters", "const float *cell_parameters"},
+        {"network_inputs", "device float       *network_inputs", "float *network_inputs"},
+        {"last_spiked", "device long        *last_spiked", "long long *last_spiked"},
+        {"spike_flags", "device int         *spike_flags", "int *spike_flags"},
+        {"cell_state_base", "device const int   *cell_state_base", "const int *cell_state_base"},
+        {"cell_parameter_base", "device const int   *cell_parameter_base",
+         "const int *cell_parameter_base"},
+        {"cell_type_index", "device const int   *cell_type_index", "const int *cell_type_index"},
+        {"neuron_count", "constant int       &neuron_count", "int neuron_count"},
+        {"dt", "constant float     &dt", "float dt"},
+        {"tick", "constant long      &tick", "long long tick"},
+        {"internal_node_words", "device const uint  *internal_node_words",
+         "const unsigned int *internal_node_words"},
+        {"leaf_node_words", "device const uint  *leaf_node_words",
+         "const unsigned int *leaf_node_words"},
+        {"rank_superblock_table", "device const uint  *rank_superblock_table",
+         "const unsigned int *rank_superblock_table"},
+        {"rank_subblock_table", "device const ushort *rank_subblock_table",
+         "const unsigned short *rank_subblock_table"},
+        {"U_matrix", "device const float *U_matrix", "const float *U_matrix"},
+        {"V_matrix", "device const float *V_matrix", "const float *V_matrix"},
+        {"edge_weight_coefficients", "device const float *edge_weight_coefficients",
+         "const float *edge_weight_coefficients"},
+        {"edge_weight_deltas", "device const float *edge_weight_deltas",
+         "const float *edge_weight_deltas"},
+        {"edge_delay_ticks", "device const int   *edge_delay_ticks",
+         "const int *edge_delay_ticks"},
+        {"branching_factor", "constant int       &branching_factor", "int branching_factor"},
+        {"superblock_size_words", "constant int       &superblock_size_words",
+         "int superblock_size_words"},
+        {"padded_node_count", "constant int       &padded_node_count", "int padded_node_count"},
+        {"tree_height", "constant int       &tree_height", "int tree_height"},
+        {"internal_bit_count", "constant int       &internal_bit_count", "int internal_bit_count"},
+        {"rank_float4_stride", "constant long      &rank_float4_stride",
+         "long long rank_float4_stride"},
+        {"constant_weight", "constant float     &constant_weight", "float constant_weight"},
+        {"max_neighbor_count", "constant int       &max_neighbor_count", "int max_neighbor_count"},
+        {"ring_depth", "constant int       &ring_depth", "int ring_depth"},
     };
+    return declarations;
+}
+
+const Vector<String> &kernel_argument_names() {
+    static const Vector<String> names = [] {
+        Vector<String> collected;
+        for (const KernelArgumentDeclaration &declaration : kernel_argument_declarations()) {
+            collected.push_back(declaration.name);
+        }
+        return collected;
+    }();
     return names;
+}
+
+// What a cell device function is handed, in order. The tick entry point carries the whole
+// propagation apparatus; the initialize entry point runs OnStart bodies only and takes just
+// the storage those touch.
+const Vector<String> &device_function_parameter_names(KernelPurpose purpose) {
+    static const Vector<String> tick_parameters = {
+        "cell_state",       "cell_parameters",          "network_inputs",
+        "last_spiked",      "spike_flags",              "internal_node_words",
+        "leaf_node_words",  "rank_superblock_table",    "rank_subblock_table",
+        "U_matrix",         "V_matrix",                 "edge_weight_coefficients",
+        "edge_weight_deltas", "edge_delay_ticks",       "state_base",
+        "parameter_base",   "neuron_index",             "neuron_count",
+        "branching_factor", "superblock_size_words",    "padded_node_count",
+        "tree_height",      "internal_bit_count",       "rank_float4_stride",
+        "constant_weight",  "max_neighbor_count",       "ring_depth",
+        "dt",               "tick",
+    };
+    static const Vector<String> initialize_parameters = {
+        "cell_state",     "cell_parameters", "network_inputs", "last_spiked", "spike_flags",
+        "state_base",     "parameter_base",  "neuron_index",   "dt",          "tick",
+    };
+    return purpose == KernelPurpose::Tick ? tick_parameters : initialize_parameters;
 }
 
 String kernel_function_name(KernelPurpose purpose) {
@@ -858,24 +1266,51 @@ String source_preamble(KernelBackend backend, KernelPurpose purpose) {
     return preamble.str();
 }
 
-String emit_device_function(const String &function_name, const String &body,
-                            KernelBackend backend) {
+// How one device-function parameter is spelled. The three the master kernel resolves itself
+// -- the thread's neuron and its two slot offsets -- are plain ints; everything else is
+// declared exactly as the corresponding kernel argument, minus the `constant`/reference
+// spelling a kernel parameter carries and a Metal address space is added back where the
+// argument is a pointer.
+String device_function_parameter_declaration(const String &parameter_name, KernelBackend backend) {
+    if (parameter_name == "state_base" || parameter_name == "parameter_base" ||
+        parameter_name == "neuron_index") {
+        return "int " + parameter_name;
+    }
+
     const bool is_metal = backend == KernelBackend::Metal;
-    const String address_space = is_metal ? "device " : "";
-    const String tick_type = is_metal ? "long" : "long long";
+    for (const KernelArgumentDeclaration &declaration : kernel_argument_declarations()) {
+        if (declaration.name != parameter_name) continue;
+
+        const String kernel_declaration =
+                is_metal ? declaration.metal_declaration : declaration.cuda_declaration;
+
+        // A scalar reaches a Metal kernel as `constant T &name`; a device function takes it
+        // by value, which is also exactly the CUDA spelling.
+        if (is_metal && kernel_declaration.rfind("constant ", 0) == 0) {
+            String by_value = kernel_declaration.substr(String("constant ").length());
+            const usize ampersand_position = by_value.find('&');
+            if (ampersand_position != String::npos) by_value.erase(ampersand_position, 1);
+            return by_value;
+        }
+        return kernel_declaration;
+    }
+
+    throw runtime_error("kernel_codegen: device function parameter '" + parameter_name +
+                        "' names no kernel argument");
+}
+
+String emit_device_function(const String &function_name, const String &body,
+                            KernelBackend backend, KernelPurpose purpose) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const Vector<String> &parameter_names = device_function_parameter_names(purpose);
 
     ostringstream function;
     function << (is_metal ? "inline void " : "__device__ inline void ") << function_name << "(\n";
-    function << indent(2) << address_space << "float *cell_state,\n";
-    function << indent(2) << address_space << "const float *cell_parameters,\n";
-    function << indent(2) << address_space << "float *network_inputs,\n";
-    function << indent(2) << address_space << tick_type << " *last_spiked,\n";
-    function << indent(2) << address_space << "int *spike_flags,\n";
-    function << indent(2) << "int state_base,\n";
-    function << indent(2) << "int parameter_base,\n";
-    function << indent(2) << "int neuron_index,\n";
-    function << indent(2) << "float dt,\n";
-    function << indent(2) << tick_type << " tick\n";
+    for (usize position = 0; position < parameter_names.size(); ++position) {
+        function << indent(2)
+                 << device_function_parameter_declaration(parameter_names[position], backend)
+                 << (position + 1 < parameter_names.size() ? ",\n" : "\n");
+    }
     function << ") {\n";
     function << body;
     function << "}\n\n";
@@ -884,51 +1319,46 @@ String emit_device_function(const String &function_name, const String &body,
 
 String emit_master_kernel(const Vector<String> &device_function_names, KernelBackend backend,
                           KernelPurpose purpose) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const Vector<KernelArgumentDeclaration> &declarations = kernel_argument_declarations();
+
     ostringstream kernel;
 
-    if (backend == KernelBackend::Metal) {
-        kernel << "kernel void " << kernel_function_name(purpose) << "(\n";
-        kernel << indent(1) << "device float       *cell_state          [[ buffer(0) ]],\n";
-        kernel << indent(1) << "device const float *cell_parameters     [[ buffer(1) ]],\n";
-        kernel << indent(1) << "device float       *network_inputs      [[ buffer(2) ]],\n";
-        kernel << indent(1) << "device long        *last_spiked         [[ buffer(3) ]],\n";
-        kernel << indent(1) << "device int         *spike_flags         [[ buffer(4) ]],\n";
-        kernel << indent(1) << "device const int   *cell_state_base     [[ buffer(5) ]],\n";
-        kernel << indent(1) << "device const int   *cell_parameter_base [[ buffer(6) ]],\n";
-        kernel << indent(1) << "device const int   *cell_type_index     [[ buffer(7) ]],\n";
-        kernel << indent(1) << "constant int       &neuron_count        [[ buffer(8) ]],\n";
-        kernel << indent(1) << "constant float     &dt                  [[ buffer(9) ]],\n";
-        kernel << indent(1) << "constant long      &tick                [[ buffer(10) ]],\n";
-        kernel << indent(1) << "uint thread_id [[ thread_position_in_grid ]]\n";
-        kernel << ") {\n";
-        kernel << indent(1) << "int neuron_index = (int)thread_id;\n";
-    } else {
-        kernel << "extern \"C\" __global__ void " << kernel_function_name(purpose) << "(\n";
-        kernel << indent(1) << "float *cell_state,\n";
-        kernel << indent(1) << "const float *cell_parameters,\n";
-        kernel << indent(1) << "float *network_inputs,\n";
-        kernel << indent(1) << "long long *last_spiked,\n";
-        kernel << indent(1) << "int *spike_flags,\n";
-        kernel << indent(1) << "const int *cell_state_base,\n";
-        kernel << indent(1) << "const int *cell_parameter_base,\n";
-        kernel << indent(1) << "const int *cell_type_index,\n";
-        kernel << indent(1) << "int neuron_count,\n";
-        kernel << indent(1) << "float dt,\n";
-        kernel << indent(1) << "long long tick\n";
-        kernel << ") {\n";
-        kernel << indent(1) << "int neuron_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n";
+    // Both entry points take the identical signature so the engine binds one argument set
+    // for both; the initialize kernel simply never reads the propagation half of it.
+    kernel << (is_metal ? "kernel void " : "extern \"C\" __global__ void ")
+           << kernel_function_name(purpose) << "(\n";
+    for (usize position = 0; position < declarations.size(); ++position) {
+        kernel << indent(1);
+        if (is_metal) {
+            kernel << declarations[position].metal_declaration << " [[ buffer(" << position
+                   << ") ]],\n";
+        } else {
+            kernel << declarations[position].cuda_declaration
+                   << (position + 1 < declarations.size() ? ",\n" : "\n");
+        }
     }
+    if (is_metal) kernel << indent(1) << "uint thread_id [[ thread_position_in_grid ]]\n";
+    kernel << ") {\n";
+    kernel << indent(1)
+           << (is_metal ? "int neuron_index = (int)thread_id;\n"
+                        : "int neuron_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n");
 
     kernel << indent(1) << "if (neuron_index >= neuron_count) return;\n\n";
     kernel << indent(1) << "int state_base = cell_state_base[neuron_index];\n";
     kernel << indent(1) << "int parameter_base = cell_parameter_base[neuron_index];\n\n";
     kernel << indent(1) << "switch (cell_type_index[neuron_index]) {\n";
 
+    String call_arguments;
+    for (const String &parameter_name : device_function_parameter_names(purpose)) {
+        if (!call_arguments.empty()) call_arguments += ", ";
+        call_arguments += parameter_name;
+    }
+
     for (usize type_index = 0; type_index < device_function_names.size(); ++type_index) {
         kernel << indent(2) << "case " << type_index << ":\n";
-        kernel << indent(3) << device_function_names[type_index]
-               << "(cell_state, cell_parameters, network_inputs, last_spiked, spike_flags, "
-                  "state_base, parameter_base, neuron_index, dt, tick);\n";
+        kernel << indent(3) << device_function_names[type_index] << "(" << call_arguments
+               << ");\n";
         kernel << indent(3) << "break;\n";
     }
 
@@ -945,6 +1375,10 @@ GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBacke
     ostringstream source;
     source << source_preamble(backend, purpose);
 
+    // Only the tick entry point propagates, so only it carries the walk and the ring
+    // helpers; emitting them into the initialize kernel would leave dead code behind.
+    if (purpose == KernelPurpose::Tick) source << emit_propagation_helpers(backend);
+
     Vector<String> device_function_names;
     Set<String> used_function_names;
 
@@ -960,10 +1394,10 @@ GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBacke
         }
 
         const String body = purpose == KernelPurpose::Tick
-                                    ? emit_tick_body(cell_type, parse_result)
+                                    ? emit_tick_body(cell_type, parse_result, backend)
                                     : emit_initialize_body(cell_type, parse_result);
 
-        source << emit_device_function(function_name, body, backend);
+        source << emit_device_function(function_name, body, backend, purpose);
         device_function_names.push_back(function_name);
     }
 

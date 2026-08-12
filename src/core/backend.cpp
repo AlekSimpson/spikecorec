@@ -97,18 +97,9 @@ static MTL::Library *load_default_metal_library(MTL::Device *device) {
 #endif
 
 // ── KernelHandle ─────────────────────────────────────────────────────────────
-// Defined for both backends (must be a complete type wherever compile_kernel /
+// Defined in backend.h (must be a complete type wherever compile_kernel /
 // dispatch / release_kernel are compiled). The Metal-only helper below stays
 // guarded since it touches MTL types.
-
-struct KernelHandle {
-#ifdef SPIKECOREC_CUDA
-    CUfunction cuda_kernel_function{};
-    CUmodule   cuda_module{};
-#elif defined(SPIKECOREC_METAL)
-    MTL::ComputePipelineState *pipeline_state = nullptr;
-#endif
-};
 
 #ifdef SPIKECOREC_METAL
 // Looks up a kernel function compiled ahead-of-time into default.metallib and

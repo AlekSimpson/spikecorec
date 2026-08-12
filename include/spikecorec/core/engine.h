@@ -53,6 +53,38 @@ namespace spikecorec {
         Vector<f64> values;
     };
 
+    // Every NetworkEdge the model declares between one ordered pair, collapsed into the one
+    // slot the k^2-tree adjacency holds for that pair.
+    struct AggregatedNetworkEdge {
+        s32 source_node = -1;
+        s32 target_node = -1;
+        f32 summed_weight = 0.0f;
+        s32 delay_tick_count = 1;
+    };
+
+    // Collapses parallel edges -- two projections between one cell pair, which is an
+    // ordinary NeuroML shape -- onto the single adjacency slot that pair has.
+    //
+    // Weights SUM: two synapses onto one cell both deliver, and the adjacency cannot
+    // represent them separately, so their total is the only faithful collapse.
+    //
+    // Delays cannot be summed or averaged into anything meaningful, and two parallel edges
+    // with genuinely different conduction delays are not representable in one slot at all.
+    // Rather than pick one silently, a conflict THROWS naming the pair and both delays: a
+    // halved or doubled conduction delay changes when every downstream spike lands, and
+    // there is no reading of the model under which either answer is right. Edges that agree
+    // (the common case -- parallel projections normally share a delay) collapse silently,
+    // since nothing is lost. `default_delay_tick_count` is what an edge declaring no delay
+    // of its own resolves to, so "declares none" and "declares the default" do not read as a
+    // conflict.
+    //
+    // Returned in first-appearance order, so the wiring it drives is deterministic.
+    Vector<AggregatedNetworkEdge> aggregate_network_edges(
+        const nml::NML_ParseResult &parse_result,
+        s32 default_delay_tick_count,
+        EngineLogger &engine_logger
+    );
+
     // One output file, plus everything needed to build its frame without re-deriving the
     // selection each tick. `gathered_indices` are flat cell_state indices for a value
     // recorder and global neuron indices for a spike-event recorder; `frame_values` is the
@@ -90,11 +122,26 @@ namespace spikecorec {
         // (see nml/kernel_codegen.h).
         GpuPointer<f32> cell_state;          // [cell_state_element_count]
         GpuPointer<f32> cell_parameters;     // [cell_parameter_element_count]
-        GpuPointer<f32> network_inputs;      // [total_neuron_count] — synaptic accumulator
         GpuPointer<s32> cell_state_base;     // [total_neuron_count]
         GpuPointer<s32> cell_parameter_base; // [total_neuron_count]
         GpuPointer<s32> cell_type_index;     // [total_neuron_count]
         GpuPointer<s32> spike_flags;         // [total_neuron_count] — this tick's emissions
+
+        // The synaptic delay ring: [network_input_ring_depth * total_neuron_count], one flat
+        // allocation indexed as [row][neuron]. Propagation, generated into the cell device
+        // functions, adds an edge's weight into row (tick + that edge's delay) %
+        // network_input_ring_depth; a cell reads row tick % network_input_ring_depth of its
+        // own column and clears it, so the row is empty when the ring wraps onto it again.
+        // External stimulus is added into the current tick's row, arriving with no delay.
+        GpuPointer<f32> network_inputs;
+
+        // [weights.node_count * weights.max_neighbor_count] — each edge's delay in whole
+        // ticks, at the slot WeightMatrix addresses that edge by (row-major by source neuron;
+        // within a row, the neighbour's position in k^2-tree traversal order). Flattened once
+        // at construction out of WeightMatrix::get_edge_delay_ticks, which is where the
+        // rounding, the >= 1 floor and the constant-delay fallback are decided; the kernel
+        // then needs one load per edge and no delay logic of its own.
+        GpuPointer<s32> edge_delay_ticks;
 
         // [total_neuron_count] — tick each neuron last fired. Always allocated: the
         // generated kernel writes it unconditionally on every emission, so it is a kernel
@@ -108,10 +155,15 @@ namespace spikecorec {
         s64 cell_state_element_count = 0;
         s64 cell_parameter_element_count = 0;
 
-        // The compiled generated master kernel. Held through a shared pointer because
-        // KernelHandle is opaque outside backend.cpp: a shared pointer type-erases its
-        // deleter at construction, where the type is complete, so neither this header nor
-        // ~SpikeEngine needs the definition.
+        // How many tick rows the network_inputs ring holds. Strictly greater than the
+        // model's largest per-edge delay, so an arrival scheduled this tick can never land
+        // in the row being drained this tick, and every row is read (and so cleared) before
+        // the ring wraps back onto it.
+        s32 network_input_ring_depth = 1;
+
+        // The compiled generated master kernel. Held through a shared pointer so its
+        // release_kernel call travels with it: the deleter is installed at compile time and
+        // runs on the last reference, wherever that is dropped.
         SharedPointer<KernelHandle> tick_kernel;
 
         // The generated kernel's own argument list. Arguments are bound positionally
@@ -172,9 +224,20 @@ namespace spikecorec {
 
         SpikeEngine &operator=(const SpikeEngine &) = delete;
 
-        SpikeEngine(SpikeEngine &&) = default;
+        // Deleted, not defaulted. A defaulted move leaves the source with `alive` still
+        // true and its `logger` null, so the moved-from engine's destructor dereferences a
+        // null shared pointer and then runs the whole shutdown body -- a segfault at the
+        // end of the scope the move happened in. The defaulted move ASSIGNMENT is worse
+        // still: it move-assigns every GpuPointer member, and GpuPointer's move assignment
+        // asserts its destination is null, which no live engine's ever is.
+        //
+        // Deleted rather than hand-written because nothing moves a SpikeEngine: it owns a
+        // GPU arena, a compiled pipeline and open recorders, and is constructed in place
+        // wherever it is used. Anything needing to relocate one should hold a
+        // unique_ptr<SpikeEngine> and move that instead.
+        SpikeEngine(SpikeEngine &&) = delete;
 
-        SpikeEngine &operator=(SpikeEngine &&) = default;
+        SpikeEngine &operator=(SpikeEngine &&) = delete;
 
         SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learning);
 

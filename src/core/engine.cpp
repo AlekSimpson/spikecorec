@@ -24,24 +24,6 @@ using namespace spikecorec;
 using namespace spikecorec::nml;
 using namespace spikecorec::log;
 
-// ── KernelHandle: temporary local definition ──────────────────────────────────
-// backend.h only forward-declares KernelHandle and the definition lives in
-// src/core/backend.cpp, so no other translation unit can call compile_kernel(),
-// release_kernel() or metal_dispatch() -- all three need a complete type, exactly as
-// backend.cpp's own comment on the struct says. Repeating the definition here is legal
-// (identical token sequence, [basic.def.odr]/6) but it belongs in backend.h; delete this
-// block the moment it is hoisted into the header.
-namespace spikecorec {
-struct KernelHandle {
-#ifdef SPIKECOREC_CUDA
-    CUfunction cuda_kernel_function{};
-    CUmodule   cuda_module{};
-#elif defined(SPIKECOREC_METAL)
-    MTL::ComputePipelineState *pipeline_state = nullptr;
-#endif
-};
-} // namespace spikecorec
-
 namespace {
 
 // One generated-kernel argument, as metal_dispatch wants it: a pointer to the argument's
@@ -194,6 +176,58 @@ spikecorec::Vector<f64> spikecorec::create_event_stream(
     return stream;
 }
 
+// ── edge aggregation ──────────────────────────────────────────────────────────
+
+spikecorec::Vector<spikecorec::AggregatedNetworkEdge> spikecorec::aggregate_network_edges(
+    const NML_ParseResult &parse_result,
+    s32 default_delay_tick_count,
+    EngineLogger &engine_logger
+) {
+    Vector<AggregatedNetworkEdge> aggregated_edges;
+    UnorderedMap<s64, usize> position_of_pair;
+
+    const s64 neuron_count = (s64)parse_result.neurons.size();
+
+    for (usize source_index = 0; source_index < parse_result.neurons.size(); ++source_index) {
+        for (const NetworkEdge &edge : parse_result.neurons[source_index].outgoing_edges) {
+            const s32 source_node = (s32)source_index;
+            const s32 target_node = (s32)edge.target_neuron_index;
+
+            // An edge that declares no delay resolves to the matrix's own default, so an
+            // undeclared delay and an explicitly-declared default one do not read as a
+            // conflict with each other.
+            const s32 delay_tick_count = edge.delay_tick_count > 0
+                                                 ? (s32)edge.delay_tick_count
+                                                 : default_delay_tick_count;
+
+            const s64 pair_key = (s64)source_node * neuron_count + (s64)target_node;
+            const auto existing = position_of_pair.find(pair_key);
+            if (existing == position_of_pair.end()) {
+                position_of_pair.emplace(pair_key, aggregated_edges.size());
+                aggregated_edges.push_back(AggregatedNetworkEdge{
+                        source_node, target_node, (f32)edge.weight, delay_tick_count});
+                continue;
+            }
+
+            AggregatedNetworkEdge &collapsed = aggregated_edges[existing->second];
+            if (collapsed.delay_tick_count != delay_tick_count) {
+                log::throw_runtime_error(
+                        engine_logger,
+                        fmt::format("SpikeEngine: neurons {} -> {} are connected by two edges "
+                                    "with different delays ({} and {} ticks). The adjacency "
+                                    "holds one slot per ordered pair, so both cannot be "
+                                    "represented; give the parallel connections the same "
+                                    "delay",
+                                    source_node, target_node, collapsed.delay_tick_count,
+                                    delay_tick_count));
+            }
+            collapsed.summed_weight += (f32)edge.weight;
+        }
+    }
+
+    return aggregated_edges;
+}
+
 // ── constructor / destructor ──────────────────────────────────────────────────
 
 SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learning)
@@ -245,7 +279,64 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
                                         (s64)cell_types[type_index].parameter_names.size();
     }
 
-    // ── 2. arena ─────────────────────────────────────────────────────────────
+    // ── 2. edge weights and delays ───────────────────────────────────────────
+    // Ahead of the arena because the ring depth the network_inputs allocation is sized by
+    // comes out of the delays wired here.
+    //
+    // The adjacency holds ONE slot per ordered pair, so a model that declares two
+    // projections between the same pair -- an AMPA and an NMDA between one cell pair, or two
+    // <connectionWD> entries that resolve to it -- has to be collapsed into that one slot
+    // before anything is written. Aggregating first is what makes the collapse a decision
+    // rather than an accident: writing each edge as it comes re-reads the slot the previous
+    // one just wrote and overwrites it, so the last projection declared would silently be
+    // the only one that survived.
+    const Vector<AggregatedNetworkEdge> aggregated_edges =
+            aggregate_network_edges(network_details, weights.constant_delay_ticks, *logger);
+
+    for (const AggregatedNetworkEdge &edge : aggregated_edges) {
+        // WeightMatrix has no per-edge weight setter: U/V is one shared low-rank plane, so
+        // an exact per-edge value is expressed as the sparse delta that carries the
+        // reconstruction onto it (arch section 4.3's Sk), which is what get() reads back.
+        const f32 reconstructed_weight = weights.get(edge.source_node, edge.target_node);
+        weights.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, edge.source_node,
+                                      edge.target_node,
+                                      edge.summed_weight - reconstructed_weight);
+
+        weights.set_edge_delay_ticks(edge.source_node, edge.target_node, edge.delay_tick_count);
+    }
+
+    // Flattened per-edge delay, staged on the host until the arena exists. Every edge is
+    // read back through get_edge_delay_ticks rather than from the model, so the rounding,
+    // the >= 1 floor and the constant-delay fallback are decided in exactly one place. The
+    // slot convention is WeightMatrix's own: row-major by source neuron, and within a row
+    // the neighbour's position in the order get_neighbors enumerates it -- which is the
+    // order the generated kernel's k^2-tree walk reproduces.
+    const s64 edge_slot_count = weights.node_count * weights.max_neighbor_count;
+    Vector<s32> staged_edge_delay_ticks((usize)(edge_slot_count > 0 ? edge_slot_count : 0), 0);
+
+    s32 maximum_edge_delay_ticks = 0;
+    if (edge_slot_count > 0) {
+        Vector<s32> neighbor_indices((usize)weights.max_neighbor_count, 0);
+        for (s64 source_node = 0; source_node < weights.node_count; ++source_node) {
+            const s64 degree = weights.get_neighbors(source_node, neighbor_indices.data());
+            for (s64 slot = 0; slot < degree; ++slot) {
+                const s32 delay_tick_count = weights.get_edge_delay_ticks(
+                        (s32)source_node, neighbor_indices[(usize)slot]);
+                staged_edge_delay_ticks[(usize)(source_node * weights.max_neighbor_count + slot)] =
+                        delay_tick_count;
+                maximum_edge_delay_ticks = std::max(maximum_edge_delay_ticks, delay_tick_count);
+            }
+        }
+    }
+
+    // Strictly greater than the largest delay, so an arrival scheduled this tick never lands
+    // in the row being drained this tick. Two rows minimum: delay is always at least one
+    // tick, so a single-row ring could not represent even the shortest edge.
+    network_input_ring_depth = std::max(maximum_edge_delay_ticks + 1, 2);
+    const s64 network_input_element_count =
+            (s64)network_input_ring_depth * total_neuron_count;
+
+    // ── 3. arena ─────────────────────────────────────────────────────────────
     // Sized to exactly what is allocated below, rounding each sub-range up to the arena's
     // own alignment so the last allocation cannot fall off the end of the slab. Nothing is
     // taken from the CPU pool: both backends hand back host-visible memory, so every
@@ -253,7 +344,8 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     u64 gpu_pool_byte_count =
             arena_cost_of(sizeof(f32) * (u64)cell_state_element_count) +
             arena_cost_of(sizeof(f32) * (u64)cell_parameter_element_count) +
-            arena_cost_of(sizeof(f32) * (u64)total_neuron_count) +      // network_inputs
+            arena_cost_of(sizeof(f32) * (u64)network_input_element_count) +
+            arena_cost_of(sizeof(s32) * (u64)edge_slot_count) +          // edge_delay_ticks
             arena_cost_of(sizeof(s32) * (u64)total_neuron_count) * 4 +  // bases, type, flags
             arena_cost_of(sizeof(s64) * (u64)total_neuron_count);       // last_spiked
     if (hebbian_learning_enabled) {
@@ -264,7 +356,8 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
 
     cell_state = allocate_engine_buffer<f32>(allocator, cell_state_element_count);
     cell_parameters = allocate_engine_buffer<f32>(allocator, cell_parameter_element_count);
-    network_inputs = allocate_engine_buffer<f32>(allocator, total_neuron_count);
+    network_inputs = allocate_engine_buffer<f32>(allocator, network_input_element_count);
+    edge_delay_ticks = allocate_engine_buffer<s32>(allocator, edge_slot_count);
     cell_state_base = allocate_engine_buffer<s32>(allocator, total_neuron_count);
     cell_parameter_base = allocate_engine_buffer<s32>(allocator, total_neuron_count);
     cell_type_index = allocate_engine_buffer<s32>(allocator, total_neuron_count);
@@ -276,12 +369,17 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
 
     zero_fill_engine_buffer(cell_state, cell_state_element_count);
     zero_fill_engine_buffer(cell_parameters, cell_parameter_element_count);
-    zero_fill_engine_buffer(network_inputs, total_neuron_count);
+    zero_fill_engine_buffer(network_inputs, network_input_element_count);
     zero_fill_engine_buffer(spike_flags, total_neuron_count);
     zero_fill_engine_buffer(last_spiked, total_neuron_count);
     zero_fill_engine_buffer(last_tick_updated, total_neuron_count);
 
-    // ── 3. per-neuron scaffolding ────────────────────────────────────────────
+    if (edge_slot_count > 0) {
+        memcpy(edge_delay_ticks.get_contents(), staged_edge_delay_ticks.data(),
+               (usize)edge_slot_count * sizeof(s32));
+    }
+
+    // ── 4. per-neuron scaffolding ────────────────────────────────────────────
     // One load each, so a kernel thread resolves its slot without searching type
     // boundaries.
     s32 *cell_state_base_values = buffer_contents_or_null(cell_state_base);
@@ -307,7 +405,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
         cell_parameter_base_values[neuron_index] = (s32)parameter_base;
         cell_type_index_values[neuron_index] = (s32)type_index;
 
-        // ── 4. starting parameters ───────────────────────────────────────────
+        // ── 5. starting parameters ───────────────────────────────────────────
         // A population names a prototype, not a type: two prototypes of one type may
         // differ, so the values come from the prototype, in the type's parameter order.
         if (neuron.prototype_index < 0 ||
@@ -340,7 +438,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     block_count = (s32)((total_neuron_count + thread_count_per_block - 1) /
                         thread_count_per_block);
 
-    // ── 5. initial cell state ────────────────────────────────────────────────
+    // ── 6. initial cell state ────────────────────────────────────────────────
     // The OnStart bodies, run once. Compiled, dispatched and released here: nothing after
     // initialisation ever runs them again.
     const GeneratedKernel initialize_kernel_source = generate_initialize_kernel(network_details);
@@ -348,28 +446,6 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
                                                     initialize_kernel_source.function_name.c_str());
     dispatch_master_kernel(initialize_kernel, initialize_kernel_source.argument_names, /*tick=*/0);
     release_kernel(initialize_kernel);
-
-    // ── 6. edge weights and delays ───────────────────────────────────────────
-    for (usize source_index = 0; source_index < network_details.neurons.size(); ++source_index) {
-        for (const NetworkEdge &edge : network_details.neurons[source_index].outgoing_edges) {
-            const s32 source_node = (s32)source_index;
-            const s32 target_node = (s32)edge.target_neuron_index;
-
-            // WeightMatrix has no per-edge weight setter: U/V is one shared low-rank plane,
-            // so an exact per-edge value is expressed as the sparse delta that carries the
-            // reconstruction onto it (arch section 4.3's Sk), which is what get() reads back.
-            const f32 reconstructed_weight = weights.get(source_node, target_node);
-            weights.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, source_node,
-                                          target_node, (f32)edge.weight - reconstructed_weight);
-
-            // Delay is always at least one tick; an edge that declares none keeps the
-            // matrix's own default rather than being pinned to zero.
-            if (edge.delay_tick_count > 0) {
-                weights.set_edge_delay_ticks(source_node, target_node,
-                                             (s32)edge.delay_tick_count);
-            }
-        }
-    }
 
     // ── 7. input event streams ───────────────────────────────────────────────
     for (const SimulationInputConfig &input_profile : network_details.input_profiles) {
@@ -508,10 +584,9 @@ void SpikeEngine::dispatch_master_kernel(
     const f32 step_dt_value = (f32)network_details.step_dt;
     const s64 tick_value = tick;
 
-    // Propagation is being moved into the generated cell device functions, which will ask
-    // for the adjacency and weight buffers by name. Offering them here costs nothing while
-    // codegen does not name them, and means the engine does not have to change again when
-    // it does.
+    // Stage 6, Propagate, runs inside the generated cell device functions, which walk the
+    // adjacency and reconstruct each edge's weight themselves -- so the k^2-tree, the shared
+    // U/V basis and the per-edge arrays are all kernel arguments.
     u32 *internal_node_words_contents = buffer_contents_or_null(weights.k2tree.internal_node_words);
     u32 *leaf_node_words_contents = buffer_contents_or_null(weights.k2tree.leaf_node_words);
     u32 *rank_superblock_table_contents =
@@ -519,6 +594,15 @@ void SpikeEngine::dispatch_master_kernel(
     u16 *rank_subblock_table_contents = buffer_contents_or_null(weights.k2tree.rank_subblock_table);
     float4 *u_matrix_contents = buffer_contents_or_null(weights.U_matrix);
     float4 *v_matrix_contents = buffer_contents_or_null(weights.V_matrix);
+    s32 *edge_delay_ticks_contents = buffer_contents_or_null(edge_delay_ticks);
+
+    // The default matrix's Ck and Sk: the kernel reconstructs an edge as
+    // Σ U·Ck·V + Sk, which is exactly what WeightMatrix::get() reports on the host, and
+    // where the exact per-edge weights this engine wires in actually live.
+    f32 *edge_weight_coefficients_contents = buffer_contents_or_null(
+            weights.coefficient_vectors[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX]);
+    f32 *edge_weight_deltas_contents = buffer_contents_or_null(
+            weights.sparse_delta_buffers[(usize)WeightMatrix::DEFAULT_MATRIX_INDEX]);
 
     const s32 branching_factor_value = weights.k2tree.branching_factor;
     const s32 superblock_size_words_value = weights.k2tree.superblock_size_words;
@@ -527,6 +611,8 @@ void SpikeEngine::dispatch_master_kernel(
     const s32 internal_bit_count_value = weights.k2tree.internal_bit_count;
     const s64 rank_float4_stride_value = weights.rank_float4_stride;
     const f32 constant_weight_value = use_constant_weight ? weights.constant_weight : 0.0f;
+    const s32 max_neighbor_count_value = (s32)weights.max_neighbor_count;
+    const s32 ring_depth_value = network_input_ring_depth;
 
     // metal_dispatch tells a buffer from a scalar by whether the slot is pointer-sized and
     // its contents resolve to a registered allocation, so a pointer-sized scalar (tick,
@@ -554,6 +640,11 @@ void SpikeEngine::dispatch_master_kernel(
          {&rank_subblock_table_contents, sizeof(rank_subblock_table_contents)}},
         {"U_matrix", {&u_matrix_contents, sizeof(u_matrix_contents)}},
         {"V_matrix", {&v_matrix_contents, sizeof(v_matrix_contents)}},
+        {"edge_weight_coefficients",
+         {&edge_weight_coefficients_contents, sizeof(edge_weight_coefficients_contents)}},
+        {"edge_weight_deltas",
+         {&edge_weight_deltas_contents, sizeof(edge_weight_deltas_contents)}},
+        {"edge_delay_ticks", {&edge_delay_ticks_contents, sizeof(edge_delay_ticks_contents)}},
         {"branching_factor", {&branching_factor_value, sizeof(branching_factor_value)}},
         {"superblock_size_words",
          {&superblock_size_words_value, sizeof(superblock_size_words_value)}},
@@ -562,6 +653,8 @@ void SpikeEngine::dispatch_master_kernel(
         {"internal_bit_count", {&internal_bit_count_value, sizeof(internal_bit_count_value)}},
         {"rank_float4_stride", {&rank_float4_stride_value, sizeof(rank_float4_stride_value)}},
         {"constant_weight", {&constant_weight_value, sizeof(constant_weight_value)}},
+        {"max_neighbor_count", {&max_neighbor_count_value, sizeof(max_neighbor_count_value)}},
+        {"ring_depth", {&ring_depth_value, sizeof(ring_depth_value)}},
     };
 
     Vector<const void *> argument_storage;
@@ -601,11 +694,16 @@ void SpikeEngine::step_simulation(s64 tick) {
     // Stage 1, Deliver. Each input's stream carries its magnitude at the ticks it fires
     // and zero everywhere else, so this tick's contribution is just the value at index
     // `tick`. A stream shorter than the simulation has already finished.
+    //
+    // External stimulus carries no synaptic delay, so it goes straight into the row the
+    // kernel is about to drain -- this tick's.
     f32 *network_input_values = buffer_contents_or_null(network_inputs);
+    const s64 current_ring_row_base =
+            (tick % (s64)network_input_ring_depth) * total_neuron_count;
     for (const NeuronInputStream &input_stream : input_event_streams) {
         if (tick < 0 || tick >= (s64)input_stream.values.size()) continue;
 
-        network_input_values[input_stream.neuron_index] +=
+        network_input_values[current_ring_row_base + input_stream.neuron_index] +=
                 (f32)input_stream.values[(usize)tick];
     }
 
@@ -616,11 +714,11 @@ void SpikeEngine::step_simulation(s64 tick) {
     // Stages 2 through 5 -- Integrate, Detect, Emit, Reset -- are the generated dynamics.
     dispatch_master_kernel(*tick_kernel, tick_kernel_argument_names, tick);
 
-    // Stage 6, Propagate, is deliberately not dispatched here: it is emitted into every
-    // generated cell device function as identical boilerplate, so it runs inside the
-    // kernel above rather than as a step of its own. network_inputs is likewise never
-    // cleared here -- the kernel drains what it reads, and clearing it engine-side would
-    // erase whatever propagation scattered into it during the previous tick.
+    // Stage 6, Propagate, is emitted into every generated cell device function as identical
+    // boilerplate, so it already ran inside the kernel above and must NOT be dispatched
+    // here. network_inputs is likewise never cleared here: each cell clears its own slot of
+    // the ring row it drains, and clearing engine-side would erase arrivals that
+    // propagation has already scheduled for later ticks.
 
     // Stage 8, Record.
     record_tick_frames();
