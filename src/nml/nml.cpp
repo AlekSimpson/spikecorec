@@ -1537,35 +1537,55 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 profile.rate = resolve_quantity(input.value_or("rate"));
             }
 
-            // Times are held in ticks so the engine never converts.
+            // Times are held in ticks so the engine never converts. Every profile reports
+            // its span the same way: a target's event_ticks.front() is the tick the input
+            // begins and event_ticks.back() is the tick it ends.
             if (return_value.step_dt > 0.0) {
-                if (input.has_value("delay")) {
-                    profile.start_tick = tick_count_from_seconds(
-                            resolve_quantity(input.value_or("delay")), return_value.step_dt);
-                }
-                if (input.has_value("duration")) {
-                    profile.end_tick = profile.start_tick + tick_count_from_seconds(
-                            resolve_quantity(input.value_or("duration")), return_value.step_dt);
-                }
+                if (profile.continuous_current_injection) {
+                    // A continuous injector (pulseGenerator and friends) fires no discrete
+                    // events -- its span is the [delay, delay + duration] window, written as
+                    // exactly those two ticks. A missing duration leaves the window empty
+                    // rather than ending it before it starts.
+                    s64 injection_start_tick = 0;
+                    if (input.has_value("delay")) {
+                        injection_start_tick = tick_count_from_seconds(
+                                resolve_quantity(input.value_or("delay")),
+                                return_value.step_dt);
+                    }
 
-                // A spikeArray carries its train as <spike time="..."/> children. Every
-                // target receives the same train.
-                Vector<s32> spike_ticks;
-                for (const String &spike_id : input.structured_instance_data) {
-                    auto spike = instance_table.find(spike_id);
-                    if (spike == instance_table.end()) continue;
-                    if (spike->second.component_type_name != "spike") continue;
-                    if (!spike->second.has_value("time")) continue;
+                    s64 injection_end_tick = injection_start_tick;
+                    if (input.has_value("duration")) {
+                        injection_end_tick = injection_start_tick + tick_count_from_seconds(
+                                resolve_quantity(input.value_or("duration")),
+                                return_value.step_dt);
+                    }
 
-                    spike_ticks.push_back(static_cast<s32>(tick_count_from_seconds(
-                            resolve_quantity(spike->second.value_or("time")),
-                            return_value.step_dt)));
-                }
-                std::sort(spike_ticks.begin(), spike_ticks.end());
+                    profile.max_delay_time = injection_end_tick;
+                    for (InputTarget &target : targets) {
+                        target.event_ticks = {static_cast<s32>(injection_start_tick),
+                                              static_cast<s32>(injection_end_tick)};
+                    }
+                } else {
+                    // A spikeArray carries its train as <spike time="..."/> children. Every
+                    // target receives the same train; sorting makes its first and last
+                    // entries the span.
+                    Vector<s32> spike_ticks;
+                    for (const String &spike_id : input.structured_instance_data) {
+                        auto spike = instance_table.find(spike_id);
+                        if (spike == instance_table.end()) continue;
+                        if (spike->second.component_type_name != "spike") continue;
+                        if (!spike->second.has_value("time")) continue;
 
-                if (!spike_ticks.empty()) {
-                    profile.max_delay_time = spike_ticks.back();
-                    for (InputTarget &target : targets) target.event_ticks = spike_ticks;
+                        spike_ticks.push_back(static_cast<s32>(tick_count_from_seconds(
+                                resolve_quantity(spike->second.value_or("time")),
+                                return_value.step_dt)));
+                    }
+                    std::sort(spike_ticks.begin(), spike_ticks.end());
+
+                    if (!spike_ticks.empty()) {
+                        profile.max_delay_time = spike_ticks.back();
+                        for (InputTarget &target : targets) target.event_ticks = spike_ticks;
+                    }
                 }
             }
 

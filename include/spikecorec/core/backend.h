@@ -10,9 +10,14 @@ namespace spikecorec {
     // Called once at program shutdown to release GPU resources.
     void release_gpu_resources();
 
+    // Both backends obey one rule: get_contents() is the first byte of the range the handle
+    // stands for, and every allocator hands out handles that are already positioned there —
+    // EngineAllocator's sub-ranges included, so nothing downstream has to carry an offset
+    // alongside a pointer. The backends only differ in what it takes to honour that rule.
     template<typename T>
     struct GpuPointer {
     #ifdef SPIKECOREC_CUDA
+        // A device address, already the range's first byte, so there is nothing to offset.
         T *pointer = nullptr;
 
         T *get_contents() {
@@ -25,12 +30,21 @@ namespace spikecorec {
     #elif defined(SPIKECOREC_METAL)
         MTL::Buffer *pointer = nullptr;
 
-        T *get_contents() { 
-            return static_cast<T *>(pointer->contents()); 
+        // How far into `pointer`'s buffer this handle's range starts. Zero for a whole
+        // allocation, which is every handle allocate() hands out; non-zero only for an
+        // EngineAllocator sub-range, where `pointer` has to name the whole slab because Metal
+        // has no sub-buffer object to name instead. It is what keeps get_contents() honest on
+        // this backend.
+        u64 offset_bytes = 0;
+
+        T *get_contents() {
+            return static_cast<T *>(static_cast<void *>(
+                    static_cast<char *>(pointer->contents()) + offset_bytes));
         }
 
-        const T *get_contents() const { 
-            return static_cast<const T *>(pointer->contents()); 
+        const T *get_contents() const {
+            return static_cast<const T *>(static_cast<const void *>(
+                    static_cast<const char *>(pointer->contents()) + offset_bytes));
         }
     #endif
 
@@ -43,6 +57,12 @@ namespace spikecorec {
         GpuPointer(GpuPointer &&other) noexcept {
             pointer = other.pointer;
             other.pointer = nullptr;
+        #ifdef SPIKECOREC_METAL
+            // Moving the buffer without its offset would silently re-aim the handle at the
+            // start of the slab instead of at its own sub-range.
+            offset_bytes = other.offset_bytes;
+            other.offset_bytes = 0;
+        #endif
         }
 
         GpuPointer &operator=(GpuPointer &&other) noexcept {
@@ -53,6 +73,10 @@ namespace spikecorec {
             if (this != &other) {
                 pointer = other.pointer;
                 other.pointer = nullptr;
+            #ifdef SPIKECOREC_METAL
+                offset_bytes = other.offset_bytes;
+                other.offset_bytes = 0;
+            #endif
             }
             return *this;
         }
@@ -62,6 +86,35 @@ namespace spikecorec {
     // non-template bridges — defined in backend.cpp, hide platform types from callers
     void *allocate_bytes(usize byte_size);
     void deallocate_bytes(void *platform_handle);
+
+    // What a unified-memory address binds to on Metal: the buffer object holding it and how far
+    // into that buffer the address sits. platform_handle is the MTL::Buffer * allocate_bytes()
+    // returned, behind a void * so this header stays free of platform types.
+    struct BufferBinding {
+        void *platform_handle = nullptr;
+        u64   offset_bytes    = 0;
+    };
+
+    // Metal only. Looks an address up in the registry of addresses the backend has been told
+    // about — every whole allocation, registered at offset 0 by allocate_bytes(), plus every
+    // arena sub-range, registered by EngineAllocator::allocate_gpu(). metal_dispatch binds a
+    // pointer argument with exactly the pair this returns, which is how a sub-range address
+    // reaches a kernel as its own range: Metal binds buffer objects rather than addresses, so
+    // the offset has to travel separately and be applied at setBuffer time.
+    //
+    // The match is exact, not by containing range: an address that was never registered — an
+    // arbitrary interior pointer, say — resolves to a null platform_handle, and metal_dispatch
+    // then treats the argument as a scalar, exactly as it did before sub-ranges existed.
+    // Always resolves to null on CUDA, where a device pointer is already what the kernel wants.
+    BufferBinding resolve_buffer_binding(const void *address);
+
+    // Metal only. Registers/withdraws one sub-range of an existing allocation so the address
+    // above resolves to (that allocation, that offset). Registering an address that is already
+    // known replaces its binding. Whoever registers a sub-range owns withdrawing it, and must do
+    // so before the underlying allocation is released — otherwise an address recycled by a later
+    // allocation would resolve to a buffer that no longer exists. No-ops on CUDA.
+    void register_buffer_sub_range(void *sub_range_address, void *platform_handle, u64 offset_bytes);
+    void unregister_buffer_sub_range(void *sub_range_address);
 
     template<typename T>
     GpuPointer<T> allocate(usize byte_size) {
@@ -74,8 +127,19 @@ namespace spikecorec {
         return wrapper;
     }
 
+    // Releases a whole allocation. Only the handle allocate() returned may be passed: an
+    // EngineAllocator sub-range aliases its arena's slab and owns nothing, so releasing one
+    // would take the whole slab down with it. The assert catches that mistake for every
+    // sub-range except one starting at offset 0, which is byte-for-byte the same handle as the
+    // slab and so cannot be told apart here — the arena's own destructor is what keeps that
+    // case right, by being the only code that ever releases the slab.
     template<typename T>
     void deallocate(GpuPointer<T> wrapper) {
+    #ifdef SPIKECOREC_METAL
+        assert(wrapper.offset_bytes == 0 &&
+               "deallocate() on an arena sub-range would release the whole slab — "
+               "only EngineAllocator releases its own pools");
+    #endif
         deallocate_bytes(wrapper.pointer);
     }
 

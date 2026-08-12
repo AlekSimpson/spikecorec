@@ -64,7 +64,15 @@ static void check_nvrtc_compile_result(nvrtcResult result, nvrtcProgram program)
 static MTL::Device       *global_device          = nullptr;
 static MTL::CommandQueue *global_queue           = nullptr;
 static MTL::Library      *global_default_library = nullptr;
-static unordered_map<void *, MTL::Buffer *> global_buffer_map;
+
+// What each address callers hand around binds to. Two kinds of entry live here, keyed the same
+// way and looked up the same way:
+//   - every whole allocation, keyed by its own data pointer at offset 0 (allocate_bytes)
+//   - every EngineAllocator sub-range, keyed by the address inside the slab where it begins,
+//     bound to the slab's buffer at that sub-range's offset (register_buffer_sub_range)
+// The second kind is why the value is a pair rather than a bare buffer: Metal binds buffer
+// objects, not addresses, so a sub-range can only reach a kernel as (slab buffer, its offset).
+static unordered_map<const void *, BufferBinding> global_buffer_map;
 
 // The shaders in src/metal/kernels.metal are compiled ahead-of-time by the
 // Makefile into default.metallib, placed alongside the build artifacts. Command
@@ -152,9 +160,13 @@ void release_gpu_resources() {
     global_context = nullptr;
 
 #elif defined(SPIKECOREC_METAL)
-    log::logger().debug("release_gpu_resources: releasing buffer_count={}", global_buffer_map.size());
-    for (auto& [pointer, buffer] : global_buffer_map) {
-        buffer->release();
+    log::logger().debug("release_gpu_resources: releasing binding_count={}", global_buffer_map.size());
+    for (auto& [address, binding] : global_buffer_map) {
+        // Sub-range entries alias a buffer some other entry already owns; releasing them too
+        // would over-release it. A sub-range starting at offset 0 shares the whole
+        // allocation's key, so it replaces that entry rather than adding one, and the buffer
+        // is still released exactly once.
+        if (binding.offset_bytes == 0) static_cast<MTL::Buffer *>(binding.platform_handle)->release();
     }
     global_buffer_map.clear();
 
@@ -186,7 +198,7 @@ void* allocate_bytes(usize byte_size) {
     MTL::Buffer *buffer = global_device->newBuffer(byte_size, MTL::ResourceStorageModeShared);
     // index by the unified-memory data pointer — that's what callers pass around
     // (GpuPointer::get_contents()), and what dispatch() must resolve back to a buffer
-    global_buffer_map[buffer->contents()] = buffer;
+    global_buffer_map[buffer->contents()] = BufferBinding{buffer, 0};
     return buffer;
 
 #else
@@ -205,6 +217,43 @@ void deallocate_bytes(void *platform_handle) {
     auto *buffer = static_cast<MTL::Buffer *>(platform_handle);
     global_buffer_map.erase(buffer->contents());
     buffer->release();
+#endif
+}
+
+BufferBinding resolve_buffer_binding(const void *address) {
+#ifdef SPIKECOREC_METAL
+    if (!address) return BufferBinding{};
+
+    auto entry = global_buffer_map.find(address);
+    if (entry == global_buffer_map.end()) return BufferBinding{};
+    return entry->second;
+
+#else
+    (void)address;
+    return BufferBinding{};
+#endif
+}
+
+void register_buffer_sub_range(void *sub_range_address, void *platform_handle, u64 offset_bytes) {
+#ifdef SPIKECOREC_METAL
+    if (!sub_range_address || !platform_handle) return;
+    log::logger().trace("register_buffer_sub_range: offset_bytes={}", offset_bytes);
+    global_buffer_map[sub_range_address] = BufferBinding{platform_handle, offset_bytes};
+
+#else
+    (void)sub_range_address;
+    (void)platform_handle;
+    (void)offset_bytes;
+#endif
+}
+
+void unregister_buffer_sub_range(void *sub_range_address) {
+#ifdef SPIKECOREC_METAL
+    if (!sub_range_address) return;
+    global_buffer_map.erase(sub_range_address);
+
+#else
+    (void)sub_range_address;
 #endif
 }
 
@@ -345,23 +394,29 @@ void metal_dispatch(
 
     encoder->setComputePipelineState(handle.pipeline_state);
 
-    for (u32 i = 0; i < arg_count; ++i) {
-        // convention: args[i] always points to the argument's storage (matches
+    for (u32 argument_index = 0; argument_index < arg_count; ++argument_index) {
+        // convention: args[argument_index] always points to the argument's storage (matches
         // CUDA's cuLaunchKernel kernelParams). For pointer-typed arguments that
         // storage holds a data pointer — try to resolve it back to its MTLBuffer.
         // Only attempt this when the slot is pointer-sized, so scalar args (which
         // may be smaller than sizeof(void*)) are never over-read.
         void *candidate = nullptr;
-        if (arg_sizes[i] == sizeof(void *)) {
-            candidate = *reinterpret_cast<void * const *>(args[i]);
+        if (arg_sizes[argument_index] == sizeof(void *)) {
+            candidate = *reinterpret_cast<void * const *>(args[argument_index]);
         }
-        auto it = candidate ? global_buffer_map.find(candidate) : global_buffer_map.end();
-        if (it != global_buffer_map.end()) {
-            // resolved to a unified memory allocation — bind its MTLBuffer
-            encoder->setBuffer(it->second, 0, i);
+
+        BufferBinding binding =
+                candidate ? resolve_buffer_binding(candidate) : BufferBinding{};
+
+        if (binding.platform_handle) {
+            // resolved to a unified memory allocation — bind its MTLBuffer. The offset is 0
+            // for a whole allocation and the sub-range's own offset for an arena sub-range,
+            // which is how an address inside a slab reaches the kernel as just that range.
+            encoder->setBuffer(static_cast<MTL::Buffer *>(binding.platform_handle),
+                               binding.offset_bytes, argument_index);
         } else {
             // scalar argument — pass by value
-            encoder->setBytes(args[i], arg_sizes[i], i);
+            encoder->setBytes(args[argument_index], arg_sizes[argument_index], argument_index);
         }
     }
 

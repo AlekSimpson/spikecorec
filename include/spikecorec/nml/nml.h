@@ -416,8 +416,6 @@ struct SimulationInputConfig {
 
     f64 amplitude = 0.0;
     f64 rate = 0.0;
-    // s64 start_tick = 0;
-    // s64 end_tick = 0;
     s64 max_delay_time = 0;
     bool continuous_current_injection = false;
 };
