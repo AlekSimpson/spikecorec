@@ -280,6 +280,13 @@ TEST(SimulationRecorder, record_frame_size_validation) {
     recorder.finish();
 }
 
+// ── LEGACY, PENDING REWORK ───────────────────────────────────────────────────
+// The three tests below drive the pre-NeuroML SpikeEngine surface: the
+// adjacency-list constructor, set_input_neurons(), reset_state(),
+// start_static_record() and the `neuron_count` member. Every one of those is
+// commented out in engine.h / engine.cpp pending rework, so these are disabled
+// alongside them rather than deleted — revive them together.
+#if 0
 TEST(SpikeEngine, start_static_record) {
     auto network = square_torus(4);
     SpikeEngine engine(&network, {4, 4}, /*rank=*/4);
@@ -381,3 +388,4 @@ TEST(SpikeEngine, start_static_record_variants) {
 
     engine.shutdown();
 }
+#endif
