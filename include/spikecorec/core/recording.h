@@ -19,19 +19,25 @@
 using namespace std;
 
 namespace spikecorec {
+    // What a recording's bytes are, NOT what the declaration asked for. Everything
+    // spikecorec writes today is a SPIRE frame stream: SPIRE/SPIREGZIP/SPIREBZ2/
+    // SPIREXZ differ only in the compression wrapped around identical frames, and
+    // SPIKE_EVENTS is a SPIRE stream whose samples are spike flags rather than a
+    // state variable.
+    //
+    // NML_STANDARD is the one member the writer cannot produce. It names the
+    // NeuroML/LEMS <OutputFile> convention — an ASCII matrix whose first column is
+    // time and whose remaining columns are the recorded quantities — and no encoder
+    // for it exists. It is retained because the parser legitimately derives it from
+    // real <OutputFile> declarations; handing it to SimulationRecorder is rejected
+    // rather than quietly served a SPIRE binary under an NML-standard name.
     enum class OutputFileFormat {
-        SPIRE, 
+        SPIRE,
         SPIREGZIP,
         SPIREBZ2,
         SPIREXZ,
         SPIKE_EVENTS,
-        NML_STANDARD // can be any file format
-                     // but the data is always 
-                     // written as a matrix of
-                     // columns where the first
-                     // column is time and the 
-                     // rest are the values 
-                     // specified to record
+        NML_STANDARD // NOT IMPLEMENTED by the recording layer — see above.
     };
     
     union RecordedValue {
@@ -311,10 +317,15 @@ namespace spikecorec {
         SimulationRecorder(const SimulationRecorder &) = delete;
         SimulationRecorder &operator=(const SimulationRecorder &) = delete;
 
+        // `declared_format` is the format the caller's declaration asked for. It is
+        // checked, not honoured: this recorder writes SPIRE frames and nothing else,
+        // so a declared format it cannot produce (NML_STANDARD) is refused up front.
+        // Defaulted so callers that have already decided on SPIRE need not say so.
         SimulationRecorder(
             const string &filename, s64 neuron_count,
             optional<string> compression = string("auto"), optional<int> compression_level = nullopt,
-            bool async = false, usize queue_max = 8, usize chunk_bytes = 4 * 1024 * 1024);
+            bool async = false, usize queue_max = 8, usize chunk_bytes = 4 * 1024 * 1024,
+            OutputFileFormat declared_format = OutputFileFormat::SPIRE);
 
         ~SimulationRecorder();
 
