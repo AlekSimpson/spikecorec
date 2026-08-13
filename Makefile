@@ -153,6 +153,17 @@ AIR_FILES   := $(patsubst $(SRC_DIR)/metal/%.metal, \
 CUDA_LIB    := $(BUILD_DIR)/lib$(PROJECT)_cuda.a
 METAL_LIB   := $(BUILD_DIR)/lib$(PROJECT)_metal.a
 
+# ── Header dependency tracking ───────────────────────────────
+# Without this, editing a header does not rebuild the .o files that include it,
+# while tests ARE recompiled every run — so new test code links against a stale
+# library. That mismatch shows up as a segfault in an unrelated test rather than
+# as a compile error, which is exactly as confusing as it sounds. -MMD emits a
+# .d file of each object's header prerequisites alongside it; -MP adds phony
+# targets so a deleted header does not wedge the build with a missing-prereq
+# error. The generated .d files are included below, once the object lists exist.
+DEPFLAGS    := -MMD -MP
+ALL_DEP_FILES := $(patsubst %.o,%.d,$(CORE_OBJS) $(NML_OBJS) $(METAL_OBJS))
+
 # ── Python toolchain ─────────────────────────────────────────
 PYTHON     ?= python3
 PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null)
@@ -192,12 +203,12 @@ $(METAL_LIB): $(CORE_OBJS) $(NML_OBJS) $(METAL_OBJS)
 # ── Core objects (platform-agnostic C++) ─────────────────────
 $(BUILD_DIR)/core/%.o: $(SRC_DIR)/core/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ── NML/LEMS front-end objects (platform-agnostic C++) ───────
 $(BUILD_DIR)/nml/%.o: $(SRC_DIR)/nml/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ── CUDA objects (.cu) ───────────────────────────────────────
 $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
@@ -207,7 +218,7 @@ $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
 # ── Metal objects (.cpp via metal-cpp) ───────────────────────
 $(BUILD_DIR)/metal/%.o: $(SRC_DIR)/metal/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ── Metal shaders (.metal → .air → .metallib) ────────────────
 $(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal
@@ -428,3 +439,6 @@ compdb:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Header prerequisites discovered by -MMD; must come after the object lists.
+-include $(ALL_DEP_FILES)
