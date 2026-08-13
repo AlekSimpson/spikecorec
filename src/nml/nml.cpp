@@ -558,11 +558,18 @@ static Vector<String> split_on_slash(const String &text) {
     return segments;
 }
 
-// `population_cell_type_name` disambiguates "pop1/0/x": x is the component type name in
-// the populationList spelling, and a trailing variable otherwise. Empty when unknown, in
-// which case a single trailing segment is read as a variable.
+// `population_cell_type_name` and `population_component_instance_id` disambiguate
+// "pop1/0/x": x is the component selector in the populationList spelling, and a trailing
+// variable otherwise. Both spellings occur -- NeuroML writes the population's own
+// component INSTANCE id there ("../pop1/0/cell0"), while a document may equally name the
+// cell TYPE -- so a segment matching either is consumed as the selector. Matching only the
+// type name left the instance id in `trailing`, which turned "pop1/0/cell0/v" into the
+// variable "cell0/v" and silently recorded the neuron's first state variable instead.
+// Either may be empty when unknown, in which case a single trailing segment is read as a
+// variable.
 static ResolvedCellPath parse_cell_path(const String &path,
-                                        const String &population_cell_type_name) {
+                                        const String &population_cell_type_name,
+                                        const String &population_component_instance_id) {
     ResolvedCellPath resolved;
 
     String remaining = path;
@@ -593,8 +600,11 @@ static ResolvedCellPath parse_cell_path(const String &path,
     resolved.local_index = static_cast<s64>(std::stoll(segments[1]));
 
     usize trailing_start = 2;
-    if (segments.size() > 2 && !population_cell_type_name.empty() &&
-        segments[2] == population_cell_type_name) {
+    if (segments.size() > 2 &&
+        ((!population_cell_type_name.empty() &&
+          segments[2] == population_cell_type_name) ||
+         (!population_component_instance_id.empty() &&
+          segments[2] == population_component_instance_id))) {
         trailing_start = 3;
     }
 
@@ -1340,6 +1350,15 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 size = static_cast<s64>(std::llround(resolve_quantity(child.value_or("size"))));
             }
 
+            // A negative size makes no member neurons, so nothing downstream notices --
+            // except that the layout it writes carries a negative neuron_count, which every
+            // consumer indexing that range then reads as a wildly out-of-bounds extent.
+            if (size < 0) {
+                throw runtime_error(
+                        "Population '" + child.id + "' declares a negative size '" +
+                        child.value_or("size") + "'");
+            }
+
             String component_reference = child.value_or("component");
             if (component_reference.empty()) {
                 throw runtime_error(
@@ -1400,9 +1419,10 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
     }
 
     // Resolves a path against the population layout, or -1. The population's own cell type
-    // name disambiguates the populationList spelling "pop/0/cellType".
+    // name and bound component instance id disambiguate the populationList spelling
+    // "pop/0/cell0".
     auto resolve_neuron_index = [&](const String &path) -> s64 {
-        ResolvedCellPath partial = parse_cell_path(path, "");
+        ResolvedCellPath partial = parse_cell_path(path, "", "");
         if (partial.population_name.empty()) return -1;
 
         auto population = population_by_name.find(partial.population_name);
@@ -1415,7 +1435,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             cell_type_name = return_value.cell_types[static_cast<usize>(cell_type_index)].name;
         }
 
-        ResolvedCellPath resolved = parse_cell_path(path, cell_type_name);
+        ResolvedCellPath resolved = parse_cell_path(
+                path, cell_type_name, leaf_id(population->second->component_instance_id));
         if (resolved.local_index < 0) return -1;
         if (resolved.local_index >= population->second->neuron_count) return -1;
 
@@ -1430,47 +1451,109 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
     };
 
     if (network) {
+        // The synapse prototype an edge uses. Resolves to a prototype as well as a type,
+        // since two projections may share a synapse ComponentType with different parameter
+        // values.
+        auto resolve_synapse = [&](const String &reference, const String &owner_id,
+                                   s64 &type_index, s64 &prototype_index) {
+            auto synapse_instance = instance_table.find(reference);
+            if (synapse_instance == instance_table.end() ||
+                !synapse_instance->second.component_type) {
+                throw runtime_error(
+                        "Projection or connection '" + owner_id + "' references synapse '" +
+                        reference + "', which no instance declares");
+            }
+            if (synapse_instance->second.component_type->runtime_category !=
+                RuntimeCategory::Synapse) {
+                throw runtime_error(
+                        "Projection or connection '" + owner_id + "' references synapse '" +
+                        reference + "' of type '" +
+                        synapse_instance->second.component_type->name +
+                        "', which is not classified as a synapse");
+            }
+
+            prototype_index = register_prototype(synapse_instance->second, false);
+            type_index = synapse_type_indices.at(
+                    synapse_instance->second.component_type->name);
+        };
+
+        // One connection -> one outgoing edge on its source neuron. The defaults are the
+        // owning projection's synapse; a connection naming its own overrides them, which is
+        // also how a network-scope synapticConnection (which has no projection to inherit
+        // from) gets one at all.
+        auto add_connection_edge = [&](const ComponentInstance &connection,
+                                       const String &owner_id,
+                                       s64 default_synapse_type,
+                                       s64 default_synapse_prototype) {
+            // connection/connectionWD spell their endpoints preCellId/postCellId; the
+            // explicitConnection family spells them from/to.
+            String pre_path = connection.value_or("preCellId",
+                                                  connection.value_or("from"));
+            String post_path = connection.value_or("postCellId",
+                                                   connection.value_or("to"));
+
+            s64 pre_neuron_index = resolve_neuron_index(pre_path);
+            s64 post_neuron_index = resolve_neuron_index(post_path);
+
+            if (pre_neuron_index < 0 || post_neuron_index < 0) {
+                throw runtime_error(
+                        "Connection '" + connection.id + "' in '" + owner_id +
+                        "' has an endpoint that resolves to no neuron: "
+                        "pre='" + pre_path + "' post='" + post_path + "'");
+            }
+
+            NetworkEdge edge;
+            edge.target_neuron_index = post_neuron_index;
+            edge.synapse_type_index = default_synapse_type;
+            edge.synapse_prototype_index = default_synapse_prototype;
+
+            // A synapticConnection names its own synapse, overriding the projection's.
+            String own_synapse = connection.value_or("synapse");
+            if (!own_synapse.empty()) {
+                resolve_synapse(own_synapse, connection.id,
+                                edge.synapse_type_index, edge.synapse_prototype_index);
+            }
+
+            if (connection.has_value("weight")) {
+                edge.weight = resolve_quantity(connection.value_or("weight"));
+            }
+            if (connection.has_value("delay")) {
+                edge.delay_tick_count = tick_count_from_seconds(
+                        resolve_quantity(connection.value_or("delay")),
+                        return_value.step_dt);
+            }
+
+            return_value.neurons[static_cast<usize>(pre_neuron_index)]
+                    .outgoing_edges.push_back(edge);
+        };
+
         for (const String &child_id : network->structured_instance_data) {
-            auto projection_entry = instance_table.find(child_id);
-            if (projection_entry == instance_table.end()) continue;
+            auto child_entry = instance_table.find(child_id);
+            if (child_entry == instance_table.end()) continue;
 
-            const ComponentInstance &projection = projection_entry->second;
-            if (projection.component_type_name != "projection") continue;
+            const ComponentInstance &child = child_entry->second;
 
-            // The projection names the synapse prototype every one of its edges uses.
-            // Resolves to a prototype as well as a type, since two projections may share
-            // a synapse ComponentType with different parameter values.
-            auto resolve_synapse = [&](const String &reference, const String &owner_id,
-                                       s64 &type_index, s64 &prototype_index) {
-                auto synapse_instance = instance_table.find(reference);
-                if (synapse_instance == instance_table.end() ||
-                    !synapse_instance->second.component_type) {
-                    throw runtime_error(
-                            "Projection '" + owner_id + "' references synapse '" +
-                            reference + "', which no instance declares");
-                }
-                if (synapse_instance->second.component_type->runtime_category !=
-                    RuntimeCategory::Synapse) {
-                    throw runtime_error(
-                            "Projection '" + owner_id + "' references synapse '" + reference +
-                            "' of type '" + synapse_instance->second.component_type->name +
-                            "', which is not classified as a synapse");
-                }
+            // <synapticConnection>/<synapticConnectionWD>/<explicitConnection> hang
+            // straight off the network rather than off a projection (NeuroML's `network`
+            // declares them as its own `synapticConnections` children). Reaching them only
+            // through projections dropped every such edge silently: the network parsed,
+            // and simulated fully disconnected.
+            if (connection_tags.find(child.component_type_name) != connection_tags.end()) {
+                add_connection_edge(child, network->id, -1, -1);
+                continue;
+            }
 
-                prototype_index = register_prototype(synapse_instance->second, false);
-                type_index = synapse_type_indices.at(
-                        synapse_instance->second.component_type->name);
-            };
+            if (child.component_type_name != "projection") continue;
 
             s64 projection_synapse_type = -1;
             s64 projection_synapse_prototype = -1;
-            String synapse_reference = projection.value_or("synapse");
+            String synapse_reference = child.value_or("synapse");
             if (!synapse_reference.empty()) {
-                resolve_synapse(synapse_reference, projection.id,
+                resolve_synapse(synapse_reference, child.id,
                                 projection_synapse_type, projection_synapse_prototype);
             }
 
-            for (const String &connection_id : projection.structured_instance_data) {
+            for (const String &connection_id : child.structured_instance_data) {
                 auto connection_entry = instance_table.find(connection_id);
                 if (connection_entry == instance_table.end()) continue;
 
@@ -1480,46 +1563,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                     continue;
                 }
 
-                // connection/connectionWD spell their endpoints preCellId/postCellId; the
-                // explicitConnection family spells them from/to.
-                String pre_path = connection.value_or("preCellId",
-                                                      connection.value_or("from"));
-                String post_path = connection.value_or("postCellId",
-                                                       connection.value_or("to"));
-
-                s64 pre_neuron_index = resolve_neuron_index(pre_path);
-                s64 post_neuron_index = resolve_neuron_index(post_path);
-
-                if (pre_neuron_index < 0 || post_neuron_index < 0) {
-                    throw runtime_error(
-                            "Connection '" + connection.id + "' in projection '" +
-                            projection.id + "' has an endpoint that resolves to no neuron: "
-                            "pre='" + pre_path + "' post='" + post_path + "'");
-                }
-
-                NetworkEdge edge;
-                edge.target_neuron_index = post_neuron_index;
-                edge.synapse_type_index = projection_synapse_type;
-                edge.synapse_prototype_index = projection_synapse_prototype;
-
-                // A synapticConnection names its own synapse, overriding the projection's.
-                String own_synapse = connection.value_or("synapse");
-                if (!own_synapse.empty()) {
-                    resolve_synapse(own_synapse, connection.id,
-                                    edge.synapse_type_index, edge.synapse_prototype_index);
-                }
-
-                if (connection.has_value("weight")) {
-                    edge.weight = resolve_quantity(connection.value_or("weight"));
-                }
-                if (connection.has_value("delay")) {
-                    edge.delay_tick_count = tick_count_from_seconds(
-                            resolve_quantity(connection.value_or("delay")),
-                            return_value.step_dt);
-                }
-
-                return_value.neurons[static_cast<usize>(pre_neuron_index)]
-                        .outgoing_edges.push_back(edge);
+                add_connection_edge(connection, child.id,
+                                    projection_synapse_type, projection_synapse_prototype);
             }
         }
     }
@@ -1709,9 +1754,13 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                             "index -1", recorded.quantity_path, filename);
                 } else {
                     String cell_type_name;
-                    ResolvedCellPath partial = parse_cell_path(recorded.quantity_path, "");
+                    String component_instance_id;
+                    ResolvedCellPath partial = parse_cell_path(recorded.quantity_path, "", "");
                     auto population = population_by_name.find(partial.population_name);
                     if (population != population_by_name.end()) {
+                        component_instance_id =
+                                leaf_id(population->second->component_instance_id);
+
                         s64 cell_type_index = population->second->cell_type_index;
                         if (cell_type_index >= 0 &&
                             cell_type_index <
@@ -1720,8 +1769,9 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                                     static_cast<usize>(cell_type_index)].name;
                         }
                     }
-                    recorded.variable_name =
-                            parse_cell_path(recorded.quantity_path, cell_type_name).trailing;
+                    recorded.variable_name = parse_cell_path(
+                            recorded.quantity_path, cell_type_name,
+                            component_instance_id).trailing;
                 }
 
                 recording_profile.selections.push_back(std::move(recorded));
