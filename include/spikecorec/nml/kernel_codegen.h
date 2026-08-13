@@ -134,6 +134,18 @@ CellRegimeLayout resolve_cell_regimes(const CellTypeSpecification &cell_type);
 // recomputed on each side.
 usize cell_state_slot_count(const CellTypeSpecification &cell_type);
 
+// Whether a state variable integrated at one unit per second reaches `threshold` on the same
+// tick a f64 reference reaches it on -- the rule the "Compensated accumulation" section below
+// states, evaluated:
+//
+//     n = round(threshold / step_dt)          the tick the reference crosses on
+//     f32(n * f32(step_dt)) == f32(threshold) iff the emitted step crosses on that same tick
+//
+// False means the comparison fires one tick late and, for a refractory period, that the cell
+// holds one tick longer than the model says. Codegen evaluates this per model and warns; it is
+// public so a caller can ask the same question of a (dt, t_ref) pair before committing to one.
+bool threshold_crossing_lands_on_reference_tick(f64 step_dt, f64 threshold);
+
 // Generated source plus what the engine needs to bind and launch it.
 //
 // `argument_names` makes the argument order data rather than a comment both sides have to
@@ -237,11 +249,26 @@ struct GeneratedKernel {
 //    them the optimiser folds it to a literal zero -- and with only one of them it reassociates
 //    into a form that evaluates to zero at run time. Both were checked in the emitted AIR.
 //  - It removes the error that GROWS with the number of steps. What it cannot remove is that
-//    f32(dt) and f32(t_ref) are separately rounded: at t_ref = 5 ms and dt = 0.1 ms they agree
-//    and the crossing lands on the reference's tick, but at t_ref = 1 ms the exact product
-//    10 * f32(0.1 ms) is still 0.63 ulp below f32(1 ms) and the crossing is a tick late.
-//    Closing that would need the accumulator to be a true two-float pair and dt to be carried
-//    as two floats.
+//    f32(dt) and f32(t_ref) are SEPARATELY rounded. The compensated sum reaches the f32
+//    nearest the exact total, so a count-up threshold lands on the reference's tick exactly
+//    when
+//
+//        f32(round(t_ref / dt) * f32(dt)) == f32(t_ref)
+//
+//    and one tick late otherwise. That is the whole rule; it is not a property of any
+//    particular t_ref. At dt = 0.1 ms it happens to hold for 5 ms (the product is 0.03 ulp
+//    below f32(5 ms), which rounds back onto it) and to fail for 0.5 ms, 1 ms and 2 ms alike
+//    (each 0.63 ulp below, which does not) -- so t_ref = 2 ms at that dt holds 21 ticks
+//    against a f64 reference's 20. Codegen evaluates the rule per model and warns
+//    (warn_about_late_threshold_crossings); closing it would need the accumulator to be a true
+//    two-float pair and dt to be carried as two floats.
+//  - A count-DOWN refractory period -- `refractoryTimeRemaining' = -1` reset to t_ref and
+//    gated on `H(0 - refractoryTimeRemaining)` -- is a tick long for a STRICTLY WIDER set of
+//    t_ref, including 5 ms, and the rule above does not describe it. The count-up sum is
+//    rounded to the scale of t_ref at every step, which is what lets it land back exactly on
+//    f32(t_ref); the countdown subtracts at that scale and keeps the residue, so after 50
+//    steps f32(5 ms) - 50 * f32(0.1 ms) is +1.455e-11 rather than zero and the gate holds one
+//    tick more. Prefer the count-up form.
 //
 // Per-edge synapse state carries no residual: it is one compressed plane per state variable
 // across every edge, so residuals would double the largest allocation the engine makes, and

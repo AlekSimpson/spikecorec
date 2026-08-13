@@ -676,9 +676,11 @@ kernel void step(
         walk_stack_row_base, walk_stack_col_base, walk_stack_block_size,
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
-        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick.
+        // "Never spiked" is last_spiked < 0: the engine seeds the buffer with
+        // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
         long child_last_spiked = last_spiked[child];
-        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+        if (learning_rate != 0.0f && !(child_last_spiked < 0 || child_last_spiked == tick)) {
             float tick_delta = (float)abs(tick - child_last_spiked);
             float decay_delta = -learning_rate * pow(tick_delta, -3.0f);
             step_apply_hebbian_update(u_row_accumulator, V, rank_float4_stride, child,
@@ -825,9 +827,11 @@ kernel void step_no_active_optimization(
         walk_stack_row_base, walk_stack_col_base, walk_stack_block_size,
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
-        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick.
+        // "Never spiked" is last_spiked < 0: the engine seeds the buffer with
+        // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
         long child_last_spiked = last_spiked[child];
-        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+        if (learning_rate != 0.0f && !(child_last_spiked < 0 || child_last_spiked == tick)) {
             float tick_delta = (float)abs(tick - child_last_spiked);
             float decay_delta = -learning_rate * pow(tick_delta, -3.0f);
             step_apply_hebbian_update(u_row_accumulator, V, rank_float4_stride, child,
@@ -921,8 +925,10 @@ kernel void reservoir_features_kernel(
     membrane_potentials[neuron_index] = membrane_potential;
     last_tick_updated[neuron_index] = tick;
 
+    // last_spiked < 0 is "has never spiked" — the engine seeds the buffer with
+    // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
     long since_spike = tick - last_spiked[neuron_index];
-    float trace = (last_spiked[neuron_index] > 0) ? exp(-(float)since_spike / spike_tau) : 0.0f;
+    float trace = (last_spiked[neuron_index] >= 0) ? exp(-(float)since_spike / spike_tau) : 0.0f;
 
     output_buffer[neuron_index] = trace;
     output_buffer[neuron_count + neuron_index] = (membrane_potential - resting_mp) / voltage_scale;

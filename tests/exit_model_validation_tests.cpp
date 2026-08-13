@@ -142,12 +142,26 @@ bool standard_library_available() {
 // performed inside its own temporary directory: a test run never writes into the working tree,
 // and -- the reason this exists rather than just being tidy -- can never land on top of
 // tests/fixtures/reference_data/'s own identically-named ground truth.
+//
+// ── why every construction gets a directory NOBODY has used before ───────────────────────────
+// Several tests run the same fixture, so `run_name` repeats: run_single_cell_fixture passes the
+// fixture's base name, and "glif3_single_cell" alone is used by four of them. Building the path
+// out of the name alone therefore meant destroying and recreating ONE path over and over inside
+// a single process, with a chdir into it each time. On APFS a chdir into a directory that was
+// just unlinked and recreated can leave the process attached to the doomed inode: the recorder's
+// writes then land somewhere the subsequent open-for-read cannot see, and the run fails with
+// "Failed to open file for reading: glif3_membrane_trace.dat" -- intermittently, at roughly one
+// run in ten, and never as a numeric disagreement.
+//
+// A monotonic suffix removes the remove-then-recreate step entirely: create_directories always
+// makes a directory that did not exist, so there is no unlinked inode to be attached to. The
+// chdir stays -- it is load-bearing until the engine takes an explicit output root -- and so
+// does the cleanup, which now runs against a path that will never be handed out again.
 class ScopedWorkingDirectory {
 public:
     explicit ScopedWorkingDirectory(const String &run_name) {
         previous_directory_ = filesystem::current_path();
-        run_directory_ = filesystem::temp_directory_path() / "spikecorec_exit_model_runs" / run_name;
-        filesystem::remove_all(run_directory_);
+        run_directory_ = runs_root() / (run_name + "_" + std::to_string(next_sequence_number()));
         filesystem::create_directories(run_directory_);
         filesystem::current_path(run_directory_);
     }
@@ -162,6 +176,27 @@ public:
     ScopedWorkingDirectory &operator=(const ScopedWorkingDirectory &) = delete;
 
 private:
+    // Cleared ONCE per process, before the first run and while the working directory is still
+    // outside it, so a previous process that died mid-run leaves nothing behind. Removing it
+    // here rather than per run is the whole point: nothing ever unlinks a directory this
+    // process has chdir'd into.
+    static const filesystem::path &runs_root() {
+        static const filesystem::path root = [] {
+            const filesystem::path path =
+                    filesystem::temp_directory_path() / "spikecorec_exit_model_runs";
+            std::error_code ignored;
+            filesystem::remove_all(path, ignored);
+            filesystem::create_directories(path);
+            return path;
+        }();
+        return root;
+    }
+
+    static s64 next_sequence_number() {
+        static s64 sequence_number = 0;
+        return ++sequence_number;
+    }
+
     filesystem::path previous_directory_;
     filesystem::path run_directory_;
 };

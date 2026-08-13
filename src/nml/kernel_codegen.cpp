@@ -1,5 +1,7 @@
 #include "spikecorec/nml/kernel_codegen.h"
 
+#include "spikecorec/core/log.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1886,15 +1888,24 @@ SymbolTable build_synapse_symbol_table(const SynapseProgram &program, bool bind_
 // the f32 the coefficient is baked as.
 const f64 charge_probe_decay_fraction = 1e-7;
 
-// And gives up after this many steps. At a 0.1 ms tick that is 20 seconds of model time,
-// thousands of time constants for any synapse; reaching it means the output is not decaying
-// at all, so the charge one event delivers is unbounded.
-const usize maximum_charge_probe_step_count = 200000;
+// And gives up after this much MODEL TIME. A budget counted in STEPS would make acceptance a
+// property of the timestep rather than of the model: at a fixed 200000 steps a 200 ms synapse
+// -- entirely ordinary -- builds at dt = 0.1 ms and throws at dt = 0.01 ms, so halving the
+// tick to check that a result has converged would turn a working model into a
+// construction-time exception. Twenty seconds is exactly what that step count bought at the
+// project's default 0.1 ms tick, so nothing that built before builds differently now; the
+// decay criterion above needs about 16 time constants, so it covers every synapse out to a
+// 1.2 s time constant, at any tick.
+const f64 maximum_charge_probe_model_time = 20.0;
 
-// Two charges are the same charge if they agree this closely, relatively. Two probes stop at
-// different steps, so each carries its own truncated tail; that difference is of the order of
-// charge_probe_decay_fraction, and the tolerance sits well above it and far below any real
-// nonlinearity.
+usize charge_probe_step_budget(f64 step_dt) {
+    return (usize)std::ceil(maximum_charge_probe_model_time / step_dt);
+}
+
+// Two charges are the same charge if they agree this closely against the magnitudes that went
+// into them. Two probes stop at different steps, so each carries its own truncated tail; that
+// difference is of the order of charge_probe_decay_fraction, and the tolerance sits well above
+// it and far below any real nonlinearity.
 const f64 charge_linearity_tolerance = 1e-4;
 
 // One synapse program's dynamics in the form the host integration walks them: the value
@@ -2038,22 +2049,46 @@ f64 bind_state_and_evaluate_output(SynapseHostDynamics &dynamics, const Vector<f
     return dynamics.values.value_for(synapse_output_variable_name);
 }
 
+// Why one probe of one state did not settle on a finite charge. `probe_description` names the
+// state it started from, because the exposed current may decay perfectly well from every other
+// one -- blaming the type's `i` as a whole sends the reader to a declaration that is fine.
+[[noreturn]] void report_charge_response_never_settles(const SynapseProgram &program,
+                                                       const String &probe_description,
+                                                       const String &reason) {
+    report_error("this synapse's exposed '" + synapse_output_variable_name +
+                         "' does not decay from " + probe_description + " -- " + reason +
+                         " -- so one arriving spike would deliver charge without end. "
+                         "Delivering the whole of an event's response at the spike needs that "
+                         "response to be finite",
+                 program.type->name);
+}
+
 // One probe: leave the synapse at `initial_state`, never touch it again, and total the charge
-// it goes on delivering. `step_count_used` reports how far it had to run, which is what makes
-// two probes comparable -- see the linearity check in synapse_event_charge_coefficients.
+// it goes on delivering.
 f64 probe_synapse_charge_response(SynapseHostDynamics &dynamics, const SynapseProgram &program,
-                                  const Vector<f64> &initial_state, usize &step_count_used) {
+                                  const String &probe_description,
+                                  const Vector<f64> &initial_state) {
     Vector<f64> state = initial_state;
+    const usize step_budget = charge_probe_step_budget(dynamics.step_dt);
 
     f64 charge = 0.0;
     f64 peak_output = 0.0;
-    step_count_used = 0;
 
-    for (usize step = 0; step < maximum_charge_probe_step_count; ++step) {
+    for (usize step = 0; step < step_budget; ++step) {
         const f64 output = bind_state_and_evaluate_output(dynamics, state);
+
+        // An output that has left the finite range grows without bound. Caught here rather
+        // than at the budget below, because infinity passes the decay test -- it is within any
+        // fraction of itself -- and would be returned as a charge coefficient, after which
+        // every linearity probe compares infinity against infinity and reports the
+        // nonlinearity of a synapse whose real defect is that it never settles.
+        if (!std::isfinite(output)) {
+            report_charge_response_never_settles(program, probe_description,
+                                                 "it grows past the finite range instead");
+        }
+
         charge += output * dynamics.step_dt;
         peak_output = std::max(peak_output, std::fabs(output));
-        step_count_used = step + 1;
 
         // The output has run its course. Tested before the step rather than after so a probe
         // whose output has not left zero yet is not mistaken for one that has already decayed:
@@ -2061,6 +2096,20 @@ f64 probe_synapse_charge_response(SynapseHostDynamics &dynamics, const SynapsePr
         if (peak_output > 0.0 && std::fabs(output) <= peak_output * charge_probe_decay_fraction) {
             return charge;
         }
+
+        // An output exactly zero for one more step than the synapse has state variables is
+        // exactly zero for ever. These dynamics are affine in the state, so the output obeys a
+        // linear recurrence of order at most state_variable_count + 1 -- linearity being the
+        // property this whole probe exists to establish, and which is checked against the
+        // probes below -- and that many consecutive zeros force every later one.
+        //
+        // What it saves is the probe of a state variable the exposed current never reads.
+        // Such a probe has no peak output to measure a decay against, so without this it runs
+        // until that variable happens to ROUND onto its own limit, which takes about 37 time
+        // constants rather than the 16 the decay criterion needs: a depressing synapse whose
+        // exposed current decays in half a millisecond is otherwise refused, at the default
+        // tick, for a recovery constant of 1 s.
+        if (peak_output == 0.0 && step + 1 > state.size()) return charge;
 
         Vector<f64> next_state = state;
         for (usize slot = 0; slot < state.size(); ++slot) {
@@ -2072,9 +2121,8 @@ f64 probe_synapse_charge_response(SynapseHostDynamics &dynamics, const SynapsePr
         }
 
         // A state the step leaves exactly where it found it is a fixed point: the output from
-        // here on repeats forever. A zero one is a finished response -- reached at once by a
-        // state variable the exposed current never reads, which has no peak output to measure a
-        // decay against. A non-zero one is a synapse that delivers without end.
+        // here on repeats forever. A zero one is a finished response. A non-zero one is a
+        // synapse that delivers without end.
         if (next_state == state) {
             if (output == 0.0) return charge;
             break;
@@ -2082,11 +2130,10 @@ f64 probe_synapse_charge_response(SynapseHostDynamics &dynamics, const SynapsePr
         state = next_state;
     }
 
-    report_error("this synapse's exposed '" + synapse_output_variable_name +
-                         "' does not decay, so one arriving spike would deliver charge without "
-                         "end. Delivering the whole of an event's response at the spike needs "
-                         "that response to be finite",
-                 program.type->name);
+    report_charge_response_never_settles(program, probe_description,
+                                         "it is still running after " +
+                                                 to_string(maximum_charge_probe_model_time) +
+                                                 " s of model time");
 }
 
 // How much charge one unit of each state variable goes on to deliver: the coefficients of
@@ -2113,20 +2160,23 @@ Vector<f64> synapse_event_charge_coefficients(const SynapseProgram &program,
 
     SynapseHostDynamics dynamics = resolve_synapse_host_dynamics(program, parse_result);
 
+    const Vector<String> &state_variable_names = program.type->state_variable_names;
+
     Vector<f64> coefficients(state_variable_count, 0.0);
-    Vector<usize> step_counts(state_variable_count, 0);
     for (usize slot = 0; slot < state_variable_count; ++slot) {
         Vector<f64> unit_state(state_variable_count, 0.0);
         unit_state[slot] = 1.0;
-        coefficients[slot] =
-                probe_synapse_charge_response(dynamics, program, unit_state, step_counts[slot]);
+        coefficients[slot] = probe_synapse_charge_response(
+                dynamics, program, "one '" + state_variable_names[slot] + "'", unit_state);
     }
 
-    // Doubling one variable must double the charge, and starting from every variable at once
-    // must deliver the sum. Between them those are homogeneity and additivity, which is the
-    // whole of linearity.
-    auto refuse_nonlinear = [&](const String &probe_description, f64 measured, f64 predicted) {
-        const f64 scale = std::max(std::fabs(measured), std::fabs(predicted));
+    // `scale` is what the tolerance is taken against: the sum of the magnitudes the prediction
+    // was BUILT from, not the magnitude of the prediction itself. A probe that combines two
+    // state variables of nearly equal coefficient predicts a near-cancelling total, and a
+    // tolerance relative to that total would refuse an exactly linear synapse over the
+    // truncated tail each of the two probes carries.
+    auto refuse_nonlinear = [&](const String &probe_description, f64 measured, f64 predicted,
+                                f64 scale) {
         if (std::fabs(measured - predicted) <= charge_linearity_tolerance * scale) return;
         report_error("this synapse's dynamics are not linear in its state variables (" +
                              probe_description + " delivers " + to_string(measured) +
@@ -2137,24 +2187,76 @@ Vector<f64> synapse_event_charge_coefficients(const SynapseProgram &program,
                      program.type->name);
     };
 
-    usize probe_step_count = 0;
+    // ── homogeneity, at a positive AND a negative factor ─────────────────────
+    //
+    // Doubling one variable must double the charge, and negating it must negate the charge.
+    // The positive factor alone is not homogeneity: every probe point of it has all
+    // coordinates >= 0, and ANY function positively homogeneous of degree one on that orthant
+    // passes it without being linear anywhere else. A rectifier `i = I * H(I)` and `i = abs(I)`
+    // both do, and an inhibitory edge into either then delivers the charge of the excitatory
+    // one -- the right magnitude with the WRONG SIGN, which is a plausible number rather than
+    // a failure.
+    //
+    // Q(-x) == -Q(x) is also what rules out a constant term in the charge. Q(x) = c.x + q0
+    // satisfies Q(2x) == 2Q(x) only for q0 = 0, but the doubling probe compares against
+    // 2*coefficient, which carries q0 with it; the negation probe does not.
     for (usize slot = 0; slot < state_variable_count; ++slot) {
         Vector<f64> doubled_state(state_variable_count, 0.0);
         doubled_state[slot] = 2.0;
-        refuse_nonlinear("twice '" + program.type->state_variable_names[slot] + "'",
-                         probe_synapse_charge_response(dynamics, program, doubled_state,
-                                                       probe_step_count),
-                         2.0 * coefficients[slot]);
+        refuse_nonlinear("twice '" + state_variable_names[slot] + "'",
+                         probe_synapse_charge_response(
+                                 dynamics, program, "twice '" + state_variable_names[slot] + "'",
+                                 doubled_state),
+                         2.0 * coefficients[slot], 2.0 * std::fabs(coefficients[slot]));
+
+        Vector<f64> negated_state(state_variable_count, 0.0);
+        negated_state[slot] = -1.0;
+        refuse_nonlinear("minus one '" + state_variable_names[slot] + "'",
+                         probe_synapse_charge_response(
+                                 dynamics, program,
+                                 "minus one '" + state_variable_names[slot] + "'", negated_state),
+                         -coefficients[slot], std::fabs(coefficients[slot]));
     }
 
+    // ── additivity, including at mixed sign ──────────────────────────────────
+    //
+    // For a single state variable the negation probe above IS the additivity probe against
+    // e and -e: Q(e) + Q(-e) has to be Q(0), and Q(0) has to be zero, which is what it
+    // asserts. With more than one there are combinations to check, so both an all-positive one
+    // and every mixed-sign pair are probed -- the pairs for the same reason the negation probe
+    // exists, that a check confined to the non-negative orthant sees only the part of the
+    // response an excitatory edge exercises.
     if (state_variable_count > 1) {
         f64 summed_coefficients = 0.0;
-        for (const f64 coefficient : coefficients) summed_coefficients += coefficient;
+        f64 summed_magnitudes = 0.0;
+        for (const f64 coefficient : coefficients) {
+            summed_coefficients += coefficient;
+            summed_magnitudes += std::fabs(coefficient);
+        }
         refuse_nonlinear("every state variable at one",
-                         probe_synapse_charge_response(
-                                 dynamics, program, Vector<f64>(state_variable_count, 1.0),
-                                 probe_step_count),
-                         summed_coefficients);
+                         probe_synapse_charge_response(dynamics, program,
+                                                       "every state variable at one",
+                                                       Vector<f64>(state_variable_count, 1.0)),
+                         summed_coefficients, summed_magnitudes);
+
+        for (usize first_slot = 0; first_slot < state_variable_count; ++first_slot) {
+            for (usize second_slot = first_slot + 1; second_slot < state_variable_count;
+                 ++second_slot) {
+                Vector<f64> mixed_state(state_variable_count, 0.0);
+                mixed_state[first_slot] = 1.0;
+                mixed_state[second_slot] = -1.0;
+
+                const String description = "one '" + state_variable_names[first_slot] +
+                                           "' less one '" + state_variable_names[second_slot] +
+                                           "'";
+                refuse_nonlinear(description,
+                                 probe_synapse_charge_response(dynamics, program, description,
+                                                               mixed_state),
+                                 coefficients[first_slot] - coefficients[second_slot],
+                                 std::fabs(coefficients[first_slot]) +
+                                         std::fabs(coefficients[second_slot]));
+            }
+        }
     }
 
     return coefficients;
@@ -3215,8 +3317,208 @@ GeneratedKernel generate_ring_row_clear(KernelBackend backend) {
     return generated;
 }
 
+// Refuses a neuron that is the target of BOTH an edge through a synapse and an edge through
+// none.
+//
+// The two write incompatible quantities into ONE `network_inputs` slot. A synapse edge writes
+// the charge its event delivers divided by dt, which is a current in amps; an edge whose
+// projection names no synapse writes the raw NeuroML `weight`, which is dimensionless and is
+// what network_inputs meant before there were any synapse dynamics at all. The slot sums them
+// and one `synapses[*]/i` read drains the sum as a current, so a weight of 2.5 arrives as
+// 2.5 A -- 2.5e6 V in one tick on a 100 pF cell, about eight orders of magnitude past
+// anything the synapse edge beside it delivers.
+//
+// Refused rather than written down as a restriction, because the result is a plausible number
+// rather than a crash: nothing downstream can tell a swamped trace from a real one, and a
+// document has no way to say which reading it meant. Onto DIFFERENT targets the two kinds
+// remain legal and independently useful -- that is what the per-edge program plane is for --
+// so the refusal is per target rather than per model.
+void reject_mixed_delivery_targets(const NML_ParseResult &parse_result) {
+    const usize neuron_count = parse_result.neurons.size();
+
+    // Per target, one source neuron of each kind, so the message names edges the document can
+    // be searched for rather than just the target they collide on.
+    Vector<s64> synapse_edge_source(neuron_count, -1);
+    Vector<s64> bare_weight_edge_source(neuron_count, -1);
+
+    for (usize source_index = 0; source_index < neuron_count; ++source_index) {
+        for (const NetworkEdge &edge : parse_result.neurons[source_index].outgoing_edges) {
+            if (edge.target_neuron_index < 0 ||
+                (usize)edge.target_neuron_index >= neuron_count) {
+                continue;
+            }
+            const usize target_index = (usize)edge.target_neuron_index;
+
+            Vector<s64> &recorded_source = edge.synapse_prototype_index >= 0
+                                                   ? synapse_edge_source
+                                                   : bare_weight_edge_source;
+            if (recorded_source[target_index] < 0) {
+                recorded_source[target_index] = (s64)source_index;
+            }
+
+            if (synapse_edge_source[target_index] < 0 ||
+                bare_weight_edge_source[target_index] < 0) {
+                continue;
+            }
+
+            throw runtime_error(
+                    "kernel_codegen: neuron " + to_string(target_index) +
+                    " is the target of both a connection through a synapse (from neuron " +
+                    to_string(synapse_edge_source[target_index]) +
+                    ") and a connection through no synapse (from neuron " +
+                    to_string(bare_weight_edge_source[target_index]) +
+                    "). The first delivers a current in amps and the second delivers its raw "
+                    "dimensionless weight, and both land in the one network_inputs slot the "
+                    "target reads as a current, so the weight swamps the synapse by orders of "
+                    "magnitude. Give the connection a synapse, or route the two kinds to "
+                    "different targets");
+        }
+    }
+}
+
+// ── Thresholds an f32 tick count cannot reach ────────────────────────────────
+//
+// A cell that counts model time -- a refractory period is the standard one -- integrates a
+// state variable at one unit per second and compares it against a time-dimensioned threshold.
+// Whether that comparison fires on the tick a f64 reference fires on is decided entirely by
+// whether f32 arithmetic reaches the threshold exactly:
+//
+//     n = round(threshold / dt)              the tick the reference crosses on
+//     f32(n * f32(dt)) == f32(threshold)     iff the emitted step crosses on that same tick
+//
+// f32(dt) and f32(threshold) are separately rounded, and the compensated accumulation the
+// emitted step performs removes only the error that GROWS with n -- it cannot close a gap
+// between two separately rounded constants. At the project's default dt = 0.1 ms the pairs
+// work out as: 5 ms agrees exactly; 2 ms, 1 ms and 0.5 ms are each 0.63 ulp short and hold a
+// tick longer than the reference does. Which pairs agree is not predictable from the model, so
+// it is measured here and reported rather than found later in a spike raster.
+//
+// Reported rather than refused: a period a tick long is a real defect but a small one, and a
+// model may want a threshold the tick cannot express for reasons of its own.
+
+// The value `expression` folds to against `values`, or false when it reads anything `values`
+// does not bind. State variables are deliberately left unbound by the caller, so an expression
+// that reads state is reported as non-constant rather than evaluated at some arbitrary state.
+bool fold_constant_expression(const String &expression, const ValueTable &values, f64 &folded) {
+    try {
+        folded = evaluate_expression(expression, values);
+    } catch (const runtime_error &) {
+        return false;
+    }
+    return std::isfinite(folded);
+}
+
+// The parameters of one cell prototype, the document's constants and dt -- everything a
+// constant expression of that prototype may resolve through, and nothing that varies per
+// neuron or per tick.
+ValueTable build_cell_constant_values(const CellTypeSpecification &cell_type,
+                                      const ComponentPrototype &prototype,
+                                      const NML_ParseResult &parse_result) {
+    ValueTable values;
+    values.component_type_name = cell_type.name;
+
+    const usize bound_parameter_count =
+            std::min(cell_type.parameter_names.size(), prototype.starting_parameters.size());
+    for (usize slot = 0; slot < bound_parameter_count; ++slot) {
+        values.define(cell_type.parameter_names[slot],
+                      prototype.starting_parameters[slot].float64);
+    }
+
+    const String type_prefix = cell_type.name + ".";
+    for (const auto &constant_entry : parse_result.global_constants) {
+        if (constant_entry.first.rfind(type_prefix, 0) != 0) continue;
+        values.define(constant_entry.first.substr(type_prefix.length()),
+                      constant_entry.second.float64);
+    }
+    for (const auto &constant_entry : parse_result.global_constants) {
+        values.define(constant_entry.first, constant_entry.second.float64);
+    }
+    values.define("dt", parse_result.step_dt);
+
+    return values;
+}
+
+void warn_about_late_threshold_crossings(const NML_ParseResult &parse_result) {
+    const f64 step_dt = parse_result.step_dt;
+    if (!(step_dt > 0.0)) return;
+
+    for (const ComponentPrototype &prototype : parse_result.cell_prototypes) {
+        if (prototype.type_index < 0 ||
+            (usize)prototype.type_index >= parse_result.cell_types.size()) {
+            continue;
+        }
+        const CellTypeSpecification &cell_type =
+                parse_result.cell_types[(usize)prototype.type_index];
+        const ValueTable values = build_cell_constant_values(cell_type, prototype, parse_result);
+
+        // Which state variables count model TIME. A TimeDerivative that folds to exactly +1 or
+        // -1 advances one unit per second, which is the only shape whose comparison against a
+        // threshold is a tick count in the first place.
+        Set<String> clock_variable_names;
+        for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+            if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+            f64 rate = 0.0;
+            if (!fold_constant_expression(instruction.expression, values, rate)) continue;
+            if (std::fabs(rate) != 1.0) continue;
+            clock_variable_names.insert(instruction.target);
+        }
+        if (clock_variable_names.empty()) continue;
+
+        // Every constant an OnCondition compares such a clock against. The test is read whole
+        // rather than decomposed into a comparison: any identifier or literal appearing in a
+        // test that also mentions the clock is a candidate threshold, which costs nothing to
+        // check and needs no assumption about the shape of the test.
+        Set<f64> reported_thresholds;
+        for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+            if (instruction.stage != DynamicsStage::Detect) continue;
+
+            const Vector<Token> tokens =
+                    tokenize_nml_expression(instruction.expression, cell_type.name);
+            const bool reads_a_clock =
+                    any_of(tokens.begin(), tokens.end(), [&](const Token &token) {
+                        return token.kind == TokenKind::Identifier &&
+                               clock_variable_names.count(token.text) > 0;
+                    });
+            if (!reads_a_clock) continue;
+
+            for (const Token &token : tokens) {
+                f64 threshold = 0.0;
+                if (token.kind == TokenKind::Number) {
+                    threshold = stod(token.text);
+                } else if (token.kind == TokenKind::Identifier) {
+                    if (!values.contains(token.text)) continue;
+                    threshold = values.value_for(token.text);
+                } else {
+                    continue;
+                }
+
+                if (!(threshold > 0.0)) continue;
+                const s64 tick_count = (s64)std::llround(threshold / step_dt);
+                if (tick_count <= 0) continue;
+                if (threshold_crossing_lands_on_reference_tick(step_dt, threshold)) continue;
+                if (!reported_thresholds.insert(threshold).second) continue;
+
+                log::logger().warn(
+                        "kernel_codegen: ComponentType '{}' compares '{}', which advances one "
+                        "unit of time per second, against {:g} in \"{}\". At dt = {:g} that is "
+                        "{} ticks, but {} f32 increments of dt reach {:.10g} where f32({:g}) is "
+                        "{:.10g}, so the comparison fires a tick after the one a f64 reference "
+                        "crosses on. A threshold that is an exact f32 multiple of dt -- 5 ms at "
+                        "0.1 ms, for one -- lands on the reference's tick",
+                        cell_type.name, *clock_variable_names.begin(), threshold,
+                        instruction.expression, step_dt, tick_count, tick_count,
+                        (f64)(f32)((f64)tick_count * (f64)(f32)step_dt), threshold,
+                        (f64)(f32)threshold);
+            }
+        }
+    }
+}
+
 GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBackend backend,
                                 KernelPurpose purpose, bool use_lazy_synapse_updates) {
+    reject_mixed_delivery_targets(parse_result);
+    if (purpose == KernelPurpose::Tick) warn_about_late_threshold_crossings(parse_result);
+
     ostringstream source;
     source << source_preamble(backend, purpose == KernelPurpose::Tick
                                                ? "generate_tick_kernel"
@@ -3403,6 +3705,21 @@ CellRegimeLayout resolve_cell_regimes(const CellTypeSpecification &cell_type) {
 usize cell_state_slot_count(const CellTypeSpecification &cell_type) {
     return cell_type.state_variable_names.size() +
            (resolve_cell_regimes(cell_type).has_regimes() ? 1u : 0u);
+}
+
+bool threshold_crossing_lands_on_reference_tick(f64 step_dt, f64 threshold) {
+    if (!(step_dt > 0.0)) return true;
+
+    const s64 tick_count = (s64)std::llround(threshold / step_dt);
+    if (tick_count <= 0) return true;
+
+    // The compensated sum the emitted step performs converges on the f32 NEAREST the exact
+    // total of tick_count increments of f32(dt), which is what this product rounds to. Compared
+    // against f32(threshold) because that is what the emitted comparison holds -- the two
+    // constants are rounded separately, and no amount of compensation closes a gap between
+    // them.
+    const f64 rounded_step_dt = (f64)(f32)step_dt;
+    return (f32)((f64)tick_count * rounded_step_dt) == (f32)threshold;
 }
 
 String translate_expression(const String &nml_expression, const SymbolTable &symbols) {

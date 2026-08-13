@@ -593,8 +593,10 @@ __global__ void reservoir_features_kernel(
     membrane_potentials[neuron_index] = membrane_potential;
     last_tick_updated[neuron_index] = tick;
 
+    // last_spiked < 0 is "has never spiked" — the engine seeds the buffer with
+    // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
     s64 since_spike = tick - last_spiked[neuron_index];
-    f32 trace = (last_spiked[neuron_index] > 0) ? expf(-(f32)since_spike / spike_tau) : 0.0f;
+    f32 trace = (last_spiked[neuron_index] >= 0) ? expf(-(f32)since_spike / spike_tau) : 0.0f;
 
     output_buffer[neuron_index] = trace;
     output_buffer[neuron_count + neuron_index] = (membrane_potential - resting_mp) / voltage_scale;
@@ -784,9 +786,11 @@ __global__ void step_kernel(
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
 
-        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick.
+        // "Never spiked" is last_spiked < 0: the engine seeds the buffer with
+        // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
         s64 child_last_spiked = last_spiked[child];
-        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+        if (learning_rate != 0.0f && !(child_last_spiked < 0 || child_last_spiked == tick)) {
             s64 delta_ticks = tick - child_last_spiked;
             f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
             f32 decay_delta = -learning_rate * powf(tick_delta, -3.0f);
@@ -929,9 +933,11 @@ __global__ void step_kernel_no_active_optimization(
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
 
-        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick.
+        // "Never spiked" is last_spiked < 0: the engine seeds the buffer with
+        // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
         s64 child_last_spiked = last_spiked[child];
-        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+        if (learning_rate != 0.0f && !(child_last_spiked < 0 || child_last_spiked == tick)) {
             s64 delta_ticks = tick - child_last_spiked;
             f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
             f32 decay_delta = -learning_rate * powf(tick_delta, -3.0f);
