@@ -50,10 +50,16 @@ f64 tick_to_seconds(s64 tick, f64 total_seconds, s64 total_ticks) {
     );
 }
 
-// Every unit symbol the vendored NeuroML standard library declares, plus the dimensionless
-// spellings and a few SI prefixes the library does not name but documents use (mA, mF, us).
-// Everything the engine sees is SI, so conversion happens at parse time and never
-// downstream; each scale below is the standard library's own 10^power * scale.
+// Every unit symbol the vendored NeuroML standard library declares that converts by a scale,
+// plus the dimensionless spellings and a few SI prefixes the library does not name but
+// documents use (mA, mF, us). Everything the engine sees is SI, so conversion happens at parse
+// time and never downstream; a symbol the standard library declares carries its own
+// 10^power * scale, and the handful it does not declare (mA, mF, us, "" and "none") carries
+// the plain SI prefix.
+//
+// One standard-library symbol has no scale-only answer at all: degC carries offset="273.15"
+// rather than a power, and this function returns a multiplicative scale. It is absent from
+// the table on purpose so it lands in the throw below -- see the note there.
 //
 // The table is not a fallback for symbols it does not know. A suffix it cannot place is a
 // misspelling or a unit nobody has taught this engine, and scaling by 1.0 silently turns
@@ -71,10 +77,10 @@ f64 unit_suffix_scale(const String &suffix) {
         {"m", 1.0}, {"cm", 1e-2}, {"um", 1e-6},
         {"m2", 1.0}, {"cm2", 1e-4}, {"um2", 1e-12},
         {"m3", 1.0}, {"cm3", 1e-6}, {"um3", 1e-18}, {"litre", 1e-3},
-        {"M", 1.0}, {"mM", 1e-3}, {"mol_per_m3", 1.0}, {"mol_per_cm3", 1e6},
+        {"M", 1e3}, {"mM", 1.0}, {"mol_per_m3", 1.0}, {"mol_per_cm3", 1e6},
         {"ohm", 1.0}, {"kohm", 1e3}, {"Mohm", 1e6},
         {"ohm_m", 1.0}, {"ohm_cm", 1e-2}, {"kohm_cm", 10.0},
-        {"degC", 1.0}, {"K", 1.0},
+        {"K", 1.0},
         {"C", 1.0}, {"e", 1.602176634e-19}, {"mol", 1.0},
         {"C_per_mol", 1.0}, {"pC_per_umol", 1e-6}, {"nA_ms_per_amol", 1e6},
         {"J_per_K_per_mol", 1.0}, {"fJ_per_K_per_umol", 1e-9},
@@ -86,6 +92,17 @@ f64 unit_suffix_scale(const String &suffix) {
         {"mol_per_m_per_A_per_s", 1.0}, {"mol_per_cm_per_uA_per_ms", 1e11},
         {"umol_per_cm_per_nA_per_ms", 1e8},
     };
+
+    // The standard library declares degC as offset="273.15" with no power, so its conversion
+    // is "+273.15", not "* anything". A scale-only return value cannot carry that, and
+    // returning 1.0 would report 20degC as 20 K. NML_Parser::resolve_quantity does apply the
+    // offset, from the document-declared <Unit>, so that is the path a temperature must take.
+    if (suffix == "degC") {
+        throw invalid_argument("unit_suffix_scale: unit suffix 'degC' converts by an offset "
+                               "(+273.15 K), not by a scale, so this scale-only table cannot "
+                               "express it. Resolve temperatures through a document-declared "
+                               "<Unit> (NML_Parser::resolve_quantity), which applies offsets");
+    }
 
     auto entry = scales.find(suffix);
     if (entry == scales.end()) {

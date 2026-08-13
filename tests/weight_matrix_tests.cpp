@@ -2019,6 +2019,49 @@ TEST(WeightMatrix, scale_neighbor_weights_refuses_a_matrix_holding_exact_weights
               float_bit_pattern(2.5e-9f));
 }
 
+TEST(WeightMatrix, set_coefficient_vector_refuses_a_matrix_holding_exact_weights) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    weight_matrix.set_edge_weight(0, network[0][0], 2.5e-9f);
+
+    // The default matrix's all-zero Ck is the whole reason an exact weight reads back as
+    // exactly its Sk entry. Writing a Ck onto it -- the shape a mistyped matrix_index takes,
+    // since DEFAULT_MATRIX_INDEX is a valid index -- would put an order-1 low-rank term on
+    // top of a 2.5e-9 weight, i.e. destroy every weight in the matrix at once.
+    vector<f32> coefficients((usize)weight_matrix.rank, 1.0f);
+    EXPECT_THROW(weight_matrix.set_coefficient_vector(WeightMatrix::DEFAULT_MATRIX_INDEX,
+                                                      coefficients),
+                 std::invalid_argument);
+    EXPECT_EQ(float_bit_pattern(weight_matrix.get(0, network[0][0])),
+              float_bit_pattern(2.5e-9f));
+
+    // Registering another matrix in the family is still allowed, and its Ck is still
+    // writable -- only the pinned matrices are refused.
+    s64 ordinary_matrix_index = weight_matrix.add_coefficient_vector(coefficients);
+    weight_matrix.set_coefficient_vector(ordinary_matrix_index,
+                                         vector<f32>((usize)weight_matrix.rank, 0.5f));
+    EXPECT_EQ(float_bit_pattern(weight_matrix.get(0, network[0][0])),
+              float_bit_pattern(2.5e-9f));
+}
+
+TEST(WeightMatrix, set_coefficient_vector_refuses_the_delay_matrix) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+
+    const s32 source_node = 0;
+    const s32 target_node = network[0][0];
+    weight_matrix.set_edge_delay_ticks(source_node, target_node, 7);
+    ASSERT_GE(weight_matrix.delay_matrix_index, 0);
+
+    // Same invariant as the exact weights above: the delay matrix's Ck is pinned to all-zero
+    // so a delay reconstructs as exactly its Sk entry. A Ck here reconstructs delays as
+    // garbage tick counts.
+    EXPECT_THROW(weight_matrix.set_coefficient_vector(weight_matrix.delay_matrix_index,
+                                                      vector<f32>((usize)weight_matrix.rank, 1.0f)),
+                 std::invalid_argument);
+    EXPECT_EQ(weight_matrix.get_edge_delay_ticks(source_node, target_node), 7);
+}
+
 TEST(WeightMatrix, move_assignment_preserves_exact_edge_weights) {
     auto network = square_torus(4);
     WeightMatrix source_matrix(network, /*rank=*/8);

@@ -33,9 +33,10 @@ namespace {
 constexpr s64 SLOW_TICKS_PER_BIT = 100; // 10ms per bit -- comfortably clear of the 5ms tRef
 constexpr s64 FAST_TICKS_PER_BIT = 20;  // 2ms per bit -- well inside it
 
-// Nanoamps. 25nA over one 0.1ms tick moves a resting 100pF membrane 25mV, past the 20mV it
-// needs to reach threshold, so one bit is one spike whenever the cell is free to fire.
-constexpr f64 BIT_AMPLITUDE = 25.0;
+// Amperes: an input stream's value lands in the same accumulator a connection weight does.
+// 25nA over one 0.1ms tick moves a resting 100pF membrane 25mV, past the 20mV it needs to
+// reach threshold, so one bit is one spike whenever the cell is free to fire.
+constexpr f64 BIT_AMPLITUDE = 25.0 * NANOAMPERE;
 
 const char *const DEFAULT_PATTERN = "1001010001101";
 

@@ -33,9 +33,9 @@ namespace {
 constexpr s64 EXCITATORY_NEURON_COUNT = 8;
 constexpr s64 INHIBITORY_NEURON_COUNT = 2;
 
-// Weights are in nanoamps: the cells read their synaptic accumulator through
-// synapticCurrentScale="1nA". 25 is one full recruiting event (see glif_torus_network.h).
-constexpr f64 EXCITATORY_WEIGHT = 25.0;
+// Weights are in amperes, like everything else the synaptic accumulator holds. 25nA is one
+// full recruiting event (see glif_torus_network.h).
+constexpr f64 EXCITATORY_WEIGHT = 25.0 * NANOAMPERE;
 
 std::string excitatory_inhibitory_network_nml(f64 inhibitory_weight) {
     std::ostringstream document;
@@ -44,7 +44,7 @@ std::string excitatory_inhibitory_network_nml(f64 inhibitory_weight) {
     )XML" << glif_cell_instance(GlifVariant::Glif3, "inhibitoryCell") << R"XML(
     <expOneSynapse id="excitatorySynapse" gbase="10nS" erev="0mV" tauDecay="3ms"/>
     <expOneSynapse id="inhibitorySynapse" gbase="10nS" erev="-80mV" tauDecay="8ms"/>
-    <pulseGenerator id="excitatoryDrive" delay="20ms" duration="1000ms" amplitude="0.6"/>
+    <pulseGenerator id="excitatoryDrive" delay="20ms" duration="1000ms" amplitude="0.6nA"/>
 
     <network id="excitatoryInhibitoryNet">
         <population id="ExcPop" component="excitatoryCell" size=")XML"
@@ -174,7 +174,7 @@ int main(int argument_count, char **argument_values) {
     try {
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/60.0);
+                                      /*default_connection_weight=*/60.0 * NANOAMPERE);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.
@@ -196,12 +196,13 @@ int main(int argument_count, char **argument_values) {
         print_heading("Does the inhibitory population actually inhibit?");
         std::cout << "  Same network, same drive, same 200ms. The only difference is the weight\n"
                      "  on the InhPop -> ExcPop projection.\n\n"
-                  << "                          ExcPop spikes   InhPop spikes\n"
-                  << "    inhibitory weight " << std::setw(6) << 0.0 << std::setw(14)
+                  << "                             ExcPop spikes   InhPop spikes\n"
+                  << "    inhibitory weight " << std::setw(6) << 0.0 << " nA" << std::setw(14)
                   << without_inhibition.excitatory_spike_count << std::setw(16)
                   << without_inhibition.inhibitory_spike_count << "\n"
-                  << "    inhibitory weight " << std::setw(6) << -options.connection_weight
-                  << std::setw(14) << with_inhibition.excitatory_spike_count << std::setw(16)
+                  << "    inhibitory weight " << std::setw(6)
+                  << -options.connection_weight / NANOAMPERE << " nA" << std::setw(14)
+                  << with_inhibition.excitatory_spike_count << std::setw(16)
                   << with_inhibition.inhibitory_spike_count << "\n\n";
 
         if (with_inhibition.excitatory_spike_count < without_inhibition.excitatory_spike_count) {

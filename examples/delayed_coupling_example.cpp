@@ -5,8 +5,11 @@
 // <connectionWD delay="10ms"/> has to cost exactly ten milliseconds instead, which needs the
 // DELAY RING -- `network_inputs` is not one flat [neuron_count] array but a ring of
 // `max_delay_ticks + 1` rows, each a full [neuron_count] wide, and an arrival is scattered
-// into the row belonging to its own arrival tick. The row a cell drains is emptied as it is
-// read, so it is clean again by the time the ring wraps onto it.
+// into the row belonging to its own arrival tick. A cell's read of its row is a plain load,
+// not a drain: the row is zeroed afterwards, by a separate clear kernel dispatched behind the
+// tick kernel in the same command batch, so it is clean again by the time the ring wraps onto
+// it. That split is exactly the redesign this example demonstrates -- every other row holds
+// arrivals that are not due yet and must survive untouched.
 //
 // This measures the delivery offset directly rather than describing it. One source drives
 // three otherwise-untouched targets over three connections declaring 1ms, 5ms and 10ms. Each
@@ -26,10 +29,10 @@ namespace {
 constexpr s64 NEURON_COUNT = 4;
 const char *const DECLARED_DELAYS[] = {"1ms", "5ms", "10ms"};
 
-// Nanoamps (the cells read their accumulator through synapticCurrentScale="1nA"). 5nA over
-// one 0.1ms tick moves a 100pF membrane 5mV -- unmistakable against a resting cell, and a
-// quarter of the 20mV it would take to actually fire one.
-constexpr f64 SUBTHRESHOLD_WEIGHT = 5.0;
+// Amperes, like everything else in the accumulator. 5nA over one 0.1ms tick moves a 100pF
+// membrane 5mV -- unmistakable against a resting cell, and a quarter of the 20mV it would
+// take to actually fire one.
+constexpr f64 SUBTHRESHOLD_WEIGHT = 5.0 * NANOAMPERE;
 
 std::string delayed_coupling_network_nml() {
     std::ostringstream document;
@@ -38,7 +41,7 @@ std::string delayed_coupling_network_nml() {
              << "    <expOneSynapse id=\"delaySynapse\" gbase=\"10nS\" erev=\"0mV\" "
                 "tauDecay=\"3ms\"/>\n"
                 "    <pulseGenerator id=\"sourceDrive\" delay=\"20ms\" duration=\"1000ms\" "
-                "amplitude=\"0.6\"/>\n\n"
+                "amplitude=\"0.6nA\"/>\n\n"
                 "    <network id=\"delayedCouplingNet\">\n"
                 "        <population id=\"pop\" component=\"delayCell\" size=\""
              << NEURON_COUNT << "\"/>\n\n";

@@ -38,6 +38,18 @@
 
 namespace spikecorec::examples {
 
+// One nanoampere, in amperes.
+//
+// Every quantity in these models is SI, because that is what NeuroML resolves to and what the
+// engine holds: a `<pulseGenerator amplitude="0.6nA">` is 6e-10 A by the time it reaches the
+// synaptic accumulator, so a connection weight summed into that same accumulator has to be in
+// amperes too. A synaptic current is naturally 1e-9-ish, which is unreadable written out, so
+// the examples spell those magnitudes as `25.0 * NANOAMPERE` rather than as `2.5e-8`.
+//
+// Nothing about the storage needs the numbers to be large: WeightMatrix::set_edge_weight
+// stores a weight exactly, at any magnitude (see examples/README.md).
+constexpr f64 NANOAMPERE = 1e-9;
+
 // Owns the GPU context for the whole program.
 //
 // DECLARE THIS BEFORE ANY LOCAL THAT HOLDS A GPU BUFFER. release_gpu_resources() frees every
@@ -71,10 +83,13 @@ struct ExampleOptions {
     // Torus edge length; the generated network holds side_length^2 neurons.
     s64 torus_side_length = 8;
 
-    // The per-connection synaptic weight. Delivered as a single-tick impulse into the
-    // target's synaptic accumulator; the models here read that accumulator in nanoamps. See
-    // the "synaptic weight" note in examples/README.md for why the projection's declared
-    // synapse ComponentType does not (yet) shape it.
+    // The per-connection synaptic weight, in AMPERES -- the models here read their synaptic
+    // accumulator as a current in SI, like every other quantity NeuroML resolves. Delivered as
+    // a single-tick impulse; see the "synaptic weight" note in examples/README.md for why the
+    // projection's declared synapse ComponentType does not (yet) shape it.
+    //
+    // `--weight` is typed in nanoamps because 25 is easier to type and read than 2.5e-8, and
+    // parse_example_options converts it here, once.
     f64 connection_weight = 0.0;
 
     // Where a model's <OutputFile> recordings are written.
@@ -100,6 +115,9 @@ inline void print_common_option_help(std::ostream &output) {
 
 // Throws on an unrecognised flag rather than ignoring it: a mistyped `--tikcs 100` that
 // silently ran the default length would be reported as a result.
+//
+// `default_connection_weight` is in AMPERES (the caller writes `25.0 * NANOAMPERE`); the
+// `--weight` flag is typed in nanoamps and converted here.
 inline ExampleOptions parse_example_options(int argument_count, char **argument_values,
                                             f64 default_connection_weight) {
     ExampleOptions options;
@@ -116,7 +134,7 @@ inline ExampleOptions parse_example_options(int argument_count, char **argument_
         } else if (flag == "--side" && has_value) {
             options.torus_side_length = std::atoll(argument_values[++index]);
         } else if (flag == "--weight" && has_value) {
-            options.connection_weight = std::atof(argument_values[++index]);
+            options.connection_weight = std::atof(argument_values[++index]) * NANOAMPERE;
         } else if (flag == "--record-dir" && has_value) {
             options.recording_directory = argument_values[++index];
         } else if (flag == "--pattern" && has_value) {

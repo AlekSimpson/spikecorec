@@ -262,11 +262,30 @@ TEST(UnitSuffixScale, resistance_suffixes) {
     EXPECT_TRUE(approx(unit_suffix_scale("Mohm"), 1e6));
 }
 
-TEST(UnitSuffixScale, concentration_and_temperature_suffixes) {
-    EXPECT_TRUE(approx(unit_suffix_scale("M"),  1.0));
-    EXPECT_TRUE(approx(unit_suffix_scale("mM"), 1e-3));
-    EXPECT_TRUE(approx(unit_suffix_scale("degC"), 1.0));
-    EXPECT_TRUE(approx(unit_suffix_scale("K"),    1.0));
+TEST(UnitSuffixScale, concentration_suffixes) {
+    // The standard library's concentration base is mol_per_m3, NOT molar: it declares
+    // M with power="3" and mM with power="0". Reading M as 1.0 and mM as 1e-3 -- the
+    // molar-based intuition -- puts both out by exactly 1000x.
+    EXPECT_TRUE(approx(unit_suffix_scale("mol_per_m3"),  1.0));
+    EXPECT_TRUE(approx(unit_suffix_scale("mol_per_cm3"), 1e6));
+    EXPECT_TRUE(approx(unit_suffix_scale("M"),  1e3));
+    EXPECT_TRUE(approx(unit_suffix_scale("mM"), 1.0));
+}
+
+TEST(UnitSuffixScale, temperature_suffixes) {
+    EXPECT_TRUE(approx(unit_suffix_scale("K"), 1.0));
+
+    // degC is declared offset="273.15", which no scale can express. Answering 1.0 read
+    // 20degC as 20 K; it is now an error pointing at the path that does apply offsets.
+    EXPECT_THROW(unit_suffix_scale("degC"), invalid_argument);
+
+    try {
+        unit_suffix_scale("degC");
+        FAIL() << "expected an offset-carrying suffix to be rejected";
+    } catch (const invalid_argument &error) {
+        EXPECT_NE(string(error.what()).find("degC"), string::npos);
+        EXPECT_NE(string(error.what()).find("offset"), string::npos);
+    }
 }
 
 TEST(UnitSuffixScale, dimensionless_suffixes_scale_by_one) {

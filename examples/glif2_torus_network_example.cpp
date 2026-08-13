@@ -23,7 +23,7 @@ int main(int argument_count, char **argument_values) {
     try {
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/25.0);
+                                      /*default_connection_weight=*/25.0 * NANOAMPERE);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.

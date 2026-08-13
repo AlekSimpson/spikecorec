@@ -81,19 +81,17 @@ inline const char *glif1_component_type() {
         <Parameter name="vth" dimension="voltage"/>
         <Parameter name="vreset" dimension="voltage"/>
         <Parameter name="tRef" dimension="time"/>
-        <Parameter name="synapticCurrentScale" dimension="current"/>
         <Attachments name="synapses" type="basePointCurrent"/>
         <EventPort name="spike" direction="out"/>
         <Exposure name="v" dimension="voltage"/>
+        <Exposure name="iSyn" dimension="current"/>
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
             <StateVariable name="refractoryTimeRemaining" dimension="time"/>
 
-            <DerivedVariable name="synapticWeightSum" dimension="none" select="synapses[*]/i"
-                             reduce="add"/>
-            <DerivedVariable name="iSyn" dimension="current"
-                             value="synapticWeightSum * synapticCurrentScale"/>
+            <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
+                             select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="integrating" dimension="none"
                              value="H(0 - refractoryTimeRemaining)"/>
 
@@ -127,19 +125,17 @@ inline const char *glif2_component_type() {
         <Parameter name="vreset" dimension="voltage"/>
         <Parameter name="tRef" dimension="time"/>
         <Parameter name="resetScale" dimension="none"/>
-        <Parameter name="synapticCurrentScale" dimension="current"/>
         <Attachments name="synapses" type="basePointCurrent"/>
         <EventPort name="spike" direction="out"/>
         <Exposure name="v" dimension="voltage"/>
+        <Exposure name="iSyn" dimension="current"/>
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
             <StateVariable name="refractoryTimeRemaining" dimension="time"/>
 
-            <DerivedVariable name="synapticWeightSum" dimension="none" select="synapses[*]/i"
-                             reduce="add"/>
-            <DerivedVariable name="iSyn" dimension="current"
-                             value="synapticWeightSum * synapticCurrentScale"/>
+            <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
+                             select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="integrating" dimension="none"
                              value="H(0 - refractoryTimeRemaining)"/>
 
@@ -176,10 +172,10 @@ inline const char *glif3_component_type() {
         <Parameter name="tauAsc2" dimension="time"/>
         <Parameter name="ascAdd1" dimension="current"/>
         <Parameter name="ascAdd2" dimension="current"/>
-        <Parameter name="synapticCurrentScale" dimension="current"/>
         <Attachments name="synapses" type="basePointCurrent"/>
         <EventPort name="spike" direction="out"/>
         <Exposure name="v" dimension="voltage"/>
+        <Exposure name="iSyn" dimension="current"/>
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
@@ -187,10 +183,8 @@ inline const char *glif3_component_type() {
             <StateVariable name="asc2" dimension="current"/>
             <StateVariable name="refractoryTimeRemaining" dimension="time"/>
 
-            <DerivedVariable name="synapticWeightSum" dimension="none" select="synapses[*]/i"
-                             reduce="add"/>
-            <DerivedVariable name="iSyn" dimension="current"
-                             value="synapticWeightSum * synapticCurrentScale"/>
+            <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
+                             select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
             <DerivedVariable name="integrating" dimension="none"
                              value="H(0 - refractoryTimeRemaining)"/>
@@ -233,20 +227,18 @@ inline const char *glif4_component_type() {
         <Parameter name="thetaInf" dimension="voltage"/>
         <Parameter name="tauTheta" dimension="time"/>
         <Parameter name="thetaSpikeAdd" dimension="voltage"/>
-        <Parameter name="synapticCurrentScale" dimension="current"/>
         <Attachments name="synapses" type="basePointCurrent"/>
         <EventPort name="spike" direction="out"/>
         <Exposure name="v" dimension="voltage"/>
+        <Exposure name="iSyn" dimension="current"/>
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
             <StateVariable name="theta" dimension="voltage"/>
             <StateVariable name="refractoryTimeRemaining" dimension="time"/>
 
-            <DerivedVariable name="synapticWeightSum" dimension="none" select="synapses[*]/i"
-                             reduce="add"/>
-            <DerivedVariable name="iSyn" dimension="current"
-                             value="synapticWeightSum * synapticCurrentScale"/>
+            <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
+                             select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="integrating" dimension="none"
                              value="H(0 - refractoryTimeRemaining)"/>
 
@@ -288,10 +280,10 @@ inline const char *glif5_component_type() {
         <Parameter name="thetaInf" dimension="voltage"/>
         <Parameter name="tauTheta" dimension="time"/>
         <Parameter name="thetaSpikeAdd" dimension="voltage"/>
-        <Parameter name="synapticCurrentScale" dimension="current"/>
         <Attachments name="synapses" type="basePointCurrent"/>
         <EventPort name="spike" direction="out"/>
         <Exposure name="v" dimension="voltage"/>
+        <Exposure name="iSyn" dimension="current"/>
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
@@ -300,10 +292,8 @@ inline const char *glif5_component_type() {
             <StateVariable name="asc2" dimension="current"/>
             <StateVariable name="refractoryTimeRemaining" dimension="time"/>
 
-            <DerivedVariable name="synapticWeightSum" dimension="none" select="synapses[*]/i"
-                             reduce="add"/>
-            <DerivedVariable name="iSyn" dimension="current"
-                             value="synapticWeightSum * synapticCurrentScale"/>
+            <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
+                             select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
             <DerivedVariable name="integrating" dimension="none"
                              value="H(0 - refractoryTimeRemaining)"/>
@@ -351,20 +341,14 @@ inline const char *glif_component_type_declaration(GlifVariant variant) {
 // across all five variants -- 100pF / 10nS / -70mV rest / -50mV threshold / 5ms refractory --
 // so a difference between two runs is the variant's own mechanism and nothing else.
 //
-// synapticCurrentScale is what turns the engine's synaptic accumulator into a current, and
-// it is set to 1nA -- so every number that lands in that accumulator, from a connection or
-// from the injected stimulus alike, reads as nanoamps.
-//
-// That indirection is not cosmetic. A NeuroML <connectionWD weight=".."> is DIMENSIONLESS, a
-// multiplier on the synapse's own contribution, and the engine delivers that multiplier
-// itself (see the projection comment in torus_network_nml). It has to be numerically
-// well-conditioned as well: an edge weight is stored as a delta against the WeightMatrix's
-// random-initialised U/V reconstruction, whose entries are order 1, so a weight far below
-// f32 epsilon relative to that -- 2.5e-8, say -- cancels away to zero when it is read back.
-// Working in nanoamps keeps every stored weight order 1..100, where it round-trips exactly.
+// `iSyn` reduces over the synaptic accumulator and is used as a current directly, with no
+// scale parameter in between: the accumulator holds AMPERES, like every other quantity the
+// engine works in, so a connection weight and an injected pulseGenerator amplitude are the
+// same kind of number and are written the same way. That is also why the weights below are
+// spelled `25.0 * NANOAMPERE` rather than as a bare 25 -- see TorusNetworkOptions.
 inline std::string glif_cell_instance(GlifVariant variant, const std::string &instance_id) {
     const std::string membrane =
-            R"( C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" tRef="5ms" synapticCurrentScale="1nA")";
+            R"( C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" tRef="5ms")";
     const std::string fixed_threshold = R"( vth="-50mV")";
     const std::string after_spike_currents =
             R"( tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-100pA" ascAdd2="-200pA")";
@@ -399,12 +383,18 @@ inline std::string glif_cell_instance(GlifVariant variant, const std::string &in
 struct TorusNetworkOptions {
     s64 side_length = 8;
 
-    // The <connectionWD weight="..."> every lateral connection carries. The cell reads the
-    // accumulator in nanoamps (synapticCurrentScale="1nA"), so this is nanoamps too: 25 is a
-    // 25nA impulse, which over one 0.1ms tick moves a 100pF membrane by 25mV -- just past the
-    // 20mV a resting cell needs to reach threshold, so one arriving spike recruits its
-    // target. Halve it and a cell needs two neighbours firing together instead.
-    f64 connection_weight = 25.0;
+    // The <connectionWD weight="..."> every lateral connection carries, in AMPERES -- the
+    // cells read their synaptic accumulator as a current in SI. 25nA over one 0.1ms tick
+    // moves a 100pF membrane by 25mV -- just past the 20mV a resting cell needs to reach
+    // threshold, so one arriving spike recruits its target. Halve it and a cell needs two
+    // neighbours firing together instead.
+    //
+    // A NeuroML <connectionWD weight="..."> is dimensionless in the schema (xs:float), a
+    // multiplier on the synapse's own contribution. The engine delivers that multiplier
+    // itself and runs no synapse dynamics behind it (see the projection comment in
+    // torus_network_nml), so here the multiplier IS the current, and it is written out in
+    // SI as 2.5e-08 to keep the accumulator's units consistent with the pulseGenerator's.
+    f64 connection_weight = 25.0 * NANOAMPERE;
 
     // Conduction delay on every lateral connection. Long enough that one hop is visible as
     // its own step in the first-spike grid rather than the whole torus lighting up at once.
@@ -438,15 +428,15 @@ inline std::string torus_network_nml(GlifVariant variant, const TorusNetworkOpti
     document << "<neuroml id=\"glifTorusNetwork\">\n    "
              << glif_cell_instance(variant, "torusCell") << "\n"
              << "    <pulseGenerator id=\"cornerDrive\" delay=\"20ms\" duration=\"1000ms\" "
-                "amplitude=\"0.6\"/>\n";
+                "amplitude=\"0.6nA\"/>\n";
 
     if (options.include_lateral_connections) {
         // NeuroML requires a <projection> to name a synapse instance, so one is declared.
         // Its OWN dynamics are not run: the engine does not lower synapse ComponentTypes
-        // yet, so each arriving spike delivers the connection's dimensionless `weight`
-        // straight into the target's synaptic accumulator, with no exponential decay shaping
-        // it. gbase/erev/tauDecay below are therefore inert, and `weight` (times the target's
-        // own synapticCurrentScale) is the whole magnitude. See examples/README.md.
+        // yet, so each arriving spike delivers the connection's `weight` straight into the
+        // target's synaptic accumulator, with no exponential decay shaping it.
+        // gbase/erev/tauDecay below are therefore inert, and `weight` -- in amperes, since
+        // that is what the accumulator holds -- is the whole magnitude. See examples/README.md.
         document << "    <expOneSynapse id=\"lateralSynapse\" gbase=\"10nS\" erev=\"0mV\" "
                     "tauDecay=\"3ms\"/>\n";
     }
@@ -590,8 +580,8 @@ inline void print_torus_run_header(GlifVariant variant, const TorusNetworkOption
               << (options.include_lateral_connections ? options.side_length * options.side_length * 4
                                                       : 0)
               << " connections, corner neuron 0 driven by a 0.6nA step\n"
-              << "  connection weight " << options.connection_weight << " nA, delay "
-              << options.connection_delay << "\n";
+              << "  connection weight " << options.connection_weight / NANOAMPERE
+              << " nA, delay " << options.connection_delay << "\n";
 }
 
 } // namespace spikecorec::examples

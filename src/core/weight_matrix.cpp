@@ -567,6 +567,30 @@ s64 WeightMatrix::add_coefficient_vector(const vector<f32> &coefficients) {
 
 void WeightMatrix::set_coefficient_vector(s64 matrix_index, const vector<f32> &coefficients) {
     validate_matrix_index(matrix_index);
+
+    // Two matrices in the family have their Ck pinned to all-zero, and that pinning is what
+    // makes their Sk entry the WHOLE value (see enable_exact_edge_weights /
+    // ensure_delay_matrix_registered). Writing any Ck onto either -- including the neutral
+    // 1.0f this method puts in the padding lanes -- restores a low-rank term of order 1 on
+    // top of stored values that are routinely 1e-9 or smaller, so every exact weight becomes
+    // noise and every delay reconstructs as garbage, silently and for every edge at once.
+    // Refused for the same reason scale_neighbor_weights_to_root_mean_square refuses an
+    // exact-mode matrix: rewriting those values is the caller's decision, not this method's.
+    if (using_exact_edge_weights && matrix_index == DEFAULT_MATRIX_INDEX) {
+        log::throw_invalid_argument(log::logger(),
+            "WeightMatrix::set_coefficient_vector: the default matrix holds exact per-edge "
+            "weights, whose value comes from its all-zero Ck plus its Sk entry alone, so "
+            "overwriting that Ck would add a low-rank term to every stored weight -- rewrite "
+            "the weights with set_edge_weight() instead");
+    }
+    if (delay_matrix_index >= 0 && matrix_index == delay_matrix_index) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_coefficient_vector: matrix_index={} is the per-edge "
+                        "delay matrix, whose Ck is pinned to all-zero so a delay reads back as "
+                        "exactly its Sk entry -- overwriting it would corrupt every stored "
+                        "delay; use set_edge_delay_ticks() instead", matrix_index));
+    }
+
     if ((s64)coefficients.size() != rank) {
         log::throw_invalid_argument(log::logger(),
             fmt::format("WeightMatrix::set_coefficient_vector: coefficients must have exactly "
@@ -1150,16 +1174,20 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     for (s32 sweep_index = 0; sweep_index < sweep_count; ++sweep_index) {
         // --- §2.1: update each Ck, fixing U and V ---
         for (s64 matrix_index = 0; matrix_index < registered_matrix_count; ++matrix_index) {
-            // DEFAULT_MATRIX_INDEX's Ck must stay pinned at all-ones for the whole
-            // lifetime of a WeightMatrix (weight_matrix.h's own documented
-            // invariant) -- get()/get_for_matrix()/neighbor_weights() all rely on
-            // it, and so does the live GPU propagate kernel (master_kernel.cpp),
-            // which never reads a coefficient vector for the default matrix at
-            // all and hardcodes the all-ones assumption unconditionally (ticket
-            // #103). Skip re-fitting it here; the U/V updates below still pool
-            // the default matrix's real edge data into the shared basis (U/V are
-            // shared across the whole matrix family) -- only THIS Ck update is
-            // skipped for DEFAULT_MATRIX_INDEX.
+            // DEFAULT_MATRIX_INDEX's Ck is whatever pinned value it currently holds
+            // -- all-ones on an ordinary matrix, all-zero once set_edge_weight() has
+            // switched this instance into exact mode -- and refit must not move it
+            // either way (ticket #103). get()/get_for_matrix()/neighbor_weights() are
+            // written against it, and so is the live GPU propagate kernel: the engine
+            // binds coefficient_vectors[DEFAULT_MATRIX_INDEX] as the generated
+            // kernel's `edge_weight_coefficients` argument (see engine.cpp's
+            // available_arguments) and the kernel reads it lane by lane to
+            // reconstruct Σ U·Ck·V + Sk (see kernel_codegen.cpp's propagation
+            // helper), so it is NOT immune to a Ck change -- a moved Ck would show up
+            // on device as an order-1 error on every exact weight. Skip re-fitting it
+            // here; the U/V updates below still pool the default matrix's real edge
+            // data into the shared basis (U/V are shared across the whole matrix
+            // family) -- only THIS Ck update is skipped for DEFAULT_MATRIX_INDEX.
             if (matrix_index == DEFAULT_MATRIX_INDEX) {
                 continue;
             }

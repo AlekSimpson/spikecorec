@@ -182,20 +182,34 @@ accumulator as a single-tick impulse, with no `expOneSynapse` exponential decay 
 declared `gbase`/`erev`/`tauDecay` are inert.
 
 So `weight` is the only knob that changes what a spike does, and `--weight` is named after it
-rather than after a conductance.
+rather than after a conductance. That accumulator holds **amperes**: the cells reduce it with
+`<DerivedVariable name="iSyn" dimension="current" select="synapses[*]/i" reduce="add"/>` and use
+the result as a current directly, and an `<explicitInput>` current injector adds into the very
+same place. See "Weights are stored exactly" below.
 
-### Weights are stored as deltas against a random low-rank plane, so keep them order 1
+### Weights are stored exactly, at any magnitude, so write them in SI
 
 `WeightMatrix` holds adjacency as `W ≈ U·Vᵀ` plus a sparse per-edge delta (a memory-compression
 scheme, not learning). `U` and `V` are initialised from a normal(0, 1) draw, so the
-reconstruction for any edge is order 1, and an exact per-edge weight is stored as
-`target - reconstruction`. A weight far below f32 epsilon *relative to that* — 2.5e-8, say —
-cancels to zero when it is read back, and the network silently does nothing.
+reconstruction for any edge is order 1 — but a per-edge weight is **not** stored as a delta
+against it. The first `set_edge_weight` call pins the default matrix's coefficient vector to
+all-zero, which makes the low-rank term identically `0.0f`, so the stored value *is* the weight.
+It round-trips bit-for-bit at any magnitude, verified in `tests/weight_matrix_tests.cpp` down to
+`1e-12`, and the GPU propagate kernel reconstructs the same bits because it reads the same
+coefficient vector and delta buffer.
 
-Every model here therefore works in **nanoamps**: the cells carry a
-`synapticCurrentScale="1nA"` parameter and read their accumulator through it, so a stored weight
-of 25 is a 25 nA impulse and round-trips exactly. Do the same in your own model, or check
-`weights.get(source, target)` after construction and confirm it reads back what you asked for.
+So write your currents in **SI, with real units**, exactly as NeuroML expects: a
+`<pulseGenerator amplitude="0.6nA"/>` is `6e-10 A`, and a `<connectionWD weight="2.5e-08"/>`
+summed into the same accumulator is `25 nA`. A dimensionless `amplitude="0.6"` is invalid LEMS —
+`pulseGenerator/amplitude` carries `dimension="current"` in `Inputs.xml`, and jNeuroML or NEURON
+would reject it — so do not reach for a scale parameter to keep the numbers large. Nothing here
+needs them large.
+
+`connectionWD/weight` is the one exception to "write the unit": it is `xs:float` in the schema,
+dimensionless, because in real NeuroML it multiplies the synapse's own `gbase`/`ibase`. Since the
+synapse is not run here (see the section above), that multiplier *is* the current, and it has to
+be written in the accumulator's units — amperes. The examples spell those magnitudes
+`25.0 * NANOAMPERE` in C++ so `2.5e-08` never has to be typed by hand.
 
 ### The refractory period is a Heaviside gate, not a `<Regime>`
 

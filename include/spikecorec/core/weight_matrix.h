@@ -434,6 +434,15 @@ namespace spikecorec {
         // (must have exactly `rank` elements). Note: matrix_index DEFAULT_MATRIX_INDEX
         // is the reserved all-ones slot get()/neighbor_weights() rely on for
         // bit-compatibility — overwriting it breaks that guarantee for this instance.
+        //
+        // THROWS std::invalid_argument for the two matrices whose Ck is pinned to
+        // all-zero, because that pinning is what makes their Sk entry the whole stored
+        // value: DEFAULT_MATRIX_INDEX once set_edge_weight() has put this instance in
+        // exact mode (using_exact_edge_weights), and delay_matrix_index once
+        // set_edge_delay_ticks() has registered it. Any Ck written onto either restores
+        // an order-1 low-rank term on top of values that are routinely 1e-9 or smaller,
+        // corrupting every weight (or every delay) at once with no diagnostic. Use
+        // set_edge_weight()/set_edge_delay_ticks() to change those values.
         void set_coefficient_vector(s64 matrix_index, const vector<f32> &coefficients);
 
         // Number of matrices currently sharing this instance's U/V basis (always >= 1;
@@ -493,16 +502,21 @@ namespace spikecorec {
         // factorization note).
         //
         // DEFAULT_MATRIX_INDEX's Ck is deliberately NEVER re-fit here (ticket
-        // #103): it stays pinned at all-ones for the whole lifetime of a
-        // WeightMatrix, matching every other method's bit-compatibility
-        // assumption and the live GPU propagate kernel (master_kernel.cpp),
-        // which never reads a coefficient vector for the default matrix and
-        // hardcodes the all-ones assumption unconditionally. U and V are still
-        // fit using the default matrix's real edge data (they are shared across
-        // the whole matrix family) -- only its own Ck update is skipped. (A
-        // caller can still move DEFAULT_MATRIX_INDEX's Ck away from all-ones by
-        // calling set_coefficient_vector() directly on it -- see that method's
-        // own header comment -- but refit() itself never does.)
+        // #103): it stays pinned for the whole lifetime of a WeightMatrix --
+        // all-ones ordinarily, all-zero once set_edge_weight() has switched this
+        // instance into exact mode -- matching every other method's
+        // bit-compatibility assumption. The live GPU propagate kernel depends on
+        // that pinning too: the engine binds
+        // coefficient_vectors[DEFAULT_MATRIX_INDEX] as the generated kernel's
+        // `edge_weight_coefficients` argument and the kernel reads it lane by lane
+        // to reconstruct Σ U·Ck·V + Sk, so a moved Ck would corrupt the weights on
+        // device exactly as it does on the host. U and V are still fit using the
+        // default matrix's real edge data (they are shared across the whole matrix
+        // family) -- only its own Ck update is skipped. (A caller can still move
+        // DEFAULT_MATRIX_INDEX's Ck away from all-ones by calling
+        // set_coefficient_vector() directly on it, which is refused outright in
+        // exact mode -- see that method's own header comment -- but refit() itself
+        // never does.)
         //
         // U and V are shared across the whole matrix family, so a refit
         // triggered by drift in ONE matrix's Sk legitimately perturbs every
