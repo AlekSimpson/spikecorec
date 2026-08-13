@@ -9,8 +9,10 @@
 //
 // One generator shared by the five glif*_torus_network_example programs. Each of them picks
 // a variant, hands it a side length and a synaptic weight, and gets back a complete
-// NeuroML/LEMS document: side^2 cells on a torus, each wired to its four neighbours, one
-// corner driven by a current step, and the whole run recorded to a pair of .spire files.
+// NeuroML/LEMS document: side^2 cells on a torus, each wired to its four neighbours, one of
+// them driven by a current step, and the whole run recorded to a pair of .spire files. The
+// examples all drive the corner; examples/demos/ drives the middle instead, so a video's
+// wavefront expands symmetrically. See TorusNetworkOptions::driven_neuron_index.
 //
 // Generated rather than checked in because an 8x8 torus has 256 connections, and hand-typing
 // that five times over is not reasonable. The generated document goes through the identical
@@ -412,6 +414,17 @@ struct TorusNetworkOptions {
     // unambiguous.
     bool include_lateral_connections = true;
 
+    // Which neuron the <explicitInput> current step is attached to, as a flat
+    // `row * side_length + column` index. 0 is the corner every example here drives; a demo
+    // that wants a wavefront expanding symmetrically instead drives the middle.
+    s64 driven_neuron_index = 0;
+
+    // The driving <pulseGenerator>'s amplitude in AMPERES, and how long into the run it
+    // switches on. The delay is dead time at the head of the run -- nothing at all has
+    // happened yet -- so a recording meant to be watched wants it short.
+    f64 stimulus_amplitude = 0.6 * NANOAMPERE;
+    std::string stimulus_delay = "20ms";
+
     std::string simulation_length = "200ms";
     std::string simulation_step = "0.1ms";
 
@@ -434,8 +447,9 @@ inline std::string torus_network_nml(GlifVariant variant, const TorusNetworkOpti
     std::ostringstream document;
     document << "<neuroml id=\"glifTorusNetwork\">\n    "
              << glif_cell_instance(variant, "torusCell") << "\n"
-             << "    <pulseGenerator id=\"cornerDrive\" delay=\"20ms\" duration=\"1000ms\" "
-                "amplitude=\"0.6nA\"/>\n";
+             << "    <pulseGenerator id=\"torusDrive\" delay=\"" << options.stimulus_delay
+             << "\" duration=\"1000ms\" amplitude=\""
+             << nanoampere_attribute(options.stimulus_amplitude) << "\"/>\n";
 
     if (options.include_lateral_connections) {
         // A <projection> must name a synapse instance, and this one's dynamics ARE run: on
@@ -486,7 +500,8 @@ inline std::string torus_network_nml(GlifVariant variant, const TorusNetworkOpti
         document << "        </projection>\n";
     }
 
-    document << "\n        <explicitInput target=\"torusPop[0]\" input=\"cornerDrive\"/>\n"
+    document << "\n        <explicitInput target=\"torusPop[" << options.driven_neuron_index
+             << "]\" input=\"torusDrive\"/>\n"
              << "    </network>\n</neuroml>\n";
 
     return document.str();
@@ -588,7 +603,9 @@ inline void print_torus_run_header(GlifVariant variant, const TorusNetworkOption
               << "  " << options.side_length * options.side_length << " neurons, "
               << (options.include_lateral_connections ? options.side_length * options.side_length * 4
                                                       : 0)
-              << " connections, corner neuron 0 driven by a 0.6nA step\n"
+              << " connections, neuron " << options.driven_neuron_index << " driven by a "
+              << options.stimulus_amplitude / NANOAMPERE << "nA step from "
+              << options.stimulus_delay << "\n"
               << "  alphaCurrentSynapse ibase " << options.synapse_peak_current / NANOAMPERE
               << " nA, tau " << options.synapse_time_constant << ", connection delay "
               << options.connection_delay << "\n";

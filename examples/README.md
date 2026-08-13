@@ -53,6 +53,20 @@ run. Each example is run with `--record-dir build/example_runs/<name>/`, so a ch
 nothing into the working tree, and its console output is kept next to it as
 `build/example_runs/<name>.log`. The whole thing takes about twenty seconds from a warm build.
 
+## Watching one instead of reading it: `examples/demos/`
+
+Every example here is sized to make its point cheaply — 64 cells, a number printed at the end.
+`examples/demos/` holds the same networks at a scale meant to be **watched**: a 48×48 torus, 2304
+cells, recorded to a `.spire` pair and rendered to a playable video by one command.
+
+```bash
+make demo-videos DEMO_PYTHON=/path/to/python-with-numpy-and-matplotlib
+```
+
+Videos and recordings land in `build/demo_videos/` and are never committed. The demos are
+deliberately outside `EX_SRCS`' wildcard, so `make check` does not run them — rendering several
+hundred matplotlib frames is far too slow for a gate. See `examples/demos/README.md`.
+
 ## The examples
 
 Read them in this order.

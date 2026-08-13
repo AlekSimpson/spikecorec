@@ -115,6 +115,10 @@ struct ExampleOptions {
     // the same. Empty means "the example's own default".
     std::string input_pattern;
 
+    // Which member of the GLIF family to run, for a program that can run any of them
+    // (examples/demos/glif_family_demo). Empty means "the program's own default".
+    std::string glif_variant_name;
+
     // Engine log output is quieted to warnings unless this is set.
     bool verbose = false;
 };
@@ -126,6 +130,7 @@ inline void print_common_option_help(std::ostream &output) {
               "  --side <length>       torus edge length; the network holds length^2 neurons\n"
               "  --record-dir <path>   where .spire recordings are written\n"
               "  --pattern <bits>      the 0/1 sequence discrete_spike_input_example drives with\n"
+              "  --variant <name>      which GLIF variant glif_family_demo runs (glif1..glif5)\n"
               "  --verbose             show engine log output\n";
 }
 
@@ -134,10 +139,16 @@ inline void print_common_option_help(std::ostream &output) {
 //
 // `default_synapse_peak_current` is in AMPERES (the caller writes `1.0 * NANOAMPERE`); the
 // `--synapse-current` flag is typed in nanoamps and converted here.
+//
+// `default_torus_side_length` is 8 for every example in this directory -- the size their point
+// is made at. A program sized for something else (examples/demos/) passes its own, rather than
+// reading a caller-supplied 8 as "no --side given".
 inline ExampleOptions parse_example_options(int argument_count, char **argument_values,
-                                            f64 default_synapse_peak_current) {
+                                            f64 default_synapse_peak_current,
+                                            s64 default_torus_side_length = 8) {
     ExampleOptions options;
     options.synapse_peak_current = default_synapse_peak_current;
+    options.torus_side_length = default_torus_side_length;
 
     for (int index = 1; index < argument_count; ++index) {
         const std::string flag = argument_values[index];
@@ -155,6 +166,8 @@ inline ExampleOptions parse_example_options(int argument_count, char **argument_
             options.recording_directory = argument_values[++index];
         } else if (flag == "--pattern" && has_value) {
             options.input_pattern = argument_values[++index];
+        } else if (flag == "--variant" && has_value) {
+            options.glif_variant_name = argument_values[++index];
         } else {
             throw std::runtime_error("unrecognised argument '" + flag + "'");
         }

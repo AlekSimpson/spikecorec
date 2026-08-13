@@ -10,6 +10,9 @@
 #   make examples     — build examples
 #   make run-examples — build AND run every example, failing on any non-zero exit
 #   make check        — the full gate: make test + make run-examples
+#   make demos        — build the demo programs (examples/demos/)
+#   make run-demos    — build AND run every demo, recording but not rendering
+#   make demo-videos  — build, run AND render every demo to a video (needs DEMO_PYTHON)
 #   make clean        — remove build artifacts
 #   make info         — show detected platform/toolchain
 # ============================================================
@@ -322,6 +325,90 @@ run-examples: examples
 	    exit 1; \
 	fi; \
 	echo "[spikecorec] all $(words $(EX_BINS)) examples ran to completion"
+
+# ── Demos ────────────────────────────────────────────────────
+# `make demo-videos` builds the demo programs, runs every GLIF variant and renders each run's
+# recordings to a playable video, in one command. That is the whole point of the target: the
+# videos are a build product, regenerated from scratch whenever the model underneath them
+# changes, and never checked in (they land under build/, which .gitignore already covers).
+#
+# Kept out of EX_SRCS' wildcard deliberately -- these are examples/demos/*.cpp, not
+# examples/*.cpp -- because `make check` runs every example on every invocation and a demo is
+# far too slow for that: each renders several hundred video frames through matplotlib.
+# `make demos` builds them; `make run-demos` runs them without rendering, which IS quick.
+DEMO_DIR        := $(EX_DIR)/demos
+DEMO_SRCS       := $(wildcard $(DEMO_DIR)/*.cpp)
+DEMO_BINS       := $(patsubst $(DEMO_DIR)/%.cpp, $(BUILD_DIR)/demos/%, $(DEMO_SRCS))
+DEMO_HDRS       := $(wildcard $(DEMO_DIR)/*.h) $(EX_HDRS)
+DEMO_OUTPUT_DIR := $(BUILD_DIR)/demo_videos
+DEMO_VARIANTS   := glif1 glif2 glif3 glif4 glif5
+DEMO_SIDE       := 48
+
+# render_spire_video.py sizes its spike markers to stay inside one grid cell, which on a
+# 48-wide grid is small enough that the spikes read as specks against the membrane heatmap
+# behind them. A demo wants the opposite emphasis -- the spikes ARE the subject -- so the
+# markers are widened to about a cell. Retune this alongside DEMO_SIDE.
+DEMO_SPIKE_SIZE := 34
+
+# Rendering needs numpy + matplotlib, which the C++/Metal/CUDA build itself does not. Point this
+# at any interpreter that has them:
+#     make demo-videos DEMO_PYTHON=/path/to/venv/bin/python
+DEMO_PYTHON     ?= python3
+
+.PHONY: demos demos-cuda demos-metal run-demos demo-videos
+
+demos: demos-$(BACKEND)
+	@echo "[spikecorec] demos built → $(BUILD_DIR)/demos/"
+
+demos-cuda: check-cuda $(CUDA_LIB) $(DEMO_BINS)
+
+demos-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(DEMO_BINS)
+
+ifeq ($(BACKEND),cuda)
+$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HDRS) | $(CUDA_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) \
+	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
+else
+$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HDRS) | $(METAL_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
+	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
+endif
+
+# Every variant simulated and recorded, no rendering. Seconds, not minutes.
+run-demos: demos
+	@rm -rf $(DEMO_OUTPUT_DIR)
+	@mkdir -p $(DEMO_OUTPUT_DIR)
+	@set -e; for demo_variant in $(DEMO_VARIANTS); do \
+	    run_directory=$(abspath $(DEMO_OUTPUT_DIR))/$$demo_variant; \
+	    mkdir -p $$run_directory; \
+	    echo "[spikecorec] running $$demo_variant demo"; \
+	    if ! $(BUILD_DIR)/demos/glif_family_demo --variant $$demo_variant \
+	            --side $(DEMO_SIDE) --record-dir $$run_directory \
+	            > $$run_directory/run.log 2>&1; then \
+	        cat $$run_directory/run.log; \
+	        echo "[spikecorec] $$demo_variant demo did not exit 0"; \
+	        exit 1; \
+	    fi; \
+	    cat $$run_directory/run.log; \
+	done
+	@echo "[spikecorec] demo recordings → $(DEMO_OUTPUT_DIR)/<variant>/"
+
+# The one command that rebuilds every demo and regenerates every video from scratch.
+demo-videos: run-demos
+	@set -e; for demo_variant in $(DEMO_VARIANTS); do \
+	    run_directory=$(abspath $(DEMO_OUTPUT_DIR))/$$demo_variant; \
+	    echo "[spikecorec] rendering $$demo_variant demo"; \
+	    $(DEMO_PYTHON) $(EX_DIR)/render_spire_video.py \
+	        $$run_directory/$${demo_variant}_demo_spikes.spire \
+	        --membrane $$run_directory/$${demo_variant}_demo_membrane.spire \
+	        --side $(DEMO_SIDE) --spike-size $(DEMO_SPIKE_SIZE) \
+	        --output $(abspath $(DEMO_OUTPUT_DIR))/$${demo_variant}_demo.gif; \
+	done
+	@echo "[spikecorec] demo videos → $(DEMO_OUTPUT_DIR)/<variant>_demo.gif"
 
 # ── Utilities ────────────────────────────────────────────────
 info:
