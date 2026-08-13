@@ -971,9 +971,11 @@ TEST(Export, synapse_types_are_classified_for_storage) {
     const SynapseTypeSpecification *synapse = synapse_type_named(result, "expOneSynapse");
     ASSERT_NE(synapse, nullptr);
 
-    // expOneSynapse computes g * (erev - v): it declares erev and requires v, so it needs
-    // the postsynaptic voltage.
-    EXPECT_TRUE(synapse->is_conductance_based);
+    // expOneSynapse computes g * (erev - v), so it needs the postsynaptic voltage. The
+    // is_conductance_based classification this used to assert is commented out for now
+    // (see SynapseTypeSpecification): conductance-based support is deferred, and the
+    // generator refuses such a synapse by name instead of carrying a flag nothing acts on.
+    // KernelCodegenSynapse.conductance_based_synapse_is_refused_by_name covers the refusal.
 
     // It carries no plasticity or block child, so its state superposes and it does not
     // need per-edge storage.

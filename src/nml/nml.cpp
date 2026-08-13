@@ -444,16 +444,22 @@ static Vector<DynamicsInstruction> extract_dynamics_program(const ComponentType 
     return program;
 }
 
-// Conductance-based synapses carry a driving force g*(erev - v), so they need the
-// postsynaptic voltage; current-based ones do not.
-static bool is_conductance_based(const ComponentType &component_type) {
-    bool declares_erev =
-            component_type.declarations.find(NML_DeclarationType::Parameter, "erev") != nullptr;
-    bool requires_voltage =
-            component_type.declarations.find(NML_DeclarationType::Requirement, "v") != nullptr;
-
-    return declares_erev && requires_voltage;
-}
+// TODO(conductance-based synapses, deferred): restore alongside
+// SynapseTypeSpecification::is_conductance_based when the driving-force lowering lands.
+// Nothing consumed the flag this produced, and the generator now refuses a
+// conductance-based synapse by name (kernel_codegen.cpp) rather than letting one through
+// as if it were current-based -- which would run and be wrong. None of GLIF1-5 uses one.
+//
+// // Conductance-based synapses carry a driving force g*(erev - v), so they need the
+// // postsynaptic voltage; current-based ones do not.
+// static bool is_conductance_based(const ComponentType &component_type) {
+//     bool declares_erev =
+//             component_type.declarations.find(NML_DeclarationType::Parameter, "erev") != nullptr;
+//     bool requires_voltage =
+//             component_type.declarations.find(NML_DeclarationType::Requirement, "v") != nullptr;
+//
+//     return declares_erev && requires_voltage;
+// }
 
 // A synapse needs per-edge storage when its state does not superpose across converging
 // edges. In NeuroML that is signalled compositionally: a plasticity or block mechanism
@@ -1202,7 +1208,6 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             specification.state_variable_names = component_type.ordered_state_variable_names();
             specification.parameter_names = component_type.ordered_parameter_names();
             specification.dynamics = extract_dynamics_program(component_type);
-            specification.is_conductance_based = is_conductance_based(component_type);
             specification.requires_per_edge_state = requires_per_edge_state(component_type);
 
             return_value.synapse_types.push_back(std::move(specification));
