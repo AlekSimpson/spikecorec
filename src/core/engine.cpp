@@ -274,6 +274,21 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
 {
     // TODO: in the future we can create custom spikecorec component types which enable
     // custom engine features like our builtin hebbian learning mechanism
+    //
+    // Until then the flag allocates last_tick_updated and does NOTHING ELSE. No generated
+    // kernel reads that buffer and no weight update runs, so a caller who asks for hebbian
+    // learning gets a simulation whose weights are bit-identical to one that did not -- a
+    // silently null experiment rather than an error. Warned about loudly at construction for
+    // exactly that reason; the flag and the allocation are kept so the wiring has somewhere
+    // to land.
+    if (hebbian_learning_enabled) {
+        logger->warn("SpikeEngine: enable_hebbian_learning=true allocates last_tick_updated "
+                     "but NO PLASTICITY IS APPLIED -- no kernel reads that buffer and no "
+                     "weight update runs, so this simulation's weights will be bit-identical "
+                     "to one built with enable_hebbian_learning=false. Compiling plasticity "
+                     "instructions into the cell model is future work; do not read a spike-"
+                     "timing-dependent result out of this run");
+    }
 
     const Vector<CellTypeSpecification> &cell_types = network_details.cell_types;
 
@@ -295,14 +310,28 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
         neuron_count_by_type[(usize)neuron.cell_type_index] += 1;
     }
 
+    // How wide one neuron's cell_state chunk is, per type. NOT state_variable_names.size():
+    // a type declaring any Regime carries one extra slot holding its current regime index,
+    // appended after its StateVariables. The generated kernel indexes that slot, so the two
+    // sides have to agree on the width -- which is why the count comes from codegen rather
+    // than being recomputed here.
+    //
+    // Resolved once per TYPE and reused per neuron: cell_state_slot_count walks the type's
+    // whole dynamics program, and calling it inside the per-neuron loop below would make
+    // construction O(neurons * instructions) with an allocation per neuron.
+    Vector<s64> state_slot_count_by_type(cell_types.size(), 0);
+    for (usize type_index = 0; type_index < cell_types.size(); ++type_index) {
+        state_slot_count_by_type[type_index] = (s64)cell_state_slot_count(cell_types[type_index]);
+    }
+
     Vector<s64> state_section_start(cell_types.size(), 0);
     Vector<s64> parameter_section_start(cell_types.size(), 0);
     for (usize type_index = 0; type_index < cell_types.size(); ++type_index) {
         state_section_start[type_index] = cell_state_element_count;
         parameter_section_start[type_index] = cell_parameter_element_count;
 
-        cell_state_element_count += neuron_count_by_type[type_index] *
-                                    (s64)cell_types[type_index].state_variable_names.size();
+        cell_state_element_count +=
+                neuron_count_by_type[type_index] * state_slot_count_by_type[type_index];
         cell_parameter_element_count += neuron_count_by_type[type_index] *
                                         (s64)cell_types[type_index].parameter_names.size();
     }
@@ -517,7 +546,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
         next_position_in_type[type_index] += 1;
 
         const s64 state_base = state_section_start[type_index] +
-                               position_in_type * (s64)cell_type.state_variable_names.size();
+                               position_in_type * state_slot_count_by_type[type_index];
         const s64 parameter_base = parameter_section_start[type_index] +
                                    position_in_type * (s64)cell_type.parameter_names.size();
 

@@ -18,6 +18,7 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/recording.h"
+#include "spikecorec/nml/kernel_codegen.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -643,6 +644,280 @@ struct AlphaSynapseReference {
 f32 trace_cell_last_input(const SpikeEngine &engine, s64 neuron_index) {
     const s64 state_base = engine.cell_state_base.get_contents()[neuron_index];
     return engine.cell_state.get_contents()[state_base];
+}
+
+// ── regime fixtures ────────────────────────────────────────────────────────────
+//
+// A GLIF3-shaped cell carrying the real two-regime refractory pattern, verbatim in the shape
+// tests/fixtures/nml/glif3_single_cell.nml uses:
+//
+//   asc1/asc2   regime-free TimeDerivatives -- they decay through BOTH regimes
+//   v           TimeDerivative in `integrating` only. Its ABSENCE from `refractory` is the
+//               refractory period: v does not move, so it stays pinned at vreset.
+//   refractoryTimeElapsed
+//               TimeDerivative in `refractory` only, so the countdown is frozen the rest of
+//               the time; `refractory`'s OnEntry zeroes it at the transition in.
+//
+// The numbers are chosen so the assertions are exact rather than approximate: t_ref = 1ms at
+// dt = 0.1ms is ten ticks, the injected current is far enough above rheobase that v crosses
+// threshold quickly, and vreset sits below EL so "pinned at vreset" cannot be confused with
+// "relaxing towards rest".
+String glif3_refractory_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="glif3RefractoryCell" extends="baseSpikingCell"
+                   description="GLIF3: two after-spike currents plus a refractory Regime pair.">
+        <Parameter name="C" dimension="capacitance"/>
+        <Parameter name="gL" dimension="conductance"/>
+        <Parameter name="EL" dimension="voltage"/>
+        <Parameter name="vth" dimension="voltage"/>
+        <Parameter name="vreset" dimension="voltage"/>
+        <Parameter name="t_ref" dimension="time"/>
+        <Parameter name="tauAsc1" dimension="time"/>
+        <Parameter name="tauAsc2" dimension="time"/>
+        <Parameter name="ascAdd1" dimension="current"/>
+        <Parameter name="ascAdd2" dimension="current"/>
+
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <StateVariable name="asc1" dimension="current"/>
+            <StateVariable name="asc2" dimension="current"/>
+            <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+
+            <DerivedVariable name="iSyn" dimension="current" select="synapses[*]/i" reduce="add"/>
+            <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
+
+            <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
+            <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
+
+            <OnStart>
+                <StateAssignment variable="v" value="EL"/>
+                <StateAssignment variable="asc1" value="0"/>
+                <StateAssignment variable="asc2" value="0"/>
+            </OnStart>
+
+            <Regime name="integrating" initial="true">
+                <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn + ascSum) / C"/>
+                <OnCondition test="v .gt. vth">
+                    <EventOut port="spike"/>
+                    <StateAssignment variable="v" value="vreset"/>
+                    <StateAssignment variable="asc1" value="asc1 + ascAdd1"/>
+                    <StateAssignment variable="asc2" value="asc2 + ascAdd2"/>
+                    <Transition regime="refractory"/>
+                </OnCondition>
+            </Regime>
+            <Regime name="refractory">
+                <OnEntry>
+                    <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+                </OnEntry>
+                <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+                <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+                    <Transition regime="integrating"/>
+                </OnCondition>
+            </Regime>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="30ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popGlif[0]/v"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String glif3_refractory_network_nml() {
+    return R"(<neuroml id="glif3refractorynet">
+    <glif3RefractoryCell id="glif3Cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"
+                         vreset="-75mV" t_ref="1ms" tauAsc1="100ms" tauAsc2="10ms"
+                         ascAdd1="-100pA" ascAdd2="-200pA"/>
+    <pulseGenerator id="pg0" delay="0ms" duration="30ms" amplitude="1nA"/>
+
+    <network id="net1">
+        <population id="popGlif" component="glif3Cell" size="1"/>
+        <explicitInput target="popGlif[0]" input="pg0"/>
+    </network>
+</neuroml>
+)";
+}
+
+String write_glif3_refractory_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", glif3_refractory_network_nml());
+    return fixture.write("model.xml",
+                         glif3_refractory_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// The four state variables plus the appended regime slot, by name, for the one glif3 neuron.
+struct Glif3CellReader {
+    const f32 *cell_state = nullptr;
+    s64 state_base = 0;
+
+    Glif3CellReader(const SpikeEngine &engine, s64 neuron_index) {
+        cell_state = engine.cell_state.get_contents();
+        state_base = engine.cell_state_base.get_contents()[neuron_index];
+    }
+
+    f32 membrane_potential() const { return cell_state[state_base + 0]; }
+    f32 after_spike_current_one() const { return cell_state[state_base + 1]; }
+    f32 after_spike_current_two() const { return cell_state[state_base + 2]; }
+    f32 refractory_time_elapsed() const { return cell_state[state_base + 3]; }
+    // Appended after every StateVariable -- see nml::cell_state_slot_count.
+    s32 regime_index() const { return (s32)cell_state[state_base + 4]; }
+};
+
+// One tick's worth of everything the refractory assertions look at.
+struct Glif3Sample {
+    s64 tick = 0;
+    bool spiked = false;
+    f32 membrane_potential = 0.0f;
+    f32 after_spike_current_one = 0.0f;
+    f32 after_spike_current_two = 0.0f;
+    s32 regime_index = 0;
+};
+
+// How many ticks the model's own refractory countdown actually takes to reach `t_ref`.
+//
+// NOT t_ref / dt. The countdown is a forward-Euler integration of `d(refractoryTimeElapsed)
+// /dt = 1`, so it is dt added to itself in f32, and repeated addition of 0.1ms accumulates
+// slightly SHORT (9.9999993e-4 after ten steps) while 1ms rounds slightly LONG
+// (1.0000000e-3). A refractory period written as an exact multiple of dt therefore runs one
+// tick longer than the multiple. jLEMS's f64 accumulation falls short in the same direction,
+// so this is the reference implementation's behaviour too rather than a divergence from it --
+// but it is not what "t_ref / dt ticks" would predict, which is why it is computed here
+// instead of assumed.
+s64 refractory_window_tick_count(f32 step_dt, f32 refractory_period) {
+    f32 accumulated = 0.0f;
+    s64 tick_count = 0;
+    while (accumulated < refractory_period && tick_count < 1000) {
+        accumulated = accumulated + step_dt * 1.0f;
+        tick_count += 1;
+    }
+    return tick_count;
+}
+
+spikecorec::Vector<Glif3Sample> run_glif3_refractory(SpikeEngine &engine, s64 tick_count) {
+    const Glif3CellReader reader(engine, /*neuron_index=*/0);
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+
+    spikecorec::Vector<Glif3Sample> samples;
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        engine.step_simulation(tick);
+        samples.push_back(Glif3Sample{tick, spike_flags[0] != 0, reader.membrane_potential(),
+                                      reader.after_spike_current_one(),
+                                      reader.after_spike_current_two(), reader.regime_index()});
+    }
+    return samples;
+}
+
+// ── regime-guard fixture ───────────────────────────────────────────────────────
+//
+// A cell whose SECOND regime carries an OnCondition that is true on every tick of the whole
+// run (`t .geq. 0`) and whose body is observable (a counter). While the cell is in the first
+// regime that condition is inactive, so the counter must stay at zero -- and the ONLY thing
+// holding it there is the regime guard on the condition.
+//
+// The GLIF3 fixture cannot show this. Its refractory condition is
+// `refractoryTimeElapsed .geq. t_ref`, and the transition into `refractory` zeroes that
+// countdown in the same block, so an unguarded version happens to produce the same trace. A
+// test built on it would pass with the guard deleted, which is exactly what this one is here
+// to rule out.
+String regime_guard_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="regimeGuardCell" extends="baseCell"
+                   description="Counts, but only once its second regime is entered.">
+        <Parameter name="risingRate" dimension="none"/>
+        <Parameter name="switchLevel" dimension="none"/>
+
+        <Dynamics>
+            <StateVariable name="level" dimension="none"/>
+            <StateVariable name="countingRegimeFirings" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="level" value="0"/>
+                <StateAssignment variable="countingRegimeFirings" value="0"/>
+            </OnStart>
+
+            <Regime name="rising" initial="true">
+                <TimeDerivative variable="level" value="risingRate"/>
+                <OnCondition test="level .gt. switchLevel">
+                    <Transition regime="counting"/>
+                </OnCondition>
+            </Regime>
+            <Regime name="counting">
+                <OnCondition test="t .geq. 0">
+                    <StateAssignment variable="countingRegimeFirings"
+                                     value="countingRegimeFirings + 1"/>
+                </OnCondition>
+            </Regime>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="3ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popGuard[0]/countingRegimeFirings"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String regime_guard_network_nml() {
+    return R"(<neuroml id="regimeguardnet">
+    <regimeGuardCell id="guardCell" risingRate="1000" switchLevel="1"/>
+
+    <network id="net1">
+        <population id="popGuard" component="guardCell" size="1"/>
+    </network>
+</neuroml>
+)";
+}
+
+String write_regime_guard_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", regime_guard_network_nml());
+    return fixture.write("model.xml",
+                         regime_guard_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// ── unwired synapse fixture ────────────────────────────────────────────────────
+//
+// Two synapse prototypes DECLARED and no projection naming either, alongside a projection
+// that names no synapse at all. One of them is conductance-based, which is refused outright
+// when it is wired -- so this also pins down that the refusal is on WIRED prototypes rather
+// than on declarations, which is what keeps a document's unused library from failing a model
+// that never touches it.
+String unwired_synapse_network_nml() {
+    return R"(<neuroml id="unwiredsynapsenet">
+    <oneShotCell id="source0" fireTime="0.25ms"/>
+    <latchCell id="target0"/>
+    <alphaCurrentSynapse id="unusedAlpha" tau="0.5ms" ibase="1nA"/>
+    <expOneSynapse id="unusedConductance" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="2.5" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+String write_unwired_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", unwired_synapse_network_nml());
+    return fixture.write("model.xml",
+                         synaptic_input_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
 
 // Where a latchCell's two state variables sit in the flat cell_state array.
@@ -1421,6 +1696,251 @@ TEST(SpikeEngine, a_conductance_based_synapse_is_refused_by_name_at_construction
         EXPECT_NE(message.find("conductance-based"), String::npos) << message;
         EXPECT_NE(message.find("not supported yet"), String::npos) << message;
     }
+}
+
+TEST(SpikeEngine, a_declared_but_unwired_synapse_prototype_is_neither_lowered_nor_refused) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // A document routinely declares more synapse components than its network wires up. An
+    // unwired one contributes nothing to any simulation, so it must neither be allocated for
+    // nor put through the lowering's refusals -- including the conductance refusal, which
+    // would otherwise make a model fail over a component it never uses.
+    FixtureDirectory fixture("neuroml_unwired_synapse");
+    String model_path = write_unwired_synapse_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    // Both prototypes reached the parse result, so this is not passing by their absence.
+    EXPECT_GE(engine.network_details.synapse_prototypes.size(), 2u);
+
+    // Neither is wired, so the ring keeps its single delivered-current plane and no synapse
+    // state is allocated at all.
+    EXPECT_EQ(engine.network_input_plane_count, 1);
+    EXPECT_EQ(engine.synapse_state_element_count, 0);
+
+    // And the synapse-free projection still delivers its raw weight, one tick late.
+    const LatchCellReader target(engine, /*neuron_index=*/1);
+    for (s64 tick = 0; tick < 8; ++tick) engine.step_simulation(tick);
+    EXPECT_NEAR(target.delivered(), 2.5f, 1e-5f);
+    EXPECT_EQ(target.delivery_count(), 1);
+
+    engine.shutdown();
+}
+
+// ── regimes ────────────────────────────────────────────────────────────────────
+
+TEST(SpikeEngine, a_regime_bearing_cell_type_widens_its_state_chunk_by_one_slot) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The regime index is per-neuron state, so it lives in the cell's own cell_state chunk
+    // rather than in a kernel argument -- the master kernel's argument table is full. The
+    // engine and the generator have to agree on the resulting width or every neuron past the
+    // first reads the previous one's state.
+    FixtureDirectory fixture("neuroml_regime_layout");
+    String model_path = write_glif3_refractory_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    ASSERT_EQ(engine.network_details.cell_types.size(), 1u);
+    const nml::CellTypeSpecification &cell_type = engine.network_details.cell_types[0];
+    EXPECT_EQ(cell_type.state_variable_names.size(), 4u);
+    EXPECT_EQ(nml::cell_state_slot_count(cell_type), 5u);
+
+    // One neuron, so the whole buffer is that one widened chunk.
+    EXPECT_EQ(engine.total_neuron_count, 1);
+    EXPECT_EQ(engine.cell_state_element_count, 5);
+
+    // The initialize kernel seeded it with `integrating`, which is the regime marked initial.
+    const Glif3CellReader reader(engine, /*neuron_index=*/0);
+    EXPECT_EQ(reader.regime_index(), 0);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, a_glif3_cell_refracts_pinning_v_while_its_after_spike_currents_decay) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The headline behaviour the whole regime mechanism exists for. `v` has a TimeDerivative
+    // in `integrating` and NONE in `refractory`; that absence is the refractory period. The
+    // after-spike currents' derivatives sit outside both regimes, so they must keep decaying
+    // THROUGH the refractory window -- a GLIF3 that froze them would still emit a spike train,
+    // just one with the wrong adaptation.
+    FixtureDirectory fixture("neuroml_glif3_refractory");
+    String model_path = write_glif3_refractory_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    const f32 reset_potential = -0.075f;
+    // t_ref = 1ms at step = 0.1ms -- eleven ticks, not ten; see
+    // refractory_window_tick_count.
+    const s64 refractory_tick_count =
+            refractory_window_tick_count((f32)engine.network_details.step_dt, 1e-3f);
+    ASSERT_EQ(refractory_tick_count, 11);
+
+    const spikecorec::Vector<Glif3Sample> samples =
+            run_glif3_refractory(engine, engine.lifetime);
+
+    // ── it spikes ────────────────────────────────────────────────────────────
+    s64 first_spike_tick = -1;
+    s64 spike_count = 0;
+    for (const Glif3Sample &sample : samples) {
+        if (!sample.spiked) continue;
+        if (first_spike_tick < 0) first_spike_tick = sample.tick;
+        spike_count += 1;
+    }
+    ASSERT_GE(first_spike_tick, 0) << "the cell never crossed threshold under a 1nA step";
+    ASSERT_GT(spike_count, 1) << "one spike proves nothing about leaving the refractory regime";
+
+    // ── the regime index actually moved ──────────────────────────────────────
+    EXPECT_EQ(samples[(usize)first_spike_tick].regime_index, 1)
+            << "the Transition did not store the refractory regime's index";
+    EXPECT_EQ(samples[(usize)first_spike_tick - 1].regime_index, 0);
+
+    // ── v is pinned at vreset for exactly the refractory window ──────────────
+    // The spike tick's own reset writes vreset; every tick of the window then leaves it
+    // untouched, because `refractory` declares no TimeDerivative for v. The countdown reaches
+    // t_ref on offset `refractory_tick_count`, so the regime flips back at the END of that
+    // tick and v is still frozen through it -- it integrates again from the tick after.
+    EXPECT_FLOAT_EQ(samples[(usize)first_spike_tick].membrane_potential, reset_potential);
+    for (s64 offset = 0; offset <= refractory_tick_count; ++offset) {
+        const Glif3Sample &sample = samples[(usize)(first_spike_tick + offset)];
+        EXPECT_FLOAT_EQ(sample.membrane_potential, reset_potential)
+                << "tick " << sample.tick << " (offset " << offset
+                << " into the refractory window): v moved while refractory";
+        EXPECT_EQ(sample.regime_index, offset < refractory_tick_count ? 1 : 0)
+                << "tick " << sample.tick << ": wrong regime";
+    }
+
+    // One tick past the window v is integrating again, and rising: the 1nA step is still on.
+    const Glif3Sample &resumed = samples[(usize)(first_spike_tick + refractory_tick_count + 1)];
+    EXPECT_EQ(resumed.regime_index, 0);
+    EXPECT_GT(resumed.membrane_potential, reset_potential)
+            << "v did not resume integrating after the refractory period ended";
+
+    // ── asc1/asc2 keep decaying DURING the refractory window ─────────────────
+    // They are bumped by ascAdd1/ascAdd2 (both negative) at the spike, then decay towards
+    // zero at tauAsc1 = 100ms and tauAsc2 = 10ms. Both are regime-free, so every refractory
+    // tick has to move them.
+    const Glif3Sample &at_spike = samples[(usize)first_spike_tick];
+    ASSERT_LT(at_spike.after_spike_current_one, 0.0f) << "the spike did not bump asc1";
+    ASSERT_LT(at_spike.after_spike_current_two, 0.0f) << "the spike did not bump asc2";
+
+    for (s64 offset = 1; offset <= refractory_tick_count; ++offset) {
+        const Glif3Sample &previous = samples[(usize)(first_spike_tick + offset - 1)];
+        const Glif3Sample &sample = samples[(usize)(first_spike_tick + offset)];
+        EXPECT_GT(sample.after_spike_current_one, previous.after_spike_current_one)
+                << "tick " << sample.tick << ": asc1 stopped decaying during the refractory "
+                << "period, but its TimeDerivative sits outside both regimes";
+        EXPECT_GT(sample.after_spike_current_two, previous.after_spike_current_two)
+                << "tick " << sample.tick << ": asc2 stopped decaying during the refractory "
+                << "period, but its TimeDerivative sits outside both regimes";
+    }
+
+    // asc2 decays ten times faster than asc1, so it has to have recovered further.
+    const Glif3Sample &window_end = samples[(usize)(first_spike_tick + refractory_tick_count)];
+    EXPECT_LT(std::fabs(window_end.after_spike_current_two - at_spike.after_spike_current_two) /
+                      std::fabs(at_spike.after_spike_current_two),
+              1.0f);
+    EXPECT_GT(std::fabs(window_end.after_spike_current_two - at_spike.after_spike_current_two) /
+                      std::fabs(at_spike.after_spike_current_two),
+              std::fabs(window_end.after_spike_current_one - at_spike.after_spike_current_one) /
+                      std::fabs(at_spike.after_spike_current_one));
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, a_regime_scoped_on_condition_does_not_fire_while_its_regime_is_inactive) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // `counting`'s OnCondition is `t .geq. 0`, true on every tick of the run, and its body
+    // increments an observable counter. The cell starts in `rising`, so the counter must be
+    // untouched until the transition -- and the regime guard on the condition is the only
+    // thing that makes that so.
+    FixtureDirectory fixture("neuroml_regime_guard");
+    String model_path = write_regime_guard_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    const f32 *cell_state = engine.cell_state.get_contents();
+    const s64 state_base = engine.cell_state_base.get_contents()[0];
+    const s64 level_index = state_base + 0;
+    const s64 counter_index = state_base + 1;
+    const s64 regime_index = state_base + 2;
+
+    s64 transition_tick = -1;
+    spikecorec::Vector<f32> counter_by_tick;
+    for (s64 tick = 0; tick < engine.lifetime; ++tick) {
+        engine.step_simulation(tick);
+        if (transition_tick < 0 && (s32)cell_state[regime_index] == 1) transition_tick = tick;
+        counter_by_tick.push_back(cell_state[counter_index]);
+    }
+
+    // level rises by risingRate * dt = 0.1 a tick, so it passes switchLevel = 1 well inside a
+    // 30-tick run. Without a transition the rest of the test proves nothing.
+    ASSERT_GE(transition_tick, 0) << "the cell never left its initial regime";
+    ASSERT_LT(transition_tick, engine.lifetime - 2);
+    EXPECT_GT(cell_state[level_index], 1.0f);
+
+    // Nothing fired while `counting` was inactive -- including on the transition tick itself,
+    // where the regime index was read before the Transition stored it.
+    for (s64 tick = 0; tick <= transition_tick; ++tick) {
+        EXPECT_FLOAT_EQ(counter_by_tick[(usize)tick], 0.0f)
+                << "tick " << tick << ": the `counting` regime's OnCondition fired while the "
+                << "cell was still in `rising`";
+    }
+
+    // And once active it fires on every tick, so the guard is holding the condition off
+    // rather than the condition simply never being true.
+    for (s64 tick = transition_tick + 1; tick < engine.lifetime; ++tick) {
+        EXPECT_FLOAT_EQ(counter_by_tick[(usize)tick], (f32)(tick - transition_tick))
+                << "tick " << tick << ": the `counting` regime's OnCondition did not fire once "
+                << "per tick after its regime became active";
+    }
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, on_entry_runs_at_the_transition_and_not_on_later_ticks_in_that_regime) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // `refractory`'s OnEntry zeroes refractoryTimeElapsed. Run once, at the transition, the
+    // countdown then advances one dt per refractory tick and the regime ends after t_ref. Run
+    // on every refractory tick instead, it would be reset to zero each time and the cell would
+    // never leave -- so this is read directly off the countdown's trajectory.
+    FixtureDirectory fixture("neuroml_on_entry_once");
+    String model_path = write_glif3_refractory_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    const Glif3CellReader reader(engine, /*neuron_index=*/0);
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+    const f32 step_dt = (f32)engine.network_details.step_dt;
+
+    s64 first_spike_tick = -1;
+    spikecorec::Vector<f32> countdown_after_spike;
+    for (s64 tick = 0; tick < engine.lifetime; ++tick) {
+        engine.step_simulation(tick);
+        if (first_spike_tick < 0 && spike_flags[0] != 0) first_spike_tick = tick;
+        if (first_spike_tick >= 0 && tick - first_spike_tick <= 10) {
+            countdown_after_spike.push_back(reader.refractory_time_elapsed());
+        }
+    }
+    ASSERT_GE(first_spike_tick, 0);
+    ASSERT_EQ(countdown_after_spike.size(), 11u);
+
+    // OnEntry ran, once, on the spike tick itself.
+    EXPECT_FLOAT_EQ(countdown_after_spike[0], 0.0f)
+            << "the target regime's OnEntry did not run at the transition";
+
+    // And not again: the countdown climbs by exactly one dt per refractory tick.
+    for (usize offset = 1; offset < countdown_after_spike.size(); ++offset) {
+        EXPECT_NEAR(countdown_after_spike[offset], step_dt * (f32)offset, step_dt * 1e-3f)
+                << "offset " << offset
+                << " into the refractory window: the countdown is not advancing one dt per "
+                << "tick, so OnEntry ran more than once";
+    }
+
+    engine.shutdown();
 }
 
 TEST(AggregateNetworkEdges, parallel_edges_between_one_pair_sum_their_weights) {

@@ -194,6 +194,134 @@ NML_ParseResult make_derived_threshold_model() {
     return parse_result;
 }
 
+// ── Regime fixtures ──────────────────────────────────────────────────────────
+
+DynamicsInstruction make_regime_instruction(DynamicsStage stage, NML_DeclarationType source_tag,
+                                            const String &target, const String &expression,
+                                            const String &regime_name,
+                                            const String &condition = "") {
+    DynamicsInstruction instruction = make_instruction(stage, source_tag, target, expression,
+                                                       condition);
+    instruction.regime_name = regime_name;
+    return instruction;
+}
+
+// A <Regime> declaration. Its `expression` carries the initial= attribute, which is the only
+// record of where a cell starts -- see DynamicsInstruction.
+DynamicsInstruction make_regime_declaration(const String &regime_name,
+                                            const String &initial_attribute) {
+    return make_instruction(DynamicsStage::RegimeEntry, NML_DeclarationType::Regime, regime_name,
+                            initial_attribute);
+}
+
+// GLIF3's shape, which is the shape every regime-bearing fixture in tests/fixtures/nml uses:
+//
+//   asc1               regime-free TimeDerivative -- decays in BOTH regimes
+//   v                  TimeDerivative in `integrating` only -- frozen while refractory
+//   refractoryTime     TimeDerivative in `refractory` only -- frozen while integrating
+//   integrating        OnCondition v > vth: spike, reset v, bump asc1, transition
+//   refractory         OnEntry refractoryTime = 0; OnCondition refractoryTime >= t_ref:
+//                      transition back
+//
+// The absences are the point: `v` having no derivative in `refractory` IS the refractory
+// period, and asc1's derivative being outside both regimes is what keeps it decaying through
+// one.
+CellTypeSpecification make_two_regime_cell_type() {
+    CellTypeSpecification cell_type;
+    cell_type.name = "glif3Cell";
+    cell_type.state_variable_names = {"v", "asc1", "refractoryTimeElapsed"};
+    cell_type.parameter_names = {"tau", "vth", "vreset", "ascAdd1", "tauAsc1", "t_ref"};
+
+    const String threshold_test = "v .gt. vth";
+    const String refractory_test = "refractoryTimeElapsed .geq. t_ref";
+
+    cell_type.dynamics.push_back(make_regime_declaration("integrating", "true"));
+    cell_type.dynamics.push_back(make_regime_declaration("refractory", ""));
+
+    cell_type.dynamics.push_back(make_instruction(DynamicsStage::Integrate,
+                                                  NML_DeclarationType::TimeDerivative, "asc1",
+                                                  "0 - asc1 / tauAsc1"));
+
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::Integrate,
+                                                         NML_DeclarationType::TimeDerivative, "v",
+                                                         "(0 - v) / tau", "integrating"));
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::Detect,
+                                                         NML_DeclarationType::OnCondition, "",
+                                                         threshold_test, "integrating"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Emit, NML_DeclarationType::EventOut, "spike", "", "integrating",
+            threshold_test));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Reset, NML_DeclarationType::StateAssignment, "v", "vreset",
+            "integrating", threshold_test));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Reset, NML_DeclarationType::StateAssignment, "asc1", "asc1 + ascAdd1",
+            "integrating", threshold_test));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::RegimeEntry, NML_DeclarationType::Transition, "refractory", "",
+            "integrating", threshold_test));
+
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::RegimeEntry, NML_DeclarationType::OnEntry, "", "", "refractory"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::RegimeEntry, NML_DeclarationType::StateAssignment,
+            "refractoryTimeElapsed", "0", "refractory"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative,
+            "refractoryTimeElapsed", "1", "refractory"));
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::Detect,
+                                                         NML_DeclarationType::OnCondition, "",
+                                                         refractory_test, "refractory"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::RegimeEntry, NML_DeclarationType::Transition, "integrating", "",
+            "refractory", refractory_test));
+
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "v", "0"));
+
+    return cell_type;
+}
+
+NML_ParseResult make_two_regime_model() {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_two_regime_cell_type());
+    return parse_result;
+}
+
+// One regime, which is therefore always active: no dispatch and no guards, so nothing reads
+// the regime index at all.
+CellTypeSpecification make_one_regime_cell_type() {
+    CellTypeSpecification cell_type;
+    cell_type.name = "oneRegimeCell";
+    cell_type.state_variable_names = {"v"};
+    cell_type.parameter_names = {"tau"};
+
+    cell_type.dynamics.push_back(make_regime_declaration("running", "true"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "0 - v / tau",
+            "running"));
+
+    return cell_type;
+}
+
+NML_ParseResult make_one_regime_model() {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_one_regime_cell_type());
+    return parse_result;
+}
+
+// The body of the one cell device function in `source`, so an assertion about generated code
+// cannot be satisfied by an unrelated part of the kernel.
+String cell_device_function_body(const String &source, const String &function_name) {
+    const usize signature_start = source.find(function_name + "(");
+    if (signature_start == String::npos) return "";
+    const usize body_start = source.find("{", signature_start);
+    if (body_start == String::npos) return "";
+    const usize body_end = source.find("\n}\n", body_start);
+    if (body_end == String::npos) return "";
+    return source.substr(body_start, body_end - body_start);
+}
+
 // ── Synapse fixtures ─────────────────────────────────────────────────────────
 //
 // alphaCurrentSynapse, verbatim from third_party/neuroml2/std_lib/Synapses.xml: two coupled
@@ -877,7 +1005,7 @@ TEST(KernelCodegenSelectPath, SelectionOverSynapsesReadsTheInputAccumulator) {
     EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
     // Plane 0: the delivered-current plane, which is where stimulus lands, where every
     // synapse adds its output, and where a synapse-free edge scatters its raw weight.
-    EXPECT_NE(source.find("int synaptic_input_index = network_input_ring_index(\n"
+    EXPECT_NE(source.find("SpikecorecBufferIndex synaptic_input_index = network_input_ring_index(\n"
                           "            tick, 0, ring_depth, neuron_count, neuron_index);"),
               String::npos);
     EXPECT_NE(source.find("float synaptic_input_accumulator = "
@@ -1116,7 +1244,8 @@ TEST(KernelCodegenSynapse, ArrivalIsDeliveredThenIntegratedThenAddedToTheInputPl
 
     // Stage 1, Deliver: this tick's row of the prototype's own arrival plane, which is plane
     // 1 -- plane 0 being the delivered current every cell reads.
-    EXPECT_NE(source.find("int synapse_arrival_index = network_input_ring_index(\n"
+    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_arrival_index = "
+                          "network_input_ring_index(\n"
                           "            tick, 1, ring_depth, neuron_count, neuron_index);"),
               String::npos);
     EXPECT_NE(source.find("float synapse_arrival_weight = "
@@ -1143,7 +1272,8 @@ TEST(KernelCodegenSynapse, ArrivalIsDeliveredThenIntegratedThenAddedToTheInputPl
 
     // Delivery converges on the input buffer: `i` added into plane 0 of this tick's row,
     // which is exactly what the cell's own "synapses[*]/i" path then reads.
-    EXPECT_NE(source.find("int synapse_output_index = network_input_ring_index(\n"
+    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_output_index = "
+                          "network_input_ring_index(\n"
                           "            tick, 0, ring_depth, neuron_count, neuron_index);"),
               String::npos);
     EXPECT_NE(source.find("network_inputs[synapse_output_index] += derived_i;"), String::npos);
@@ -1159,7 +1289,9 @@ TEST(KernelCodegenSynapse, SynapseParametersAreBakedAndStateIsPerTargetNeuron) {
 
     // One slice per (prototype, neuron): the first prototype starts at offset zero and a
     // neuron occupies its type's two state variables.
-    EXPECT_NE(source.find("int synapse_state_base = 0 * neuron_count + neuron_index * 2;"),
+    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base = 0 * "
+                          "(SpikecorecBufferIndex)neuron_count + "
+                          "(SpikecorecBufferIndex)neuron_index * 2;"),
               String::npos);
 
     // The synapse runs ahead of the cell that reads what it delivered, in the same thread.
@@ -1186,9 +1318,13 @@ TEST(KernelCodegenSynapse, TwoPrototypesGetTheirOwnPlaneAndTheirOwnStateSlice) {
     EXPECT_NE(source.find("tick, 2, ring_depth, neuron_count, neuron_index);"), String::npos);
 
     // The second prototype's slice starts past the first's two state variables.
-    EXPECT_NE(source.find("int synapse_state_base = 0 * neuron_count + neuron_index * 2;"),
+    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base = 0 * "
+                          "(SpikecorecBufferIndex)neuron_count + "
+                          "(SpikecorecBufferIndex)neuron_index * 2;"),
               String::npos);
-    EXPECT_NE(source.find("int synapse_state_base = 2 * neuron_count + neuron_index * 2;"),
+    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base = 2 * "
+                          "(SpikecorecBufferIndex)neuron_count + "
+                          "(SpikecorecBufferIndex)neuron_index * 2;"),
               String::npos);
 
     // Each decays at its own tau, which is the whole reason they are kept apart.
@@ -1360,33 +1496,66 @@ TEST(KernelCodegenUnsupported, EventArrivalIsRejectedByName) {
     }
 }
 
-TEST(KernelCodegenUnsupported, RegimesAreRejectedByName) {
-    CellTypeSpecification cell_type = make_integrate_and_fire_cell_type();
-    cell_type.dynamics.push_back(make_instruction(
-            DynamicsStage::RegimeEntry, NML_DeclarationType::Regime, "refractory", ""));
+TEST(KernelCodegenUnsupported, ARegimeNestedInsideAnotherIsRejected) {
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::RegimeEntry, NML_DeclarationType::Regime, "inner", "", "integrating"));
 
     NML_ParseResult parse_result;
     parse_result.cell_types.push_back(cell_type);
 
     try {
         generate_tick_kernel(parse_result);
-        FAIL() << "expected a Regime to be rejected";
+        FAIL() << "expected a nested Regime to be rejected";
     } catch (const runtime_error &error) {
         const String message = error.what();
-        EXPECT_NE(message.find("Regime"), String::npos);
-        EXPECT_NE(message.find("iafCell"), String::npos);
+        EXPECT_NE(message.find("nested"), String::npos);
+        EXPECT_NE(message.find("glif3Cell"), String::npos);
     }
 }
 
-TEST(KernelCodegenUnsupported, InstructionInsideARegimeIsRejected) {
-    CellTypeSpecification cell_type;
-    cell_type.name = "regimeCell";
-    cell_type.state_variable_names = {"v"};
+TEST(KernelCodegenUnsupported, ATransitionOutsideAnOnConditionIsRejected) {
+    // Nothing would gate it, so it would fire on every tick and the cell would never settle
+    // in any regime.
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::RegimeEntry,
+                                                         NML_DeclarationType::Transition,
+                                                         "refractory", "", "integrating"));
 
-    DynamicsInstruction instruction = make_instruction(
-            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "1");
-    instruction.regime_name = "integrating";
-    cell_type.dynamics.push_back(instruction);
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
+}
+
+TEST(KernelCodegenUnsupported, ATransitionToAnUndeclaredRegimeIsRejectedByName) {
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    for (DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::Transition) continue;
+        if (instruction.target != "refractory") continue;
+        instruction.target = "recovering";
+    }
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a Transition to an undeclared regime to be rejected";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("recovering"), String::npos);
+        EXPECT_NE(message.find("glif3Cell"), String::npos);
+    }
+}
+
+TEST(KernelCodegenUnsupported, ADerivedVariableInsideARegimeIsRejected) {
+    // It would be emitted as an ordinary local, evaluated and visible in every regime, which
+    // is not what declaring it inside one means.
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::Integrate,
+                                                         NML_DeclarationType::DerivedVariable,
+                                                         "scaled", "v * 2", "integrating"));
 
     NML_ParseResult parse_result;
     parse_result.cell_types.push_back(cell_type);
@@ -1453,6 +1622,361 @@ TEST(KernelCodegenUnsupported, ResetWithNoMatchingConditionIsRejected) {
     EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
 }
 
+// ── Regimes ──────────────────────────────────────────────────────────────────
+
+TEST(KernelCodegenRegimes, RegimesAreIndexedInDeclarationOrderWithTheInitialOneRecorded) {
+    const CellRegimeLayout layout = resolve_cell_regimes(make_two_regime_cell_type());
+
+    ASSERT_EQ(layout.regime_names.size(), 2u);
+    EXPECT_EQ(layout.regime_names[0], "integrating");
+    EXPECT_EQ(layout.regime_names[1], "refractory");
+    EXPECT_EQ(layout.index_of("integrating"), 0);
+    EXPECT_EQ(layout.index_of("refractory"), 1);
+    EXPECT_EQ(layout.index_of("nonexistent"), -1);
+    EXPECT_EQ(layout.initial_regime_index, 0);
+    EXPECT_TRUE(layout.has_regimes());
+}
+
+TEST(KernelCodegenRegimes, TheRegimeIndexIsOneSlotAppendedAfterTheStateVariables) {
+    // Appended rather than inserted, so every real state variable keeps the slot it had --
+    // which is what lets recording and the engine's own layout stay unchanged.
+    const CellTypeSpecification regime_cell = make_two_regime_cell_type();
+    ASSERT_EQ(regime_cell.state_variable_names.size(), 3u);
+    EXPECT_EQ(cell_state_slot_count(regime_cell), 4u);
+    EXPECT_EQ(resolve_cell_regimes(regime_cell).regime_state_slot, 3u);
+
+    // A type with no Regime pays nothing for the mechanism.
+    const CellTypeSpecification plain_cell = make_integrate_and_fire_cell_type();
+    EXPECT_EQ(cell_state_slot_count(plain_cell), plain_cell.state_variable_names.size());
+    EXPECT_FALSE(resolve_cell_regimes(plain_cell).has_regimes());
+}
+
+TEST(KernelCodegenRegimes, AModelWithNoInitialRegimeThrowsNamingTheComponentType) {
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    for (DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::Regime) continue;
+        instruction.expression = "";
+    }
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a model with no initial regime to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("glif3Cell"), String::npos) << message;
+        EXPECT_NE(message.find("initial"), String::npos) << message;
+    }
+
+    // The initialize kernel refuses it too: whichever entry point is generated first is where
+    // a caller finds out, and both go through the same resolution.
+    EXPECT_THROW(generate_initialize_kernel(parse_result), runtime_error);
+}
+
+TEST(KernelCodegenRegimes, TwoInitialRegimesAreRefused) {
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    for (DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::Regime) continue;
+        instruction.expression = "true";
+    }
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
+}
+
+TEST(KernelCodegenRegimes, ARegimeDeclaredTwiceIsRefused) {
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    cell_type.dynamics.push_back(make_regime_declaration("refractory", ""));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
+}
+
+TEST(KernelCodegenRegimes, AnUnrecognisedInitialAttributeIsRefused) {
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    for (DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::Regime) continue;
+        if (instruction.target != "integrating") continue;
+        instruction.expression = "yes";
+    }
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
+}
+
+TEST(KernelCodegenRegimes, TheRegimeIndexIsReadOnceIntoALocalAndDispatchedOnAsAnInteger) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // Read exactly once. Reading it again after a Transition has stored this tick's new value
+    // would let the regime a cell just entered run its own OnCondition in the same tick.
+    EXPECT_NE(body.find("int active_regime_index = (int)cell_state[state_base + 3];"),
+              String::npos)
+            << body;
+    EXPECT_EQ(body.find("active_regime_index = (int)",
+                        body.find("active_regime_index = (int)") + 1),
+              String::npos)
+            << "the regime index is read more than once:\n"
+            << body;
+}
+
+TEST(KernelCodegenRegimes, AVariableWithNoDerivativeInARegimeEmitsNothingAndSoIsFrozen) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // `v` is seeded with its current value and only assigned inside the `integrating` branch.
+    // The refractory branch carries no assignment at all -- that ABSENCE is the refractory
+    // period. A zero derivative or a hold instruction would also freeze it, and would also
+    // hide a regime that genuinely forgot to declare one.
+    EXPECT_NE(body.find("float next_v = cell_state[state_base + 0];"), String::npos) << body;
+    EXPECT_NE(body.find("if (active_regime_index == 0) {\n        next_v = cell_state[state_base "
+                        "+ 0] + dt *"),
+              String::npos)
+            << body;
+    EXPECT_NE(body.find("} else {\n        // Regime 'refractory' declares no TimeDerivative for "
+                        "'v', so it holds its value.\n    }"),
+              String::npos)
+            << body;
+
+    // And the mirror image: refractoryTimeElapsed only advances while refractory.
+    EXPECT_NE(body.find("if (active_regime_index == 0) {\n        // Regime 'integrating' declares "
+                        "no TimeDerivative for 'refractoryTimeElapsed'"),
+              String::npos)
+            << body;
+}
+
+TEST(KernelCodegenRegimes, ARegimeFreeDerivativeIntegratesInEveryRegime) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // asc1's decay carries no regime, so it is emitted unguarded -- before the dispatch and
+    // outside every branch. A GLIF3 whose after-spike currents stopped decaying during the
+    // refractory period would still produce a spike train, just the wrong one.
+    const usize decay_position = body.find("float next_asc1 = cell_state[state_base + 1] + dt *");
+    ASSERT_NE(decay_position, String::npos) << body;
+    EXPECT_LT(decay_position, body.find("if (active_regime_index ==")) << body;
+}
+
+TEST(KernelCodegenRegimes, EveryDerivativeIsWrittenBackAfterAllOfThemAreComputed) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // The regime dispatch computes into a temporary and the write-back follows it, exactly as
+    // the regime-free path does, so a regime-scoped derivative reading a regime-free variable
+    // still sees the state as it stood at tick entry.
+    const usize dispatch_position = body.find("if (active_regime_index == 0) {");
+    const usize write_back_position = body.find("cell_state[state_base + 0] = next_v;");
+    ASSERT_NE(dispatch_position, String::npos) << body;
+    ASSERT_NE(write_back_position, String::npos) << body;
+    EXPECT_LT(dispatch_position, write_back_position) << body;
+}
+
+TEST(KernelCodegenRegimes, ARegimeScopedOnConditionIsGuardedByItsRegimeBeingActive) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // Both tests are ANDed with their own regime index. Without the guard the refractory
+    // countdown's condition would be live while integrating -- and since
+    // refractoryTimeElapsed is frozen at whatever the last refractory period left, it would
+    // be permanently true, transitioning the cell back to integrating every tick.
+    EXPECT_NE(body.find("if (active_regime_index == 0 && ((cell_state[state_base + 0] > "),
+              String::npos)
+            << body;
+    EXPECT_NE(body.find("if (active_regime_index == 1 && ((cell_state[state_base + 2] >= "),
+              String::npos)
+            << body;
+}
+
+TEST(KernelCodegenRegimes, ATransitionStoresTheTargetIndexAndInlinesItsOnEntry) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // The whole of the transition: one store of the target regime's index, then that regime's
+    // OnEntry body, inlined right here. There is no "did I just enter a regime" check
+    // anywhere in the kernel -- entering IS the transition.
+    EXPECT_NE(body.find("cell_state[state_base + 3] = 1.0f;\n        cell_state[state_base + 2] = "
+                        "0.0f;"),
+              String::npos)
+            << body;
+
+    // Coming back the other way needs no OnEntry, because `integrating` declares none.
+    EXPECT_NE(body.find("if (active_regime_index == 1 && "), String::npos) << body;
+    EXPECT_NE(body.find("cell_state[state_base + 3] = 0.0f;"), String::npos) << body;
+}
+
+TEST(KernelCodegenRegimes, OnEntryIsEmittedOnlyAtTransitionSitesSoItCannotRunTwice) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_two_regime_model()).source, "cell_type_step_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // refractoryTimeElapsed = 0 appears exactly once in the tick body: at the one transition
+    // into `refractory`. If it were emitted anywhere the refractory regime runs, the
+    // countdown would be reset on every refractory tick and the cell would never leave.
+    usize occurrence_count = 0;
+    for (usize position = body.find("cell_state[state_base + 2] = 0.0f;");
+         position != String::npos;
+         position = body.find("cell_state[state_base + 2] = 0.0f;", position + 1)) {
+        occurrence_count += 1;
+    }
+    EXPECT_EQ(occurrence_count, 1u) << body;
+}
+
+TEST(KernelCodegenRegimes, InitializeSeedsTheInitialRegimeAndRunsItsOnEntry) {
+    const String body = cell_device_function_body(
+            generate_initialize_kernel(make_two_regime_model()).source,
+            "cell_type_initialize_glif3Cell");
+    ASSERT_FALSE(body.empty());
+
+    // `integrating` is index 0 and declares no OnEntry, so seeding is the whole of it.
+    EXPECT_NE(body.find("cell_state[state_base + 3] = 0.0f;"), String::npos) << body;
+
+    // Marking the OTHER regime initial has to move the seed, not merely reorder the source.
+    CellTypeSpecification refractory_first = make_two_regime_cell_type();
+    for (DynamicsInstruction &instruction : refractory_first.dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::Regime) continue;
+        instruction.expression = instruction.target == "refractory" ? "true" : "";
+    }
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(refractory_first);
+
+    const String refractory_body =
+            cell_device_function_body(generate_initialize_kernel(parse_result).source,
+                                      "cell_type_initialize_glif3Cell");
+    EXPECT_NE(refractory_body.find("cell_state[state_base + 3] = 1.0f;"), String::npos)
+            << refractory_body;
+    // ... and its OnEntry runs, because entering the initial regime is an entry like any
+    // other.
+    EXPECT_NE(refractory_body.find("cell_state[state_base + 2] = 0.0f;"), String::npos)
+            << refractory_body;
+}
+
+TEST(KernelCodegenRegimes, TwoRegimesWithTheSameConditionTestKeepTheirOwnBodies) {
+    // The join from a Reset/Emit/Transition back to the OnCondition that fires it is keyed on
+    // the regime AND the test. On the test alone, two regimes that happen to test the same
+    // thing -- which costs nothing to write and reads as obviously equivalent -- would each
+    // execute the other's resets and the other's transition.
+    CellTypeSpecification cell_type;
+    cell_type.name = "sharedTestCell";
+    cell_type.state_variable_names = {"v", "marker"};
+    cell_type.parameter_names = {"thresh"};
+
+    const String shared_test = "v .gt. thresh";
+
+    cell_type.dynamics.push_back(make_regime_declaration("first", "true"));
+    cell_type.dynamics.push_back(make_regime_declaration("second", ""));
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::Integrate,
+                                                         NML_DeclarationType::TimeDerivative, "v",
+                                                         "1", "first"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Detect, NML_DeclarationType::OnCondition, "", shared_test, "first"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Reset, NML_DeclarationType::StateAssignment, "marker", "11", "first",
+            shared_test));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Detect, NML_DeclarationType::OnCondition, "", shared_test, "second"));
+    cell_type.dynamics.push_back(make_regime_instruction(
+            DynamicsStage::Reset, NML_DeclarationType::StateAssignment, "marker", "22", "second",
+            shared_test));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    const String body = cell_device_function_body(
+            generate_tick_kernel(parse_result).source, "cell_type_step_sharedTestCell");
+    ASSERT_FALSE(body.empty());
+
+    // Two separate guarded blocks, each carrying exactly its own assignment.
+    EXPECT_NE(body.find("if (active_regime_index == 0 && ((cell_state[state_base + 0] > "
+                        "cell_parameters[parameter_base + 0]))) {\n        cell_state[state_base + "
+                        "1] = 11.0f;\n    }"),
+              String::npos)
+            << body;
+    EXPECT_NE(body.find("if (active_regime_index == 1 && ((cell_state[state_base + 0] > "
+                        "cell_parameters[parameter_base + 0]))) {\n        cell_state[state_base + "
+                        "1] = 22.0f;\n    }"),
+              String::npos)
+            << body;
+}
+
+TEST(KernelCodegenRegimes, AVariableDerivedBothInsideAndOutsideARegimeIsRefused) {
+    // Which one applies is not decidable from the document, and silently preferring either
+    // changes how the variable moves in every regime.
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "0"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a doubly-declared TimeDerivative to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("'v'"), String::npos) << message;
+        EXPECT_NE(message.find("glif3Cell"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenRegimes, TwoTimeDerivativesForOneVariableOutsideAnyRegimeAreRefused) {
+    // Left alone this emits two `float next_v` declarations and fails inside the shader
+    // compiler, far from the model that caused it.
+    CellTypeSpecification cell_type = make_integrate_and_fire_cell_type();
+    cell_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "v", "0"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
+}
+
+TEST(KernelCodegenRegimes, ASingleRegimeNeedsNoDispatchAtAll) {
+    const String body = cell_device_function_body(
+            generate_tick_kernel(make_one_regime_model()).source, "cell_type_step_oneRegimeCell");
+    ASSERT_FALSE(body.empty());
+    EXPECT_EQ(body.find("if (active_regime_index =="), String::npos)
+            << "a regime that is always active needs no guard:\n"
+            << body;
+    // And with no guard and no dispatch, nothing reads the regime index -- so it is not
+    // declared either. An unused local is a shader-compiler warning on every kernel a model
+    // of this shape produces.
+    EXPECT_EQ(body.find("int active_regime_index"), String::npos) << body;
+    EXPECT_NE(body.find("next_v = cell_state[state_base + 0] + dt *"), String::npos) << body;
+}
+
+// ── Flat buffer offsets are 64-bit ───────────────────────────────────────────
+
+TEST(KernelCodegenBufferIndex, RingAndSynapseOffsetsAreComputedInSixtyFourBits) {
+    // The host sizes and indexes network_inputs and synapse_state in s64. In `int` the two
+    // disagree silently past INT_MAX -- ring_depth 64 over four wired prototypes and 8.4M
+    // neurons already crosses it -- and an arrival wraps to a negative offset, which lands in
+    // another neuron's slot rather than faulting.
+    const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
+
+    EXPECT_NE(source.find("typedef long SpikecorecBufferIndex;"), String::npos) << source;
+    EXPECT_NE(source.find("inline long network_input_ring_index("), String::npos) << source;
+    EXPECT_EQ(source.find("inline int network_input_ring_index("), String::npos) << source;
+    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base ="), String::npos) << source;
+    EXPECT_EQ(source.find("int synapse_state_base ="), String::npos) << source;
+    EXPECT_EQ(source.find("int arrival_index ="), String::npos) << source;
+    EXPECT_EQ(source.find("int synaptic_input_index ="), String::npos) << source;
+}
+
 // ── End-to-end shader compilation ────────────────────────────────────────────
 
 #ifdef SPIKECOREC_METAL
@@ -1479,6 +2003,43 @@ TEST(KernelCodegenMetal, GeneratedInitializeKernelCompilesAsMetal) {
             << "generated Metal source failed to compile:\n"
             << compiler_output << "\n--- source ---\n"
             << source;
+}
+
+TEST(KernelCodegenMetal, TwoRegimeCellCompilesAsMetalWithoutWarnings) {
+    // The regime dispatch emits an if / else-if / else chain with one branch deliberately
+    // EMPTY, and a Transition writes an integer literal into a float slot. Both are the kind
+    // of thing a substring assertion is happy with and the shader compiler is not.
+    //
+    // Warnings are failures here, not noise: the two shapes this generator can produce that
+    // the compiler merely warns about -- an unused regime local, an empty branch -- are
+    // exactly the shapes the regime lowering emits, and a warning on every generated kernel
+    // is what stops anyone reading the ones that matter.
+    ASSERT_TRUE(metal_compiler_is_available())
+            << "xcrun metal is unavailable, so the generated source was never compiled";
+
+    struct GeneratedCase {
+        String case_name;
+        String source;
+    };
+    const Vector<GeneratedCase> generated_cases = {
+        {"regime_tick", generate_tick_kernel(make_two_regime_model()).source},
+        {"regime_initialize", generate_initialize_kernel(make_two_regime_model()).source},
+        {"one_regime_tick", generate_tick_kernel(make_one_regime_model()).source},
+        {"one_regime_initialize", generate_initialize_kernel(make_one_regime_model()).source},
+    };
+
+    for (const GeneratedCase &generated_case : generated_cases) {
+        String compiler_output;
+        EXPECT_TRUE(compile_as_metal(generated_case.source, generated_case.case_name,
+                                     compiler_output))
+                << generated_case.case_name << ": generated Metal source failed to compile:\n"
+                << compiler_output << "\n--- source ---\n"
+                << generated_case.source;
+        EXPECT_TRUE(compiler_output.empty())
+                << generated_case.case_name << ": the shader compiler warned:\n"
+                << compiler_output << "\n--- source ---\n"
+                << generated_case.source;
+    }
 }
 
 TEST(KernelCodegenMetal, CellConsumingSynapticInputCompilesAsMetal) {
