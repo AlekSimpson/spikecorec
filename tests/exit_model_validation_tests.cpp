@@ -4,6 +4,8 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <unistd.h> // getpid -- the run directories are named after this process; see below
+
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -137,53 +139,62 @@ bool standard_library_available() {
            filesystem::exists(parser.STANDARD_LIBRARY_PATH);
 }
 
-// The fixtures name their outputs relatively (`fileName="glif3_membrane_trace.dat"`), so the
-// engine's recorders write them into the process's working directory. Each run is therefore
-// performed inside its own temporary directory: a test run never writes into the working tree,
-// and -- the reason this exists rather than just being tidy -- can never land on top of
-// tests/fixtures/reference_data/'s own identically-named ground truth.
+// The fixtures name their outputs relatively (`fileName="glif3_membrane_trace.dat"`), so every
+// run is given its own directory as the engine's output root: a test run never writes into the
+// working tree, and -- the reason this exists rather than just being tidy -- can never land on
+// top of tests/fixtures/reference_data/'s own identically-named ground truth.
 //
-// ── why every construction gets a directory NOBODY has used before ───────────────────────────
-// Several tests run the same fixture, so `run_name` repeats: run_single_cell_fixture passes the
-// fixture's base name, and "glif3_single_cell" alone is used by four of them. Building the path
-// out of the name alone therefore meant destroying and recreating ONE path over and over inside
-// a single process, with a chdir into it each time. On APFS a chdir into a directory that was
-// just unlinked and recreated can leave the process attached to the doomed inode: the recorder's
-// writes then land somewhere the subsequent open-for-read cannot see, and the run fails with
-// "Failed to open file for reading: glif3_membrane_trace.dat" -- intermittently, at roughly one
-// run in ten, and never as a numeric disagreement.
+// ── why the directory is private to THIS PROCESS, and why nothing chdir's ────────────────────
+// This replaces a version that chdir'd the whole process into a directory under the FIXED path
+// $TMPDIR/spikecorec_exit_model_runs and wiped that path once per process. $TMPDIR is shared by
+// every process on the machine, so both halves of that were shared with every other spikecorec
+// test binary running at the same time:
 //
-// A monotonic suffix removes the remove-then-recreate step entirely: create_directories always
-// makes a directory that did not exist, so there is no unlinked inode to be attached to. The
-// chdir stays -- it is load-bearing until the engine takes an explicit output root -- and so
-// does the cleanup, which now runs against a path that will never be handed out again.
-class ScopedWorkingDirectory {
+//   * the once-per-process wipe deleted the live run directories of any test binary ALREADY
+//     running, and
+//   * the per-run suffix came from a counter that starts at 1 in every process, so two
+//     processes hand out the SAME run directory and each one's scope exit removes the other's.
+//
+// Either way the loser's recording is unlinked while its recorder still holds the file open:
+// the writes go to a doomed inode, the engine's numbers stay perfect, and the run fails at the
+// subsequent open-for-read with `Failed to open file for reading: glif3_membrane_trace.dat`.
+// Measured on the pre-fix tree: 8 of 8 processes fail when two ExitModel runs overlap, against
+// 0 of 20 sequential runs. That is the whole of the intermittency -- this tree is developed with
+// several worktrees on one machine, so an overlap is routine, and a lone run never failed.
+//
+// Naming the root after this process is the fix: no other test binary can create, use or remove
+// anything inside it. Dropping the chdir is why it stays fixed -- the engine takes the directory
+// as an explicit output root and the recording is read back through the absolute path the engine
+// reports, so nothing here depends on the process working directory, which is global state any
+// other test (or any future parallel runner) can move out from under this one.
+class ScopedRunDirectory {
 public:
-    explicit ScopedWorkingDirectory(const String &run_name) {
-        previous_directory_ = filesystem::current_path();
+    explicit ScopedRunDirectory(const String &run_name) {
         run_directory_ = runs_root() / (run_name + "_" + std::to_string(next_sequence_number()));
         filesystem::create_directories(run_directory_);
-        filesystem::current_path(run_directory_);
     }
 
-    ~ScopedWorkingDirectory() {
+    ~ScopedRunDirectory() {
         std::error_code ignored;
-        filesystem::current_path(previous_directory_, ignored);
         filesystem::remove_all(run_directory_, ignored);
+        // Non-recursive: it takes the process's root away once the last run has cleaned up
+        // after itself, and fails harmlessly while any run directory is still there.
+        filesystem::remove(runs_root(), ignored);
     }
 
-    ScopedWorkingDirectory(const ScopedWorkingDirectory &) = delete;
-    ScopedWorkingDirectory &operator=(const ScopedWorkingDirectory &) = delete;
+    ScopedRunDirectory(const ScopedRunDirectory &) = delete;
+    ScopedRunDirectory &operator=(const ScopedRunDirectory &) = delete;
+
+    const filesystem::path &path() const { return run_directory_; }
 
 private:
-    // Cleared ONCE per process, before the first run and while the working directory is still
-    // outside it, so a previous process that died mid-run leaves nothing behind. Removing it
-    // here rather than per run is the whole point: nothing ever unlinks a directory this
-    // process has chdir'd into.
+    // Cleared once on first use, which is safe precisely because the name carries this
+    // process's id: the only process that could have left anything under it is a dead one.
     static const filesystem::path &runs_root() {
         static const filesystem::path root = [] {
             const filesystem::path path =
-                    filesystem::temp_directory_path() / "spikecorec_exit_model_runs";
+                    filesystem::temp_directory_path() /
+                    ("spikecorec_exit_model_runs_" + std::to_string(getpid()));
             std::error_code ignored;
             filesystem::remove_all(path, ignored);
             filesystem::create_directories(path);
@@ -197,17 +208,21 @@ private:
         return ++sequence_number;
     }
 
-    filesystem::path previous_directory_;
     filesystem::path run_directory_;
 };
 
-// Where a generated fixture lives for the length of one test. Separate from ScopedWorkingDirectory
-// because a perturbed fixture has to SURVIVE the run that reads it, and ScopedWorkingDirectory
-// wipes its directory on construction.
+// Where a generated fixture lives for the length of one test. Separate from ScopedRunDirectory
+// because a perturbed fixture has to SURVIVE the run that reads it, and ScopedRunDirectory hands
+// its directory to the engine to write recordings into.
+//
+// Named after this process for the same reason ScopedRunDirectory's root is: the path used to be
+// fixed and it is wiped on construction, so two test binaries running the same perturbation
+// control at once deleted each other's generated .nml out from under the parser.
 class ScopedTemporaryDirectory {
 public:
     explicit ScopedTemporaryDirectory(const String &directory_name) {
-        directory_ = filesystem::temp_directory_path() / "spikecorec_exit_model_perturbations" /
+        directory_ = filesystem::temp_directory_path() /
+                     ("spikecorec_exit_model_perturbations_" + std::to_string(getpid())) /
                      directory_name;
         filesystem::remove_all(directory_);
         filesystem::create_directories(directory_);
@@ -216,6 +231,9 @@ public:
     ~ScopedTemporaryDirectory() {
         std::error_code ignored;
         filesystem::remove_all(directory_, ignored);
+        // Non-recursive, as in ScopedRunDirectory: takes this process's perturbation root away
+        // once the last control has cleaned up after itself.
+        filesystem::remove(directory_.parent_path(), ignored);
     }
 
     ScopedTemporaryDirectory(const ScopedTemporaryDirectory &) = delete;
@@ -246,32 +264,27 @@ struct SingleCellRun {
 // is seeded or reconstructed by hand -- the OnStart bodies, the pulseGenerator schedule and the
 // recording selections all come from the .nml.
 SingleCellRun run_model(const String &model_path, const String &run_name) {
-    ScopedWorkingDirectory run_directory(run_name);
+    ScopedRunDirectory run_directory(run_name);
 
     SingleCellRun run;
-    String membrane_trace_filename;
-    String spike_events_filename;
+    String membrane_trace_path;
+    String spike_events_path;
     String engine_input_path = model_path; // SpikeEngine takes a non-const String&
 
     {
-        SpikeEngine engine(engine_input_path, /*enable_hebbian_learning=*/false);
+        SpikeEngine engine(engine_input_path, /*enable_hebbian_learning=*/false,
+                           /*use_lazy_synapse_updates=*/true,
+                           /*output_directory=*/run_directory.path().string());
 
         run.tick_count = engine.lifetime;
         run.step_dt = engine.network_details.step_dt;
 
-        for (const RecordingConfig &recording_profile : engine.recording_profiles) {
-            for (usize output_index = 0; output_index < recording_profile.output_filenames.size();
-                 output_index += 1) {
-                const bool is_spike_event_file =
-                        output_index < recording_profile.file_output_format.size() &&
-                        recording_profile.file_output_format[output_index] ==
-                                OutputFileFormat::SPIKE_EVENTS;
-                if (is_spike_event_file) {
-                    spike_events_filename = recording_profile.output_filenames[output_index];
-                } else {
-                    membrane_trace_filename = recording_profile.output_filenames[output_index];
-                }
-            }
+        // Read off the engine's own streams rather than reconstructed from the model's
+        // filenames: these are the paths its recorders actually opened, so a recording is read
+        // back from exactly where it was written even though the fixture named it relatively.
+        for (const RecordingStream &stream : engine.recording_streams) {
+            if (stream.gathers_spike_flags) spike_events_path = stream.output_path;
+            else                            membrane_trace_path = stream.output_path;
         }
 
         for (s64 tick = 0; tick < engine.lifetime; tick += 1) engine.step_simulation(tick);
@@ -281,12 +294,12 @@ SingleCellRun run_model(const String &model_path, const String &run_name) {
         engine.shutdown();
     }
 
-    if (membrane_trace_filename.empty() || spike_events_filename.empty()) {
+    if (membrane_trace_path.empty() || spike_events_path.empty()) {
         throw std::runtime_error("exit_model_validation_tests: model '" + model_path +
                                  "' declared no membrane-trace and/or spike-event output file");
     }
 
-    const SpireRecording membrane_recording = read_spire_recording(membrane_trace_filename);
+    const SpireRecording membrane_recording = read_spire_recording(membrane_trace_path);
     run.recorded_columns.assign((usize)membrane_recording.neuron_count, spikecorec::Vector<f32>());
     for (spikecorec::Vector<f32> &column : run.recorded_columns) column.reserve((usize)membrane_recording.frame_count);
     for (s64 frame_index = 0; frame_index < membrane_recording.frame_count; frame_index += 1) {
@@ -299,7 +312,7 @@ SingleCellRun run_model(const String &model_path, const String &run_name) {
 
     // A spike-event stream records each selected neuron's spike flag, one frame per tick, so a
     // nonzero sample is exactly "this neuron emitted on this tick".
-    const SpireRecording spike_recording = read_spire_recording(spike_events_filename);
+    const SpireRecording spike_recording = read_spire_recording(spike_events_path);
     for (s64 frame_index = 0; frame_index < spike_recording.frame_count; frame_index += 1) {
         for (s64 column_index = 0; column_index < spike_recording.neuron_count; column_index += 1) {
             if (spike_recording.frames[(usize)(frame_index * spike_recording.neuron_count +

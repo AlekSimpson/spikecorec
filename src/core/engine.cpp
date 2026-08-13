@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 
@@ -263,7 +264,7 @@ spikecorec::Vector<spikecorec::AggregatedNetworkEdge> spikecorec::aggregate_netw
 // ── constructor / destructor ──────────────────────────────────────────────────
 
 SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learning,
-                         bool use_lazy_synapse_updates)
+                         bool use_lazy_synapse_updates, const String &output_directory)
     : logger(make_logger())
     , network_details(parse_and_validate_model(neuroml_input_file, *logger))
     , weights(weight_matrix_network_for(network_details))
@@ -694,6 +695,17 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     // ── 10. recorders ────────────────────────────────────────────────────────
     recording_profiles = network_details.recording_profiles;
 
+    // Where a relative <OutputFile fileName> lands. LEMS names an output file against no root
+    // at all, so with no output_directory it resolves against the process working directory --
+    // what this engine has always done, and what every existing caller still gets. An absolute
+    // name is already fully resolved and is left exactly as the model wrote it.
+    auto resolve_output_path = [&](const String &output_filename) -> String {
+        if (output_directory.empty()) return output_filename;
+        const std::filesystem::path declared_path(output_filename);
+        if (declared_path.is_absolute()) return output_filename;
+        return (std::filesystem::path(output_directory) / declared_path).string();
+    };
+
     // Slot 0 of a neuron's cell_state chunk, refused for a cell type that declares no
     // StateVariable at all. That refusal is the point of the helper: a type declaring a
     // Regime and no StateVariable still occupies one cell_state slot -- the appended regime
@@ -784,9 +796,10 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
             stream.gathers_spike_flags = gathers_spike_flags;
             stream.frame_values.assign(gathered_indices.size(), 0.0f);
             stream.gathered_indices = std::move(gathered_indices);
+            stream.output_path =
+                    resolve_output_path(recording_profile.output_filenames[output_index]);
             stream.recorder = make_unique<SimulationRecorder>(
-                    recording_profile.output_filenames[output_index],
-                    (s64)stream.frame_values.size());
+                    stream.output_path, (s64)stream.frame_values.size());
 
             recording_streams.push_back(std::move(stream));
         }

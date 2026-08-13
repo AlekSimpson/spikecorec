@@ -113,6 +113,12 @@ namespace spikecorec {
         Vector<s64> gathered_indices;
         Vector<f32> frame_values;
         bool gathers_spike_flags = false;
+
+        // The path this recorder actually writes: the <OutputFile fileName> resolved against
+        // the engine's output directory. Kept so a caller can read a recording back without
+        // reconstructing that resolution -- or, worse, without having to make the process
+        // working directory be the answer.
+        String output_path;
     };
 
     class SpikeEngine {
@@ -367,8 +373,17 @@ namespace spikecorec {
         // field of that name. Defaulted so an existing caller keeps the (exact, cheaper) lazy
         // behaviour without a source change, and so the eager reference path is one argument
         // away for anything checking the two against each other.
+        //
+        // `output_directory` is the root a relative <OutputFile fileName>/<EventOutputFile
+        // fileName> is resolved against. LEMS gives such a name no root at all, so when this
+        // is empty -- the default, and the historical behaviour -- it resolves against the
+        // process working directory. Supplying one lets a caller place a run's recordings
+        // somewhere specific WITHOUT chdir'ing the whole process, which is the only way to do
+        // it when several runs, or several processes, are in flight. An absolute fileName is
+        // used verbatim either way.
         SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learning,
-                    bool use_lazy_synapse_updates = true);
+                    bool use_lazy_synapse_updates = true,
+                    const String &output_directory = String());
 
         // ── legacy, pending rework ────────────────────────────────────────────────
         // Every declaration below this line predates the NeuroML path and depends on the
