@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
 #ifdef SPIKECOREC_HAVE_ZLIB
 #include <zlib.h>
@@ -531,13 +532,28 @@ void AsyncSpireWriter::close() {
 SimulationRecorder::SimulationRecorder(
     const string &filename, s64 neuron_count,
     optional<string> compression, optional<int> compression_level,
-    bool async, usize queue_max, usize chunk_bytes
+    bool async, usize queue_max, usize chunk_bytes,
+    OutputFileFormat declared_format
 )
     : neuron_count_(neuron_count)
     , chunk_bytes_(chunk_bytes)
 {
     log::logger().debug("SimulationRecorder: filename={} neuron_count={} async={} queue_max={} chunk_bytes={}",
                         filename, neuron_count, async, queue_max, chunk_bytes);
+
+    // Every other OutputFileFormat is a SPIRE frame stream, which is exactly what
+    // this class writes. NML_STANDARD is not: it is an ASCII time-column matrix and
+    // no encoder for it exists. Writing SPIRE binary under that name would hand back
+    // a file whose contents contradict what was asked for, and nothing downstream
+    // would notice until something tried to read it as text.
+    if (declared_format == OutputFileFormat::NML_STANDARD) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("SimulationRecorder: '{}' was declared as the NML-standard column matrix, "
+                        "which spikecorec cannot write — it emits SPIRE frame streams only. "
+                        "Substituting SPIRE binary silently would produce a file that is not what "
+                        "the declaration asked for", filename));
+    }
+
     if (neuron_count_ < 0 || neuron_count_ > static_cast<s64>(UINT32_MAX)) {
         log::throw_runtime_error(log::logger(),
             fmt::format("SimulationRecorder: neuron_count {} does not fit in the .spire format's 32-bit header",
@@ -644,6 +660,28 @@ SpireReader::SpireReader(const string &filename)
     }
 
     neuron_count_ = (s64)from_big_endian_u32(header);
+
+    // The header is 4 bytes of a file that may be corrupt, and it is what callers
+    // size their frame buffer from (`vector<f32> buffer(reader.neuron_count())`).
+    // Unchecked, a garbage header is a caller-side allocation of up to 17 GB
+    // (neuron_count tops out at UINT32_MAX, times 4 bytes a sample). Cross-check
+    // it against the bytes that actually follow before handing it out. A file
+    // holding only a header is legitimately a zero-frame recording, so any
+    // neuron_count is admissible there — the check only fires once there is
+    // payload too small to be even one frame of the claimed width.
+    file_.seekg(0, ios::end);
+    streamoff total_bytes = file_.tellg();
+    file_.seekg((streamoff)sizeof(u32), ios::beg);
+
+    streamoff payload_bytes = total_bytes - (streamoff)sizeof(u32);
+    streamoff frame_bytes = (streamoff)((u64)neuron_count_ * sizeof(f32));
+    if (payload_bytes > 0 && frame_bytes > payload_bytes) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format(".spire header claims neuron_count {} ({} bytes a frame) but only {} bytes "
+                        "follow it in {} — the header is corrupt, not merely truncated",
+                        neuron_count_, (s64)frame_bytes, (s64)payload_bytes, filename));
+    }
+
     log::logger().debug("SpireReader: filename={} neuron_count={}", filename, neuron_count_);
 }
 
@@ -694,11 +732,47 @@ SpireRecording spikecorec::read_spire_recording(const string &filename) {
     recording.neuron_count = (s64)from_big_endian_u32(header);
     recording.frame_count = 0;
 
-    usize frame_bytes = (usize)recording.neuron_count * sizeof(f32);
-    vector<f32> frame((usize)recording.neuron_count);
+    usize frame_bytes = (usize)((u64)recording.neuron_count * sizeof(f32));
+
+    // The frame buffer is NEVER sized from the header alone. neuron_count is 4
+    // bytes of a possibly-corrupt file and tops out at UINT32_MAX, so
+    // `vector<f32> frame(neuron_count)` is a header-controlled allocation of up
+    // to 17 GB — measured: an 8-byte file whose header reads 0x20000000 drove a
+    // 2.15 GB resident zero-fill before the truncation check ever ran. Instead
+    // the buffer grows only as far as bytes actually arrive, bounded by one
+    // staging block past real progress, so a garbage header costs the size of
+    // what is genuinely in the file and then reports the truncation.
+    constexpr usize STAGING_BLOCK_BYTES = 1024 * 1024;
+    vector<u8> frame_buffer;
+
+    auto read_one_frame = [&]() -> usize {
+        usize total = 0;
+        while (total < frame_bytes) {
+            usize want = std::min(frame_bytes - total, STAGING_BLOCK_BYTES);
+            frame_buffer.resize(total + want);
+            usize got = read_fully(frame_buffer.data() + total, want);
+            total += got;
+            if (got < want) break; // source hit EOF
+        }
+        frame_buffer.resize(total);
+        return total;
+    };
+
+    // A zero neuron_count makes every frame zero bytes wide, so no amount of
+    // payload can be accounted for as frames. Reporting "0 frames" for a file
+    // that plainly holds data would hand back an empty recording that looks
+    // like a legitimately empty run.
+    if (recording.neuron_count == 0) {
+        u8 probe_byte = 0;
+        if (source->read(&probe_byte, 1) != 0) {
+            log::throw_runtime_error(log::logger(),
+                fmt::format(".spire header claims neuron_count 0 but {} holds frame data after it — "
+                            "the header is corrupt", filename));
+        }
+    }
 
     for (;;) {
-        usize bytes_read = read_fully(reinterpret_cast<u8 *>(frame.data()), frame_bytes);
+        usize bytes_read = read_one_frame();
         if (bytes_read == 0) break; // clean EOF — no partial frame
 
         if (bytes_read != frame_bytes) {
@@ -707,7 +781,9 @@ SpireRecording spikecorec::read_spire_recording(const string &filename) {
                             bytes_read, frame_bytes));
         }
 
-        recording.frames.insert(recording.frames.end(), frame.begin(), frame.end());
+        usize previous_sample_count = recording.frames.size();
+        recording.frames.resize(previous_sample_count + (usize)recording.neuron_count);
+        memcpy(recording.frames.data() + previous_sample_count, frame_buffer.data(), frame_bytes);
         ++recording.frame_count;
     }
 
