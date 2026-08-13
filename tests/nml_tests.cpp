@@ -126,17 +126,24 @@ String two_population_network_nml() {
 )";
 }
 
-String lems_simulation_xml(const String &included_file) {
+// The Simulation block most fixtures share. `second_recorded_cell` is the cell both output
+// files record besides pop1[0], and it DEFAULTS to pop1[0] rather than to pop2[1] because
+// most networks written against this helper declare only pop1: an <OutputFile> that resolves
+// none of its columns is a hard error (it would otherwise be silently replaced by an
+// every-neuron recording), so a fixture may not ask for a population it does not have.
+// Fixtures built on two_population_network_nml pass "pop2[1]".
+String lems_simulation_xml(const String &included_file,
+                           const String &second_recorded_cell = "pop1[0]") {
     return R"(<Lems>
     <Target component="sim1"/>
     <Include file=")" + included_file + R"("/>
     <Simulation id="sim1" length="100ms" step="0.01ms" target="net1" seed="1234">
         <OutputFile id="of1" fileName="out.dat">
             <OutputColumn id="c0" quantity="pop1[0]/v"/>
-            <OutputColumn id="c1" quantity="pop2[1]/v"/>
+            <OutputColumn id="c1" quantity=")" + second_recorded_cell + R"(/v"/>
         </OutputFile>
         <EventOutputFile id="ef1" fileName="spikes.dat" format="TIME_ID">
-            <EventSelection id="0" select="pop2[1]" eventPort="spike"/>
+            <EventSelection id="0" select=")" + second_recorded_cell + R"(" eventPort="spike"/>
         </EventOutputFile>
     </Simulation>
 </Lems>
@@ -1108,12 +1115,12 @@ TEST(Export, inputs_resolve_their_targets_and_times) {
     EXPECT_DOUBLE_EQ(explicit_input.amplitude, 0.5e-9); // 0.5nA
     ASSERT_EQ(explicit_input.targets.size(), 1u);
     EXPECT_EQ(explicit_input.targets[0].neuron_index, 0);
-    // A continuous injector reports its span as exactly two event_ticks entries,
-    // {delay, delay + duration}.
-    // 10ms and 10ms + 40ms at dt = 0.01ms. Truncation would give 999 and 4998.
+    // A continuous injector reports its span as exactly two event_ticks entries, and that
+    // span is CLOSED at both ends: {delay, delay + duration - 1} in ticks. 10ms and
+    // 10ms + 40ms - 1 tick at dt = 0.01ms. Truncation would give 999 and 4997.
     ASSERT_EQ(explicit_input.targets[0].event_ticks.size(), 2u);
     EXPECT_EQ(explicit_input.targets[0].event_ticks.front(), 1000);
-    EXPECT_EQ(explicit_input.targets[0].event_ticks.back(), 5000);
+    EXPECT_EQ(explicit_input.targets[0].event_ticks.back(), 4999);
 
     const SimulationInputConfig &input_list = result.input_profiles[1];
     ASSERT_EQ(input_list.targets.size(), 2u);
@@ -1166,7 +1173,7 @@ TEST(Export, recording_selections_resolve_to_neurons_and_variables) {
 
     FixtureDirectory fixture("recordings");
     fixture.write("net.nml", two_population_network_nml());
-    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml", "pop2[1]"));
 
     NML_Parser parser;
     NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
@@ -1527,6 +1534,70 @@ TEST(Errors, unmodelled_metadata_tags_are_skipped_rather_than_fatal) {
     EXPECT_EQ(result.cell_types.size(), 1u);
 }
 
+TEST(Errors, a_model_with_no_simulation_block_throws) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("no_simulation");
+    fixture.write("net.nml", R"(<neuroml id="nosimnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+    </network>
+</neuroml>
+)");
+    // A complete, well-formed network and no <Simulation> anywhere. Warning about it is not
+    // enough: step_dt stays 0.0 and total_tick_count stays 0, every delay and input window
+    // converts to tick 0, and the engine then constructs, ticks SUCCESSFULLY and holds every
+    // membrane at its resting potential for the whole run -- a simulation that ran and means
+    // nothing.
+    fixture.write("LEMS.xml", R"(<Lems>
+    <Include file="net.nml"/>
+</Lems>
+)");
+
+    NML_Parser parser;
+    try {
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        FAIL() << "a model with no Simulation was accepted";
+    } catch (const std::runtime_error &simulation_error) {
+        EXPECT_NE(String(simulation_error.what()).find("<Simulation>"), String::npos)
+                << simulation_error.what();
+    }
+}
+
+TEST(Errors, a_simulation_with_a_non_positive_step_throws) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("zero_step_simulation");
+    fixture.write("net.nml", R"(<neuroml id="zerostepnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+    </network>
+</neuroml>
+)");
+    // The same defect reached through a Simulation that declares no usable step. dt is what
+    // every downstream conversion divides by, so a zero one makes all of them zero rather
+    // than making any of them fail.
+    fixture.write("LEMS.xml", R"(<Lems>
+    <Target component="sim1"/>
+    <Include file="net.nml"/>
+    <Simulation id="sim1" length="100ms" step="0ms" target="net1"/>
+</Lems>
+)");
+
+    NML_Parser parser;
+    try {
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        FAIL() << "a Simulation with a zero step was accepted";
+    } catch (const std::runtime_error &step_error) {
+        EXPECT_NE(String(step_error.what()).find("sim1"), String::npos) << step_error.what();
+        EXPECT_NE(String(step_error.what()).find("step"), String::npos) << step_error.what();
+    }
+}
+
 
 // ── NML_Node ─────────────────────────────────────────────────────────────────────
 //
@@ -1777,15 +1848,28 @@ TEST(Ingest, a_standard_library_lems_file_can_be_included_by_a_neuroml_document)
     EXPECT_EQ(parser.component_type_catalogue.count("iafCell"), 1u);
 }
 
-TEST(Ingest, a_missing_path_is_not_fatal_and_leaves_the_parser_empty) {
+TEST(Ingest, a_missing_path_throws_and_names_the_file) {
+    // A document that cannot be read contributes NOTHING, and nothing downstream notices:
+    // the model reaches the weight matrix with zero neurons and the failure surfaces as
+    // "network must have at least one neuron", naming a subsystem that is working
+    // correctly. The read has to be the thing that fails.
     NML_Parser parser;
-    EXPECT_NO_THROW(parser.ingest_document("/definitely/does/not/exist_xyz.nml"));
+    try {
+        parser.ingest_document("/definitely/does/not/exist_xyz.nml");
+        FAIL() << "an unreadable document was accepted";
+    } catch (const std::runtime_error &ingest_error) {
+        EXPECT_NE(String(ingest_error.what()).find("exist_xyz.nml"), String::npos)
+                << ingest_error.what();
+    }
 
     EXPECT_TRUE(parser.component_type_catalogue.empty());
     EXPECT_TRUE(parser.document_instance_nodes.empty());
 }
 
-TEST(Ingest, a_missing_include_does_not_abandon_the_rest_of_the_file) {
+TEST(Ingest, a_missing_include_throws_rather_than_leaving_the_model_half_wired) {
+    // The dangerous shape: everything after the dropped <Include> still lands, so the parse
+    // SUCCEEDS and the model is partially wired -- it constructs, it runs, and it produces
+    // plausible wrong numbers with nothing anywhere naming the half that went missing.
     FixtureDirectory fixture("ingest_missing_include");
     fixture.write("root.xml", R"(<Lems>
     <Include file="no_such_file.xml"/>
@@ -1794,10 +1878,15 @@ TEST(Ingest, a_missing_include_does_not_abandon_the_rest_of_the_file) {
 )");
 
     NML_Parser parser;
-    EXPECT_NO_THROW(parser.ingest_document(fixture.path_of("root.xml")));
-
-    // The include is reported and skipped; the declarations after it still land.
-    EXPECT_EQ(parser.component_type_catalogue.count("declared_after_the_bad_include"), 1u);
+    try {
+        parser.ingest_document(fixture.path_of("root.xml"));
+        FAIL() << "a dropped include was accepted";
+    } catch (const std::runtime_error &ingest_error) {
+        // The INCLUDED file is named, not the one the caller passed in: include graphs run
+        // several levels deep and the top of one says nothing about where it broke.
+        EXPECT_NE(String(ingest_error.what()).find("no_such_file.xml"), String::npos)
+                << ingest_error.what();
+    }
 }
 
 
@@ -2738,10 +2827,10 @@ TEST(Errors, an_unresolvable_recording_path_is_marked_rather_than_read_as_neuron
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
     FixtureDirectory fixture("unresolvable_recording");
-    // A recording is read-only, so an unresolvable one is deliberately not fatal the way a
-    // connection or a stimulus target is. What it must never do is fall back to a real
-    // neuron: index 0 would log a genuine trace under a column the document asked for
-    // somewhere else entirely.
+    // A recording is read-only, so an unresolvable COLUMN of a file that still resolves
+    // something is deliberately not fatal the way a connection or a stimulus target is.
+    // What it must never do is fall back to a real neuron: index 0 would log a genuine
+    // trace under a column the document asked for somewhere else entirely.
     fixture.write("net.nml", R"(<neuroml id="recordingnet">
     <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
              C="0.2nF" leakConductance="0.01uS"/>
@@ -2755,9 +2844,10 @@ TEST(Errors, an_unresolvable_recording_path_is_marked_rather_than_read_as_neuron
     <Include file="net.nml"/>
     <Simulation id="sim1" length="100ms" step="0.01ms" target="net1">
         <OutputFile id="of1" fileName="out.dat">
-            <OutputColumn id="c0" quantity="nosuchpop[0]/v"/>
-            <OutputColumn id="c1" quantity="pop1[99]/v"/>
-            <OutputColumn id="c2" quantity="pop1/v"/>
+            <OutputColumn id="c0" quantity="pop1[1]/v"/>
+            <OutputColumn id="c1" quantity="nosuchpop[0]/v"/>
+            <OutputColumn id="c2" quantity="pop1[99]/v"/>
+            <OutputColumn id="c3" quantity="pop1/v"/>
         </OutputFile>
     </Simulation>
 </Lems>
@@ -2768,14 +2858,60 @@ TEST(Errors, an_unresolvable_recording_path_is_marked_rather_than_read_as_neuron
 
     ASSERT_EQ(result.recording_profiles.size(), 1u);
     const RecordingConfig &columns = result.recording_profiles[0];
-    ASSERT_EQ(columns.selections.size(), 3u);
+    ASSERT_EQ(columns.selections.size(), 4u);
+
+    EXPECT_EQ(columns.selections[0].neuron_index, 1);
 
     // An unknown population, an out-of-range index, and a slash-form path with no index at
     // all: none of the three names a cell, and all three are kept as the -1 sentinel with
     // their raw path intact for the diagnostic.
-    for (const RecordingSelection &selection : columns.selections) {
+    for (usize selection_index = 1; selection_index < columns.selections.size();
+         ++selection_index) {
+        const RecordingSelection &selection = columns.selections[selection_index];
         EXPECT_EQ(selection.neuron_index, -1) << selection.quantity_path;
         EXPECT_FALSE(selection.quantity_path.empty());
+    }
+}
+
+TEST(Errors, an_output_file_that_resolves_none_of_its_columns_throws) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    // The last live route to the every-neuron fallback. An <OutputFile> with no columns at
+    // all legitimately means "record every neuron's first state variable", but a file that
+    // ASKED for columns and resolved none of them is a mistyped request, not that -- and
+    // silently answering it with a whole-population recording of slot 0 produces a file
+    // that is the same shape as the intended one whenever the request happened to be
+    // neuron_count columns wide, holding entirely different variables.
+    FixtureDirectory fixture("wholly_unresolvable_recording");
+    fixture.write("net.nml", R"(<neuroml id="recordingnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="3"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", R"(<Lems>
+    <Target component="sim1"/>
+    <Include file="net.nml"/>
+    <Simulation id="sim1" length="100ms" step="0.01ms" target="net1">
+        <OutputFile id="of1" fileName="mistyped.dat">
+            <OutputColumn id="c0" quantity="pop_1[0]/v"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)");
+
+    NML_Parser parser;
+    try {
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        FAIL() << "an output file that resolved none of its columns was accepted";
+    } catch (const std::runtime_error &recording_error) {
+        const String message(recording_error.what());
+        // Both the file and the path it asked for: the file alone does not say what was
+        // mistyped, and the path alone does not say which recording lost its columns.
+        EXPECT_NE(message.find("mistyped.dat"), String::npos) << message;
+        EXPECT_NE(message.find("pop_1[0]/v"), String::npos) << message;
     }
 }
 
@@ -3002,6 +3138,45 @@ TEST(Export, an_input_component_that_delivers_nothing_is_named_in_the_log) {
 
     EXPECT_NE(log_text.find("sg0"), String::npos) << log_text;
     EXPECT_NE(log_text.find("spikeGeneratorPoisson"), String::npos) << log_text;
+    EXPECT_NE(log_text.find("delivers nothing"), String::npos) << log_text;
+}
+
+TEST(Export, a_pulse_shorter_than_one_step_is_named_in_the_log) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("subtick_pulse");
+    // A pulse narrower than dt cannot be delivered on any tick, so its window is zero ticks
+    // wide and it injects nothing -- while still reading, everywhere it is inspected, as a
+    // wired stimulus carrying a real 0.5nA amplitude. The run then looks like a model whose
+    // cell simply never responds.
+    fixture.write("net.nml", R"(<neuroml id="subticknet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <pulseGenerator id="pg0" delay="10ms" duration="0.001ms" amplitude="0.5nA"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="1"/>
+        <explicitInput target="pop1[0]" input="pg0"/>
+    </network>
+</neuroml>
+)");
+    // dt is 0.01ms here, so the 0.001ms duration is a tenth of one step.
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result;
+    String log_text;
+    {
+        CapturedLog captured;
+        result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+        log_text = captured.text();
+    }
+
+    ASSERT_EQ(result.input_profiles.size(), 1u);
+    ASSERT_EQ(result.input_profiles[0].targets.size(), 1u);
+    EXPECT_TRUE(result.input_profiles[0].targets[0].event_ticks.empty());
+    EXPECT_DOUBLE_EQ(result.input_profiles[0].amplitude, 0.5e-9);
+
+    EXPECT_NE(log_text.find("pg0"), String::npos) << log_text;
     EXPECT_NE(log_text.find("delivers nothing"), String::npos) << log_text;
 }
 

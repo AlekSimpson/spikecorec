@@ -170,6 +170,66 @@ String two_cell_type_network_nml() {
 )";
 }
 
+// ── stimulus window fixtures ───────────────────────────────────────────────────
+//
+// One cell, one pulseGenerator, no projections and no recording columns: everything that
+// is not the injection window is stripped out so the window length is the only thing the
+// assertions can be reading. `pulse_duration` is the whole point of the fixture, so it is
+// the only thing that varies.
+String pulse_window_network_nml(const String &pulse_duration) {
+    return R"(<neuroml id="pulsewindownet">
+    <simpleLifCell id="quietCell" tau="10ms" restingPotential="-70mV" threshold="0mV"
+                   resetPotential="-70mV" startPotential="-70mV"/>
+    <pulseGenerator id="pg0" delay="1ms" duration=")" + pulse_duration +
+           R"(" amplitude="0.5nA"/>
+
+    <network id="net1">
+        <population id="pop1" component="quietCell" size="1"/>
+        <explicitInput target="pop1[0]" input="pg0"/>
+    </network>
+</neuroml>
+)";
+}
+
+String pulse_window_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="simpleLifCell" extends="baseSpikingCell"
+                   description="Leaky integrator relaxing towards restingPotential.">
+        <Parameter name="tau" dimension="time"/>
+        <Parameter name="restingPotential" dimension="voltage"/>
+        <Parameter name="threshold" dimension="voltage"/>
+        <Parameter name="resetPotential" dimension="voltage"/>
+        <Parameter name="startPotential" dimension="voltage"/>
+
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+
+            <TimeDerivative variable="v" value="(restingPotential - v) / tau"/>
+
+            <OnStart>
+                <StateAssignment variable="v" value="startPotential"/>
+            </OnStart>
+
+            <OnCondition test="v .gt. threshold">
+                <StateAssignment variable="v" value="resetPotential"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="300ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="pop1[0]/v"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
 // Writes both fixture files and returns the LEMS main file's path, which is what the
 // engine is handed.
 String write_two_cell_type_model(const FixtureDirectory &fixture) {
@@ -1081,6 +1141,33 @@ TEST(CreateEventStream, no_events_produces_no_stream) {
 
 // ── construction from a NeuroML/LEMS model ─────────────────────────────────────
 
+TEST(SpikeEngine, a_model_file_that_cannot_be_read_names_the_file) {
+    // The failure the caller sees has to name the thing that failed. An unreadable model
+    // used to reach the constructor as a parse that "succeeded" and produced nothing, and
+    // surfaced from the weight matrix as "network must have at least one neuron (got 0)" --
+    // an error naming a subsystem that was working correctly, about a model that was never
+    // read.
+    String missing_model_path = "/definitely/does/not/exist_xyz_model.xml";
+
+    try {
+        SpikeEngine engine(missing_model_path, /*enable_hebbian_learning=*/false);
+        FAIL() << "an unreadable model file was accepted";
+    } catch (const std::runtime_error &construction_error) {
+        const String message(construction_error.what());
+        EXPECT_NE(message.find("exist_xyz_model.xml"), String::npos) << message;
+
+        // The READ has to be the thing that failed. Naming the file is not enough on its
+        // own: a model that was never read also declares no <Simulation>, so a check for
+        // the filename alone is satisfied by the missing-Simulation error -- which is a
+        // true statement about a document nobody could open, and says nothing about why.
+        EXPECT_NE(message.find("Could not read"), String::npos)
+                << "the failure does not report that the document could not be read: "
+                << message;
+        EXPECT_EQ(message.find("at least one neuron"), String::npos)
+                << "the failure is still being reported as a WeightMatrix problem: " << message;
+    }
+}
+
 TEST(SpikeEngine, neuroml_construction_builds_type_sectioned_layout) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
 
@@ -1181,15 +1268,61 @@ TEST(SpikeEngine, neuroml_construction_wires_edges_and_inputs) {
     // that is currently being changed.
 
     // <explicitInput target="pop1[0]" input="pg0"/> with a pulseGenerator: one continuous
-    // window over [delay, delay + duration] = [0.5ms, 1.5ms] = ticks 5..15.
+    // window starting at delay=0.5ms (tick 5) and running duration=1ms (10 ticks at
+    // 0.1ms), so ticks 5..14 -- NOT 5..15, which would be eleven ticks of a ten-tick pulse.
     ASSERT_EQ(engine.input_event_streams.size(), 1u);
     const NeuronInputStream &input_stream = engine.input_event_streams[0];
     EXPECT_EQ(input_stream.neuron_index, 0);
-    ASSERT_EQ(input_stream.values.size(), 16u);
+    ASSERT_EQ(input_stream.values.size(), 15u);
     EXPECT_DOUBLE_EQ(input_stream.values[4], 0.0);
-    for (usize tick = 5; tick <= 15; ++tick) EXPECT_GT(input_stream.values[tick], 0.0);
+    for (usize tick = 5; tick <= 14; ++tick) EXPECT_GT(input_stream.values[tick], 0.0);
 
     engine.shutdown();
+}
+
+TEST(SpikeEngine, a_pulse_generator_injects_on_exactly_duration_over_dt_ticks) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The stimulus window is where two conventions meet: LEMS gates a pulseGenerator on
+    // `t .geq. delay .and. t .lt. delay + duration` (Inputs.xml), which is HALF-OPEN, while
+    // the engine's event stream is filled `tick <= end_tick`, which is CLOSED. The window
+    // is therefore duration/dt ticks long and no other number is defensible -- an extra
+    // tick is 10% too much charge on a 1ms pulse at a 0.1ms step, and stays wrong at every
+    // duration.
+    //
+    // Two durations, three orders of magnitude apart, because an off-by-one end is a
+    // constant error: it is 10% of a 1ms pulse and 0.05% of a 200ms one, so a single short
+    // duration would let a proportional band hide it and a single long one would let an
+    // absolute band hide it.
+    const spikecorec::Vector<Pair<String, usize>> duration_and_expected_tick_count = {
+            {"1ms", 10u}, {"200ms", 2000u}};
+
+    for (const auto &[pulse_duration, expected_tick_count] : duration_and_expected_tick_count) {
+        FixtureDirectory fixture("pulse_window_" + pulse_duration);
+        fixture.write("net.nml", pulse_window_network_nml(pulse_duration));
+        String model_path = fixture.write(
+                "model.xml", pulse_window_lems_xml("net.nml", fixture.path_of("out.spire")));
+
+        SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+        ASSERT_EQ(engine.input_event_streams.size(), 1u) << pulse_duration;
+        const spikecorec::Vector<f64> &stream = engine.input_event_streams[0].values;
+
+        usize injected_tick_count = 0;
+        for (f64 injected : stream) {
+            if (injected != 0.0) injected_tick_count += 1;
+        }
+        EXPECT_EQ(injected_tick_count, expected_tick_count) << pulse_duration;
+
+        // And the window sits where the model put it: delay="1ms" is tick 10, and the
+        // stream ends on the last injected tick, so its length pins both ends at once.
+        ASSERT_EQ(stream.size(), 10u + expected_tick_count) << pulse_duration;
+        EXPECT_DOUBLE_EQ(stream[9], 0.0) << pulse_duration;
+        EXPECT_GT(stream[10], 0.0) << pulse_duration;
+        EXPECT_GT(stream.back(), 0.0) << pulse_duration;
+
+        engine.shutdown();
+    }
 }
 
 // ── step_simulation ────────────────────────────────────────────────────────────
@@ -1311,6 +1444,78 @@ TEST(SpikeEngine, step_simulation_after_shutdown_throws) {
     EXPECT_THROW(engine.step_simulation(0), std::runtime_error);
 }
 
+TEST(SpikeEngine, step_simulation_refuses_a_negative_tick) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_negative_tick_guard");
+    String model_path = write_two_cell_type_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    // Not a wrong answer -- an out-of-bounds WRITE. Both ring indices, the host's and the
+    // generated kernel's, are (tick % ring_depth) * neuron_count in signed arithmetic, and
+    // C's % keeps the sign of its left operand, so tick=-1 addresses network_inputs
+    // neuron_count elements BEFORE its first element and corrupts whatever the arena put
+    // there. Nothing faults, so nothing but this guard reports it.
+    for (s64 negative_tick : {(s64)-1, (s64)-7, (s64)-4096}) {
+        try {
+            engine.step_simulation(negative_tick);
+            FAIL() << "step_simulation accepted tick " << negative_tick;
+        } catch (const std::runtime_error &step_error) {
+            // Distinguished from the "engine is not running" throw on the line above it,
+            // which this engine would not have produced anyway.
+            EXPECT_NE(String(step_error.what()).find("tick must be >= 0"), String::npos)
+                    << step_error.what();
+        }
+    }
+
+    // The ring is untouched by the refusal: the guard runs before anything is written.
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    const s64 ring_element_count =
+            (s64)engine.network_input_ring_depth * engine.total_neuron_count;
+    for (s64 element = 0; element < ring_element_count; ++element) {
+        EXPECT_FLOAT_EQ(network_inputs[element], 0.0f) << "network_inputs[" << element << "]";
+    }
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, last_spiked_starts_negative_so_a_dead_network_is_distinguishable) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    FixtureDirectory fixture("neuroml_last_spiked_sentinel");
+    String model_path = write_two_cell_type_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    const s64 *last_spiked = engine.last_spiked.get_contents();
+    const s32 *spike_flags = engine.spike_flags.get_contents();
+
+    // Tick 0 is a tick a neuron can genuinely fire on, so a zero seed would make "has never
+    // fired" and "fired on tick 0" the same value -- and every `last_spiked >= 0` test would
+    // read true on a network that never fired at all.
+    for (s64 neuron_index = 0; neuron_index < engine.total_neuron_count; ++neuron_index) {
+        EXPECT_LT(last_spiked[neuron_index], 0)
+                << "neuron " << neuron_index << " reads as having already fired";
+    }
+
+    // pop1 (neurons 0 and 1) is simpleLifCell and crosses its threshold inside the run;
+    // pop2 (neurons 2 and 3) is dualStateCell, which declares no EventOut and therefore
+    // cannot fire at all. After the run the two must not read the same.
+    bool any_neuron_fired = false;
+    for (s64 tick = 0; tick < engine.lifetime; ++tick) {
+        engine.step_simulation(tick);
+        if (spike_flags[0] != 0) any_neuron_fired = true;
+    }
+    ASSERT_TRUE(any_neuron_fired) << "the fixture's spiking cell never fired";
+
+    EXPECT_GE(last_spiked[0], 0);
+    EXPECT_GE(last_spiked[1], 0);
+    EXPECT_LT(last_spiked[2], 0) << "a cell type with no EventOut reads as having fired";
+    EXPECT_LT(last_spiked[3], 0) << "a cell type with no EventOut reads as having fired";
+
+    engine.shutdown();
+}
+
 // ── stage 1, Deliver: draining the ring ────────────────────────────────────────
 
 TEST(SpikeEngine, injected_current_is_delivered_at_constant_amplitude_not_as_a_ramp) {
@@ -1322,8 +1527,8 @@ TEST(SpikeEngine, injected_current_is_delivered_at_constant_amplitude_not_as_a_r
     SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
     const LatchCellReader target(engine, /*neuron_index=*/0);
 
-    // The injector's window is [0.2ms, 0.7ms] at 0.1ms per tick, so ticks 2 through 7 each
-    // deliver one tick's worth of the same current.
+    // The injector starts at delay=0.2ms (tick 2) and runs duration=0.5ms (5 ticks at
+    // 0.1ms), so ticks 2 through 6 each deliver one tick's worth of the same current.
     spikecorec::Vector<f32> delivered_per_tick;
     for (s64 tick = 0; tick < 12; ++tick) {
         engine.step_simulation(tick);
@@ -1335,15 +1540,15 @@ TEST(SpikeEngine, injected_current_is_delivered_at_constant_amplitude_not_as_a_r
     // Every tick of the window delivers the SAME amount. A slot that is read without being
     // cleared accumulates instead, turning a constant current into a linear ramp -- which
     // still rises, still looks plausible, and is wrong at every steady state.
-    for (usize tick = 3; tick <= 7; ++tick) {
+    for (usize tick = 3; tick <= 6; ++tick) {
         EXPECT_FLOAT_EQ(delivered_per_tick[tick], delivered_per_tick[2])
                 << "delivered current changed at tick " << tick
                 << "; the ring row is not being cleared after it is read";
     }
 
-    // Delivered on exactly the six ticks of the window and on no others: past the window the
+    // Delivered on exactly the five ticks of the window and on no others: past the window the
     // row is empty, which is only true if each read cleared it.
-    EXPECT_EQ(target.delivery_count(), 6);
+    EXPECT_EQ(target.delivery_count(), 5);
 
     engine.shutdown();
 }
@@ -1532,7 +1737,7 @@ TEST(SpikeEngine, clearing_the_current_row_preserves_a_spike_already_in_flight) 
     FixtureDirectory fixture("neuroml_in_flight_across_clears");
     String model_path = write_stimulated_two_neuron_model(fixture, /*stimulus_target=*/"popTarget",
                                                           /*pulse_delay=*/"0ms",
-                                                          /*pulse_duration=*/"0.2ms");
+                                                          /*pulse_duration=*/"0.3ms");
 
     SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
     ASSERT_EQ(engine.network_input_ring_depth, 4);

@@ -513,6 +513,11 @@ struct NML_Parser {
 
     bool validate_against_schema(const String &nml_file_path);
 
+    // Ingests the vendored standard library, then `lems_main_file` and everything it
+    // includes, and exports the flattened model. An EMPTY path is the "standard library
+    // only" load: nothing is exported, the result is empty, and no <Simulation> is looked
+    // for. Any non-empty path names a real file, and a file that cannot be read throws
+    // rather than contributing nothing (see ingest_document).
     NML_ParseResult parse_lems(const String &lems_main_file);
 
     void parse_neuroml(const String &nml_file_path);

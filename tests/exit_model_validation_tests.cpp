@@ -55,8 +55,19 @@ using namespace spikecorec;
 // The measured result, once the engine defect described below is fixed, is ZERO samples outside
 // those bands out of the 3499 compared per column, on all four models, and every spike on the
 // reference's exact tick. The bands above are ceilings, not the achieved agreement: the largest
-// same-tick deviation anywhere in the four runs is 600uV on `v` (glif3), 24uV on `theta` (glif5),
-// 0.42pA on asc1 and 2.6pA on asc2 -- one to four orders of magnitude inside the asserted band.
+// same-tick deviation anywhere in the four runs is 11nV on `v` (glif3), 24uV on `theta` (glif5),
+// 0.42pA on asc1 and 2.6pA on asc2 -- four to five orders of magnitude inside the asserted band
+// on `v`.
+//
+// `v` reads 11nV rather than the 600uV this comment carried before because of a SECOND engine
+// defect, since fixed: <pulseGenerator> wrote its injection window with an exclusive end tick
+// into an event stream filled inclusively, so the pulse ran one tick long. That extra tick is
+// I*dt/C of membrane voltage delivered after jNeuroML's pulse had already stopped -- 600uV on
+// glif3 and glif4's 0.6nA/100pF, 220uV on glif2's 0.22nA, 250uV on glif4's 0.25nA -- and it was
+// the entire `v` disagreement on three of the four models. glif5 read the numeric floor even
+// before the fix only by coincidence: its last reference spike is at t=0.3171s and t_ref is 5ms,
+// so the extra tick at 3200 landed inside a refractory hold with `v` pinned at vreset, where the
+// current had nowhere to go.
 //
 // An earlier version of this file asserted something much weaker and advertised it as 1mV: it
 // took, per sample, the SMALLEST deviation against any reference row within +-10 ticks. That

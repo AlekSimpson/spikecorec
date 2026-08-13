@@ -519,7 +519,8 @@ static String leaf_id(const String &scoped_id) {
 }
 
 // Exactly two input shapes are modelled: a rectangular current window (`amplitude` held
-// across [delay, delay + duration]) and an explicit <spike> train. An input component that
+// across [delay, delay + duration), half-open as LEMS declares it) and an explicit <spike>
+// train. An input component that
 // is neither still parses into a profile, and that profile is quietly wrong in one of two
 // ways -- it delivers nothing, or it delivers the wrong waveform. Neither is visible
 // downstream: SpikeEngine::create_event_stream turns empty event_ticks into an empty
@@ -554,10 +555,24 @@ static void report_unmodelled_input_shape(const ComponentInstance &input,
 
             log::logger().warn(
                     "Input '{}' of type '{}' is injected as a rectangular pulse holding its "
-                    "amplitude across [delay, delay + duration]; it also sets {}, which that "
+                    "amplitude across [delay, delay + duration); it also sets {}, which that "
                     "shape ignores, so the current delivered is not the one the model declares",
                     input.id, input.component_type_name, joined_names);
         }
+
+        // A duration shorter than one simulation step rounds to a zero-tick window, and a
+        // missing duration is that window. The injector then delivers NOTHING while still
+        // reading as a wired stimulus carrying a real amplitude -- the same silence a
+        // spikeGeneratorPoisson produces below, reached a different way.
+        for (const InputTarget &target : targets) {
+            if (!target.event_ticks.empty()) return;
+        }
+
+        log::logger().warn(
+                "Input '{}' of type '{}' has an injection window less than one simulation step "
+                "wide, so it delivers nothing at all: the {} target(s) wired to it receive no "
+                "current despite its amplitude",
+                input.id, input.component_type_name, targets.size());
         return;
     }
 
@@ -744,8 +759,26 @@ void NML_Parser::ingest_document(const String &file_path) {
     // the stack runs out.
     parsed_neuroml_files.insert(canonical_text);
 
+    // THROWS rather than returning quietly. A document that could not be read contributes
+    // none of its ComponentTypes, none of its instances, and none of its populations,
+    // projections or inputs -- and not one of those omissions stops the model from
+    // constructing and running. The two shapes it takes are both silent:
+    //
+    //   * the file the caller named is missing, and the model reaches WeightMatrix with zero
+    //     neurons, which reports "network must have at least one neuron" and names the wrong
+    //     subsystem entirely;
+    //   * an <Include> is dropped, and the model is PARTIALLY WIRED -- it constructs, it
+    //     runs, and it produces plausible wrong numbers with nothing anywhere saying which
+    //     half of the network went missing.
+    //
+    // The failing file is named because include graphs are several levels deep and it is
+    // rarely the one the caller passed in.
     NML_Node root;
-    if (!read_document_root(canonical_text, root)) return;
+    if (!read_document_root(canonical_text, root)) {
+        throw runtime_error("Could not read NML/LEMS document '" + canonical_text +
+                            "'; every ComponentType, instance and network element it "
+                            "declares is missing from the model");
+    }
 
     path containing_directory = path(canonical_text).parent_path();
 
@@ -1120,7 +1153,12 @@ NML_ParseResult NML_Parser::parse_lems(const String &lems_main_file) {
                             STANDARD_LIBRARY_PATH);
     }
 
-    ingest_document(lems_main_file);
+    // An EMPTY path is "the standard library and nothing else": there is no model document
+    // to read, so none is ingested and none is exported. Every other path names a real file
+    // whose failure to read throws (ingest_document), which is why this is a test on the
+    // path rather than on whether reading it worked.
+    const bool has_model_document = !lems_main_file.empty();
+    if (has_model_document) ingest_document(lems_main_file);
 
     // Every document is in, so `extends` can finally be resolved by name across all of
     // them, and only then can instances be bound to their types.
@@ -1133,6 +1171,8 @@ NML_ParseResult NML_Parser::parse_lems(const String &lems_main_file) {
     for (NML_Node &instance_node : document_instance_nodes) {
         instantiate(&instance_node);
     }
+
+    if (!has_model_document) return {};
 
     std::error_code path_error;
     path canonical = weakly_canonical(path(lems_main_file), path_error);
@@ -1217,30 +1257,54 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         }
     }
 
-    if (simulation) {
-        return_value.simulation_component_id = simulation->id;
-        return_value.target_network_id = simulation->value_or("target");
+    // A model with no <Simulation> cannot be simulated, and warning about it is not enough.
+    // Everything the tick loop is scaled by comes from here: step_dt stays 0.0 and
+    // total_tick_count stays 0, every delay and every input window converts to tick 0
+    // (tick_count_from_seconds returns 0 for a non-positive step), and the engine then
+    // constructs, ticks SUCCESSFULLY and holds every membrane at its resting potential for
+    // the whole run. That is a simulation that ran and means nothing, which is worse than
+    // one that refused to start.
+    if (!simulation) {
+        throw runtime_error(
+                "The model declares no <Simulation> component (root <" +
+                (lems_root ? lems_root->tag_name : String("?")) +
+                ">), so it carries no step size, no duration and no target network: there "
+                "is nothing to simulate. Declare a <Simulation id=... length=... step=... "
+                "target=.../> and name it with <Target component=.../>");
+    }
 
-        if (simulation->has_value("step")) {
-            return_value.step_dt = resolve_quantity(simulation->value_or("step"));
-        }
-        if (simulation->has_value("length")) {
-            return_value.simulation_duration = resolve_quantity(simulation->value_or("length"));
-        }
-        return_value.total_tick_count = tick_count_from_seconds(
-                return_value.simulation_duration, return_value.step_dt);
+    return_value.simulation_component_id = simulation->id;
+    return_value.target_network_id = simulation->value_or("target");
 
-        if (simulation->has_value("seed")) {
-            try {
-                return_value.random_seed =
-                        static_cast<u64>(std::stoull(simulation->value_or("seed")));
-            } catch (const std::exception &) {
-                log::logger().warn("Simulation '{}' has a non-numeric seed '{}'; ignoring",
-                                   simulation->id, simulation->value_or("seed"));
-            }
+    if (simulation->has_value("step")) {
+        return_value.step_dt = resolve_quantity(simulation->value_or("step"));
+    }
+    if (simulation->has_value("length")) {
+        return_value.simulation_duration = resolve_quantity(simulation->value_or("length"));
+    }
+    return_value.total_tick_count = tick_count_from_seconds(
+            return_value.simulation_duration, return_value.step_dt);
+
+    // The same defect as a missing <Simulation>, reached through a Simulation that declares
+    // no usable `step`: dt is what every conversion downstream divides by, and a
+    // non-positive one makes every one of them zero rather than making anything fail.
+    if (return_value.step_dt <= 0.0) {
+        throw runtime_error(
+                "Simulation '" + simulation->id + "' has a step of " +
+                std::to_string(return_value.step_dt) +
+                "s; the step is the dt every tick advances by and every delay and input "
+                "window is measured in, so a non-positive one leaves the model unable to "
+                "advance any state at all");
+    }
+
+    if (simulation->has_value("seed")) {
+        try {
+            return_value.random_seed =
+                    static_cast<u64>(std::stoull(simulation->value_or("seed")));
+        } catch (const std::exception &) {
+            log::logger().warn("Simulation '{}' has a non-numeric seed '{}'; ignoring",
+                               simulation->id, simulation->value_or("seed"));
         }
-    } else if (lems_root) {
-        log::logger().warn("No Simulation instance found in {}", lems_root->tag_name);
     }
 
     // ── Pass 1: types and prototypes ─────────────────────────────────────────────
@@ -1676,14 +1740,23 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             }
 
             // Times are held in ticks so the engine never converts. Every profile reports
-            // its span the same way: a target's event_ticks.front() is the tick the input
-            // begins and event_ticks.back() is the tick it ends.
+            // its span the same way, and the span is CLOSED AT BOTH ENDS: a target's
+            // event_ticks.front() is the first tick the input is delivered on and
+            // event_ticks.back() is the LAST tick it is delivered on, both inclusive.
+            // create_event_stream fills `tick <= back()`, so anything computing a span here
+            // has to hand it an inclusive last tick.
             if (return_value.step_dt > 0.0) {
                 if (profile.continuous_current_injection) {
                     // A continuous injector (pulseGenerator and friends) fires no discrete
-                    // events -- its span is the [delay, delay + duration] window, written as
-                    // exactly those two ticks. A missing duration leaves the window empty
-                    // rather than ending it before it starts.
+                    // events -- its span is one window, written as its first and last ticks.
+                    //
+                    // LEMS gates a pulseGenerator on `t .geq. delay .and. t .lt. delay +
+                    // duration` (Inputs.xml), a HALF-OPEN window: current flows on exactly
+                    // duration/dt ticks and NOT on the tick at delay + duration. Converting
+                    // that to this inclusive convention is the -1 below. Without it the
+                    // window ran one tick long and the pulse delivered one extra tick of
+                    // charge -- 2001 ticks for duration="200ms" at 0.1ms, and 10% too much
+                    // charge for a 1ms pulse.
                     s64 injection_start_tick = 0;
                     if (input.has_value("delay")) {
                         injection_start_tick = tick_count_from_seconds(
@@ -1691,17 +1764,25 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                                 return_value.step_dt);
                     }
 
-                    s64 injection_end_tick = injection_start_tick;
+                    s64 injection_tick_count = 0;
                     if (input.has_value("duration")) {
-                        injection_end_tick = injection_start_tick + tick_count_from_seconds(
+                        injection_tick_count = tick_count_from_seconds(
                                 resolve_quantity(input.value_or("duration")),
                                 return_value.step_dt);
                     }
 
-                    profile.max_delay_time = injection_end_tick;
-                    for (InputTarget &target : targets) {
-                        target.event_ticks = {static_cast<s32>(injection_start_tick),
-                                              static_cast<s32>(injection_end_tick)};
+                    // A window shorter than one tick -- and a missing duration, which is
+                    // that window -- delivers nothing at all, and is left with NO event
+                    // ticks rather than a pair whose end precedes its start.
+                    if (injection_tick_count > 0) {
+                        const s64 injection_end_tick =
+                                injection_start_tick + injection_tick_count - 1;
+
+                        profile.max_delay_time = injection_end_tick;
+                        for (InputTarget &target : targets) {
+                            target.event_ticks = {static_cast<s32>(injection_start_tick),
+                                                  static_cast<s32>(injection_end_tick)};
+                        }
                     }
                 } else {
                     // A spikeArray carries its train as <spike time="..."/> children. Every
@@ -1812,6 +1893,10 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                                   : output_format_for_filename(filename));
             recording_profile.recordings_count = 0;
 
+            // Collected so a file that asked for columns and got none can name what it asked
+            // for. See the throw below the loop.
+            Vector<String> unresolved_quantity_paths;
+
             for (const String &selection_id : output.structured_instance_data) {
                 auto selection_entry = instance_table.find(selection_id);
                 if (selection_entry == instance_table.end()) continue;
@@ -1830,6 +1915,7 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
 
                 recorded.neuron_index = resolve_neuron_index(recorded.quantity_path);
                 if (recorded.neuron_index < 0) {
+                    unresolved_quantity_paths.push_back(recorded.quantity_path);
                     log::logger().warn(
                             "Recording '{}' in {} resolves to no neuron; recorded with "
                             "index -1", recorded.quantity_path, filename);
@@ -1857,6 +1943,32 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
 
                 recording_profile.selections.push_back(std::move(recorded));
                 recording_profile.recordings_count += 1;
+            }
+
+            // A file that asked for columns and resolved NONE of them is an error, not a
+            // warning. The engine's recording setup treats an empty selection list as "record
+            // every neuron's first state variable", which is the intended reading of an
+            // <OutputFile> with no columns at all -- but applied here it silently substitutes
+            // a whole-population recording of slot 0 for the one column that was asked for.
+            // One mistyped population name then produces a file of the right SHAPE (it is
+            // neuron_count columns wide, which matches whenever the request happened to be
+            // that wide) holding entirely different variables, and nothing downstream can
+            // tell it from the recording that was meant.
+            if (recording_profile.recordings_count > 0 &&
+                unresolved_quantity_paths.size() ==
+                        static_cast<usize>(recording_profile.recordings_count)) {
+                String requested;
+                for (const String &quantity_path : unresolved_quantity_paths) {
+                    if (!requested.empty()) requested += ", ";
+                    requested += "'" + quantity_path + "'";
+                }
+                throw runtime_error(
+                        "Output file '" + filename + "' asked for " +
+                        std::to_string(recording_profile.recordings_count) +
+                        " column(s) and not one of them names a neuron this model declares (" +
+                        requested +
+                        "); recording every neuron's first state variable instead would write "
+                        "a file of plausible shape holding entirely different variables");
             }
 
             return_value.recording_profiles.push_back(std::move(recording_profile));
