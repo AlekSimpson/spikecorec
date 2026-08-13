@@ -120,6 +120,23 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
 - `make examples-cuda`
   Builds `build/cuda_example` from `examples/cuda_example.cpp`.
 
+### Demos
+
+`examples/demos/` holds the same GLIF networks at a scale meant to be watched, recorded and
+rendered to video. Not part of `make check` — rendering is far too slow for a gate.
+
+- `make demos`
+  Builds `examples/demos/*.cpp` → `build/demos/`.
+
+- `make run-demos`
+  Builds and runs every GLIF variant, recording to `build/demo_videos/<variant>/` without
+  rendering.
+
+- `make demo-videos DEMO_PYTHON=<interpreter>`
+  The one command that rebuilds every demo and regenerates every video from scratch, into
+  `build/demo_videos/`. `DEMO_PYTHON` must have numpy and matplotlib; it defaults to `python3`.
+  See `examples/demos/README.md`.
+
 ### Utilities
 
 - `make info`
