@@ -6,6 +6,7 @@
 #   make cuda         — build CUDA backend
 #   make metal        — build Metal backend
 #   make python       — build Python extension (pip editable install)
+#   make python-test  — build the extension AND run python/tests (needs PYTHON=, see below)
 #   make test         — build and run C++ tests
 #   make examples     — build examples
 #   make run-examples — build AND run every example, failing on any non-zero exit
@@ -165,12 +166,17 @@ DEPFLAGS    := -MMD -MP
 ALL_DEP_FILES := $(patsubst %.o,%.d,$(CORE_OBJS) $(NML_OBJS) $(METAL_OBJS))
 
 # ── Python toolchain ─────────────────────────────────────────
+# Building the extension needs pybind11; running python/tests additionally needs numpy and
+# pytest. None of the three is needed by the C++/Metal/CUDA build, so point this at whatever
+# interpreter has them:
+#     make python PYTHON=/path/to/venv/bin/python
+#     make python-test PYTHON=/path/to/venv/bin/python
 PYTHON     ?= python3
 PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null)
 PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
 
 # ── Top-level targets ────────────────────────────────────────
-.PHONY: all cuda metal python test examples run-examples check clean info
+.PHONY: all cuda metal python python-test test examples run-examples check clean info
 
 all: $(BACKEND)
 
@@ -245,6 +251,18 @@ ifeq ($(BACKEND),metal)
 	cp $(BUILD_DIR)/default.metallib python/spikecorec/default.metallib
 endif
 	@echo "[spikecorec] Python extension installed (backend=$(BACKEND))"
+
+# Builds the extension and runs python/tests against it. A few seconds: the fixture is an
+# 8-neuron ring run for a few thousand ticks.
+#
+# Deliberately NOT wired into `make check`. `make check` has to stay runnable with no
+# arguments, and this cannot be: PYTHON defaults to `python3`, and whether that particular
+# interpreter has pybind11, numpy and pytest is a property of the machine rather than of the
+# repository. A `make check` that failed on a missing pytest would be reporting the
+# environment instead of the code. Run it explicitly:
+#     make python-test PYTHON=/path/to/venv/bin/python
+python-test: python
+	$(PYTHON) -m pytest python/tests
 
 # ── Tests ────────────────────────────────────────────────────
 .PHONY: test test-cuda test-metal

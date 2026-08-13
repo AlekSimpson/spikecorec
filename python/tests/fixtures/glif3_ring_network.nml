@@ -1,0 +1,112 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif3RingNetworkContent">
+  <!--
+    A small (8-neuron ring) GLIF3 network fixture for python/tests/test_glif_network.py.
+
+    Ported from nightly's fixture of the same name, with two changes forced by the engine
+    this branch actually has:
+
+      - the lateral synapse is an <alphaCurrentSynapse> (current-based), not nightly's
+        <expOneSynapse>. A conductance-based synapse computes i = g * (erev - v), a driving
+        force that depends on the postsynaptic voltage and reverses sign as v crosses erev,
+        and the codegen refuses those BY NAME rather than running one as if it were
+        current-based (src/nml/kernel_codegen.cpp, declares_conductance_parameter). Keeping
+        expOneSynapse here would make the fixture unloadable, not merely approximate.
+
+      - the run's dt and length come from the model now, so they live in a <Simulation>
+        rather than in a dt_seconds constructor argument. See glif3_ring_network_top.nml,
+        which is the file the engine is handed.
+
+    The GLIF3Cell ComponentType below is character-for-character the one in
+    tests/fixtures/nml/glif3_single_cell.nml, the Phase-1 exit model already validated
+    against jNeuroML reference traces, so this fixture exercises dynamics that are known
+    good and only varies the wiring: a plain unidirectional ring, small enough to hand-type,
+    instead of a single isolated cell. Neuron 0 gets a real pulseGenerator explicitInput;
+    each neuron n drives neuron (n+1) mod 8 through the lateral synapse, so a real
+    per-edge synapse dispatch is exercised end to end.
+
+    This document deliberately omits the xsi/schemaLocation attributes: it is consumed only
+    by spikecorec's own front end, never by jNeuroML/pyneuroml.
+  -->
+  <ComponentType name="GLIF3Cell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <Parameter name="vreset" dimension="voltage"/>
+    <Parameter name="t_ref" dimension="time"/>
+    <Parameter name="tauAsc1" dimension="time"/>
+    <Parameter name="tauAsc2" dimension="time"/>
+    <Parameter name="ascAdd1" dimension="current"/>
+    <Parameter name="ascAdd2" dimension="current"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Exposure name="asc1" dimension="current"/>
+    <Exposure name="asc2" dimension="current"/>
+    <Exposure name="iSyn" dimension="current"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="asc1" dimension="current" exposure="asc1"/>
+      <StateVariable name="asc2" dimension="current" exposure="asc2"/>
+      <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+      <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+      <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
+      <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
+      <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
+      <OnStart>
+        <StateAssignment variable="v" value="EL"/>
+        <StateAssignment variable="asc1" value="0"/>
+        <StateAssignment variable="asc2" value="0"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn + ascSum) / C"/>
+        <OnCondition test="v .gt. vth">
+          <EventOut port="spike"/>
+          <StateAssignment variable="v" value="vreset"/>
+          <StateAssignment variable="asc1" value="asc1 + ascAdd1"/>
+          <StateAssignment variable="asc2" value="asc2 + ascAdd2"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="refractoryTimeElapsed" value="0"/>
+        </OnEntry>
+        <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
+        <OnCondition test="refractoryTimeElapsed .geq. t_ref">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <GLIF3Cell id="glif3CellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             t_ref="5ms" tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-100pA" ascAdd2="-200pA"/>
+
+  <!--
+    ibase is the PEAK of the alpha current one arriving spike injects, reached one tau after
+    it lands, not a single-tick impulse. 1nA into a 100pF membrane leaking with a 10ms time
+    constant is comfortably enough for one arrival to recruit its target, which is what makes
+    activity travel round the ring rather than dying at neuron 1.
+  -->
+  <alphaCurrentSynapse id="ringSynapse" tau="2ms" ibase="1nA"/>
+
+  <pulseGenerator id="pulseGen0" delay="10ms" duration="200ms" amplitude="600pA"/>
+
+  <network id="Glif3RingNet">
+    <population id="RingPop" component="glif3CellInstance" size="8"/>
+
+    <explicitInput target="RingPop[0]" input="pulseGen0"/>
+
+    <projection id="RingProj" presynapticPopulation="RingPop" postsynapticPopulation="RingPop" synapse="ringSynapse">
+      <connectionWD id="0" preCellId="../RingPop[0]" postCellId="../RingPop[1]" weight="1" delay="1ms"/>
+      <connectionWD id="1" preCellId="../RingPop[1]" postCellId="../RingPop[2]" weight="1" delay="1ms"/>
+      <connectionWD id="2" preCellId="../RingPop[2]" postCellId="../RingPop[3]" weight="1" delay="1ms"/>
+      <connectionWD id="3" preCellId="../RingPop[3]" postCellId="../RingPop[4]" weight="1" delay="1ms"/>
+      <connectionWD id="4" preCellId="../RingPop[4]" postCellId="../RingPop[5]" weight="1" delay="1ms"/>
+      <connectionWD id="5" preCellId="../RingPop[5]" postCellId="../RingPop[6]" weight="1" delay="1ms"/>
+      <connectionWD id="6" preCellId="../RingPop[6]" postCellId="../RingPop[7]" weight="1" delay="1ms"/>
+      <connectionWD id="7" preCellId="../RingPop[7]" postCellId="../RingPop[0]" weight="1" delay="1ms"/>
+    </projection>
+  </network>
+</neuroml>

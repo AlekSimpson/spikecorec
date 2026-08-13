@@ -6,14 +6,16 @@ Build the _spikecorec extension module.
   SPIKECOREC_BACKEND=metal pip install -e .
 """
 
+import glob
 import os
-import sys
 import platform
 import shutil
 import subprocess
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext as _build_ext
 import pybind11
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 class CudaBuildExt(_build_ext):
@@ -73,20 +75,29 @@ if BACKEND not in ("cuda", "metal"):
 
 # ── Common settings ──────────────────────────────────────────
 INC = ["include", pybind11.get_include(), "third_party/spdlog/include"]
-SRCS = [
-    "src/bindings/bindings.cpp",
-    "src/core/backend.cpp",
-    "src/core/engine.cpp",
-    "src/core/k2tree.cpp",
-    "src/core/log.cpp",
-    "src/core/recording.cpp",
-    "src/core/topologies.cpp",
-    "src/core/types.cpp",
-    "src/core/weight_matrix.cpp",
-]
+
+# Globbed, not listed by hand. A hand-maintained list is how this extension came to be
+# missing src/core/engine_allocator.cpp, src/core/units.cpp and the whole of src/nml/ while
+# the Makefile (which globs) built them fine — `make python` then failed at link time with
+# undefined symbols that named nothing about the real cause. The Makefile's own CORE_SRCS /
+# NML_SRCS are the same two wildcards.
+SRCS = (
+    ["src/bindings/bindings.cpp"]
+    + sorted(glob.glob("src/core/*.cpp"))
+    + sorted(glob.glob("src/nml/*.cpp"))
+)
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
 EXTRA_LINK_ARGS = []
-DEFINE_MACROS = [("SPDLOG_ACTIVE_LEVEL", "SPDLOG_LEVEL_TRACE")]  # spdlog is header-only by default
+DEFINE_MACROS = [
+    ("SPDLOG_ACTIVE_LEVEL", "SPDLOG_LEVEL_TRACE"),  # spdlog is header-only by default
+    # Baked in as absolute paths, exactly as the Makefile's $(abspath ...) does, so the
+    # vendored NeuroML/LEMS standard library and the XSD schema resolve no matter what
+    # directory the interpreter importing this extension was started from.
+    ("SPIKECOREC_NML_STD_LIB_DIR",
+     '"' + os.path.join(REPO_ROOT, "third_party", "neuroml2", "std_lib") + '"'),
+    ("SPIKECOREC_NML_SCHEMA_PATH",
+     '"' + os.path.join(REPO_ROOT, "third_party", "neuroml2", "schema", "NeuroML_v2.3.xsd") + '"'),
+]
 
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ──────────────
 # Mirrors the Makefile's HAS_ZLIB/HAS_LZMA/HAS_BZ2 probing: query pkg-config
@@ -109,6 +120,25 @@ for _macro, _package in (
             EXTRA_COMPILE_ARGS.append(_flag)
     for _flag in _libs:
         EXTRA_LINK_ARGS.append(_flag)
+
+# ── XML parsing (libxml2 — the NML/LEMS front-end) ──────────────────────────
+# Not optional the way the compression codecs are: src/nml/nml.cpp includes
+# <libxml/parser.h> unconditionally and the engine cannot read a model without it.
+# Probed the same way, but a miss is a hard error rather than a graceful degrade.
+_libxml2_libs = _pkg_config("--libs", package="libxml-2.0")
+if _libxml2_libs is None:
+    raise RuntimeError(
+        "libxml2 not found via pkg-config. The NeuroML/LEMS front-end needs it; "
+        "install libxml2 (macOS: `brew install libxml2`, and make sure its .pc file is on "
+        "PKG_CONFIG_PATH)."
+    )
+DEFINE_MACROS.append(("SPIKECOREC_HAVE_LIBXML2", None))
+for _flag in _pkg_config("--cflags", package="libxml-2.0") or []:
+    if _flag.startswith("-I"):
+        INC.append(_flag[2:])
+    else:
+        EXTRA_COMPILE_ARGS.append(_flag)
+EXTRA_LINK_ARGS += _libxml2_libs
 
 # ── CUDA backend ─────────────────────────────────────────────
 if BACKEND == "cuda":

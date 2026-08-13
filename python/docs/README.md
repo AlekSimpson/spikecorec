@@ -1,46 +1,65 @@
 # `spikecorec` — Python bindings
 
-`spikecorec` is a pybind11 wrapper around the C++/CUDA/Metal spiking-network
-engine in this repo. It exposes the same simulation primitives as the
-`spikecore` Python reference (`SpikeEngine`, topology generators, weight
-inspection) while running the actual step loop on the GPU.
+`spikecorec` is a pybind11 wrapper around the C++/Metal/CUDA spiking-network engine in this
+repo. The engine simulates whatever a NeuroML/LEMS document describes: it parses the model,
+generates a GPU kernel from the LEMS dynamics, compiles it at runtime, and runs the tick loop
+on the GPU.
 
-> **Looking for a quick parameter/method lookup while developing?** See
-> [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for a complete,
-> table-based reference of every function, class, method, property, and
-> default. This README focuses on tutorials and explanations.
+> **Looking for a parameter/method lookup while developing?** See
+> [`API_REFERENCE.md`](API_REFERENCE.md) — a table-based reference of every function, class,
+> method, property and default. This document is the walkthrough.
 
 ## Installation
 
-Build and install the extension as an editable package (auto-detects the
-backend — Metal on macOS, CUDA elsewhere):
+Build and install the extension as an editable package (auto-detects the backend — Metal on
+macOS, CUDA elsewhere):
 
 ```bash
-pip install pybind11
-make python
+make python PYTHON=/path/to/python
 ```
+
+The interpreter needs `pybind11` to build and `numpy` to be useful; `pytest` on top of that to
+run the test suite. `PYTHON` defaults to `python3`, which is only right if that interpreter is
+the one with those packages.
 
 Or force a backend explicitly:
 
 ```bash
-SPIKECOREC_BACKEND=metal make python
-SPIKECOREC_BACKEND=cuda  make python
+SPIKECOREC_BACKEND=metal make python PYTHON=...
+SPIKECOREC_BACKEND=cuda  make python PYTHON=...
 ```
 
-This runs `pip install -e .` under the hood, so `import spikecorec` works from
-anywhere once it completes. On Metal it also copies `default.metallib` next to
-the compiled `.so` — required at import time for the GPU kernels to load.
+This runs `pip install -e .` under the hood, so `import spikecorec` works from anywhere once
+it completes. On Metal it also copies `default.metallib` next to the compiled `.so`.
 
-> **Note:** the C++ GPU context is initialized once, at module import
-> (`initialize_gpu_context()`), and intentionally never torn down — there is no
-> safe ordering between releasing GPU resources and Python's garbage collector
-> finalizing `SpikeEngine`/`WeightMatrix` objects. The OS reclaims GPU memory at
-> process exit, the same way most CUDA-backed Python extensions behave.
+The build also needs **libxml2** (via `pkg-config`) — the NeuroML/LEMS front end is not
+optional. `setup.py` fails with that named as the reason if it is missing.
+
+> **Note:** the GPU context is initialized once, at module import
+> (`initialize_gpu_context()`), and intentionally never torn down — there is no safe ordering
+> between releasing GPU resources and Python finalizing a `SpikeEngine`. The OS reclaims GPU
+> memory at process exit, the same way most GPU-backed Python extensions behave.
 
 ```python
 import spikecorec
 print(spikecorec.__version__)
 ```
+
+## The idea
+
+**The model drives the engine, not Python.** A NeuroML/LEMS document states everything: the
+cell dynamics (as LEMS `<ComponentType>` declarations), the populations, the wiring, the
+stimulus, the timestep, the run length and the recordings. `SpikeEngine` reads the file and
+does one thing per call — advance every neuron by one `dt`.
+
+There is no Python API for building a network out of an adjacency list, designating input
+neurons, or pushing a vector of drive in each tick. That was the pre-NeuroML engine; those
+methods are commented out in `engine.h` and are not bound. If you want a different network,
+write a different model.
+
+**Everything crossing the boundary is SI.** A `C="100pF"` reads back as `1e-10` farads, a
+membrane potential as `-0.07` volts, a synaptic current as `6e-10` amperes. Nothing is scaled
+for readability on the way out.
 
 ## Quick start
 
@@ -48,395 +67,216 @@ print(spikecorec.__version__)
 import numpy as np
 import spikecorec
 
-# Build an 8x8 reservoir (64 neurons) on a 4-neighbor wraparound torus.
-network = spikecorec.square_torus(8)
-engine = spikecorec.SpikeEngine(network, shape=[8, 8], rank=4)
+spikecorec.set_log_level("warn")
 
-# Designate which neurons receive external input each tick.
-engine.set_input_neurons([0, 1, 2])
+engine = spikecorec.SpikeEngine("python/tests/fixtures/glif3_ring_network_top.nml")
 
-# Step the simulation. input_values[i] is added to the membrane potential of
-# input_neuron_indices[i] (set above) before the step's spike propagation runs.
-for tick in range(50):
-    engine.step_simulation([2.0, 2.0, 2.0], tick=tick)
+print(engine.total_neuron_count)          # 8
+print(engine.step_dt, engine.lifetime)    # 0.0001 s per tick, 3000 ticks
+print(engine.cell_type_names())           # ['GLIF3Cell']
+print(engine.state_variable_names(0))     # ['v', 'asc1', 'asc2', 'refractoryTimeElapsed']
 
-# Read GPU state back as numpy arrays.
-mp = engine.get_membrane_potentials()
-print("membrane potentials:", mp[:5])
-print("active neurons this tick:", engine.get_active_neuron_count())
+engine.run(engine.lifetime)
 
-# Pull a feature vector for use in a downstream readout/classifier.
-features = engine.get_reservoir_features_vector(tick=50, spike_tau=10.0, voltage_scale=1.0)
-print("feature vector shape:", features.shape)  # (2 * neuron_count + 1,)
+print(engine.state_variable_values("v"))  # membrane potential per neuron, in volts
+print(engine.state_variable_values("asc1"))   # after-spike current, in amperes
 
 engine.shutdown()
 ```
 
-## Topology generators
+`examples/demo_script.py` is this, end to end, with recordings.
 
-Build adjacency lists (`list[list[int]]`, node `i`'s entry holds the indices of
-its outgoing neighbors) for use as a `SpikeEngine`'s `network` argument. These
-mirror `spikecore/topologies.py`; randomized generators are **structurally**
-equivalent to the NumPy/PCG64 reference but not bit-identical (different RNG
-stream).
+## Writing the model
+
+A model needs two things the engine will not invent for you: a `<Simulation>` giving `step`
+and `length`, and a root element it can read.
+
+The NeuroML XSD describes `<neuroml>` documents. A raw LEMS `<ComponentType>` does not
+validate against it, and neither does a `<Simulation>`. `SpikeEngine` XSD-validates only a
+top-level file whose root **is** `<neuroml>`, so the usual shape is a `<Lems>` wrapper that
+includes the network and states the simulation:
+
+```xml
+<Lems>
+  <Target component="ringSimulation"/>
+  <Include file="glif3_ring_network.nml"/>
+  <Simulation id="ringSimulation" length="300ms" step="0.1ms" target="Glif3RingNet">
+    <OutputFile id="membrane" fileName="/absolute/path/membrane.spire">
+      <OutputColumn id="v0" quantity="RingPop[0]/v"/>
+    </OutputFile>
+    <EventOutputFile id="spikes" fileName="/absolute/path/spikes.spire" format="TIME_ID"/>
+  </Simulation>
+</Lems>
+```
+
+`<Include file="..."/>` resolves against the **including file's own** directory, not the
+process working directory, so a generated wrapper in a scratch directory should name the
+network by absolute path. `<OutputFile fileName>` is *not* resolved that way — it is used as
+written, so a relative one lands wherever the process happens to be running.
+
+Two things to watch, because neither is an error:
+
+- **A model with no `<Simulation>` only warns.** `step_dt` stays `0.0` and `lifetime` stays
+  `0`; every tick then integrates nothing while reporting success. Check `engine.step_dt`
+  after constructing a model you did not write.
+- **A `<Simulation>` with no `<OutputFile>` records nothing**, which is what you want for a
+  test but not for a run you meant to keep. `engine.recording_output_filenames()` says what
+  was actually opened.
+
+Conductance-based synapses (`expOneSynapse` and friends, anything declaring `erev`/`gbase`)
+are **refused by name** at construction rather than approximated. Use a current-based synapse
+(`alphaCurrentSynapse`, `expCurrSynapse`) until the driving-force lowering lands.
+
+## Running the simulation
 
 ```python
-spikecorec.square_torus(k)
-# 4-neighbor wraparound k*k grid. Every node has exactly 4 neighbors
-# (right, left, down, up). Deterministic — no seed.
-
-spikecorec.small_world_torus(k, random_fanout=4, seed=-1)
-# square_torus plus `random_fanout` deterministic long-range shortcuts per
-# node, so activity can mix across the reservoir rather than only drifting
-# locally. Every node ends up with out-degree 4 + random_fanout (capped by
-# reservoir size). seed < 0 seeds from std::random_device (non-deterministic).
-
-spikecorec.random_fixed_outdegree(k, fanout=8, seed=-1)
-# Directed random graph — no torus/grid structure at all. Every node has the
-# same out-degree `fanout`, with no self-loops and no duplicate edges.
+for tick in range(engine.lifetime):
+    engine.step_simulation(tick)
 ```
 
-All three return `k * k` nodes indexed `0 .. k*k - 1`.
-
-## `SpikeEngine`
+or, keeping the loop in C++ and dropping the GIL for its duration:
 
 ```python
-SpikeEngine(network, shape, rank=1, resting_mp=0.1, decay_rate=0.01, learning_rate=0.00222)
+engine.run(engine.lifetime)
 ```
 
-- `network` — `list[list[int]]` adjacency list (e.g. from a topology generator
-  above). Copied into a k²-tree-backed `WeightMatrix` at construction time.
-- `shape` — `[rows, cols]`; `neuron_count = rows * cols` must equal
-  `len(network)`.
-- `rank` — latent-factor dimensionality for the low-rank weight
-  approximation (`-1` → `min(64, neuron_count)`).
-- `resting_mp`, `decay_rate`, `learning_rate` — simulation constants (resting
-  membrane potential, exponential decay rate toward rest, Hebbian learning
-  rate).
+The tick index is **yours**. The engine keeps no counter and does not check the one you pass,
+and it is not decorative: it indexes the precomputed stimulus streams *and* selects which row
+of the synaptic delay ring is read. A repeated, skipped or out-of-order tick produces a wrong
+simulation quietly. Step from `0` upwards by one.
 
-### Running the simulation
+The one tick the binding does refuse is a negative one, which is an out-of-bounds device access
+rather than a wrong answer: the ring row is `tick % ring_depth` in signed arithmetic.
+
+### Counting spikes
+
+`spike_flags()` is this tick's emissions and nothing else — the master kernel lowers every flag
+at the top of each tick — so a `run()` loop cannot see the emissions of any tick but the last.
+To count them, drive the loop yourself:
 
 ```python
-engine.set_input_neurons(input_neuron_list)
+spike_counts = np.zeros(engine.total_neuron_count, dtype=np.int64)
+for tick in range(engine.lifetime):
+    engine.step_simulation(tick)
+    spike_counts += engine.spike_flags()
 ```
-Designates which neurons receive external input. `step_simulation`'s
-`input_values[i]` is added to the membrane potential of
-`input_neuron_list[i]` — the two lists are matched positionally and must be
-the same length.
+
+`last_spiked()` is the cheaper alternative, with one sharp edge: it is **zero-filled at
+construction**, not filled with `-1`. A `0` in it means either "fired on tick 0" or "never
+fired", and there is nothing in the array to tell those apart. Use it for *when* a neuron last
+fired, not for *whether* it ever did.
+
+## Reading state back
+
+Every accessor copies into a fresh numpy array; no GPU handle crosses the boundary.
 
 ```python
-engine.step_simulation(input_values, tick, override_input_neurons=[], decay_all_neurons=False)
+membrane_potentials = engine.state_variable_values("v")       # volts, per global neuron index
+after_spike_current = engine.state_variable_values("asc1")    # amperes
+capacitance         = engine.parameter_values("C")            # farads
 ```
-Advances the simulation by one tick:
-1. (optionally) decays every neuron toward `resting_mp` based on elapsed time
-   since its last update (`decay_all_neurons=True`),
-2. adds `input_values` into the membrane potentials of the configured input
-   neurons,
-3. merges `override_input_neurons` into this tick's active set (forces those
-   neurons to be processed even if they weren't already active — useful for
-   injecting activity at arbitrary locations, e.g. a "live keyboard input"
-   feature),
-4. propagates spikes through the network for one tick, applying Hebbian
-   weight updates along active edges.
+
+`state_variable_values` / `parameter_values` gather rather than slice. `cell_state` is
+sectioned by cell **type** — every neuron of type 0, then every neuron of type 1 — so the slot
+a variable occupies is resolved per neuron, from that neuron's own type. Two cell types may
+put `"v"` in different slots, and in a heterogeneous network one of them may not declare it at
+all; asking for a variable a neuron's type does not declare **raises**, naming the neuron, its
+type and what that type does declare.
+
+That last part is the one place the binding deliberately differs from the engine. The engine's
+own recording path, handed a quantity a cell type does not declare, warns and records that
+neuron's *first* state variable instead. A read-back accessor doing the same would answer a
+question about `asc1` with a membrane potential and look entirely plausible doing it.
+
+The raw layout is available too, if you want it: `cell_state()`, `cell_parameters()`,
+`cell_state_base()`, `cell_parameter_base()`, `cell_type_index()`, `synapse_state()` and
+`network_inputs()`.
+
+## Inspecting the wiring
 
 ```python
-engine.reset_state(last_spiked_value=0, active_gen_value=-1)
+for source_neuron in range(engine.total_neuron_count):
+    for target_neuron in engine.weights.get_neighbors(source_neuron):
+        print(source_neuron, "->", target_neuron,
+              engine.weights.get(source_neuron, target_neuron),
+              engine.weights.get_edge_delay_ticks(source_neuron, target_neuron))
 ```
-Returns the engine to its initial state: membrane potentials back to
-`resting_mp`, spike/update/active-set bookkeeping cleared, network input
-accumulator zeroed.
+
+Worth doing on any model you did not write. A model whose connection paths did not resolve
+produces a perfectly well-formed, fully **disconnected** network: the cells exist, the kernel
+runs, every neuron integrates alone, and the result looks like a quiet network rather than a
+broken one. The adjacency read-back is the only thing that tells those apart.
+
+Two notes on what you will see:
+
+- Delays come back in **ticks**, floored at `1`. The delay ring requires every delay to be at
+  least one tick, so a `delay="0ms"` reads back as `1`.
+- Two projections between the same ordered pair collapse onto the one adjacency slot that pair
+  has. Their weights **sum**; conflicting delays or conflicting synapses **throw** at
+  construction rather than picking one.
+
+The `rank` property, and the `U·V` factorization behind it, are a **memory-compression**
+scheme for very large adjacencies. They are not learning of any kind, and edge weights are
+stored exactly regardless (`using_exact_edge_weights`).
+
+## Recordings (`.spire`)
+
+A `.spire` file is a 4-byte big-endian value count followed by raw `float32` frames, one per
+tick. Compression is by extension: `.spire.gz`, `.spire.xz`, `.spire.bz2`.
+
+The engine opens one recorder per `<OutputFile>` / `<EventOutputFile>` in the model, and writes
+one frame to each per `step_simulation`. Columns are the file's own selections, in selection
+order; a file with no child selections records every neuron (its first state variable for a
+value file, its spike flag for an event file).
 
 ```python
-engine.is_alive() -> bool
-engine.shutdown()
+engine.run(engine.lifetime)
+engine.shutdown()                       # THIS is what flushes the last frames
+
+frames = spikecorec.read_spire_recording(engine.recording_output_filenames()[0])
+print(frames.shape)                     # (tick_count, column_count)
 ```
-`shutdown()` frees the engine's GPU buffers; `is_alive()` reflects whether
-that has happened. The engine also calls `shutdown()` automatically when
-garbage collected.
 
-### Reading state back
+Read the file **after** `shutdown()`. Frames are buffered and only flushed when the recorder is
+finished; a live read comes up short by up to a chunk.
 
-All of these copy GPU buffer contents into fresh numpy arrays (no GPU memory
-is exposed directly to Python — there's no sound cross-runtime ownership story
-for that):
+`examples/render_spire_video.py` renders a `.spire` pair (spikes plus membrane) to a video.
+
+### Writing your own
+
+`SimulationRecorder` is the same buffering/compression layer, exposed for values you gather
+yourself between ticks:
 
 ```python
-engine.get_membrane_potentials()    # float32[neuron_count]
-engine.get_network_inputs()         # float32[neuron_count] — pending input accumulator
-engine.get_last_spiked()            # int64[neuron_count]   — tick each neuron last fired
-engine.get_last_tick_updated()      # int64[neuron_count]   — tick each neuron last processed
-engine.get_active_neuron_indices()  # int32[active_neuron_count] — current active set
-engine.get_active_neuron_count()    # int — size of the current active set
-```
-
-### Reservoir features
-
-```python
-engine.get_reservoir_features_vector(tick, spike_tau, voltage_scale) -> np.ndarray[float32]
-```
-Builds a `2 * neuron_count + 1`-element feature vector suitable for a
-downstream readout layer:
-- `features[0:neuron_count]` — per-neuron spike trace,
-  `exp(-(tick - last_spiked) / spike_tau)` (`0` if the neuron has never fired)
-- `features[neuron_count:2*neuron_count]` — per-neuron scaled membrane
-  potential, `(membrane_potential - resting_mp) / voltage_scale`
-- `features[-1]` — bias term, always `1.0`
-
-Both `spike_tau` and `voltage_scale` must be positive (the call is a no-op,
-returning an unmodified buffer, if either is `<= 0`).
-
-### Weight scaling near the bifurcation point
-
-These tune the network's weights so that, on average, a neuron receiving
-periodic input of period `input_period` sits near its spiking threshold —
-the "edge of chaos" regime that gives reservoirs rich dynamics.
-
-```python
-engine.estimate_bifurcation_weight(input_period=1) -> (w_accum, w_instant)
-```
-Returns the accumulated-input and instantaneous-input weight estimates that
-would put a neuron with the engine's current `resting_membrane_potential`,
-`spike_threshold`, and `decay_rate` right at its firing threshold under
-periodic stimulation.
-
-```python
-engine.scale_uniform_weights_near_bifurcation(input_period=1, scale=1.2, freeze_learning=False)
-    -> (target, w_accum, w_instant)
-```
-Sets every edge to the same constant weight `target = w_accum * scale`
-(`weights.using_constant_weight` becomes `True`). If `freeze_learning` is set,
-`learning_rate` is zeroed.
-
-```python
-engine.scale_randomized_weights_near_bifurcation(input_period=1, scale=1.2, freeze_learning=False)
-    -> ScaledReservoirResult
-```
-Instead of collapsing to a constant, rescales the existing (randomized) edge
-weights so their RMS matches `target = abs(w_accum * scale)`. Returns a
-`ScaledReservoirResult`:
-
-| field | meaning |
-|---|---|
-| `weight_scale_result` | `ScaleResult` — before/after `WeightStats`, the applied `scale_factor`, and `target_root_mean_square` (the RMS value weights were scaled toward) |
-| `w_accum`, `w_instant` | the underlying bifurcation-weight estimates |
-
-### Properties
-
-| name | type | meaning |
-|---|---|---|
-| `neuron_count` | `int`, read-only | total neurons (`shape[0] * shape[1]`) |
-| `input_neuron_count` | `int`, read-only | length of the list passed to `set_input_neurons` |
-| `resting_membrane_potential` | `float`, read/write | rest potential neurons decay toward |
-| `decay_rate` | `float`, read/write | exponential decay rate toward rest |
-| `learning_rate` | `float`, read/write | Hebbian update step size |
-| `spike_period` | `int`, read/write | refractory ticks after a spike before a neuron can fire again |
-| `spike_threshold` | `float`, read/write | membrane potential at which a neuron spikes |
-| `use_constant_weight` | `bool`, read/write | when `True`, every edge uses `weights.constant_weight` instead of the learned `U·V` factorization |
-| `running` | `bool`, read-only | `False` once `shutdown()` has run |
-| `weights` | `WeightMatrix`, read-only | the engine's weight matrix (see below) — its lifetime is tied to the engine |
-
-### `setup_lifetime` (membrane-potential logging)
-
-```python
-engine.setup_lifetime(lifetime, allocate_logs, max_log_bytes=512 * 1024 * 1024)
-```
-Allocates host-side per-neuron membrane-potential log buffers
-(`neuron_count * lifetime` floats) for recording over a fixed-length run.
-Raises `RuntimeError` if the requested allocation would exceed
-`max_log_bytes`.
-
-## Simulation recording (`.spire` format)
-
-`spikecorec` can record a run's membrane potentials to disk in the same
-`.spire` binary format used by the `spikecore` Python reference — files are
-**byte-for-byte interoperable** between the two implementations (and with
-`gzip`/`xz`/`bzip2`-compressed variants of either).
-
-### Format
-
-```
-offset 0:  u32, big-endian   — neuron_count
-offset 4:  f32[neuron_count] — frame 0 membrane potentials (native byte order)
-offset 4 + neuron_count*4:   — frame 1 ...
-...repeated until EOF
-```
-
-No magic bytes or version marker. The whole byte sequence (header included)
-may optionally be wrapped end-to-end in gzip (`.gz`/`.gzip`), xz/lzma
-(`.xz`/`.lzma`), or bzip2 (`.bz2`) — `spikecorec` auto-detects this from the
-filename extension when `compression="auto"` (the default).
-
-> **Note:** gzip/xz/bz2 support depends on `zlib`/`liblzma`/`libbz2` being
-> available when `spikecorec` was built (the Makefile/`setup.py` probe for
-> them via `pkg-config` and degrade gracefully). Run `make info` to check
-> which were detected (`zlib found`/`lzma found`/`bzip2 found`); uncompressed
-> `.spire` always works regardless. Reading/writing a format whose library
-> wasn't available raises a `RuntimeError` with a clear message.
-
-### Recording a run
-
-```python
-engine.start_static_record(
-    input_spikes, lifetime, filename,
-    record_membrane=True, record_stride=1,
-    compression="auto", compression_level=None,
-    full_decay=True,
-    compression_async=False, compression_queue_max=8,
-    compression_chunk_bytes=4 * 1024 * 1024,
-)
-```
-
-Drives its own tick loop for `lifetime` ticks and writes a `.spire` recording
-to `filename` — a direct port of the `spikecore` reference's
-`start_static_record`:
-
-- `input_spikes` — `list[list[float]]`; `input_spikes[tick][i]` is added to
-  the membrane potential of `input_neuron_indices[i]` (as set via
-  `set_input_neurons`) for that tick. Must provide at least `lifetime` ticks,
-  and each tick's row must contain exactly `input_neuron_count` values — a
-  wrong-width or empty row raises `RuntimeError` before any file is written.
-- Each tick, the configured input neurons are forced into the active set
-  (mirrors the reference's per-tick `_add_active` call) before the step runs.
-- `record_membrane`/`record_stride` — whether/how often (every `record_stride`
-  ticks) to snapshot membrane potentials into the recording.
-- `compression`/`compression_level` — `"auto"` (infer from `filename`'s
-  extension), `"none"`, `"gzip"`, `"xz"`, or `"bz2"`; `compression_level` maps
-  to each codec's native level/preset (1-9 for gzip/bz2, 0-9 for xz; default
-  `6`, matching the reference).
-- `full_decay` — on each *recorded* tick, runs a full decay pass (advancing
-  `last_tick_updated` for every neuron, not just active ones) immediately
-  before the membrane-potential snapshot — exactly mirrors the reference's
-  `_decay_all` timing. This is a real, stateful operation, not a preview.
-- `compression_async`/`compression_queue_max`/`compression_chunk_bytes` —
-  when `compression_async=True`, compression and file I/O run on a background
-  thread fed by a bounded queue (`compression_queue_max` chunks of up to
-  `compression_chunk_bytes` bytes each) so the simulation loop isn't blocked
-  on slow I/O — this call releases the GIL while it runs, so other Python
-  threads keep making progress too. `compression_queue_max=0` makes the queue
-  unbounded (no backpressure), matching Python's `queue.Queue(maxsize=0)`.
-
-```python
-engine.set_input_neurons([0, 1, 2])
-input_spikes = [[2.0, 2.0, 2.0] for _ in range(500)]
-engine.start_static_record(
-    input_spikes, lifetime=500, filename="run.spire.gz",
-    record_stride=2, compression_async=True,
-)
-```
-
-### Reading a recording back
-
-```python
-spikecorec.read_spire_recording(filename) -> np.ndarray[float32]  # (frame_count, neuron_count)
-```
-
-Auto-detects compression from the extension, parses the header, and decodes
-every frame into one contiguous `(frame_count, neuron_count)` array. Raises
-`RuntimeError` if the final frame is truncated.
-
-```python
-recording = spikecorec.read_spire_recording("run.spire.gz")
-print(recording.shape)  # (250, neuron_count)
-```
-
-### `SimulationRecorder` (custom per-tick recording loops)
-
-`start_static_record` is built on top of a standalone `SimulationRecorder` —
-exposed directly for callers who want to drive their own tick loop (e.g.
-mixing in custom stimulus logic between `step_simulation` calls) while still
-producing a `.spire` file:
-
-```python
-recorder = spikecorec.SimulationRecorder(
-    filename, neuron_count,
-    compression="auto", compression_level=None,
-    compression_async=False, queue_max=8, chunk_bytes=4 * 1024 * 1024,
-)
-recorder.record_frame(membrane_potentials)  # float32[neuron_count]
-recorder.finish()                           # flush + close — call exactly once
-
-recorder.neuron_count                       # int, read-only — frame width it expects
-```
-
-`record_frame` appends one frame's worth of bytes to an internal buffer,
-flushing to the (possibly compressed, possibly async) sink once `chunk_bytes`
-is reached; `finish()` flushes any remainder and closes the underlying file.
-The array passed to `record_frame` must have exactly `recorder.neuron_count`
-elements — a wrong-size array raises `RuntimeError` rather than reading out of
-bounds. As with `start_static_record`, `queue_max=0` makes the async queue
-unbounded.
-
-## `WeightMatrix`
-
-Accessible read-only via `engine.weights`. Wraps a k²-tree-compressed sparse
-adjacency structure plus a low-rank `U·V` weight factorization.
-
-```python
-wm = engine.weights
-
-wm.node_count            # int — number of nodes
-wm.max_neighbor_count    # int — upper bound on neighbors per node (row padding width)
-wm.rank                  # int — latent factor dimensionality
-wm.rank_float4_stride    # int — ceil(rank / 4); internal SIMD row stride
-wm.constant_weight       # float — value used for every edge when using_constant_weight is True
-wm.using_constant_weight # bool
-
-wm.get(source_node, target_node) -> float          # weight of a specific edge
-wm.get_neighbors(node_index) -> list[int]          # outgoing neighbor indices of a node
-wm.neighbor_weight_stats() -> WeightStats          # mean/stddev/RMS/min/max over all edge weights
-wm.set_constant_weight(value)                      # set the constant-weight value
-```
-
-`WeightStats` and `ScaleResult` are plain read-only structs:
-
-| `WeightStats` | | `ScaleResult` | |
-|---|---|---|---|
-| `mean` | `float` | `target_root_mean_square` | `float` |
-| `standard_deviation` | `float` | `scale_factor` | `float` |
-| `root_mean_square` | `float` | `before` | `WeightStats` |
-| `min_value` | `float` | `after` | `WeightStats` |
-| `max_value` | `float` | | |
-
-## Putting it together: a minimal reservoir-readout loop
-
-```python
-import numpy as np
-import spikecorec
-
-network = spikecorec.small_world_torus(k=16, random_fanout=4, seed=42)
-engine = spikecorec.SpikeEngine(network, shape=[16, 16], rank=8)
-engine.set_input_neurons(list(range(8)))
-
-# Push the reservoir's weights toward the edge-of-chaos regime for period-1 input.
-engine.scale_randomized_weights_near_bifurcation(input_period=1, scale=1.2)
-
-feature_log = []
-for tick in range(200):
-    drive = np.random.uniform(0.5, 2.5, size=8).tolist()
-    engine.step_simulation(drive, tick=tick, decay_all_neurons=True)
-    if tick % 10 == 0:
-        feature_log.append(engine.get_reservoir_features_vector(tick, spike_tau=10.0, voltage_scale=1.0))
-
-features = np.stack(feature_log)
-print(features.shape)  # (20, 2 * 256 + 1)
-
-engine.shutdown()
+recorder = spikecorec.SimulationRecorder("custom.spire.gz", engine.total_neuron_count)
+for tick in range(engine.lifetime):
+    engine.step_simulation(tick)
+    recorder.record_frame(engine.state_variable_values("asc1"))
+recorder.finish()
 ```
 
 ## Running the tests
 
-The C++ core/codec test suite (topology, k²-tree, weight-matrix, engine, and
-`.spire` recording tests — `tests/test_core.cpp`) builds and runs with:
-
 ```bash
-make test          # auto-detects backend (Metal on macOS, CUDA elsewhere)
-make test-metal    # force the Metal build
+make python-test PYTHON=/path/to/venv/bin/python
 ```
 
-To build the Python extension itself, point `make python` at your interpreter.
-The project's intended Python environment is the `spike_engine` conda env
-(`numpy`, `pybind11`, etc. already present):
+That builds the extension and runs `python/tests` against it: a binding-layer smoke test, an
+end-to-end run of the checked-in 8-neuron GLIF3 ring fixture, a recording round-trip, and a
+stimulus test that recovers the injected current from the membrane trajectory. A few seconds
+in total.
+
+One test there is an `xfail`: `test_pulse_generator_duration_is_the_duration_it_states`. A
+`<pulseGenerator>` currently injects on one tick more than its `duration` states, because the
+delivery window is computed with an exclusive end index and then filled inclusively. Its
+`reason` string carries the two files and the two candidate one-line fixes.
+
+It is **not** part of `make check`, which has to stay runnable with no arguments — whether
+`python3` happens to have pybind11, numpy and pytest is a property of the machine, not of the
+repository, and a `make check` that failed on a missing pytest would be reporting the
+environment instead of the code. The C++ suite and the examples are what `make check` covers:
 
 ```bash
-make python PYTHON=/path/to/envs/spike_engine/bin/python
+make check         # make test + make run-examples
+make test-metal    # force the Metal build of the C++ suite
 ```
