@@ -40,21 +40,75 @@ using namespace spikecorec;
 // their <Include file="Cells.xml"/> resolves against the fixture directory rather than the
 // vendored standard library, so all six fail to parse.
 //
-// ── What these comparisons do and do not catch ───────────────────────────────────────────────
-// The tolerances are cross-simulator tolerances, not bit-exactness: two independently discretized
-// forward-Euler integrators drift by a few ticks around each threshold crossing over a 3500-tick
-// run, and demanding identical floats would only ever measure that drift. A spike count within
-// +-20%, first/last spike within 5ms, and a membrane sample within 1mV of SOME reference sample
-// within 10 ticks is loose enough to absorb that drift and still orders of magnitude tighter than
-// a wrong model, a missing mechanism or a units error, each of which misses by a factor rather
-// than by a tick. The honest limit: a purely systematic few-tick timing shift is absorbed by
-// design and is not caught here.
+// ── WHAT IS ACTUALLY ASSERTED, AND HOW TIGHT IT REALLY IS ────────────────────────────────────
+// Both simulators run the SAME model at the SAME 0.1ms step with the SAME forward-Euler scheme.
+// They are therefore not merely expected to agree "closely" -- they are expected to agree
+// TICK FOR TICK. That is what is asserted, with no tick-shift search anywhere in the verdict:
 //
-// That the band still discriminates was measured rather than assumed, with two throwaway negative
-// controls run against this same harness: comparing glif3's own membrane trace against GLIF5's
-// reference (a different but related model) puts 2718 of 3500 samples outside the band, and
-// comparing it against glif3's own asc1 column (a current where a voltage belongs -- the shape a
-// units error takes) puts all 3500 outside it. Against its own reference, glif3 puts zero outside.
+//   * the spike count is EXACTLY the reference's,
+//   * EVERY spike lands on the reference's exact tick -- first, last, and every one between,
+//   * EVERY recorded sample is within its column's band of the reference sample for the SAME
+//     instant: 1mV on `v` and on the adapting threshold `theta`, 10pA on asc1 and 20pA on asc2
+//     (10% of each after-spike current's own spike-time bump),
+//   * every refractory hold is exactly as many samples long as the reference's.
+//
+// The measured result, once the engine defect described below is fixed, is ZERO samples outside
+// those bands out of the 3499 compared per column, on all four models, and every spike on the
+// reference's exact tick. The bands above are ceilings, not the achieved agreement: the largest
+// same-tick deviation anywhere in the four runs is 600uV on `v` (glif3), 24uV on `theta` (glif5),
+// 0.42pA on asc1 and 2.6pA on asc2 -- one to four orders of magnitude inside the asserted band.
+//
+// An earlier version of this file asserted something much weaker and advertised it as 1mV: it
+// took, per sample, the SMALLEST deviation against any reference row within +-10 ticks. That
+// accepts any value in the reference's own range over those 21 rows, widened by 1mV on each side.
+// Measured on this reference data, that band is 3.2mV wide at the median and 22.0mV at the widest
+// on glif2, 4.1mV and 29.1mV on glif5, and it exceeds 15mV on 5.7% and 6.9% of samples
+// respectively -- so the advertised 1mV was really 15-29mV wherever the trace moved fast, which is
+// precisely around every spike. A model drifting by up to 10 ticks scored a perfect zero.
+//
+// The tick-shift search survives ONLY as a printed diagnostic (`best_uniform_shift`, below):
+// applied uniformly to the whole trace rather than per sample, it says whether a failure is "the
+// right trajectory, N ticks off" or "the wrong trajectory", and the same figure over the first and
+// last third of the run says whether that offset is DRIFTING. None of those three numbers gates a
+// test.
+//
+// ── SAMPLE ALIGNMENT: own[tick] == reference row (tick + 2) ──────────────────────────────────
+// Pinned by the stimulus onset, which is the one instant in the run whose timing depends on no
+// cell parameter at all. The pulse is declared `delay="20ms"`, so at 0.1ms the engine's first
+// deflected sample is own[200] and the reference's first deflected row is 202, and they agree to
+// 7 significant figures on all four models (own[200]=-0.06978 == glif2 row 202=-0.06978,
+// -0.069399998 == glif3 row 202=-0.0694, -0.069750004 == glif4 row 202=-0.06975). Two rows, not
+// one: jLEMS writes a t=0 initial condition before it steps, AND applies a pulseGenerator's
+// current on the step AFTER its OnCondition fires, where the engine applies it on the same step.
+// The previous `tick + 1` was a systematic one-tick misalignment -- invisible only because the
+// +-10 tick-shift search absorbed it. Under it, the four models' same-tick disagreement reads
+// 238/10/36/1 samples; under the correct alignment it reads 325/19/81/11, and after the fix
+// below it reads 0/0/0/0.
+//
+// The spike raster keeps its own convention: jLEMS timestamps the event one row BEFORE the row
+// carrying the post-reset voltage, so a spike recorded in engine frame `f` is the reference's
+// spike at tick `f + 1` -- the same row `f + 2` the membrane comparison uses.
+//
+// ── KNOWN ENGINE DEFECT THESE ASSERTIONS CURRENTLY FAIL ON ───────────────────────────────────
+// The regime counter accumulates dt in f32, so after 50 steps `refractoryTimeElapsed` reaches
+// 4.9999989e-3 against a 5e-3 threshold and the refractory->integrating transition fires one tick
+// late. Every GLIF refractory hold is therefore 52 samples where jNeuroML's is 51, every ISI is
+// one tick long, and the error accumulates over the run: glif2's spikes fall 0,1,2...9 ticks
+// behind the reference's, and 325 of 3499 membrane samples land outside 1mV. The assertions in
+// this file are written against what is CORRECT, not against that drift, so seven of them fail
+// until it is fixed.
+//
+// That the fix is sufficient -- that nothing ELSE disagrees underneath it -- was measured, by
+// running each fixture with t_ref one tick shorter, which produces exactly the tick counts a fixed
+// engine produces at the declared 5ms. All four models then match the reference on every spike
+// tick, every refractory hold and every sample of every recorded column, at zero shift.
+//
+// ── NEGATIVE CONTROLS ────────────────────────────────────────────────────────────────────────
+// That the bands above discriminate at all is not assumed, it is a standing test. Two controls
+// feed this same harness a deliberately wrong pairing (ExitModelNegativeControls) and three feed
+// it a copy of glif2 with exactly one attribute perturbed by 2% (ExitModelPerturbationControls),
+// and each asserts the harness REJECTS it. Without them a harness can go vacuous -- a tolerance
+// widened, a comparison silently comparing a trace against itself -- and still report green.
 
 namespace {
 
@@ -62,6 +116,10 @@ String fixture_path(const String &relative_path) {
     return String(SPIKECOREC_TEST_FIXTURES_DIR) + "/" + relative_path;
 }
 
+// The standard library is CHECKED IN under third_party/neuroml2/std_lib, not fetched, so its
+// absence is a broken checkout rather than a configuration this suite may skip over. Skipping
+// would silently retract every external check in this file and still report green -- the exact
+// failure mode an exit-model suite exists to prevent -- so it is a hard failure instead.
 bool standard_library_available() {
     nml::NML_Parser parser;
     return !parser.STANDARD_LIBRARY_PATH.empty() &&
@@ -97,6 +155,32 @@ private:
     filesystem::path run_directory_;
 };
 
+// Where a generated fixture lives for the length of one test. Separate from ScopedWorkingDirectory
+// because a perturbed fixture has to SURVIVE the run that reads it, and ScopedWorkingDirectory
+// wipes its directory on construction.
+class ScopedTemporaryDirectory {
+public:
+    explicit ScopedTemporaryDirectory(const String &directory_name) {
+        directory_ = filesystem::temp_directory_path() / "spikecorec_exit_model_perturbations" /
+                     directory_name;
+        filesystem::remove_all(directory_);
+        filesystem::create_directories(directory_);
+    }
+
+    ~ScopedTemporaryDirectory() {
+        std::error_code ignored;
+        filesystem::remove_all(directory_, ignored);
+    }
+
+    ScopedTemporaryDirectory(const ScopedTemporaryDirectory &) = delete;
+    ScopedTemporaryDirectory &operator=(const ScopedTemporaryDirectory &) = delete;
+
+    const filesystem::path &path() const { return directory_; }
+
+private:
+    filesystem::path directory_;
+};
+
 // ── running a fixture ────────────────────────────────────────────────────────────────────────
 
 struct SingleCellRun {
@@ -111,21 +195,20 @@ struct SingleCellRun {
     f64 step_dt = 0.0;
 };
 
-// Drives one fixture end to end through the real engine: parse -> resolve -> codegen -> compile ->
+// Drives one model end to end through the real engine: parse -> resolve -> codegen -> compile ->
 // run -> record, then reads the recordings back out of the files the engine itself wrote. Nothing
 // is seeded or reconstructed by hand -- the OnStart bodies, the pulseGenerator schedule and the
 // recording selections all come from the .nml.
-SingleCellRun run_single_cell_fixture(const String &fixture_base_name) {
-    ScopedWorkingDirectory run_directory(fixture_base_name);
-
-    String model_path = fixture_path("nml/" + fixture_base_name + "_top.nml");
+SingleCellRun run_model(const String &model_path, const String &run_name) {
+    ScopedWorkingDirectory run_directory(run_name);
 
     SingleCellRun run;
     String membrane_trace_filename;
     String spike_events_filename;
+    String engine_input_path = model_path; // SpikeEngine takes a non-const String&
 
     {
-        SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+        SpikeEngine engine(engine_input_path, /*enable_hebbian_learning=*/false);
 
         run.tick_count = engine.lifetime;
         run.step_dt = engine.network_details.step_dt;
@@ -153,7 +236,7 @@ SingleCellRun run_single_cell_fixture(const String &fixture_base_name) {
     }
 
     if (membrane_trace_filename.empty() || spike_events_filename.empty()) {
-        throw std::runtime_error("exit_model_validation_tests: fixture '" + fixture_base_name +
+        throw std::runtime_error("exit_model_validation_tests: model '" + model_path +
                                  "' declared no membrane-trace and/or spike-event output file");
     }
 
@@ -181,6 +264,50 @@ SingleCellRun run_single_cell_fixture(const String &fixture_base_name) {
     }
 
     return run;
+}
+
+SingleCellRun run_single_cell_fixture(const String &fixture_base_name) {
+    return run_model(fixture_path("nml/" + fixture_base_name + "_top.nml"), fixture_base_name);
+}
+
+// ── deliberately perturbed fixtures ──────────────────────────────────────────────────────────
+//
+// Written out of the checked-in glif2_single_cell.nml with ONE attribute substituted, rather than
+// checked in as a second copy: the perturbation is then guaranteed to be the only difference, and
+// a later edit to the real fixture cannot leave a stale copy behind. The include-only wrapper is
+// the same trick glif2_single_cell_top.nml uses -- NML_Parser only XSD-validates the top-level
+// file it is handed, and a bare ComponentType declaration is raw LEMS rather than schema-valid
+// NeuroML.
+String write_perturbed_glif2_fixture(const filesystem::path &destination_directory,
+                                     const String &original_attribute,
+                                     const String &replacement_attribute) {
+    std::ifstream source_file(fixture_path("nml/glif2_single_cell.nml"));
+    if (!source_file.is_open()) {
+        throw std::runtime_error("exit_model_validation_tests: could not open glif2_single_cell.nml");
+    }
+    std::stringstream source_buffer;
+    source_buffer << source_file.rdbuf();
+    String fixture_text = source_buffer.str();
+
+    const usize attribute_position = fixture_text.find(original_attribute);
+    if (attribute_position == String::npos) {
+        throw std::runtime_error("exit_model_validation_tests: glif2_single_cell.nml no longer "
+                                 "declares '" + original_attribute + "'");
+    }
+    fixture_text.replace(attribute_position, original_attribute.size(), replacement_attribute);
+
+    std::ofstream perturbed_fixture(destination_directory / "glif2_single_cell.nml");
+    perturbed_fixture << fixture_text;
+    perturbed_fixture.close();
+
+    const filesystem::path wrapper_path = destination_directory / "glif2_perturbed_top.nml";
+    std::ofstream wrapper(wrapper_path);
+    wrapper << "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Glif2PerturbedTop\">\n"
+            << "  <include href=\"glif2_single_cell.nml\"/>\n"
+            << "</neuroml>\n";
+    wrapper.close();
+
+    return wrapper_path.string();
 }
 
 // ── reference data (jLEMS OutputFile / EventOutputFile TIME_ID plain text) ───────────────────
@@ -250,146 +377,250 @@ spikecorec::Vector<f64> extract_spike_time_seconds(const spikecorec::Vector<Refe
 
 // ── cross-simulator comparison ───────────────────────────────────────────────────────────────
 
-const f64 SPIKE_COUNT_RELATIVE_TOLERANCE = 0.2;     // own spike count within +-20% of the reference's
-const f64 SPIKE_EDGE_TIME_TOLERANCE_SECONDS = 5e-3; // first/last spike within 5ms of the reference's
+// The reference row carrying the same instant this tick's sample does. See the header's
+// "SAMPLE ALIGNMENT" section: pinned by the stimulus onset, agreeing to 7 significant figures on
+// all four models. Two rows rather than one because jLEMS writes a t=0 initial condition before it
+// steps AND applies a pulseGenerator's current one step after its OnCondition fires.
+s64 reference_row_for_tick(s64 tick) { return tick + 2; }
 
-// Reference row `tick + 1` is this tick's post-integration sample: row 0 is the t=0 initial
-// condition jLEMS writes before stepping, whereas the engine records after each step_simulation.
-s64 reference_row_for_tick(s64 tick) { return tick + 1; }
-
-// The same convention in seconds. The engine's spike flag for a tick is recorded in the same frame
-// as that tick's membrane sample, so it denotes the same instant that frame does: the END of the
-// tick, t = (tick + 1) * dt. Converting with `tick * dt` instead would report every spike a tick
-// early against a reference whose own first row is t=0.
-f64 spike_time_seconds(s64 tick, f64 step_dt) { return (f64)(tick + 1) * step_dt; }
-
-void expect_spike_train_roughly_matches_reference(const spikecorec::Vector<s64> &own_spike_ticks,
-                                                  const spikecorec::Vector<f64> &reference_spike_times_seconds,
-                                                  f64 step_dt, const String &label) {
-    ASSERT_FALSE(reference_spike_times_seconds.empty())
-            << label << ": reference has no spikes to compare against";
-
-    const f64 reference_count = (f64)reference_spike_times_seconds.size();
-    const f64 own_count = (f64)own_spike_ticks.size();
-    EXPECT_LE(std::fabs(own_count - reference_count),
-              std::max(1.0, reference_count * SPIKE_COUNT_RELATIVE_TOLERANCE))
-            << label << ": own spike count=" << own_spike_ticks.size()
-            << " reference spike count=" << reference_spike_times_seconds.size();
-    if (own_spike_ticks.empty()) return; // the count check above already reports this
-
-    const f64 own_first_spike_time_seconds = spike_time_seconds(own_spike_ticks.front(), step_dt);
-    const f64 own_last_spike_time_seconds = spike_time_seconds(own_spike_ticks.back(), step_dt);
-    EXPECT_NEAR(own_first_spike_time_seconds, reference_spike_times_seconds.front(),
-                SPIKE_EDGE_TIME_TOLERANCE_SECONDS)
-            << label << ": first spike time";
-    EXPECT_NEAR(own_last_spike_time_seconds, reference_spike_times_seconds.back(),
-                SPIKE_EDGE_TIME_TOLERANCE_SECONDS)
-            << label << ": last spike time";
+// A reference spike timestamp as a tick index. The engine's spike flag for a tick is recorded in
+// the same frame as that tick's membrane sample, and jLEMS timestamps a spike one row before the
+// row carrying the post-reset voltage, so the event that lands in engine frame `f` is the reference
+// spike at tick `f + 1` -- the same row `f + 2` reference_row_for_tick maps that frame to.
+s64 reference_spike_tick(f64 time_seconds, f64 step_dt) {
+    return (s64)std::llround(time_seconds / step_dt);
 }
 
-// Smallest distance between `own_value` and the reference column over a window of `tick_shift_radius`
-// ticks either side of this tick's own reference row. The window absorbs a bounded timing shift --
-// two independently discretized simulators' reset/refractory-exit instants land a few ticks apart,
-// which would otherwise make every sample around every spike fail even when the dynamics agree. It
-// does not absorb a magnitude-class error: a value produced by the wrong equation, the wrong sign or
-// the wrong scale lands near no nearby reference sample either.
-f64 nearest_reference_deviation(f32 own_value, const ReferenceTrace &reference_trace, s64 tick,
-                                usize column_index, s64 tick_shift_radius) {
-    f64 smallest_deviation = std::numeric_limits<f64>::infinity();
-    for (s64 shift = -tick_shift_radius; shift <= tick_shift_radius; shift += 1) {
-        const s64 reference_row = reference_row_for_tick(tick) + shift;
-        if (reference_row < 0 || (usize)reference_row >= reference_trace.column_values.size()) continue;
-        if (column_index >= reference_trace.column_values[(usize)reference_row].size()) continue;
+// ── spike raster ─────────────────────────────────────────────────────────────────────────────
 
-        const f64 reference_value = reference_trace.column_values[(usize)reference_row][column_index];
-        smallest_deviation = std::min(smallest_deviation, std::fabs((f64)own_value - reference_value));
+struct SpikeTrainComparison {
+    s64 own_spike_count = 0;
+    s64 reference_spike_count = 0;
+
+    // own_spike_ticks[k] + 1 - reference_spike_tick[k], over the spikes the two rasters have in
+    // common. Zero everywhere is the assertion; the sequence itself is what says whether a failure
+    // is a constant offset or an accumulating drift.
+    spikecorec::Vector<s64> spike_tick_deviations;
+
+    s64 mismatched_spike_count = 0;
+    s64 largest_absolute_tick_deviation = 0;
+
+    bool matches_reference() const {
+        return own_spike_count == reference_spike_count && mismatched_spike_count == 0;
     }
-    return smallest_deviation;
-}
-
-struct ColumnComparison {
-    f64 peak_aligned_deviation = 0.0; // largest |own - reference| at the SAME tick
-    f64 rms_aligned_deviation = 0.0;  // root-mean-square of the same
-    f64 peak_shifted_deviation = 0.0; // largest deviation after the tick-shift search
-
-    // Reported, never asserted on: how many samples would fail without the tick-shift search at
-    // all. It is what says how much of the agreement below is the dynamics agreeing and how much
-    // is the search absorbing a reset landing one tick apart.
-    s64 sample_count_outside_tolerance_aligned = 0;
-
-    s64 sample_count_outside_tolerance = 0;
-    s64 first_tick_outside_tolerance = -1;
-    f32 own_value_at_first_failure = 0.0f;
 };
 
-ColumnComparison compare_column_against_reference(const spikecorec::Vector<f32> &own_column,
-                                                  const ReferenceTrace &reference_trace,
-                                                  usize column_index, f64 tolerance,
-                                                  s64 tick_shift_radius) {
-    ColumnComparison comparison;
-    f64 squared_deviation_total = 0.0;
-    s64 compared_sample_count = 0;
+SpikeTrainComparison compare_spike_train_against_reference(
+        const spikecorec::Vector<s64> &own_spike_ticks,
+        const spikecorec::Vector<f64> &reference_spike_times_seconds, f64 step_dt) {
+    SpikeTrainComparison comparison;
+    comparison.own_spike_count = (s64)own_spike_ticks.size();
+    comparison.reference_spike_count = (s64)reference_spike_times_seconds.size();
 
-    for (usize tick = 0; tick < own_column.size(); tick += 1) {
-        const s64 reference_row = reference_row_for_tick((s64)tick);
-        if (reference_row >= 0 && (usize)reference_row < reference_trace.column_values.size() &&
-            column_index < reference_trace.column_values[(usize)reference_row].size()) {
-            const f64 aligned_deviation =
-                    std::fabs((f64)own_column[tick] -
-                              reference_trace.column_values[(usize)reference_row][column_index]);
-            comparison.peak_aligned_deviation =
-                    std::max(comparison.peak_aligned_deviation, aligned_deviation);
-            squared_deviation_total += aligned_deviation * aligned_deviation;
-            compared_sample_count += 1;
-            if (aligned_deviation > tolerance) comparison.sample_count_outside_tolerance_aligned += 1;
-        }
-
-        const f64 shifted_deviation = nearest_reference_deviation(
-                own_column[tick], reference_trace, (s64)tick, column_index, tick_shift_radius);
-        comparison.peak_shifted_deviation =
-                std::max(comparison.peak_shifted_deviation, shifted_deviation);
-        if (shifted_deviation > tolerance) {
-            comparison.sample_count_outside_tolerance += 1;
-            if (comparison.first_tick_outside_tolerance < 0) {
-                comparison.first_tick_outside_tolerance = (s64)tick;
-                comparison.own_value_at_first_failure = own_column[tick];
-            }
-        }
-    }
-
-    if (compared_sample_count > 0) {
-        comparison.rms_aligned_deviation = std::sqrt(squared_deviation_total / (f64)compared_sample_count);
+    const usize paired_count = std::min(own_spike_ticks.size(), reference_spike_times_seconds.size());
+    for (usize spike_index = 0; spike_index < paired_count; spike_index += 1) {
+        const s64 deviation =
+                own_spike_ticks[spike_index] + 1 -
+                reference_spike_tick(reference_spike_times_seconds[spike_index], step_dt);
+        comparison.spike_tick_deviations.push_back(deviation);
+        if (deviation != 0) comparison.mismatched_spike_count += 1;
+        comparison.largest_absolute_tick_deviation =
+                std::max(comparison.largest_absolute_tick_deviation, (s64)std::llabs(deviation));
     }
     return comparison;
 }
 
-// Measured numbers go to stdout for every model, passing or failing: this suite exists to produce a
-// measurement, and a bare "OK" reports nothing about how close the engine actually is.
-void report_column_comparison(const String &label, const String &column_name,
-                              const ColumnComparison &comparison, f64 tolerance) {
-    std::cout << "[ MEASURED ] " << label << " " << column_name
-              << ": peak_aligned_deviation=" << comparison.peak_aligned_deviation
-              << " rms_aligned_deviation=" << comparison.rms_aligned_deviation
-              << " peak_deviation_after_tick_shift=" << comparison.peak_shifted_deviation
-              << " samples_outside_tolerance_same_tick=" << comparison.sample_count_outside_tolerance_aligned
-              << " samples_outside_tolerance=" << comparison.sample_count_outside_tolerance
-              << " (tolerance=" << tolerance << ")" << std::endl;
-}
+// ── refractory holds ─────────────────────────────────────────────────────────────────────────
+//
+// A GLIF cell's refractory regime declares no TimeDerivative for `v`, so `v` is HELD rather than
+// integrated -- which shows up in a recorded trace as a bit-identical value repeated for the whole
+// refractory period. Its length in samples is therefore the one directly observable consequence of
+// t_ref, and comparing it hold for hold against the reference's says whether the refractory period
+// itself is right, independently of anything the membrane trajectory does around it.
 
-void report_spike_train(const String &label, const spikecorec::Vector<s64> &own_spike_ticks,
-                        const spikecorec::Vector<f64> &reference_spike_times_seconds, f64 step_dt) {
-    std::cout << "[ MEASURED ] " << label << " spikes: own_count=" << own_spike_ticks.size()
-              << " reference_count=" << reference_spike_times_seconds.size();
-    if (!own_spike_ticks.empty() && !reference_spike_times_seconds.empty()) {
-        std::cout << " own_first=" << spike_time_seconds(own_spike_ticks.front(), step_dt)
-                  << "s reference_first=" << reference_spike_times_seconds.front()
-                  << "s own_last=" << spike_time_seconds(own_spike_ticks.back(), step_dt)
-                  << "s reference_last=" << reference_spike_times_seconds.back() << "s";
+s64 constant_run_length_from(const spikecorec::Vector<f32> &samples, s64 start_index) {
+    if (start_index < 0 || (usize)start_index >= samples.size()) return 0;
+    s64 length = 1;
+    while ((usize)(start_index + length) < samples.size() &&
+           samples[(usize)(start_index + length)] == samples[(usize)start_index]) {
+        length += 1;
     }
-    std::cout << std::endl;
+    return length;
 }
 
-// Everything a per-model test needs, gathered once.
+s64 constant_run_length_from(const ReferenceTrace &trace, usize column_index, s64 start_row) {
+    if (start_row < 0 || (usize)start_row >= trace.column_values.size()) return 0;
+    if (column_index >= trace.column_values[(usize)start_row].size()) return 0;
+    const f64 held_value = trace.column_values[(usize)start_row][column_index];
+    s64 length = 1;
+    while ((usize)(start_row + length) < trace.column_values.size() &&
+           column_index < trace.column_values[(usize)(start_row + length)].size() &&
+           trace.column_values[(usize)(start_row + length)][column_index] == held_value) {
+        length += 1;
+    }
+    return length;
+}
+
+spikecorec::Vector<s64> engine_refractory_hold_lengths(const SingleCellRun &run) {
+    spikecorec::Vector<s64> lengths;
+    if (run.recorded_columns.empty()) return lengths;
+    for (s64 spike_tick : run.spike_ticks) {
+        lengths.push_back(constant_run_length_from(run.recorded_columns[0], spike_tick));
+    }
+    return lengths;
+}
+
+spikecorec::Vector<s64> reference_refractory_hold_lengths(
+        const ReferenceTrace &reference_trace,
+        const spikecorec::Vector<f64> &reference_spike_times_seconds, f64 step_dt) {
+    spikecorec::Vector<s64> lengths;
+    for (f64 spike_time : reference_spike_times_seconds) {
+        // The post-reset voltage lands on the row after the one jLEMS timestamps the event on.
+        lengths.push_back(constant_run_length_from(
+                reference_trace, /*column_index=*/0, reference_spike_tick(spike_time, step_dt) + 1));
+    }
+    return lengths;
+}
+
+// ── recorded columns ─────────────────────────────────────────────────────────────────────────
+
+// Only ever a diagnostic. Applied UNIFORMLY to the whole span rather than per sample, so it cannot
+// smuggle in the per-sample local-range permissiveness the header describes: it answers "is this
+// the right trajectory at the wrong time, and by how much", and comparing it across the run says
+// whether that offset is constant or drifting.
+const s64 UNIFORM_SHIFT_SEARCH_RADIUS = 12;
+
+struct UniformShiftDiagnostic {
+    s64 shift_ticks = 0;
+    s64 sample_count_outside_tolerance = 0;
+};
+
+s64 count_samples_outside_at_uniform_shift(const spikecorec::Vector<f32> &own_column,
+                                           const ReferenceTrace &reference_trace, usize column_index,
+                                           f64 tolerance, s64 shift_ticks, s64 first_tick,
+                                           s64 last_tick) {
+    s64 count = 0;
+    for (s64 tick = first_tick; tick < last_tick && (usize)tick < own_column.size(); tick += 1) {
+        const s64 reference_row = reference_row_for_tick(tick) + shift_ticks;
+        if (reference_row < 0 || (usize)reference_row >= reference_trace.column_values.size()) continue;
+        if (column_index >= reference_trace.column_values[(usize)reference_row].size()) continue;
+        const f64 deviation =
+                std::fabs((f64)own_column[(usize)tick] -
+                          reference_trace.column_values[(usize)reference_row][column_index]);
+        if (deviation > tolerance) count += 1;
+    }
+    return count;
+}
+
+UniformShiftDiagnostic best_uniform_shift(const spikecorec::Vector<f32> &own_column,
+                                          const ReferenceTrace &reference_trace, usize column_index,
+                                          f64 tolerance, s64 first_tick, s64 last_tick) {
+    UniformShiftDiagnostic best;
+    best.shift_ticks = 0;
+    best.sample_count_outside_tolerance = count_samples_outside_at_uniform_shift(
+            own_column, reference_trace, column_index, tolerance, 0, first_tick, last_tick);
+    for (s64 shift = -UNIFORM_SHIFT_SEARCH_RADIUS; shift <= UNIFORM_SHIFT_SEARCH_RADIUS; shift += 1) {
+        if (shift == 0) continue;
+        const s64 count = count_samples_outside_at_uniform_shift(
+                own_column, reference_trace, column_index, tolerance, shift, first_tick, last_tick);
+        if (count < best.sample_count_outside_tolerance) {
+            best.sample_count_outside_tolerance = count;
+            best.shift_ticks = shift;
+        }
+    }
+    return best;
+}
+
+struct ColumnComparison {
+    s64 compared_sample_count = 0;
+    f64 peak_deviation = 0.0;             // largest |own - reference| at the SAME tick
+    f64 root_mean_square_deviation = 0.0; // root-mean-square of the same
+
+    // The asserted quantity. No tick-shift search: same tick, same instant.
+    s64 sample_count_outside_tolerance = 0;
+    s64 first_tick_outside_tolerance = -1;
+    f32 own_value_at_first_failure = 0.0f;
+    f64 reference_value_at_first_failure = 0.0;
+
+    // Diagnostics only. `whole_run` says how far off a failing trace is as a whole; the first and
+    // last third say whether that offset is drifting.
+    UniformShiftDiagnostic whole_run_best_shift;
+    UniformShiftDiagnostic first_third_best_shift;
+    UniformShiftDiagnostic last_third_best_shift;
+};
+
+ColumnComparison compare_column_against_reference(const spikecorec::Vector<f32> &own_column,
+                                                  const ReferenceTrace &reference_trace,
+                                                  usize column_index, f64 tolerance) {
+    ColumnComparison comparison;
+    f64 squared_deviation_total = 0.0;
+
+    for (usize tick = 0; tick < own_column.size(); tick += 1) {
+        const s64 reference_row = reference_row_for_tick((s64)tick);
+        if (reference_row < 0 || (usize)reference_row >= reference_trace.column_values.size()) continue;
+        if (column_index >= reference_trace.column_values[(usize)reference_row].size()) continue;
+
+        const f64 reference_value = reference_trace.column_values[(usize)reference_row][column_index];
+        const f64 deviation = std::fabs((f64)own_column[tick] - reference_value);
+
+        comparison.compared_sample_count += 1;
+        comparison.peak_deviation = std::max(comparison.peak_deviation, deviation);
+        squared_deviation_total += deviation * deviation;
+
+        if (deviation > tolerance) {
+            comparison.sample_count_outside_tolerance += 1;
+            if (comparison.first_tick_outside_tolerance < 0) {
+                comparison.first_tick_outside_tolerance = (s64)tick;
+                comparison.own_value_at_first_failure = own_column[tick];
+                comparison.reference_value_at_first_failure = reference_value;
+            }
+        }
+    }
+
+    if (comparison.compared_sample_count > 0) {
+        comparison.root_mean_square_deviation =
+                std::sqrt(squared_deviation_total / (f64)comparison.compared_sample_count);
+    }
+
+    const s64 tick_count = (s64)own_column.size();
+    const s64 third = tick_count / 3;
+    comparison.whole_run_best_shift =
+            best_uniform_shift(own_column, reference_trace, column_index, tolerance, 0, tick_count);
+    comparison.first_third_best_shift =
+            best_uniform_shift(own_column, reference_trace, column_index, tolerance, 0, third);
+    comparison.last_third_best_shift = best_uniform_shift(own_column, reference_trace, column_index,
+                                                          tolerance, 2 * third, tick_count);
+    return comparison;
+}
+
+// ── whole-model verdict ──────────────────────────────────────────────────────────────────────
+//
+// One structure for both directions: the per-model tests assert its parts individually so a
+// failure names the part, and the negative controls assert the whole verdict is REJECT. Sharing
+// it is the point -- a negative control that reimplemented the comparison would only prove its own
+// reimplementation discriminates.
+
+struct ModelComparison {
+    SpikeTrainComparison spike_train;
+    spikecorec::Vector<ColumnComparison> columns;
+    spikecorec::Vector<s64> own_refractory_hold_lengths;
+    spikecorec::Vector<s64> reference_refractory_hold_lengths;
+
+    bool refractory_holds_match_reference() const {
+        return own_refractory_hold_lengths == reference_refractory_hold_lengths;
+    }
+
+    bool agrees_with_reference() const {
+        if (!spike_train.matches_reference()) return false;
+        if (!refractory_holds_match_reference()) return false;
+        for (const ColumnComparison &column : columns) {
+            if (column.compared_sample_count == 0) return false;
+            if (column.sample_count_outside_tolerance != 0) return false;
+        }
+        return true;
+    }
+};
+
 struct ModelComparisonInputs {
     SingleCellRun run;
     ReferenceTrace reference_trace;
@@ -408,38 +639,156 @@ ModelComparisonInputs load_model_comparison_inputs(const String &fixture_base_na
 }
 
 // 1mV, the resolution at which two forward-Euler integrators of the same GLIF cell can be said to
-// agree; the deflections these models make are tens of mV.
+// agree about a membrane voltage; the deflections these models make are tens of mV. Applied at the
+// same tick, with no shift search -- see the header.
 const f64 VOLTAGE_TOLERANCE_VOLTS = 1e-3;
 
-// 10 ticks = 1ms at these fixtures' own 0.1ms step. Covers the reset-instant drift between the two
-// simulators without being wide enough to match an unrelated part of the trajectory.
-const s64 TICK_SHIFT_RADIUS = 10;
+// 10% of each after-spike current's own spike-time bump (ascAdd1=-100pA, ascAdd2=-200pA), the scale
+// at which two simulators can be said to agree about a current that decays by orders of magnitude
+// between spikes.
+const f64 FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS = 1e-11;
+const f64 SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS = 2e-11;
 
-void expect_membrane_trace_matches_reference(const ModelComparisonInputs &inputs, const String &label) {
+ModelComparison compare_run_against_reference(const ModelComparisonInputs &inputs,
+                                              const spikecorec::Vector<f64> &column_tolerances) {
+    const spikecorec::Vector<f64> reference_spike_times =
+            extract_spike_time_seconds(inputs.reference_spikes);
+
+    ModelComparison comparison;
+    comparison.spike_train = compare_spike_train_against_reference(
+            inputs.run.spike_ticks, reference_spike_times, inputs.run.step_dt);
+    for (usize column_index = 0; column_index < column_tolerances.size(); column_index += 1) {
+        if (column_index >= inputs.run.recorded_columns.size()) break;
+        comparison.columns.push_back(compare_column_against_reference(
+                inputs.run.recorded_columns[column_index], inputs.reference_trace, column_index,
+                column_tolerances[column_index]));
+    }
+    comparison.own_refractory_hold_lengths = engine_refractory_hold_lengths(inputs.run);
+    comparison.reference_refractory_hold_lengths = reference_refractory_hold_lengths(
+            inputs.reference_trace, reference_spike_times, inputs.run.step_dt);
+    return comparison;
+}
+
+// ── reporting ────────────────────────────────────────────────────────────────────────────────
+//
+// Measured numbers go to stdout for every model, passing or failing: this suite exists to produce a
+// measurement, and a bare "OK" reports nothing about how close the engine actually is.
+
+String format_tick_sequence(const spikecorec::Vector<s64> &values) {
+    std::ostringstream text;
+    text << "[";
+    for (usize index = 0; index < values.size(); index += 1) {
+        if (index > 0) text << " ";
+        text << values[index];
+    }
+    text << "]";
+    return text.str();
+}
+
+void report_column_comparison(const String &label, const String &column_name,
+                              const ColumnComparison &comparison, f64 tolerance) {
+    std::cout << "[ MEASURED ] " << label << " " << column_name
+              << ": compared_samples=" << comparison.compared_sample_count
+              << " peak_deviation=" << comparison.peak_deviation
+              << " rms_deviation=" << comparison.root_mean_square_deviation
+              << " samples_outside_tolerance=" << comparison.sample_count_outside_tolerance
+              << " (tolerance=" << tolerance
+              << ", same tick, no shift search) | diagnostic best_uniform_shift="
+              << comparison.whole_run_best_shift.shift_ticks << " ticks (outside="
+              << comparison.whole_run_best_shift.sample_count_outside_tolerance
+              << "), first_third=" << comparison.first_third_best_shift.shift_ticks
+              << " last_third=" << comparison.last_third_best_shift.shift_ticks << std::endl;
+}
+
+void report_spike_train(const String &label, const SpikeTrainComparison &comparison) {
+    std::cout << "[ MEASURED ] " << label << " spikes: own_count=" << comparison.own_spike_count
+              << " reference_count=" << comparison.reference_spike_count
+              << " mismatched_spikes=" << comparison.mismatched_spike_count
+              << " largest_tick_deviation=" << comparison.largest_absolute_tick_deviation
+              << " per_spike_tick_deviation="
+              << format_tick_sequence(comparison.spike_tick_deviations) << std::endl;
+}
+
+void report_refractory_holds(const String &label, const ModelComparison &comparison) {
+    std::cout << "[ MEASURED ] " << label << " refractory holds (samples): own="
+              << format_tick_sequence(comparison.own_refractory_hold_lengths)
+              << " reference=" << format_tick_sequence(comparison.reference_refractory_hold_lengths)
+              << std::endl;
+}
+
+void report_model_comparison(const String &label, const ModelComparison &comparison,
+                             const spikecorec::Vector<f64> &column_tolerances) {
+    report_spike_train(label, comparison.spike_train);
+    for (usize column_index = 0; column_index < comparison.columns.size(); column_index += 1) {
+        report_column_comparison(label, "column" + std::to_string(column_index),
+                                 comparison.columns[column_index], column_tolerances[column_index]);
+    }
+    report_refractory_holds(label, comparison);
+}
+
+// ── per-model expectations ───────────────────────────────────────────────────────────────────
+
+void expect_spike_train_matches_reference(const ModelComparison &comparison, const String &label) {
+    EXPECT_EQ(comparison.spike_train.own_spike_count, comparison.spike_train.reference_spike_count)
+            << label << ": spike count";
+
+    // Every spike, not just the first and the last: a model that fires at the right rate at the
+    // ends and at wrong times in between is exactly what a first/last-only check waves through.
+    EXPECT_EQ(comparison.spike_train.mismatched_spike_count, 0)
+            << label << ": " << comparison.spike_train.mismatched_spike_count << " of "
+            << comparison.spike_train.spike_tick_deviations.size()
+            << " spikes did not land on the reference's tick; per-spike deviation (ticks) "
+            << format_tick_sequence(comparison.spike_train.spike_tick_deviations)
+            << ". A deviation that GROWS along that sequence is an accumulating rate error, not a "
+               "one-off timing tie";
+}
+
+void expect_refractory_holds_match_reference(const ModelComparison &comparison, const String &label) {
+    EXPECT_EQ(comparison.own_refractory_hold_lengths, comparison.reference_refractory_hold_lengths)
+            << label << ": the refractory hold is not the reference's length. own="
+            << format_tick_sequence(comparison.own_refractory_hold_lengths) << " reference="
+            << format_tick_sequence(comparison.reference_refractory_hold_lengths)
+            << ". A uniform +1 here is the known f32 regime-counter defect described in this "
+               "file's header";
+}
+
+void expect_column_matches_reference(const ColumnComparison &comparison, const String &label,
+                                     const String &column_name, f64 tolerance) {
+    ASSERT_GT(comparison.compared_sample_count, 0)
+            << label << " " << column_name << ": nothing was compared";
+    EXPECT_EQ(comparison.sample_count_outside_tolerance, 0)
+            << label << " " << column_name << ": " << comparison.sample_count_outside_tolerance
+            << " of " << comparison.compared_sample_count
+            << " samples are outside +-" << tolerance << " of the reference sample for the SAME "
+            << "tick; first at tick " << comparison.first_tick_outside_tolerance << " (own="
+            << comparison.own_value_at_first_failure
+            << ", reference=" << comparison.reference_value_at_first_failure
+            << ", peak deviation=" << comparison.peak_deviation
+            << "). Diagnostic: shifting the whole trace by "
+            << comparison.whole_run_best_shift.shift_ticks << " ticks leaves "
+            << comparison.whole_run_best_shift.sample_count_outside_tolerance
+            << " outside, and the best shift moves from "
+            << comparison.first_third_best_shift.shift_ticks << " over the first third to "
+            << comparison.last_third_best_shift.shift_ticks
+            << " over the last -- a moving shift is drift, a large residual at the best shift is "
+               "the wrong trajectory";
+}
+
+void expect_membrane_trace_matches_reference(const ModelComparisonInputs &inputs,
+                                             const ModelComparison &comparison, const String &label) {
     ASSERT_FALSE(inputs.run.recorded_columns.empty()) << label << ": nothing was recorded";
     // One recorded frame per tick, and 350ms at 0.1ms -> 3500 engine ticks against 3501 reference
     // rows (the extra row is jLEMS's t=0 initial condition, written before it steps).
     ASSERT_EQ(inputs.run.recorded_columns[0].size(), (usize)inputs.run.tick_count);
     ASSERT_EQ(inputs.run.recorded_columns[0].size() + 1, inputs.reference_trace.time_seconds.size());
+    ASSERT_FALSE(comparison.columns.empty()) << label << ": no column was compared";
 
-    const ColumnComparison comparison =
-            compare_column_against_reference(inputs.run.recorded_columns[0], inputs.reference_trace,
-                                             /*column_index=*/0, VOLTAGE_TOLERANCE_VOLTS,
-                                             TICK_SHIFT_RADIUS);
-    report_column_comparison(label, "v", comparison, VOLTAGE_TOLERANCE_VOLTS);
+    // Under the tick+2 alignment the last engine tick has no reference row, so every other one must
+    // be compared. Asserted so a truncated reference file cannot quietly shrink the coverage.
+    EXPECT_EQ(comparison.columns[0].compared_sample_count, inputs.run.tick_count - 1)
+            << label << ": the membrane comparison did not cover the whole run";
 
-    EXPECT_EQ(comparison.sample_count_outside_tolerance, 0)
-            << label << ": membrane trace leaves the tolerance band at " << comparison.sample_count_outside_tolerance
-            << " of " << inputs.run.recorded_columns[0].size() << " ticks; first at tick "
-            << comparison.first_tick_outside_tolerance << " (own_v=" << comparison.own_value_at_first_failure
-            << ", peak deviation after tick shift=" << comparison.peak_shifted_deviation << ")";
-}
-
-void expect_spike_train_matches_reference(const ModelComparisonInputs &inputs, const String &label) {
-    const spikecorec::Vector<f64> reference_spike_times = extract_spike_time_seconds(inputs.reference_spikes);
-    report_spike_train(label, inputs.run.spike_ticks, reference_spike_times, inputs.run.step_dt);
-    expect_spike_train_roughly_matches_reference(inputs.run.spike_ticks, reference_spike_times,
-                                                 inputs.run.step_dt, label);
+    expect_column_matches_reference(comparison.columns[0], label, "v", VOLTAGE_TOLERANCE_VOLTS);
 }
 
 } // namespace
@@ -447,55 +796,59 @@ void expect_spike_train_matches_reference(const ModelComparisonInputs &inputs, c
 // ── GLIF2: scaled reset ──────────────────────────────────────────────────────────────────────
 
 TEST(ExitModelGlif2SingleCell, matches_pyneuroml_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif2_single_cell", "glif2");
-    expect_spike_train_matches_reference(inputs, "glif2_single_cell");
-    expect_membrane_trace_matches_reference(inputs, "glif2_single_cell");
+    const spikecorec::Vector<f64> column_tolerances = {VOLTAGE_TOLERANCE_VOLTS};
+    const ModelComparison comparison = compare_run_against_reference(inputs, column_tolerances);
+    report_model_comparison("glif2_single_cell", comparison, column_tolerances);
+
+    expect_spike_train_matches_reference(comparison, "glif2_single_cell");
+    expect_refractory_holds_match_reference(comparison, "glif2_single_cell");
+    expect_membrane_trace_matches_reference(inputs, comparison, "glif2_single_cell");
 }
 
 // ── GLIF3: after-spike currents ──────────────────────────────────────────────────────────────
 
 TEST(ExitModelGlif3SingleCell, matches_pyneuroml_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif3_single_cell", "glif3");
-    expect_spike_train_matches_reference(inputs, "glif3_single_cell");
-    expect_membrane_trace_matches_reference(inputs, "glif3_single_cell");
+    const spikecorec::Vector<f64> column_tolerances = {VOLTAGE_TOLERANCE_VOLTS};
+    const ModelComparison comparison = compare_run_against_reference(inputs, column_tolerances);
+    report_model_comparison("glif3_single_cell", comparison, column_tolerances);
+
+    expect_spike_train_matches_reference(comparison, "glif3_single_cell");
+    expect_refractory_holds_match_reference(comparison, "glif3_single_cell");
+    expect_membrane_trace_matches_reference(inputs, comparison, "glif3_single_cell");
 }
 
 // The mechanism GLIF3 exists to demonstrate, checked against the reference rather than only against
-// itself: asc1/asc2 are recorded columns 1 and 2 of the fixture's own <OutputFile>. Their tolerance
-// is 10% of each one's own spike-time bump (ascAdd1=-100pA, ascAdd2=-200pA), the scale at which two
-// simulators can be said to agree about a current that decays by orders of magnitude between spikes.
+// itself: asc1/asc2 are recorded columns 1 and 2 of the fixture's own <OutputFile>.
 TEST(ExitModelGlif3SingleCell, after_spike_currents_match_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif3_single_cell", "glif3");
     ASSERT_EQ(inputs.run.recorded_columns.size(), 3u); // v, asc1, asc2
 
-    const f64 first_current_tolerance = 1e-11;  // 10pA
-    const f64 second_current_tolerance = 2e-11; // 20pA
-
     const ColumnComparison first_current_comparison = compare_column_against_reference(
             inputs.run.recorded_columns[1], inputs.reference_trace, /*column_index=*/1,
-            first_current_tolerance, TICK_SHIFT_RADIUS);
+            FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
     report_column_comparison("glif3_single_cell", "asc1", first_current_comparison,
-                             first_current_tolerance);
-    EXPECT_EQ(first_current_comparison.sample_count_outside_tolerance, 0)
-            << "glif3 asc1 leaves the tolerance band; first at tick "
-            << first_current_comparison.first_tick_outside_tolerance
-            << " (own asc1=" << first_current_comparison.own_value_at_first_failure << ")";
+                             FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
+    expect_column_matches_reference(first_current_comparison, "glif3_single_cell", "asc1",
+                                    FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
 
     const ColumnComparison second_current_comparison = compare_column_against_reference(
             inputs.run.recorded_columns[2], inputs.reference_trace, /*column_index=*/2,
-            second_current_tolerance, TICK_SHIFT_RADIUS);
+            SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
     report_column_comparison("glif3_single_cell", "asc2", second_current_comparison,
-                             second_current_tolerance);
-    EXPECT_EQ(second_current_comparison.sample_count_outside_tolerance, 0)
-            << "glif3 asc2 leaves the tolerance band; first at tick "
-            << second_current_comparison.first_tick_outside_tolerance
-            << " (own asc2=" << second_current_comparison.own_value_at_first_failure << ")";
+                             SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
+    expect_column_matches_reference(second_current_comparison, "glif3_single_cell", "asc2",
+                                    SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
 
     // Non-vacuity: the currents genuinely take on the hyperpolarizing values the spikes add, rather
     // than agreeing with the reference by both staying at zero.
@@ -516,28 +869,33 @@ TEST(ExitModelGlif3SingleCell, after_spike_currents_match_reference) {
 // ── GLIF4: adapting threshold ────────────────────────────────────────────────────────────────
 
 TEST(ExitModelGlif4SingleCell, matches_pyneuroml_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif4_single_cell", "glif4");
-    expect_spike_train_matches_reference(inputs, "glif4_single_cell");
-    expect_membrane_trace_matches_reference(inputs, "glif4_single_cell");
+    const spikecorec::Vector<f64> column_tolerances = {VOLTAGE_TOLERANCE_VOLTS};
+    const ModelComparison comparison = compare_run_against_reference(inputs, column_tolerances);
+    report_model_comparison("glif4_single_cell", comparison, column_tolerances);
+
+    expect_spike_train_matches_reference(comparison, "glif4_single_cell");
+    expect_refractory_holds_match_reference(comparison, "glif4_single_cell");
+    expect_membrane_trace_matches_reference(inputs, comparison, "glif4_single_cell");
 }
 
 TEST(ExitModelGlif4SingleCell, adaptive_threshold_matches_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif4_single_cell", "glif4");
     ASSERT_EQ(inputs.run.recorded_columns.size(), 2u); // v, theta
 
     const ColumnComparison threshold_comparison = compare_column_against_reference(
             inputs.run.recorded_columns[1], inputs.reference_trace, /*column_index=*/1,
-            VOLTAGE_TOLERANCE_VOLTS, TICK_SHIFT_RADIUS);
+            VOLTAGE_TOLERANCE_VOLTS);
     report_column_comparison("glif4_single_cell", "theta", threshold_comparison,
                              VOLTAGE_TOLERANCE_VOLTS);
-    EXPECT_EQ(threshold_comparison.sample_count_outside_tolerance, 0)
-            << "glif4 theta leaves the tolerance band; first at tick "
-            << threshold_comparison.first_tick_outside_tolerance
-            << " (own theta=" << threshold_comparison.own_value_at_first_failure << ")";
+    expect_column_matches_reference(threshold_comparison, "glif4_single_cell", "theta",
+                                    VOLTAGE_TOLERANCE_VOLTS);
 
     // Non-vacuity: the threshold actually adapts. thetaInf is -50mV and each spike adds 5mV, so a
     // threshold that never rises above thetaInf means the mechanism did not run at all.
@@ -549,51 +907,49 @@ TEST(ExitModelGlif4SingleCell, adaptive_threshold_matches_reference) {
 // ── GLIF5: after-spike currents AND adapting threshold ───────────────────────────────────────
 
 TEST(ExitModelGlif5SingleCell, matches_pyneuroml_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif5_single_cell", "glif5");
-    expect_spike_train_matches_reference(inputs, "glif5_single_cell");
-    expect_membrane_trace_matches_reference(inputs, "glif5_single_cell");
+    const spikecorec::Vector<f64> column_tolerances = {VOLTAGE_TOLERANCE_VOLTS};
+    const ModelComparison comparison = compare_run_against_reference(inputs, column_tolerances);
+    report_model_comparison("glif5_single_cell", comparison, column_tolerances);
+
+    expect_spike_train_matches_reference(comparison, "glif5_single_cell");
+    expect_refractory_holds_match_reference(comparison, "glif5_single_cell");
+    expect_membrane_trace_matches_reference(inputs, comparison, "glif5_single_cell");
 }
 
 TEST(ExitModelGlif5SingleCell, adaptive_threshold_and_after_spike_currents_match_reference) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
 
     const ModelComparisonInputs inputs = load_model_comparison_inputs("glif5_single_cell", "glif5");
     ASSERT_EQ(inputs.run.recorded_columns.size(), 4u); // v, theta, asc1, asc2
 
-    const f64 first_current_tolerance = 1e-11;  // 10pA, 10% of ascAdd1
-    const f64 second_current_tolerance = 2e-11; // 20pA, 10% of ascAdd2
-
     const ColumnComparison threshold_comparison = compare_column_against_reference(
             inputs.run.recorded_columns[1], inputs.reference_trace, /*column_index=*/1,
-            VOLTAGE_TOLERANCE_VOLTS, TICK_SHIFT_RADIUS);
+            VOLTAGE_TOLERANCE_VOLTS);
     report_column_comparison("glif5_single_cell", "theta", threshold_comparison,
                              VOLTAGE_TOLERANCE_VOLTS);
-    EXPECT_EQ(threshold_comparison.sample_count_outside_tolerance, 0)
-            << "glif5 theta leaves the tolerance band; first at tick "
-            << threshold_comparison.first_tick_outside_tolerance
-            << " (own theta=" << threshold_comparison.own_value_at_first_failure << ")";
+    expect_column_matches_reference(threshold_comparison, "glif5_single_cell", "theta",
+                                    VOLTAGE_TOLERANCE_VOLTS);
 
     const ColumnComparison first_current_comparison = compare_column_against_reference(
             inputs.run.recorded_columns[2], inputs.reference_trace, /*column_index=*/2,
-            first_current_tolerance, TICK_SHIFT_RADIUS);
+            FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
     report_column_comparison("glif5_single_cell", "asc1", first_current_comparison,
-                             first_current_tolerance);
-    EXPECT_EQ(first_current_comparison.sample_count_outside_tolerance, 0)
-            << "glif5 asc1 leaves the tolerance band; first at tick "
-            << first_current_comparison.first_tick_outside_tolerance
-            << " (own asc1=" << first_current_comparison.own_value_at_first_failure << ")";
+                             FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
+    expect_column_matches_reference(first_current_comparison, "glif5_single_cell", "asc1",
+                                    FIRST_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
 
     const ColumnComparison second_current_comparison = compare_column_against_reference(
             inputs.run.recorded_columns[3], inputs.reference_trace, /*column_index=*/3,
-            second_current_tolerance, TICK_SHIFT_RADIUS);
+            SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
     report_column_comparison("glif5_single_cell", "asc2", second_current_comparison,
-                             second_current_tolerance);
-    EXPECT_EQ(second_current_comparison.sample_count_outside_tolerance, 0)
-            << "glif5 asc2 leaves the tolerance band; first at tick "
-            << second_current_comparison.first_tick_outside_tolerance
-            << " (own asc2=" << second_current_comparison.own_value_at_first_failure << ")";
+                             SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
+    expect_column_matches_reference(second_current_comparison, "glif5_single_cell", "asc2",
+                                    SECOND_AFTER_SPIKE_CURRENT_TOLERANCE_AMPS);
 
     // Non-vacuity: both mechanisms genuinely act, which is the whole point of GLIF5.
     f32 highest_threshold = -std::numeric_limits<f32>::infinity();
@@ -612,4 +968,139 @@ TEST(ExitModelGlif5SingleCell, adaptive_threshold_and_after_spike_currents_match
             << "glif5's first after-spike current never became hyperpolarizing";
     EXPECT_LT(most_negative_second_current, -1e-10f)
             << "glif5's second after-spike current never became hyperpolarizing";
+}
+
+// ── negative controls: a WRONG PAIRING must be rejected ──────────────────────────────────────
+//
+// Both feed this same harness a comparison that is known to be wrong and assert it says so. They
+// exist because a validation suite's real failure mode is going vacuous -- comparing a trace with
+// itself, or against a band wide enough to admit anything -- while still reporting green.
+
+TEST(ExitModelNegativeControls, glif3_membrane_trace_is_rejected_against_glif5s_reference) {
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
+
+    // A DIFFERENT but closely related model: GLIF5 is GLIF3 plus an adapting threshold, driven by
+    // the same 0.6nA pulse over the same window. Nothing about the two traces is absurd next to
+    // each other, which is what makes it the right control -- it is the near miss, not a wild one.
+    const SingleCellRun glif3_run = run_single_cell_fixture("glif3_single_cell");
+    const ReferenceTrace glif5_reference = load_reference_trace(
+            fixture_path("reference_data/glif5_single_cell/glif5_membrane_trace.dat"));
+
+    const ColumnComparison comparison = compare_column_against_reference(
+            glif3_run.recorded_columns[0], glif5_reference, /*column_index=*/0,
+            VOLTAGE_TOLERANCE_VOLTS);
+    report_column_comparison("negative_control_glif3_v_vs_glif5_reference", "v", comparison,
+                             VOLTAGE_TOLERANCE_VOLTS);
+
+    // Measured 2909 of 3499. Asserted as a majority rather than as that exact count so the control
+    // states what it means -- most of the run disagrees -- instead of pinning an incidental number.
+    EXPECT_GT(comparison.sample_count_outside_tolerance, comparison.compared_sample_count / 2)
+            << "the harness accepted glif3's membrane trace against GLIF5's reference; the "
+               "membrane band is no longer discriminating";
+}
+
+TEST(ExitModelNegativeControls, glif3_membrane_trace_is_rejected_against_an_after_spike_current) {
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
+
+    // A voltage compared against a current -- the shape a units or column-index error takes. The
+    // two differ by nine orders of magnitude, so every single sample must land outside.
+    const SingleCellRun glif3_run = run_single_cell_fixture("glif3_single_cell");
+    const ReferenceTrace glif3_reference = load_reference_trace(
+            fixture_path("reference_data/glif3_single_cell/glif3_membrane_trace.dat"));
+
+    const ColumnComparison comparison = compare_column_against_reference(
+            glif3_run.recorded_columns[0], glif3_reference, /*column_index=*/1,
+            VOLTAGE_TOLERANCE_VOLTS);
+    report_column_comparison("negative_control_glif3_v_vs_glif3_asc1", "v_against_asc1", comparison,
+                             VOLTAGE_TOLERANCE_VOLTS);
+
+    EXPECT_EQ(comparison.sample_count_outside_tolerance, comparison.compared_sample_count)
+            << "the harness accepted glif3's membrane voltage against a CURRENT column";
+}
+
+// ── perturbation controls: a 2% PARAMETER ERROR must be rejected ─────────────────────────────
+//
+// Each takes the checked-in glif2 fixture, substitutes exactly one attribute, and asserts the
+// harness rejects the result against the UNMODIFIED reference. The verdict is the same
+// ModelComparison::agrees_with_reference() the per-model tests above assert the parts of, so these
+// measure this harness rather than a parallel reimplementation of it.
+//
+// Not every 2% perturbation is detectable, and pretending otherwise would be the same dishonesty
+// this file exists to remove: resetScale 0.3 -> 0.306 was measured and produces a trace IDENTICAL
+// to the unmodified model's, because `v` crosses vth by microvolts and so `resetScale * (v - vth)`
+// is microvolts times 2% either way. The three below are perturbations this data can actually see.
+
+namespace {
+
+void expect_perturbed_glif2_is_rejected(const String &control_name, const String &original_attribute,
+                                        const String &replacement_attribute) {
+    ScopedTemporaryDirectory perturbation_directory(control_name);
+    const String model_path = write_perturbed_glif2_fixture(perturbation_directory.path(),
+                                                            original_attribute, replacement_attribute);
+
+    ModelComparisonInputs inputs;
+    inputs.run = run_model(model_path, "perturbation_" + control_name);
+    inputs.reference_trace = load_reference_trace(
+            fixture_path("reference_data/glif2_single_cell/glif2_membrane_trace.dat"));
+    inputs.reference_spikes =
+            load_reference_spikes(fixture_path("reference_data/glif2_single_cell/glif2_spikes.dat"));
+
+    const spikecorec::Vector<f64> column_tolerances = {VOLTAGE_TOLERANCE_VOLTS};
+    const ModelComparison comparison = compare_run_against_reference(inputs, column_tolerances);
+    report_model_comparison("perturbation_control_" + control_name, comparison, column_tolerances);
+
+    EXPECT_FALSE(comparison.agrees_with_reference())
+            << control_name << ": the harness ACCEPTED glif2 with " << original_attribute
+            << " replaced by " << replacement_attribute
+            << " against the unmodified reference. Spike-tick deviations "
+            << format_tick_sequence(comparison.spike_train.spike_tick_deviations)
+            << ", refractory holds " << format_tick_sequence(comparison.own_refractory_hold_lengths)
+            << " against " << format_tick_sequence(comparison.reference_refractory_hold_lengths)
+            << ", membrane samples outside tolerance "
+            << (comparison.columns.empty() ? -1 : comparison.columns[0].sample_count_outside_tolerance);
+}
+
+} // namespace
+
+// The reviewer's exact experiment. A 2% refractory error shortens every hold by one tick at this
+// fixture's 0.1ms step, so a correct engine ends the run 10 ticks ahead of the reference.
+//
+// THIS TEST FAILS TODAY, and will pass unchanged once the f32 regime-counter defect described in
+// this file's header is fixed. The two errors are the same size and cancel exactly: today's engine
+// holds one tick too LONG, so at t_ref=4.9ms it holds for the reference's 51 samples and reproduces
+// the reference tick for tick -- measured, zero samples outside 1mV, every spike on the reference's
+// tick. On today's engine 4.9ms is genuinely the value that matches jNeuroML, so no honest harness
+// can reject it; what is broken is the engine, not the discrimination. Deliberately NOT weakened to
+// go green, because the moment the refractory hold is 51 samples at the declared 5ms, this model
+// drifts one tick per spike and is rejected on all three grounds at once.
+TEST(ExitModelPerturbationControls, rejects_a_two_percent_shorter_refractory_period) {
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
+
+    expect_perturbed_glif2_is_rejected("t_ref_4900us", "t_ref=\"5ms\"", "t_ref=\"4.9ms\"");
+}
+
+// The same 2% error in the other direction, which today's engine defect does not mask. Measured:
+// refractory holds 53 samples against the reference's 51, every ISI two ticks long, the last spike
+// 18 ticks late, and 876 of 3499 membrane samples outside 1mV.
+TEST(ExitModelPerturbationControls, rejects_a_two_percent_longer_refractory_period) {
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
+
+    expect_perturbed_glif2_is_rejected("t_ref_5100us", "t_ref=\"5ms\"", "t_ref=\"5.1ms\"");
+}
+
+// A second parameter, and a different mechanism: membrane capacitance sets the time constant
+// C/gL, so a 2% error is a 2% error in how fast `v` approaches threshold, with no effect at all on
+// the refractory period. Measured: every ISI 295 ticks against the reference's 289, the last spike
+// 59 ticks late, and 2242 of 3499 membrane samples outside 1mV. The same perturbation at 0.5%
+// (100.5pF) was also measured and is also rejected -- 914 samples outside, ISI 291 -- so 2% is not
+// near this harness's floor.
+TEST(ExitModelPerturbationControls, rejects_a_two_percent_membrane_capacitance_error) {
+    ASSERT_TRUE(standard_library_available())
+            << "the vendored NML standard library is missing from third_party/neuroml2/std_lib";
+
+    expect_perturbed_glif2_is_rejected("capacitance_102pF", "C=\"100pF\"", "C=\"102pF\"");
 }
