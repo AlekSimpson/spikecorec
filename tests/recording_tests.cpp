@@ -4,9 +4,12 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <unistd.h>
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -32,10 +35,55 @@ string read_file(const string &path) {
     return string((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
 }
 
+// Every temporary file in this suite lives under a root named after this process.
+// These paths used to be fixed /tmp literals, which made them shared mutable state
+// between concurrently running test binaries: one process would read a .spire while
+// another was part-way through writing the same path. That showed up as roughly a
+// fifth of this suite failing under concurrency, truncated_decode_error among them
+// segfaulting outright -- it slurps a file and then writes a fixed 74 bytes from the
+// buffer, so a short read walks off the end of the vector.
+//
+// Wiped once on construction, which is safe precisely because the name carries this
+// process's id: the only process that could have left anything behind is a dead one.
+// Removed again in the destructor, so the root does not outlive the binary. Same
+// shape as ScopedRunDirectory in exit_model_validation_tests.
+class ScratchDirectory {
+public:
+    ScratchDirectory()
+        : path_(filesystem::temp_directory_path() /
+                ("spikecorec_recording_tests_" + to_string(getpid())))
+    {
+        error_code ignored;
+        filesystem::remove_all(path_, ignored);
+        filesystem::create_directories(path_);
+    }
+
+    ~ScratchDirectory() {
+        error_code ignored;
+        filesystem::remove_all(path_, ignored);
+    }
+
+    ScratchDirectory(const ScratchDirectory &) = delete;
+    ScratchDirectory &operator=(const ScratchDirectory &) = delete;
+
+    const filesystem::path &path() const { return path_; }
+
+private:
+    filesystem::path path_;
+};
+
+string scratch_path(const string &leaf_name) {
+    // Function-local so it is created on first use and destroyed at exit; a
+    // namespace-scope object would have to reach back into this one during static
+    // destruction, after it had already been torn down.
+    static const ScratchDirectory directory;
+    return (directory.path() / leaf_name).string();
+}
+
 } // namespace
 
 TEST(SpireCodec, raw_roundtrip) {
-    const string path = "/tmp/spikecorec_test_raw.spire";
+    const string path = scratch_path("raw.spire");
     const s64 neuron_count = 6;
     const s64 frame_count = 9;
 
@@ -77,7 +125,7 @@ TEST(SpireCodec, compression_roundtrip) {
     for (usize index = 0; index < byte_count; ++index)
         data[index] = (u8)((index * 37 + 11) & 0xFF);
 
-    auto roundtrip = [&](SpireCompression compression, const char *path) {
+    auto roundtrip = [&](SpireCompression compression, const string &path) {
         {
             auto sink = make_spire_sink(path, compression, 6);
             sink->write(data.data(), byte_count / 3);
@@ -93,13 +141,13 @@ TEST(SpireCodec, compression_roundtrip) {
     };
 
 #ifdef SPIKECOREC_HAVE_ZLIB
-    roundtrip(SpireCompression::Gzip, "/tmp/spikecorec_test_compress.gz");
+    roundtrip(SpireCompression::Gzip, scratch_path("compress.gz"));
 #endif
 #ifdef SPIKECOREC_HAVE_LZMA
-    roundtrip(SpireCompression::Xz, "/tmp/spikecorec_test_compress.xz");
+    roundtrip(SpireCompression::Xz, scratch_path("compress.xz"));
 #endif
 #ifdef SPIKECOREC_HAVE_BZ2
-    roundtrip(SpireCompression::Bz2, "/tmp/spikecorec_test_compress.bz2");
+    roundtrip(SpireCompression::Bz2, scratch_path("compress.bz2"));
 #endif
 }
 
@@ -200,7 +248,7 @@ TEST(AsyncSpireWriter, no_reentry_after_error) {
 }
 
 TEST(SpireCodec, zero_frame_recording) {
-    const string path = "/tmp/spikecorec_test_zero_frame.spire";
+    const string path = scratch_path("zero_frame.spire");
     const s64 neuron_count = 5;
     {
         SimulationRecorder recorder(path, neuron_count, string("none"), nullopt, /*async=*/false);
@@ -216,20 +264,20 @@ TEST(SpireCodec, header_neuron_count_overflow) {
     const s64 too_big = (s64)UINT32_MAX + 1;
 
     EXPECT_THROW(
-        (SimulationRecorder("/tmp/spikecorec_test_overflow.spire", too_big,
+        (SimulationRecorder(scratch_path("overflow.spire"), too_big,
                             string("none"), nullopt, /*async=*/false)),
         std::exception
     );
 
     EXPECT_THROW(
-        SpireWriter("/tmp/spikecorec_test_overflow2.spire", too_big),
+        SpireWriter(scratch_path("overflow2.spire"), too_big),
         std::exception
     );
 }
 
 TEST(SpireCodec, truncated_decode_error) {
-    const string good_path = "/tmp/spikecorec_test_trunc_source.spire";
-    const string truncated_path = "/tmp/spikecorec_test_truncated.spire";
+    const string good_path = scratch_path("trunc_source.spire");
+    const string truncated_path = scratch_path("truncated.spire");
     const s64 neuron_count = 4;
 
     {
@@ -243,8 +291,14 @@ TEST(SpireCodec, truncated_decode_error) {
     {
         ifstream source_file(good_path, ios::binary);
         vector<char> all((istreambuf_iterator<char>(source_file)), istreambuf_iterator<char>());
+        const streamsize kept_bytes = 4 + neuron_count * 4 * 4 + 6;
+        // write() reads kept_bytes through a bare pointer, so a short slurp walks
+        // off the end of the vector rather than failing. That is what turned a
+        // clobbered source file into a segfault when this path was shared.
+        ASSERT_GE((streamsize)all.size(), kept_bytes)
+                << "source recording is shorter than expected: " << good_path;
         ofstream destination(truncated_path, ios::binary);
-        destination.write(all.data(), 4 + neuron_count * 4 * 4 + 6);
+        destination.write(all.data(), kept_bytes);
     }
 
     string log_before = read_file("logs/spikecorec.log");
@@ -259,7 +313,7 @@ TEST(SpireCodec, truncated_decode_error) {
 }
 
 TEST(SimulationRecorder, record_frame_size_validation) {
-    const string path = "/tmp/spikecorec_test_record_frame_size.spire";
+    const string path = scratch_path("record_frame_size.spire");
     const s64 neuron_count = 8;
     SimulationRecorder recorder(path, neuron_count, string("none"), nullopt, /*async=*/false);
 
@@ -296,7 +350,7 @@ TEST(SpikeEngine, start_static_record) {
     const s64 stride = 2;
     vector<vector<f32>> input_spikes((usize)lifetime, vector<f32>{2.0f, 2.0f, 2.0f});
 
-    const string path = "/tmp/spikecorec_test_record.spire";
+    const string path = scratch_path("record.spire");
     engine.start_static_record(input_spikes, lifetime, path, /*record_membrane=*/true, stride,
                                /*compression=*/string("none"), nullopt, /*full_decay=*/true,
                                /*compression_async=*/false);
@@ -325,7 +379,7 @@ TEST(SpikeEngine, start_static_record_bad_input_width) {
     engine.set_input_neurons({0, 1, 2});
 
     const s64 lifetime = 5;
-    const string path = "/tmp/spikecorec_test_bad_width.spire";
+    const string path = scratch_path("bad_width.spire");
 
     {
         vector<vector<f32>> wide((usize)lifetime, vector<f32>{1.0f, 1.0f, 1.0f});
@@ -362,13 +416,13 @@ TEST(SpikeEngine, start_static_record_variants) {
     vector<vector<f32>> input((usize)lifetime, vector<f32>{1.0f, 1.0f, 1.0f});
 
     {
-        const string path = "/tmp/spikecorec_test_norec.spire";
+        const string path = scratch_path("norec.spire");
         engine.start_static_record(input, lifetime, path, /*record_membrane=*/false);
         EXPECT_EQ(read_spire_recording(path).frame_count, 0);
     }
     engine.reset_state();
     {
-        const string path = "/tmp/spikecorec_test_stride.spire";
+        const string path = scratch_path("stride.spire");
         engine.start_static_record(input, lifetime, path, /*record_membrane=*/true,
                                    /*record_stride=*/4);
         SpireRecording recording = read_spire_recording(path);
@@ -377,7 +431,7 @@ TEST(SpikeEngine, start_static_record_variants) {
     }
     engine.reset_state();
     {
-        const string path = "/tmp/spikecorec_test_nodecay.spire";
+        const string path = scratch_path("nodecay.spire");
         engine.start_static_record(input, lifetime, path, true, 1, string("none"), nullopt,
                                    /*full_decay=*/false);
         SpireRecording recording = read_spire_recording(path);

@@ -37,22 +37,40 @@ namespace {
 // Temporary paths carry this process's id. Several test binaries run on this
 // machine at once and a fixed path lets one process truncate or delete a file
 // another is mid-way through reading — which surfaces as an unrelated codec
-// "failure". Same reasoning as ScopedRunDirectory in exit_model_validation_tests.
-const filesystem::path &codec_scratch_directory() {
-    static const filesystem::path directory = [] {
-        const filesystem::path path =
-                filesystem::temp_directory_path() /
-                ("spikecorec_recording_codec_" + to_string(getpid()));
+// "failure". Wiped on construction (only a dead process could have left anything
+// under a name carrying this pid) and removed again on the way out. Same shape as
+// ScopedRunDirectory in exit_model_validation_tests.
+class ScratchDirectory {
+public:
+    ScratchDirectory()
+        : path_(filesystem::temp_directory_path() /
+                ("spikecorec_recording_codec_tests_" + to_string(getpid())))
+    {
         error_code ignored;
-        filesystem::remove_all(path, ignored);
-        filesystem::create_directories(path);
-        return path;
-    }();
-    return directory;
-}
+        filesystem::remove_all(path_, ignored);
+        filesystem::create_directories(path_);
+    }
+
+    ~ScratchDirectory() {
+        error_code ignored;
+        filesystem::remove_all(path_, ignored);
+    }
+
+    ScratchDirectory(const ScratchDirectory &) = delete;
+    ScratchDirectory &operator=(const ScratchDirectory &) = delete;
+
+    const filesystem::path &path() const { return path_; }
+
+private:
+    filesystem::path path_;
+};
 
 string scratch_path(const string &leaf_name) {
-    return (codec_scratch_directory() / leaf_name).string();
+    // Function-local so it is created on first use and destroyed at exit; a
+    // namespace-scope object would have to reach back into this one during static
+    // destruction, after it had already been torn down.
+    static const ScratchDirectory directory;
+    return (directory.path() / leaf_name).string();
 }
 
 vector<char> read_whole_file(const string &path) {
