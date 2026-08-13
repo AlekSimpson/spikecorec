@@ -4,8 +4,11 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <unistd.h> // getpid -- the save/load file is named after this process; see below
+
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -20,6 +23,62 @@ using namespace std;
 using namespace spikecorec;
 
 namespace {
+
+// A file that only THIS process can see, for the save/load round-trip below.
+//
+// It replaces the hardcoded literal "/tmp/spikecorec_test_k2tree.bin", which named one fixed file
+// for the whole machine. This tree is developed with several worktrees on one machine, so two test
+// binaries run at once routinely, and both then used the same file: one process read the other's
+// HALF-WRITTEN save. The header's node_count and tree_height come back as whatever bytes happened
+// to be there -- 69780080 and 1809129440 in one observed run -- and a garbage tree_height is a
+// garbage loop bound, so the usual outcome is a SEGFAULT with no gtest summary at all. Measured on
+// the pre-fix tree with two `--gtest_filter='*save_load*'` processes overlapping: 3 of 30
+// processes crashed here. After: 0 of 30.
+//
+// Naming the file after this process is the fix -- no other test binary can create, use or remove
+// it. The path is also a real temporary path rather than a hardcoded /tmp literal, so it follows
+// $TMPDIR like everything else here.
+class ScopedTemporaryFile {
+public:
+    explicit ScopedTemporaryFile(const string &file_name) {
+        // Recreated here rather than only alongside the one-time wipe below, because the
+        // destructor takes the root away again as soon as it is empty, and K2Tree::save()
+        // opens an ofstream without checking it opened: a missing directory would leave
+        // K2Tree::load() reading a file that was never written.
+        filesystem::create_directories(files_root());
+        path_ = files_root() / file_name;
+    }
+
+    ~ScopedTemporaryFile() {
+        std::error_code ignored;
+        filesystem::remove(path_, ignored);
+        // Non-recursive: it takes this process's root away once the last file has cleaned up
+        // after itself, and fails harmlessly while any file is still there.
+        filesystem::remove(files_root(), ignored);
+    }
+
+    ScopedTemporaryFile(const ScopedTemporaryFile &) = delete;
+    ScopedTemporaryFile &operator=(const ScopedTemporaryFile &) = delete;
+
+    const char *path() const { return path_.c_str(); }
+
+private:
+    // Created once on first use. Clearing it is safe precisely because the name carries this
+    // process's id: the only process that could have left anything under it is a dead one.
+    static const filesystem::path &files_root() {
+        static const filesystem::path root = [] {
+            const filesystem::path path = filesystem::temp_directory_path() /
+                                          ("spikecorec_k2tree_tests_" + std::to_string(getpid()));
+            std::error_code ignored;
+            filesystem::remove_all(path, ignored);
+            filesystem::create_directories(path);
+            return path;
+        }();
+        return root;
+    }
+
+    filesystem::path path_;
+};
 
 // Small fixed 8-node directed graph. Self-loops are not supported (see
 // K2Tree's self-loop validation in build_tree_arrays), so this fixture must
@@ -182,7 +241,8 @@ TEST(K2Tree, save_load) {
     const s32 node_count = 8;
     K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
 
-    const char *path = "/tmp/spikecorec_test_k2tree.bin";
+    const ScopedTemporaryFile temporary_file("save_load.bin");
+    const char *path = temporary_file.path();
     tree.save(path);
     K2Tree loaded = K2Tree::load(path);
 

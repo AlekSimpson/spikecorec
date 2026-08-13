@@ -4,10 +4,14 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <unistd.h> // getpid -- the save/load files are named after this process; see below
+
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <utility>
@@ -22,6 +26,66 @@ using namespace std;
 using namespace spikecorec;
 
 namespace {
+
+// A file that only THIS process can see, for the save/load round-trips below.
+//
+// It replaces a set of hardcoded literals -- "/tmp/spikecorec_test_wm.bin" and friends -- which
+// named one fixed file per round-trip for the whole machine. This tree is developed with several
+// worktrees on one machine, so two test binaries run at once routinely, and both then used the
+// same file: one process read the other's HALF-WRITTEN save. The two round-trips are milliseconds
+// long, so the reader usually won: the failure was rare, and it was not always a failure. A
+// partial read lands anywhere between "the weights come back wrong" (a plain assertion failure)
+// and "the header's node_count/rank come back as whatever bytes happened to be there", which is a
+// garbage length driving an allocation, i.e. a SEGFAULT with no gtest summary at all. Measured on
+// the pre-fix tree with two `--gtest_filter='WeightMatrix.save_load*' --gtest_repeat=60` processes
+// overlapping: 12 of 24 processes bad, most of them crashes. After: 0 of 24.
+//
+// Naming the file after this process is the fix -- no other test binary can create, use or remove
+// it. The path is also a real temporary path rather than a hardcoded /tmp literal, so it follows
+// $TMPDIR like everything else here.
+class ScopedTemporaryFile {
+public:
+    explicit ScopedTemporaryFile(const string &file_name) {
+        // Recreated here rather than only alongside the one-time wipe below, because the
+        // destructor takes the root away again as soon as it is empty: WeightMatrix::save()
+        // opens an ofstream and never checks it opened, so a missing directory would leave
+        // load_from_disk() reading a file that was never written -- which is exactly the
+        // garbage-header crash this class exists to stop.
+        filesystem::create_directories(files_root());
+        path_ = files_root() / file_name;
+    }
+
+    ~ScopedTemporaryFile() {
+        std::error_code ignored;
+        filesystem::remove(path_, ignored);
+        // Non-recursive: it takes this process's root away once the last file has cleaned up
+        // after itself, and fails harmlessly while any file is still there.
+        filesystem::remove(files_root(), ignored);
+    }
+
+    ScopedTemporaryFile(const ScopedTemporaryFile &) = delete;
+    ScopedTemporaryFile &operator=(const ScopedTemporaryFile &) = delete;
+
+    const char *path() const { return path_.c_str(); }
+
+private:
+    // Created once on first use. Clearing it is safe precisely because the name carries this
+    // process's id: the only process that could have left anything under it is a dead one.
+    static const filesystem::path &files_root() {
+        static const filesystem::path root = [] {
+            const filesystem::path path = filesystem::temp_directory_path() /
+                                          ("spikecorec_weight_matrix_tests_" +
+                                           std::to_string(getpid()));
+            std::error_code ignored;
+            filesystem::remove_all(path, ignored);
+            filesystem::create_directories(path);
+            return path;
+        }();
+        return root;
+    }
+
+    filesystem::path path_;
+};
 
 bool approx(f32 first, f32 second, f32 epsilon = 1e-3f) {
     return std::fabs(first - second) <= epsilon * (1.0f + std::fabs(second));
@@ -237,7 +301,8 @@ TEST(WeightMatrix, save_load) {
     WeightMatrix weight_matrix(network, /*rank=*/8);
     weight_matrix.set_constant_weight(0.75f);
 
-    const char *path = "/tmp/spikecorec_test_wm.bin";
+    const ScopedTemporaryFile temporary_file("save_load.bin");
+    const char *path = temporary_file.path();
     weight_matrix.save(path);
 
     WeightMatrix loaded(network, /*rank=*/8);
@@ -871,7 +936,8 @@ TEST(WeightMatrix, save_load_reallocates_on_dimension_change) {
     WeightMatrix source(small_network, /*rank=*/4); // rank_float4_stride=1
     source.set_constant_weight(0.42f);
 
-    const char *path = "/tmp/spikecorec_test_wm_realloc.bin";
+    const ScopedTemporaryFile temporary_file("save_load_realloc.bin");
+    const char *path = temporary_file.path();
     source.save(path);
 
     auto large_network = square_torus(4); // 16 nodes, different rank/node_count
@@ -1204,7 +1270,8 @@ TEST(WeightMatrix, load_from_disk_does_not_persist_sparse_delta_buffer) {
     source.set_constant_weight(0.42f);
     source.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 5.0f); // never persisted
 
-    const char *path = "/tmp/spikecorec_test_wm_sparse_delta.bin";
+    const ScopedTemporaryFile temporary_file("sparse_delta.bin");
+    const char *path = temporary_file.path();
     source.save(path);
 
     // Non-reallocating load: same node_count/rank_float4_stride as `source`.
@@ -1220,7 +1287,8 @@ TEST(WeightMatrix, load_from_disk_resets_sparse_delta_buffer_on_reallocation) {
     source.set_constant_weight(0.42f);
     source.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 5.0f); // never persisted
 
-    const char *path = "/tmp/spikecorec_test_wm_sparse_delta_realloc.bin";
+    const ScopedTemporaryFile temporary_file("sparse_delta_realloc.bin");
+    const char *path = temporary_file.path();
     source.save(path);
 
     auto large_network = square_torus(4); // 16 nodes, rank_float4_stride=3 -- forces reallocation
@@ -2078,7 +2146,8 @@ TEST(WeightMatrix, move_assignment_preserves_exact_edge_weights) {
 TEST(WeightMatrix, load_from_disk_leaves_exact_mode_off_after_reallocating) {
     auto network = square_torus(4);
     WeightMatrix saved_matrix(network, /*rank=*/4); // rank_float4_stride 1
-    const char *path = "/tmp/spikecorec_test_wm_exact_weight_realloc.bin";
+    const ScopedTemporaryFile temporary_file("exact_weight_realloc.bin");
+    const char *path = temporary_file.path();
     saved_matrix.save(path);
 
     // A different rank_float4_stride forces load_from_disk to reallocate, which resets the
@@ -2368,7 +2437,8 @@ TEST(WeightMatrix, per_edge_variables_are_unregistered_when_load_from_disk_reall
     // and refit would then stop clearing it.
     auto network = square_torus(4);
     WeightMatrix saved_matrix(network, /*rank=*/4); // rank_float4_stride 1
-    const char *path = "/tmp/spikecorec_test_wm_per_edge_realloc.bin";
+    const ScopedTemporaryFile temporary_file("per_edge_realloc.bin");
+    const char *path = temporary_file.path();
     saved_matrix.save(path);
 
     WeightMatrix loading_matrix(network, /*rank=*/8); // rank_float4_stride 2

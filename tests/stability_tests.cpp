@@ -4,6 +4,8 @@
 #include <Metal/Metal.hpp>
 #endif
 
+#include <unistd.h> // getpid -- the fixture root is named after this process; see below
+
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -13,6 +15,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -282,10 +285,22 @@ bool standard_library_available() {
 // temporary directory addressed by ABSOLUTE path because nothing here may depend on the
 // process's working directory: this binary's working directory is shared with every other
 // suite in it.
+//
+// ── why the directory is private to THIS PROCESS ─────────────────────────────────────────────
+// The root used to be the FIXED path $TMPDIR/spikecorec_stability_tests, and the per-run
+// directory under it is wiped on construction. $TMPDIR is shared by every process on the machine,
+// and this tree is developed with several worktrees on one machine, so two test binaries running
+// at once used the same per-run directory: each one's construction deleted the other's .nml, and
+// each one's destruction deleted it again mid-run. The engine then failed to open a fixture this
+// test had just written, or parsed a half-written one. Measured on the pre-fix tree with two
+// `--gtest_filter='Stability*'` processes overlapping: 7 of 12 processes failed. After: 0 of 24.
+//
+// Naming the root after this process is the fix -- no other test binary can create, use or remove
+// anything inside it, so the wipe on construction can only ever remove this process's own leftovers.
 class FixtureDirectory {
 public:
     explicit FixtureDirectory(const String &run_name) {
-        root_ = filesystem::temp_directory_path() / "spikecorec_stability_tests" / run_name;
+        root_ = process_root() / run_name;
         filesystem::remove_all(root_);
         filesystem::create_directories(root_);
     }
@@ -293,6 +308,9 @@ public:
     ~FixtureDirectory() {
         std::error_code ignored;
         filesystem::remove_all(root_, ignored);
+        // Non-recursive: it takes this process's root away once the last run has cleaned up
+        // after itself, and fails harmlessly while any run directory is still there.
+        filesystem::remove(process_root(), ignored);
     }
 
     FixtureDirectory(const FixtureDirectory &) = delete;
@@ -308,6 +326,15 @@ public:
     }
 
 private:
+    // Created once on first use, and named after this process so that nothing else on the
+    // machine shares it.
+    static const filesystem::path &process_root() {
+        static const filesystem::path root =
+                filesystem::temp_directory_path() /
+                ("spikecorec_stability_tests_" + std::to_string(getpid()));
+        return root;
+    }
+
     filesystem::path root_;
 };
 
