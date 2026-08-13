@@ -198,7 +198,28 @@ void* allocate_bytes(usize byte_size) {
     return pointer;
 
 #elif defined(SPIKECOREC_METAL)
+    // Metal cannot represent a zero-length buffer, and a zero-length request is legitimate
+    // here: a cell type with no parameters, a graph with no edges, an empty arena slab.
+    // Callers already cope with a null handle (see buffer_contents_or_null in engine.cpp and
+    // EngineAllocator's zero-size contract), so hand one back rather than calling newBuffer
+    // and turning a legal empty buffer into a device error.
+    if (byte_size == 0) return nullptr;
+
     MTL::Buffer *buffer = global_device->newBuffer(byte_size, MTL::ResourceStorageModeShared);
+
+    // newBuffer returns null when the device cannot satisfy the request. Every caller
+    // immediately writes through get_contents(), so an unchecked null here surfaces as a
+    // segfault inside a memset somewhere downstream rather than as an allocation failure —
+    // which is exactly what it looked like when two processes contended for the GPU and the
+    // crash report pointed at WeightMatrix::load_from_disk. Exhaustion is the *expected*
+    // failure mode for the network sizes this engine targets, so it has to be reportable.
+    if (buffer == nullptr) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("allocate_bytes: the GPU device could not allocate {} bytes "
+                        "({:.2f} MiB) — out of device memory",
+                        byte_size, static_cast<f64>(byte_size) / (1024.0 * 1024.0)));
+    }
+
     // index by the unified-memory data pointer — that's what callers pass around
     // (GpuPointer::get_contents()), and what dispatch() must resolve back to a buffer
     global_buffer_map[buffer->contents()] = BufferBinding{buffer, 0};
