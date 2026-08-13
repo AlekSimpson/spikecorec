@@ -512,7 +512,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
             weights.k2tree.internal_bit_count};
 
     u64 gpu_pool_byte_count =
-            arena_cost_of(sizeof(f32) * (u64)cell_state_element_count) +
+            arena_cost_of(sizeof(f32) * (u64)cell_state_element_count) * 2 +  // state + residual
             arena_cost_of(sizeof(f32) * (u64)cell_parameter_element_count) +
             arena_cost_of(sizeof(f32) * (u64)network_input_element_count) +
             arena_cost_of(sizeof(s32) * (u64)edge_attribute_element_count) +
@@ -526,6 +526,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     allocator = EngineAllocator(/*cpu_total_bytes=*/0, gpu_pool_byte_count);
 
     cell_state = allocate_engine_buffer<f32>(allocator, cell_state_element_count);
+    cell_state_residual = allocate_engine_buffer<f32>(allocator, cell_state_element_count);
     cell_parameters = allocate_engine_buffer<f32>(allocator, cell_parameter_element_count);
     network_inputs = allocate_engine_buffer<f32>(allocator, network_input_element_count);
     edge_attributes = allocate_engine_buffer<s32>(allocator, edge_attribute_element_count);
@@ -540,6 +541,9 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     }
 
     zero_fill_engine_buffer(cell_state, cell_state_element_count);
+    // Zero is the only correct start: no accumulation has happened yet, so no part of one is
+    // outstanding.
+    zero_fill_engine_buffer(cell_state_residual, cell_state_element_count);
     zero_fill_engine_buffer(cell_parameters, cell_parameter_element_count);
     zero_fill_engine_buffer(network_inputs, network_input_element_count);
     zero_fill_engine_buffer(spike_flags, total_neuron_count);
@@ -786,6 +790,7 @@ void SpikeEngine::dispatch_master_kernel(
     // Every binding below points at one of these locals, so they all have to outlive the
     // metal_dispatch call at the bottom of this function.
     f32 *cell_state_contents = buffer_contents_or_null(cell_state);
+    f32 *cell_state_residual_contents = buffer_contents_or_null(cell_state_residual);
     f32 *cell_parameters_contents = buffer_contents_or_null(cell_parameters);
     f32 *network_inputs_contents = buffer_contents_or_null(network_inputs);
     s64 *last_spiked_contents = buffer_contents_or_null(last_spiked);
@@ -840,6 +845,8 @@ void SpikeEngine::dispatch_master_kernel(
     // which a tick index or a stride never is.
     const UnorderedMap<String, KernelArgumentBinding> available_arguments = {
         {"cell_state", {&cell_state_contents, sizeof(cell_state_contents)}},
+        {"cell_state_residual",
+         {&cell_state_residual_contents, sizeof(cell_state_residual_contents)}},
         {"cell_parameters", {&cell_parameters_contents, sizeof(cell_parameters_contents)}},
         {"network_inputs", {&network_inputs_contents, sizeof(network_inputs_contents)}},
         {"last_spiked", {&last_spiked_contents, sizeof(last_spiked_contents)}},

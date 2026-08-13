@@ -132,6 +132,18 @@ namespace spikecorec {
         // neuron to its slot in one load. This is the layout the generated kernel assumes
         // (see nml/kernel_codegen.h).
         GpuPointer<f32> cell_state;          // [cell_state_element_count]
+
+        // The compensated-accumulation residual for every cell_state slot: laid out exactly
+        // parallel to cell_state, same size and same bases, so one index reaches both.
+        //
+        // Forward Euler is a running sum, and in f32 each step loses the low bits of an
+        // increment that is small beside the total. Over a refractory period of fifty 0.1 ms
+        // ticks that costs a whole tick -- the `.geq.` comparison lands one tick late, every
+        // time. Metal has no double precision, so the sum is compensated instead: each slot
+        // carries the part of its last increment that did not fit, and the next step folds it
+        // back in. See "Compensated accumulation" in src/nml/kernel_codegen.cpp.
+        GpuPointer<f32> cell_state_residual; // [cell_state_element_count]
+
         GpuPointer<f32> cell_parameters;     // [cell_parameter_element_count]
         GpuPointer<s32> cell_state_base;     // [total_neuron_count]
         GpuPointer<s32> cell_parameter_base; // [total_neuron_count]
@@ -146,9 +158,11 @@ namespace spikecorec {
         // own column with a plain load. External stimulus is added into the current tick's
         // row, arriving with no delay.
         //
-        // One value per (row, neuron) and no synapse dimension: a spike delivers the whole
-        // scalar its synapse computes, in one tick, into one slot (see kernel_codegen.h). An
-        // edge naming no synapse scatters its raw weight into that same slot.
+        // One value per (row, neuron) and no synapse dimension: a spike delivers the whole of
+        // the charge its synapse's response to that event carries, in one tick, into one slot
+        // -- as the current that delivers it over that tick, so charge Q arrives as Q / dt
+        // (see kernel_codegen.h). An edge naming no synapse scatters its raw weight into that
+        // same slot.
         //
         // A row is emptied as a WHOLE ROW by the ring clear kernel dispatched behind the tick
         // kernel, at the end of the tick that read it -- clearing the input this tick consumed

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -263,6 +264,162 @@ String format_float_literal(f64 value) {
     return stream.str();
 }
 
+// ── Expression semantics ─────────────────────────────────────────────────────
+//
+// The grammar below is folded by one of two semantics: SourceEmission, which produces the
+// C-family text a kernel is built out of, and NumericEvaluation, which produces the value
+// the same expression takes for one set of variable values.
+//
+// Both are needed, because this generator does not only emit a synapse's dynamics: it also
+// integrates them on the host to work out how much charge one arriving event delivers (see
+// synapse_event_charge_coefficients). A second, evaluating parser would be a second
+// precedence table, a second dotted-operator mapping and a second `^`-associativity rule to
+// keep in step with this one -- and every way they could drift is a silently different
+// number rather than a compile error.
+
+// One NML standard-library function: the name a document writes it by, the C-family name the
+// generated source calls, and the host function computing the same thing. Declared once so a
+// name cannot mean one function in the emitted kernel and another on the host.
+struct BuiltinFunctionEntry {
+    String nml_name;
+    String c_name;
+    f64 (*host_function)(f64);
+};
+
+// `ln` and `log` are the trap: LEMS's `log` is base 10 and its natural log is `ln`, which is
+// the reverse of C.
+const Vector<BuiltinFunctionEntry> &builtin_function_table() {
+    static const Vector<BuiltinFunctionEntry> table = {
+        {"exp", "exp", [](f64 value) { return std::exp(value); }},
+        {"ln", "log", [](f64 value) { return std::log(value); }},
+        {"log", "log10", [](f64 value) { return std::log10(value); }},
+        {"sin", "sin", [](f64 value) { return std::sin(value); }},
+        {"cos", "cos", [](f64 value) { return std::cos(value); }},
+        {"tan", "tan", [](f64 value) { return std::tan(value); }},
+        {"sinh", "sinh", [](f64 value) { return std::sinh(value); }},
+        {"cosh", "cosh", [](f64 value) { return std::cosh(value); }},
+        {"tanh", "tanh", [](f64 value) { return std::tanh(value); }},
+        {"sqrt", "sqrt", [](f64 value) { return std::sqrt(value); }},
+        {"abs", "fabs", [](f64 value) { return std::fabs(value); }},
+        {"ceil", "ceil", [](f64 value) { return std::ceil(value); }},
+        {"floor", "floor", [](f64 value) { return std::floor(value); }},
+    };
+    return table;
+}
+
+const BuiltinFunctionEntry *find_builtin_function(const String &nml_name) {
+    for (const BuiltinFunctionEntry &entry : builtin_function_table()) {
+        if (entry.nml_name == nml_name) return &entry;
+    }
+    return nullptr;
+}
+
+// Folds the grammar into generated C source. Identifiers resolve through the SymbolTable,
+// which is what binds a name to the buffer element or local that holds it.
+class SourceEmission {
+public:
+    using Value = String;
+
+    explicit SourceEmission(const SymbolTable &symbols) : symbols_(symbols) {}
+
+    const String &component_type_name() const { return symbols_.component_type_name; }
+
+    Value number(const String &literal_text) const { return to_float_literal(literal_text); }
+
+    Value identifier(const String &name) const { return symbols_.read_expression_for(name); }
+
+    Value binary(const String &operator_text, const Value &left, const Value &right) const {
+        return "(" + left + " " + operator_text + " " + right + ")";
+    }
+
+    Value negate(const Value &operand) const { return "(-" + operand + ")"; }
+
+    Value power(const Value &base, const Value &exponent) const {
+        return "pow(" + base + ", " + exponent + ")";
+    }
+
+    Value heaviside(const Value &operand) const {
+        return "((" + operand + ") >= 0.0f ? 1.0f : 0.0f)";
+    }
+
+    Value builtin(const BuiltinFunctionEntry &entry, const Value &operand) const {
+        return entry.c_name + "(" + operand + ")";
+    }
+
+private:
+    const SymbolTable &symbols_;
+};
+
+// A name -> value binding, with SymbolTable's first-definition-wins rule so the two resolve
+// the same identifier to the same thing: the emitted kernel and the host integration have to
+// agree about which `tau` an expression means.
+struct ValueTable {
+    UnorderedMap<String, f64> identifier_values;
+    String component_type_name;
+
+    void define(const String &identifier, f64 value) {
+        identifier_values.emplace(identifier, value);
+    }
+
+    bool contains(const String &identifier) const {
+        return identifier_values.find(identifier) != identifier_values.end();
+    }
+
+    f64 value_for(const String &identifier) const {
+        const auto entry = identifier_values.find(identifier);
+        if (entry == identifier_values.end()) {
+            throw runtime_error("kernel_codegen: unknown identifier '" + identifier +
+                                "' in ComponentType '" + component_type_name + "'");
+        }
+        return entry->second;
+    }
+};
+
+// Folds the same grammar into a number. Comparisons and connectives yield 1.0 / 0.0, which is
+// what the emitted C's own comparisons yield once they are used as floats.
+class NumericEvaluation {
+public:
+    using Value = f64;
+
+    explicit NumericEvaluation(const ValueTable &values) : values_(values) {}
+
+    const String &component_type_name() const { return values_.component_type_name; }
+
+    Value number(const String &literal_text) const { return stod(literal_text); }
+
+    Value identifier(const String &name) const { return values_.value_for(name); }
+
+    Value binary(const String &operator_text, Value left, Value right) const {
+        if (operator_text == "+") return left + right;
+        if (operator_text == "-") return left - right;
+        if (operator_text == "*") return left * right;
+        if (operator_text == "/") return left / right;
+        if (operator_text == ">") return left > right ? 1.0 : 0.0;
+        if (operator_text == "<") return left < right ? 1.0 : 0.0;
+        if (operator_text == ">=") return left >= right ? 1.0 : 0.0;
+        if (operator_text == "<=") return left <= right ? 1.0 : 0.0;
+        if (operator_text == "==") return left == right ? 1.0 : 0.0;
+        if (operator_text == "!=") return left != right ? 1.0 : 0.0;
+        if (operator_text == "&&") return (left != 0.0 && right != 0.0) ? 1.0 : 0.0;
+        if (operator_text == "||") return (left != 0.0 || right != 0.0) ? 1.0 : 0.0;
+        report_error("no host evaluation for operator '" + operator_text + "'",
+                     values_.component_type_name);
+    }
+
+    Value negate(Value operand) const { return -operand; }
+
+    Value power(Value base, Value exponent) const { return std::pow(base, exponent); }
+
+    Value heaviside(Value operand) const { return operand >= 0.0 ? 1.0 : 0.0; }
+
+    Value builtin(const BuiltinFunctionEntry &entry, Value operand) const {
+        return entry.host_function(operand);
+    }
+
+private:
+    const ValueTable &values_;
+};
+
 // ── Expression parser ────────────────────────────────────────────────────────
 //
 // Recursive descent, lowest precedence outermost:
@@ -270,13 +427,16 @@ String format_float_literal(f64 value) {
 // Each binary result is parenthesised, so the emitted C reproduces the parse regardless of
 // how C would have grouped it.
 
+template <typename Semantics>
 class ExpressionParser {
 public:
-    ExpressionParser(Vector<Token> tokens, const SymbolTable &symbols)
-        : tokens_(std::move(tokens)), symbols_(symbols) {}
+    using Value = typename Semantics::Value;
 
-    String parse_complete_expression() {
-        String result = parse_logical_or();
+    ExpressionParser(Vector<Token> tokens, const Semantics &semantics)
+        : tokens_(std::move(tokens)), semantics_(semantics) {}
+
+    Value parse_complete_expression() {
+        Value result = parse_logical_or();
         if (current().kind != TokenKind::EndOfInput) {
             fail("unexpected trailing token '" + current().text + "'");
         }
@@ -284,10 +444,10 @@ public:
     }
 
 private:
-    using ParseFunction = String (ExpressionParser::*)();
+    using ParseFunction = Value (ExpressionParser::*)();
 
     Vector<Token> tokens_;
-    const SymbolTable &symbols_;
+    const Semantics &semantics_;
     usize position_ = 0;
 
     const Token &current() const { return tokens_[position_]; }
@@ -297,7 +457,7 @@ private:
     }
 
     [[noreturn]] void fail(const String &message) const {
-        report_error(message, symbols_.component_type_name);
+        report_error(message, semantics_.component_type_name());
     }
 
     bool current_matches(const Vector<String> &operators) const {
@@ -308,71 +468,71 @@ private:
         return false;
     }
 
-    String parse_left_associative(ParseFunction next_level, const Vector<String> &operators) {
-        String left = (this->*next_level)();
+    Value parse_left_associative(ParseFunction next_level, const Vector<String> &operators) {
+        Value left = (this->*next_level)();
         while (current_matches(operators)) {
             const String operator_text = current().text;
             advance();
-            const String right = (this->*next_level)();
-            left = "(" + left + " " + operator_text + " " + right + ")";
+            const Value right = (this->*next_level)();
+            left = semantics_.binary(operator_text, left, right);
         }
         return left;
     }
 
-    String parse_logical_or() {
+    Value parse_logical_or() {
         return parse_left_associative(&ExpressionParser::parse_logical_and, {"||"});
     }
 
-    String parse_logical_and() {
+    Value parse_logical_and() {
         return parse_left_associative(&ExpressionParser::parse_equality, {"&&"});
     }
 
-    String parse_equality() {
+    Value parse_equality() {
         return parse_left_associative(&ExpressionParser::parse_relational, {"==", "!="});
     }
 
-    String parse_relational() {
+    Value parse_relational() {
         return parse_left_associative(&ExpressionParser::parse_additive, {">", "<", ">=", "<="});
     }
 
-    String parse_additive() {
+    Value parse_additive() {
         return parse_left_associative(&ExpressionParser::parse_multiplicative, {"+", "-"});
     }
 
-    String parse_multiplicative() {
+    Value parse_multiplicative() {
         return parse_left_associative(&ExpressionParser::parse_unary, {"*", "/"});
     }
 
-    String parse_unary() {
+    Value parse_unary() {
         if (current_matches({"-", "+"})) {
             const String operator_text = current().text;
             advance();
-            const String operand = parse_unary();
+            const Value operand = parse_unary();
             // Unary plus on a float is a no-op, so it is dropped rather than emitted.
             if (operator_text == "+") return operand;
-            return "(-" + operand + ")";
+            return semantics_.negate(operand);
         }
         return parse_power();
     }
 
     // `^` binds tighter than unary minus and is right-associative: `-x^2` is -(x^2) and
     // `a^b^c` is a^(b^c). The exponent re-enters at parse_unary so `2^-1` parses.
-    String parse_power() {
-        String base = parse_primary();
+    Value parse_power() {
+        Value base = parse_primary();
         if (current_matches({"^"})) {
             advance();
-            const String exponent = parse_unary();
-            return "pow(" + base + ", " + exponent + ")";
+            const Value exponent = parse_unary();
+            return semantics_.power(base, exponent);
         }
         return base;
     }
 
-    String parse_primary() {
+    Value parse_primary() {
         const Token token = current();
 
         if (token.kind == TokenKind::Number) {
             advance();
-            return to_float_literal(token.text);
+            return semantics_.number(token.text);
         }
 
         if (token.kind == TokenKind::Identifier) {
@@ -380,12 +540,12 @@ private:
             if (current().kind == TokenKind::LeftParenthesis) {
                 return parse_function_call(token.text);
             }
-            return symbols_.read_expression_for(token.text);
+            return semantics_.identifier(token.text);
         }
 
         if (token.kind == TokenKind::LeftParenthesis) {
             advance();
-            const String inner = parse_logical_or();
+            const Value inner = parse_logical_or();
             if (current().kind != TokenKind::RightParenthesis) {
                 fail("expected ')' in expression");
             }
@@ -399,10 +559,10 @@ private:
         fail("expected a value but found '" + token.text + "'");
     }
 
-    String parse_function_call(const String &function_name) {
+    Value parse_function_call(const String &function_name) {
         advance(); // past '('
 
-        Vector<String> arguments;
+        Vector<Value> arguments;
         if (current().kind != TokenKind::RightParenthesis) {
             arguments.push_back(parse_logical_or());
             while (current().kind == TokenKind::Comma) {
@@ -416,39 +576,28 @@ private:
         }
         advance();
 
-        return emit_function_call(function_name, arguments);
+        return apply_function(function_name, arguments);
     }
 
-    String emit_function_call(const String &function_name, const Vector<String> &arguments) const {
+    Value apply_function(const String &function_name, const Vector<Value> &arguments) const {
         if (function_name == "random") {
             fail("unsupported function 'random': a deterministic per-neuron stream needs a "
                  "seed argument the generated kernels do not take");
         }
 
-        // NeuroML's standard library onto the C-family names. `ln` and `log` are the trap:
-        // LEMS's `log` is base 10 and its natural log is `ln`, which is the reverse of C.
-        static const UnorderedMap<String, String> single_argument_functions = {
-            {"exp", "exp"},   {"ln", "log"},    {"log", "log10"}, {"sin", "sin"},
-            {"cos", "cos"},   {"tan", "tan"},   {"sinh", "sinh"}, {"cosh", "cosh"},
-            {"tanh", "tanh"}, {"sqrt", "sqrt"}, {"abs", "fabs"},  {"ceil", "ceil"},
-            {"floor", "floor"},
-        };
-
         if (function_name == "H") {
             require_argument_count(function_name, arguments, 1);
-            return "((" + arguments[0] + ") >= 0.0f ? 1.0f : 0.0f)";
+            return semantics_.heaviside(arguments[0]);
         }
 
-        const auto entry = single_argument_functions.find(function_name);
-        if (entry == single_argument_functions.end()) {
-            fail("unknown function '" + function_name + "'");
-        }
+        const BuiltinFunctionEntry *entry = find_builtin_function(function_name);
+        if (entry == nullptr) fail("unknown function '" + function_name + "'");
 
         require_argument_count(function_name, arguments, 1);
-        return entry->second + "(" + arguments[0] + ")";
+        return semantics_.builtin(*entry, arguments[0]);
     }
 
-    void require_argument_count(const String &function_name, const Vector<String> &arguments,
+    void require_argument_count(const String &function_name, const Vector<Value> &arguments,
                                 usize expected_count) const {
         if (arguments.size() != expected_count) {
             fail("function '" + function_name + "' takes " + to_string(expected_count) +
@@ -456,6 +605,17 @@ private:
         }
     }
 };
+
+// Evaluates one NML expression against a set of numeric bindings, through exactly the
+// grammar translate_expression emits with.
+f64 evaluate_expression(const String &nml_expression, const ValueTable &values) {
+    Vector<Token> tokens = tokenize_nml_expression(nml_expression, values.component_type_name);
+    if (tokens.size() == 1) report_error("empty expression", values.component_type_name);
+
+    const NumericEvaluation semantics(values);
+    ExpressionParser<NumericEvaluation> parser(std::move(tokens), semantics);
+    return parser.parse_complete_expression();
+}
 
 // ── Symbol tables ────────────────────────────────────────────────────────────
 
@@ -475,6 +635,11 @@ struct StateStorage {
     // sparse-delta convention this state shares -- so its stride is the plane size.
     String element_stride_expression;
 
+    // Where this storage's accumulation residuals live, or empty when it keeps none. See
+    // "Compensated accumulation" below. Laid out exactly parallel to `array_name` -- same
+    // size, same base, same slot -- so nothing has to be indexed twice.
+    String residual_array_name;
+
     String element(usize slot) const {
         if (element_stride_expression.empty()) {
             return array_name + "[" + base_name + " + " + to_string(slot) + "]";
@@ -482,12 +647,19 @@ struct StateStorage {
         return array_name + "[" + base_name + " + " + to_string(slot) + " * " +
                element_stride_expression + "]";
     }
+
+    bool keeps_residuals() const { return !residual_array_name.empty(); }
+
+    String residual_element(usize slot) const {
+        return residual_array_name + "[" + base_name + " + " + to_string(slot) + "]";
+    }
 };
 
 StateStorage cell_state_storage(const CellTypeSpecification &cell_type) {
     // Empty stride: a cell's state variables are adjacent inside its own cell_state chunk.
-    return StateStorage{cell_type.name, cell_type.state_variable_names, "cell_state",
-                        "state_base", ""};
+    return StateStorage{cell_type.name,     cell_type.state_variable_names,
+                        "cell_state",       "state_base",
+                        "",                 "cell_state_residual"};
 }
 
 SymbolTable build_base_symbol_table(const CellTypeSpecification &cell_type) {
@@ -584,17 +756,31 @@ const String active_regime_local_name = "active_regime_index";
 
 // The TimeDerivative `regime_name` declares for `variable_name`, or nullptr when that regime
 // declares none -- which is exactly what freezes the variable while the regime is active.
+//
+// Two of them in one regime is malformed LEMS and is refused, exactly as
+// emit_unconditional_euler_temporaries refuses the same shape outside any regime. Returning
+// the first and dropping the rest is what a model splitting its leak and its synaptic term
+// into two TimeDerivatives would silently lose -- the whole of its synaptic input, with no
+// diagnostic anywhere.
 const DynamicsInstruction *find_regime_time_derivative(const CellTypeSpecification &cell_type,
                                                        const String &regime_name,
                                                        const String &variable_name) {
+    const DynamicsInstruction *found = nullptr;
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
         if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
         if (instruction.regime_name != regime_name) continue;
         if (instruction.target != variable_name) continue;
-        return &instruction;
+
+        if (found != nullptr) {
+            report_error("'" + variable_name +
+                                 "' carries more than one TimeDerivative inside Regime '" +
+                                 regime_name + "'",
+                         cell_type.name);
+        }
+        found = &instruction;
     }
-    return nullptr;
+    return found;
 }
 
 // `regime_name`'s OnEntry StateAssignments, in declaration order. An OnEntry body is located
@@ -755,6 +941,96 @@ void reject_unsupported_instructions(const CellTypeSpecification &cell_type,
     }
 }
 
+// ── Compensated accumulation ─────────────────────────────────────────────────
+//
+// Forward Euler is a running sum, and a running sum in f32 loses the low bits of every
+// increment that is small beside the total. Fifty f32 additions of a 0.1 ms dt reach
+// 4.9999989569e-03 where f32(5 ms) is 4.9999998882e-03, so a `refractoryTimeElapsed .geq.
+// t_ref` fires on the fifty-FIRST tick and the refractory period is one tick longer than the
+// model declares. At dt = 0.1 ms that is +1 tick for essentially every t_ref, and at a 0.5 ms
+// t_ref it is a 20% error in the refractory period.
+//
+// The fix cannot be "accumulate in f64": Metal has no double precision. Instead each state
+// variable carries an f32 RESIDUAL -- the part of the last increment that did not fit -- which
+// is folded into the next one (Kahan compensated summation). The accumulated error stops
+// growing with the number of steps and stays at the order of one ulp of the value itself, so
+// the sum after n steps rounds to the correctly rounded n * dt and the comparison lands where
+// a f64 accumulation lands it.
+//
+// This is general rather than aimed at a refractory counter: it applies to every state
+// variable of every ComponentType, whatever its TimeDerivative, and it is the accumulation it
+// repairs rather than any particular comparison.
+//
+// Two things this depends on, both of which the engine's own tests hold it to:
+//  - The residual must be discarded whenever the variable is ASSIGNED (OnStart, an
+//    OnCondition's reset, a regime's OnEntry): it describes a sum that no longer exists. That
+//    is emit_residual_reset, called from every state write that is not an Euler step.
+//  - The compensation is an exact-arithmetic identity that a reassociating optimiser can fold
+//    to zero, and Metal compiles with fast math on by default. Nothing here can turn that off
+//    -- the compile options are the engine's -- so the guard is a test on the OBSERVED
+//    refractory length rather than on the emitted text: see the engine's
+//    a_regime_refractory_period_lasts_the_ticks_the_reference_freezes_for.
+String emit_residual_reset(const StateStorage &storage, usize slot, usize indent_level) {
+    if (!storage.keeps_residuals()) return "";
+    return indent(indent_level) + storage.residual_element(slot) + " = 0.0f;\n";
+}
+
+// What one Euler step writes back: the integrated value, and (where the storage keeps them)
+// the residual that step left behind.
+struct PendingStateWrite {
+    usize slot = 0;
+    String next_value_name;
+    String residual_name; // empty when this storage keeps no residual
+};
+
+// One forward-Euler step of `derivative_expression` into `next_value_name`, compensated
+// against `residual_name` where the storage keeps residuals. `declares_result` distinguishes
+// the unconditional path (which declares the temporary here) from a regime branch (where it
+// was declared once, ahead of the chain, and each branch only assigns it).
+String emit_compensated_euler_step(const StateStorage &storage, usize slot,
+                                   const String &variable_name,
+                                   const String &derivative_expression,
+                                   const String &next_value_name, const String &residual_name,
+                                   bool declares_result, usize indent_level) {
+    const String declaration = declares_result ? "float " : "";
+
+    if (!storage.keeps_residuals()) {
+        return indent(indent_level) + declaration + next_value_name + " = " +
+               storage.element(slot) + " + dt * (" + derivative_expression + ");\n";
+    }
+
+    const String sanitized_name = sanitize_identifier(variable_name);
+    const String increment_name = "increment_" + sanitized_name;
+    const String rounded_name = "rounded_" + sanitized_name;
+    const String rounding_loss_name = "rounding_loss_" + sanitized_name;
+
+    // The two `volatile` locals are load-bearing, not defensive.
+    //
+    // The residual is `((x + increment) - x) - increment`: zero in exact arithmetic, and the
+    // whole of the rounding loss in floating point. Metal compiles with fast math ON by
+    // default -- and the compile options belong to the engine's backend, not to this
+    // generator -- so the optimiser is free to apply that exact-arithmetic identity and fold
+    // the residual to a literal zero. It does: with neither barrier the emitted AIR stores a
+    // constant 0.0 into the residual, and the refractory hold stays exactly where it was.
+    //
+    // ONE barrier is not enough, which is the part worth writing down. Making only the sum
+    // opaque leaves `(next - x) - increment` reassociable into `next - (x + increment)`, and
+    // the recomputed sum is bit-identical to `next`, so the residual is zero at run time even
+    // though the arithmetic survived in the IR. The difference that recovers the rounding loss
+    // therefore has to be forced to happen on its own, before anything is subtracted from it.
+    //
+    // Both were checked in the emitted AIR (xcrun metal -S) and against the observed
+    // refractory length, not reasoned about.
+    return indent(indent_level) + "float " + increment_name + " = dt * (" +
+           derivative_expression + ") - " + residual_name + ";\n" + indent(indent_level) +
+           "volatile float " + rounded_name + " = " + storage.element(slot) + " + " +
+           increment_name + ";\n" + indent(indent_level) + declaration + next_value_name + " = " +
+           rounded_name + ";\n" + indent(indent_level) + "volatile float " + rounding_loss_name +
+           " = " + next_value_name + " - " + storage.element(slot) + ";\n" +
+           indent(indent_level) + residual_name + " = " + rounding_loss_name + " - " +
+           increment_name + ";\n";
+}
+
 // One handler's StateAssignments, emitted with LEMS's simultaneous semantics: every
 // right-hand side is evaluated against the state as it stood when the handler fired, and
 // only then is anything written back. Emitting them sequentially would make "v = u; u = v"
@@ -783,11 +1059,12 @@ String emit_state_assignment_group(const StateStorage &storage,
         const usize slot = require_state_variable_slot(storage, assignments.front()->target,
                                                        "StateAssignment");
         return indent(indent_level) + storage.element(slot) + " = " +
-               translate_expression(assignments.front()->expression, visible_symbols) + ";\n";
+               translate_expression(assignments.front()->expression, visible_symbols) + ";\n" +
+               emit_residual_reset(storage, slot, indent_level);
     }
 
     ostringstream group;
-    Vector<Pair<usize, String>> pending_state_writes;
+    Vector<PendingStateWrite> pending_state_writes;
     Set<String> declared_temporaries;
 
     for (const DynamicsInstruction *assignment : assignments) {
@@ -804,12 +1081,15 @@ String emit_state_assignment_group(const StateStorage &storage,
               << temporary_name << " = "
               << translate_expression(assignment->expression, visible_symbols) << ";\n";
 
-        if (is_first_assignment_to_target) pending_state_writes.push_back({slot, temporary_name});
+        if (is_first_assignment_to_target) {
+            pending_state_writes.push_back({slot, temporary_name, String()});
+        }
     }
 
-    for (const auto &pending_write : pending_state_writes) {
-        group << indent(indent_level) << storage.element(pending_write.first) << " = "
-              << pending_write.second << ";\n";
+    for (const PendingStateWrite &pending_write : pending_state_writes) {
+        group << indent(indent_level) << storage.element(pending_write.slot) << " = "
+              << pending_write.next_value_name << ";\n";
+        group << emit_residual_reset(storage, pending_write.slot, indent_level);
     }
 
     return group.str();
@@ -824,7 +1104,7 @@ String emit_state_assignment_group(const StateStorage &storage,
 String emit_unconditional_euler_temporaries(
         const StateStorage &storage, const Vector<DynamicsInstruction> &dynamics,
         const NML_ParseResult &parse_result, const SymbolTable &symbols, usize indent_level,
-        Vector<Pair<usize, String>> &pending_state_writes) {
+        Vector<PendingStateWrite> &pending_state_writes) {
     const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
 
     ostringstream step;
@@ -847,11 +1127,22 @@ String emit_unconditional_euler_temporaries(
                          storage.component_type_name);
         }
 
-        const String temporary_name = "next_" + sanitize_identifier(instruction.target);
-        step << indent(indent_level) << "float " << temporary_name << " = "
-             << storage.element(slot) << " + dt * ("
-             << translate_expression(instruction.expression, visible_symbols) << ");\n";
-        pending_state_writes.push_back({slot, temporary_name});
+        const String sanitized_name = sanitize_identifier(instruction.target);
+        const String temporary_name = "next_" + sanitized_name;
+        const String residual_name =
+                storage.keeps_residuals() ? "residual_" + sanitized_name : String();
+        const String derivative_expression =
+                translate_expression(instruction.expression, visible_symbols);
+
+        if (storage.keeps_residuals()) {
+            step << indent(indent_level) << "float " << residual_name << " = "
+                 << storage.residual_element(slot) << ";\n";
+        }
+        step << emit_compensated_euler_step(storage, slot, instruction.target,
+                                            derivative_expression, temporary_name, residual_name,
+                                            /*declares_result=*/true, indent_level);
+
+        pending_state_writes.push_back({slot, temporary_name, residual_name});
     }
 
     return step.str();
@@ -869,7 +1160,7 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
                                           const StateStorage &storage,
                                           const NML_ParseResult &parse_result,
                                           const SymbolTable &symbols, usize indent_level,
-                                          Vector<Pair<usize, String>> &pending_state_writes) {
+                                          Vector<PendingStateWrite> &pending_state_writes) {
     if (!regimes.has_regimes()) return "";
 
     const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
@@ -881,17 +1172,28 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
 
         // Which of the two applies is not decidable from the document, and picking either
         // silently changes how the variable moves in every regime.
-        for (const auto &pending_write : pending_state_writes) {
-            if (pending_write.first != slot) continue;
+        for (const PendingStateWrite &pending_write : pending_state_writes) {
+            if (pending_write.slot != slot) continue;
             report_error("'" + variable_name +
                                  "' carries both a regime-scoped TimeDerivative and one outside "
                                  "any Regime",
                          cell_type.name);
         }
 
-        const String temporary_name = "next_" + sanitize_identifier(variable_name);
+        const String sanitized_name = sanitize_identifier(variable_name);
+        const String temporary_name = "next_" + sanitized_name;
+        const String residual_name =
+                storage.keeps_residuals() ? "residual_" + sanitized_name : String();
+
         dispatch << indent(indent_level) << "float " << temporary_name << " = "
                  << storage.element(slot) << ";\n";
+        // Read once, outside the chain, and written back whatever branch runs. A regime that
+        // declares no derivative for this variable leaves it untouched, so a variable frozen
+        // for a while resumes with the residual it was frozen holding.
+        if (storage.keeps_residuals()) {
+            dispatch << indent(indent_level) << "float " << residual_name << " = "
+                     << storage.residual_element(slot) << ";\n";
+        }
 
         // One regime's body for this variable: the Euler step it declares, or a comment
         // recording that it declares none and the variable is therefore held.
@@ -903,15 +1205,16 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
                        "' declares no TimeDerivative for '" + variable_name +
                        "', so it holds its value.\n";
             }
-            return indent(body_indent) + temporary_name + " = " + storage.element(slot) +
-                   " + dt * (" + translate_expression(derivative->expression, visible_symbols) +
-                   ");\n";
+            return emit_compensated_euler_step(
+                    storage, slot, variable_name,
+                    translate_expression(derivative->expression, visible_symbols), temporary_name,
+                    residual_name, /*declares_result=*/false, body_indent);
         };
 
         // A single regime is always active, so its body needs no guard at all.
         if (regimes.regime_names.size() == 1) {
             dispatch << branch_body(regimes.regime_names[0], indent_level);
-            pending_state_writes.push_back({slot, temporary_name});
+            pending_state_writes.push_back({slot, temporary_name, residual_name});
             continue;
         }
 
@@ -927,19 +1230,22 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
         dispatch << " {\n" << branch_body(regimes.regime_names.back(), indent_level + 1)
                  << indent(indent_level) << "}\n";
 
-        pending_state_writes.push_back({slot, temporary_name});
+        pending_state_writes.push_back({slot, temporary_name, residual_name});
     }
 
     return dispatch.str();
 }
 
 String emit_euler_write_back(const StateStorage &storage,
-                             const Vector<Pair<usize, String>> &pending_state_writes,
+                             const Vector<PendingStateWrite> &pending_state_writes,
                              usize indent_level) {
     ostringstream write_back;
-    for (const auto &pending_write : pending_state_writes) {
-        write_back << indent(indent_level) << storage.element(pending_write.first) << " = "
-                   << pending_write.second << ";\n";
+    for (const PendingStateWrite &pending_write : pending_state_writes) {
+        write_back << indent(indent_level) << storage.element(pending_write.slot) << " = "
+                   << pending_write.next_value_name << ";\n";
+        if (pending_write.residual_name.empty()) continue;
+        write_back << indent(indent_level) << storage.residual_element(pending_write.slot)
+                   << " = " << pending_write.residual_name << ";\n";
     }
     return write_back.str();
 }
@@ -1495,9 +1801,15 @@ void reject_unsupported_synapse(const SynapseProgram &program) {
     }
 }
 
+// No residual array: a per-edge variable is one compressed plane per state variable across
+// every edge in the model, so carrying residuals for them would double the largest allocation
+// the engine makes. What the residuals buy -- a threshold crossed on the tick the reference
+// crosses it -- is a property of a CELL's OnConditions; a synapse declares none (they are
+// refused), and its state is only ever read as the size of the charge one event delivers.
 StateStorage synapse_state_storage(const SynapseTypeSpecification &synapse_type) {
-    return StateStorage{synapse_type.name, synapse_type.state_variable_names,
-                        "edge_synapse_state", "edge_synapse_state_base", "edge_slot_count"};
+    return StateStorage{synapse_type.name,      synapse_type.state_variable_names,
+                        "edge_synapse_state",   "edge_synapse_state_base",
+                        "edge_slot_count",      ""};
 }
 
 // State variables read from this EDGE's own per-edge variable planes; parameters read as the
@@ -1537,6 +1849,315 @@ SymbolTable build_synapse_symbol_table(const SynapseProgram &program, bool bind_
     }
 
     return symbols;
+}
+
+// ── What one arriving event delivers: the charge response ────────────────────
+//
+// A spike delivers the whole of the charge the synapse's response to THAT event would inject
+// over all the ticks that follow, in the one tick the spike lands on. Sampling the `i`
+// exposure at the instant of the spike instead is the thing this exists not to do:
+// alphaCurrentSynapse's OnEvent bumps `J` while `i` exposes `I`, and `I` only grows out of
+// `J` over later ticks, so an instantaneous sample returns whatever `I` had decayed to --
+// exactly zero for an isolated first spike, whatever the weight.
+//
+// The response is worked out here, on the host, by integrating the synapse's OWN lowered
+// dynamics; no closed form is written down for any synapse type. For state x, write
+//     Q(x) = sum over the ticks that follow of i(x_n) * dt,     x_0 = x, x_{n+1} = Euler(x_n)
+// the total charge a synapse left at state x and never touched again would still deliver.
+// An event moves the state from x to x' = handler(x, weight), so the charge THAT event adds
+// is Q(x') - Q(x): the tail Q(x) was already delivered by whichever earlier event produced
+// it, and delivering it a second time would inject more total charge than the synapse ever
+// carries.
+//
+// For dynamics linear in the state -- which every current-based synapse this generator
+// lowers is, and which is CHECKED below rather than assumed -- Q is a linear functional:
+//     Q(x) = sum over v of charge_coefficient[v] * x[v]
+// so Q(x') - Q(x) is that same combination of the state CHANGE the handler made. Only the
+// coefficients are precomputed; the state change is read off the edge's live state at the
+// spike, so a handler whose assignment depends on the state it finds (a depressing or
+// facilitating synapse) still delivers a different amount on each successive spike.
+//
+// The engine's `network_inputs` slot holds a CURRENT, which the target cell integrates over
+// one tick as dv = i * dt / C. Delivering charge Q in that one tick therefore means writing
+// Q / dt into the slot, and the division is applied where the value is returned.
+
+// A probe runs until the output has decayed to this fraction of the largest magnitude it
+// reached. The tail beyond that point is the same fraction of the total, which is far below
+// the f32 the coefficient is baked as.
+const f64 charge_probe_decay_fraction = 1e-7;
+
+// And gives up after this many steps. At a 0.1 ms tick that is 20 seconds of model time,
+// thousands of time constants for any synapse; reaching it means the output is not decaying
+// at all, so the charge one event delivers is unbounded.
+const usize maximum_charge_probe_step_count = 200000;
+
+// Two charges are the same charge if they agree this closely, relatively. Two probes stop at
+// different steps, so each carries its own truncated tail; that difference is of the order of
+// charge_probe_decay_fraction, and the tolerance sits well above it and far below any real
+// nonlinearity.
+const f64 charge_linearity_tolerance = 1e-4;
+
+// One synapse program's dynamics in the form the host integration walks them: the value
+// table every expression resolves through, which slot each TimeDerivative advances, and the
+// DerivedVariables that are visible under their own names.
+//
+// The value table is built ONCE and mutated in place per step. Everything constant -- the
+// prototype's parameters, the document's constants, dt -- is bound here, under the same
+// first-definition-wins precedence build_synapse_symbol_table gives the emitted kernel, so
+// the host and the device resolve every identifier to the same quantity.
+struct SynapseHostDynamics {
+    ValueTable values;
+
+    // Which state variables are reachable by their own name, as (slot, name). A state
+    // variable declared twice under one name is bound once, by its first slot.
+    Vector<Pair<usize, String>> bound_state_variables;
+
+    Vector<const DynamicsInstruction *> derivative_by_slot;
+    Vector<const DynamicsInstruction *> visible_derived_variables;
+    f64 step_dt = 0.0;
+};
+
+// Whether `expression` mentions `identifier` as a whole token. Tokenized rather than
+// searched: "t" occurs inside "tau" and inside a number's exponent, and neither is a read of
+// the built-in time.
+bool expression_reads_token(const String &expression, const String &component_type_name,
+                            const String &identifier) {
+    for (const Token &token : tokenize_nml_expression(expression, component_type_name)) {
+        if (token.kind == TokenKind::Identifier && token.text == identifier) return true;
+    }
+    return false;
+}
+
+SynapseHostDynamics resolve_synapse_host_dynamics(const SynapseProgram &program,
+                                                  const NML_ParseResult &parse_result) {
+    const SynapseTypeSpecification &synapse_type = *program.type;
+
+    SynapseHostDynamics dynamics;
+    dynamics.step_dt = parse_result.step_dt;
+    dynamics.values.component_type_name = synapse_type.name;
+    dynamics.derivative_by_slot.assign(synapse_type.state_variable_names.size(), nullptr);
+
+    // State variables first, then parameters, exactly as build_synapse_symbol_table orders
+    // them: a Parameter and a StateVariable of one name collide, and the state variable is
+    // the one the emitted kernel reads.
+    Set<String> bound_names;
+    for (usize slot = 0; slot < synapse_type.state_variable_names.size(); ++slot) {
+        if (!bound_names.insert(synapse_type.state_variable_names[slot]).second) continue;
+        dynamics.bound_state_variables.push_back({slot, synapse_type.state_variable_names[slot]});
+        dynamics.values.define(synapse_type.state_variable_names[slot], 0.0);
+    }
+    for (usize slot = 0; slot < synapse_type.parameter_names.size(); ++slot) {
+        if (!bound_names.insert(synapse_type.parameter_names[slot]).second) continue;
+        dynamics.values.define(synapse_type.parameter_names[slot],
+                               program.prototype->starting_parameters[slot].float64);
+    }
+
+    for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Integrate) continue;
+
+        if (instruction.source_tag == NML_DeclarationType::DerivedVariable) {
+            // A shadowed DerivedVariable is unreachable by name in the emitted kernel too,
+            // so it is not evaluated here either.
+            if (!bound_names.insert(instruction.target).second) continue;
+            dynamics.visible_derived_variables.push_back(&instruction);
+            dynamics.values.define(instruction.target, 0.0);
+            continue;
+        }
+
+        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+
+        const usize slot = require_state_variable_slot(synapse_state_storage(synapse_type),
+                                                       instruction.target, "TimeDerivative");
+        // Same refusal emit_unconditional_euler_temporaries makes of the emitted step: two
+        // derivatives for one variable is malformed LEMS, and keeping either one silently
+        // drops the other.
+        if (dynamics.derivative_by_slot[slot] != nullptr) {
+            report_error("'" + instruction.target + "' carries more than one TimeDerivative",
+                         synapse_type.name);
+        }
+        dynamics.derivative_by_slot[slot] = &instruction;
+    }
+
+    // Constants sit below the derived locals, and the built-in dt below those -- the order
+    // with_fallback_symbols layers them onto the emitted kernel's table in.
+    const String type_prefix = synapse_type.name + ".";
+    for (const auto &constant_entry : parse_result.global_constants) {
+        if (constant_entry.first.rfind(type_prefix, 0) != 0) continue;
+        const String bare_name = constant_entry.first.substr(type_prefix.length());
+        if (!bound_names.insert(bare_name).second) continue;
+        dynamics.values.define(bare_name, constant_entry.second.float64);
+    }
+    for (const auto &constant_entry : parse_result.global_constants) {
+        if (!bound_names.insert(constant_entry.first).second) continue;
+        dynamics.values.define(constant_entry.first, constant_entry.second.float64);
+    }
+    if (bound_names.insert("dt").second) dynamics.values.define("dt", parse_result.step_dt);
+
+    // `t` is deliberately never bound. The charge one event delivers is worked out once, at
+    // generation time, and a synapse whose dynamics read the absolute clock would deliver a
+    // different amount depending on when the spike arrived -- which one precomputed set of
+    // coefficients cannot express. Named here rather than surfacing as an unknown identifier.
+    if (!dynamics.values.contains("t")) {
+        for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
+            if (instruction.stage != DynamicsStage::Integrate) continue;
+            if (instruction.source_tag != NML_DeclarationType::TimeDerivative &&
+                instruction.source_tag != NML_DeclarationType::DerivedVariable) {
+                continue;
+            }
+            if (!expression_reads_token(instruction.expression, synapse_type.name, "t")) continue;
+            report_error("this synapse's dynamics read the absolute time 't' (in the expression "
+                         "for '" + instruction.target +
+                                 "'), so what one arriving spike delivers depends on when it "
+                                 "arrives; that cannot be resolved once at generation time",
+                         synapse_type.name);
+        }
+    }
+
+    if (!dynamics.values.contains(synapse_output_variable_name)) {
+        report_error("this synapse exposes no '" + synapse_output_variable_name +
+                             "', so there is no current to deliver. A synapse's output current "
+                             "is the StateVariable or DerivedVariable of that name, which is what "
+                             "a postsynaptic cell's \"synapses[*]/i\" path selects",
+                     synapse_type.name);
+    }
+
+    return dynamics;
+}
+
+// Binds `state` into the value table and evaluates the visible DerivedVariables in source
+// order, so each sees the ones declared before it -- the same visibility the emitted locals
+// have. Returns the exposed current the state leaves behind.
+f64 bind_state_and_evaluate_output(SynapseHostDynamics &dynamics, const Vector<f64> &state) {
+    for (const auto &bound_variable : dynamics.bound_state_variables) {
+        dynamics.values.identifier_values[bound_variable.second] = state[bound_variable.first];
+    }
+    for (const DynamicsInstruction *derived_variable : dynamics.visible_derived_variables) {
+        dynamics.values.identifier_values[derived_variable->target] =
+                evaluate_expression(derived_variable->expression, dynamics.values);
+    }
+    return dynamics.values.value_for(synapse_output_variable_name);
+}
+
+// One probe: leave the synapse at `initial_state`, never touch it again, and total the charge
+// it goes on delivering. `step_count_used` reports how far it had to run, which is what makes
+// two probes comparable -- see the linearity check in synapse_event_charge_coefficients.
+f64 probe_synapse_charge_response(SynapseHostDynamics &dynamics, const SynapseProgram &program,
+                                  const Vector<f64> &initial_state, usize &step_count_used) {
+    Vector<f64> state = initial_state;
+
+    f64 charge = 0.0;
+    f64 peak_output = 0.0;
+    step_count_used = 0;
+
+    for (usize step = 0; step < maximum_charge_probe_step_count; ++step) {
+        const f64 output = bind_state_and_evaluate_output(dynamics, state);
+        charge += output * dynamics.step_dt;
+        peak_output = std::max(peak_output, std::fabs(output));
+        step_count_used = step + 1;
+
+        // The output has run its course. Tested before the step rather than after so a probe
+        // whose output has not left zero yet is not mistaken for one that has already decayed:
+        // an alpha current starts at exactly zero and only rises later.
+        if (peak_output > 0.0 && std::fabs(output) <= peak_output * charge_probe_decay_fraction) {
+            return charge;
+        }
+
+        Vector<f64> next_state = state;
+        for (usize slot = 0; slot < state.size(); ++slot) {
+            const DynamicsInstruction *derivative = dynamics.derivative_by_slot[slot];
+            if (derivative == nullptr) continue;
+            next_state[slot] = state[slot] + dynamics.step_dt *
+                                                     evaluate_expression(derivative->expression,
+                                                                         dynamics.values);
+        }
+
+        // A state the step leaves exactly where it found it is a fixed point: the output from
+        // here on repeats forever. A zero one is a finished response -- reached at once by a
+        // state variable the exposed current never reads, which has no peak output to measure a
+        // decay against. A non-zero one is a synapse that delivers without end.
+        if (next_state == state) {
+            if (output == 0.0) return charge;
+            break;
+        }
+        state = next_state;
+    }
+
+    report_error("this synapse's exposed '" + synapse_output_variable_name +
+                         "' does not decay, so one arriving spike would deliver charge without "
+                         "end. Delivering the whole of an event's response at the spike needs "
+                         "that response to be finite",
+                 program.type->name);
+}
+
+// How much charge one unit of each state variable goes on to deliver: the coefficients of
+// Q(x) above, indexed by state variable slot.
+//
+// Probed rather than derived: each state variable is set to one, everything else to zero, and
+// the synapse's own lowered dynamics are integrated until the output has decayed. No closed
+// form is written down for any synapse type, so this works for whatever current-based
+// dynamics a document declares.
+//
+// The linear decomposition Q(x) = sum of coefficient[v] * x[v] is then CHECKED, not assumed:
+// a synapse whose dynamics are nonlinear in its state has no such decomposition, and using
+// one anyway would deliver a wrong number rather than fail.
+Vector<f64> synapse_event_charge_coefficients(const SynapseProgram &program,
+                                              const NML_ParseResult &parse_result) {
+    const usize state_variable_count = program.type->state_variable_names.size();
+    if (state_variable_count == 0) return {};
+
+    if (!(parse_result.step_dt > 0.0)) {
+        report_error("the model declares no positive simulation step, so the charge one "
+                     "arriving spike delivers through this synapse cannot be resolved",
+                     program.type->name);
+    }
+
+    SynapseHostDynamics dynamics = resolve_synapse_host_dynamics(program, parse_result);
+
+    Vector<f64> coefficients(state_variable_count, 0.0);
+    Vector<usize> step_counts(state_variable_count, 0);
+    for (usize slot = 0; slot < state_variable_count; ++slot) {
+        Vector<f64> unit_state(state_variable_count, 0.0);
+        unit_state[slot] = 1.0;
+        coefficients[slot] =
+                probe_synapse_charge_response(dynamics, program, unit_state, step_counts[slot]);
+    }
+
+    // Doubling one variable must double the charge, and starting from every variable at once
+    // must deliver the sum. Between them those are homogeneity and additivity, which is the
+    // whole of linearity.
+    auto refuse_nonlinear = [&](const String &probe_description, f64 measured, f64 predicted) {
+        const f64 scale = std::max(std::fabs(measured), std::fabs(predicted));
+        if (std::fabs(measured - predicted) <= charge_linearity_tolerance * scale) return;
+        report_error("this synapse's dynamics are not linear in its state variables (" +
+                             probe_description + " delivers " + to_string(measured) +
+                             " C where a linear response would deliver " + to_string(predicted) +
+                             "). The charge one arriving spike delivers is precomputed as a "
+                             "fixed combination of the state change its handler makes, which "
+                             "only holds for linear dynamics",
+                     program.type->name);
+    };
+
+    usize probe_step_count = 0;
+    for (usize slot = 0; slot < state_variable_count; ++slot) {
+        Vector<f64> doubled_state(state_variable_count, 0.0);
+        doubled_state[slot] = 2.0;
+        refuse_nonlinear("twice '" + program.type->state_variable_names[slot] + "'",
+                         probe_synapse_charge_response(dynamics, program, doubled_state,
+                                                       probe_step_count),
+                         2.0 * coefficients[slot]);
+    }
+
+    if (state_variable_count > 1) {
+        f64 summed_coefficients = 0.0;
+        for (const f64 coefficient : coefficients) summed_coefficients += coefficient;
+        refuse_nonlinear("every state variable at one",
+                         probe_synapse_charge_response(
+                                 dynamics, program, Vector<f64>(state_variable_count, 1.0),
+                                 probe_step_count),
+                         summed_coefficients);
+    }
+
+    return coefficients;
 }
 
 // Resolves this edge's slice of the per-edge variable block. Plane-major, matching
@@ -1649,7 +2270,7 @@ String emit_synapse_integration_step(const SynapseProgram &program,
 
     // A synapse has no Regimes -- reject_unsupported_synapse refuses one -- so every
     // TimeDerivative it declares integrates unconditionally.
-    Vector<Pair<usize, String>> pending_state_writes;
+    Vector<PendingStateWrite> pending_state_writes;
     ostringstream integration;
     integration << emit_unconditional_euler_temporaries(storage, program.type->dynamics,
                                                         parse_result, symbols, indent_level + 1,
@@ -1677,13 +2298,18 @@ String emit_synapse_advance_body(const SynapseProgram &program,
 }
 
 // The delivery: what one out-edge contributes to its target's ring slot when the source
-// spikes. Returns the scalar the caller scatters -- the whole of the synapse's output, as a
-// single value in a single slot.
+// spikes. Returns the scalar the caller scatters -- one value, one slot.
+//
+// That scalar is the whole of the charge this event's response will deliver, expressed as
+// the current that delivers it inside one tick (charge / dt, since the ring slot holds a
+// current the target integrates over one dt). It is NOT a sample of the `i` exposure: see
+// the charge-response section above for why a sample reads zero on an isolated first spike.
 //
 // Order is load-bearing. The state is advanced to this tick FIRST (either here, by catching
-// up from the tick it was last advanced through, or already by the eager pass), then the
-// arrival handler runs, and only then is `i` evaluated. Evaluating `i` ahead of the handler
-// would deliver only the residue of previous spikes, and exactly zero on the first one.
+// up from the tick it was last advanced through, or already by the eager pass); the state is
+// then snapshotted, the arrival handler runs, and the charge is read off the CHANGE the
+// handler made. Snapshotting after the catch-up is what keeps the response the response to
+// this event alone, rather than to everything still in flight from earlier ones.
 String emit_synapse_deliver_body(const SynapseProgram &program,
                                  const NML_ParseResult &parse_result, bool use_lazy_updates) {
     reject_unsupported_synapse(program);
@@ -1712,9 +2338,54 @@ String emit_synapse_deliver_body(const SynapseProgram &program,
         }
     }
 
+    // Refuses a select= path on a synapse before the charge probe below would meet the same
+    // path as an unresolvable identifier. The symbol table it fills is discarded: nothing in
+    // the delivery reads a DerivedVariable any more, because the delivered amount is a
+    // function of the state change rather than of the exposed current.
+    SymbolTable exposure_symbols = build_synapse_symbol_table(program, false);
+    Vector<DerivedLocal> discarded_locals;
+    collect_synapse_derived_variables(program, parse_result, exposure_symbols, discarded_locals, 1);
+
+    const Vector<f64> charge_coefficients =
+            synapse_event_charge_coefficients(program, parse_result);
+
     const SymbolTable arrival_symbols = build_synapse_symbol_table(program, true);
     const Vector<const DynamicsInstruction *> arrival_assignments =
             arrival_assignments_on_port(*program.type, "in");
+
+    // Which state variables the handler moves. Everything else is unchanged by the event and
+    // so contributes nothing to what the event delivers, which is why only these are
+    // snapshotted.
+    Vector<usize> assigned_slots;
+    for (const DynamicsInstruction *assignment : arrival_assignments) {
+        const usize slot =
+                require_state_variable_slot(storage, assignment->target, "StateAssignment");
+        if (find(assigned_slots.begin(), assigned_slots.end(), slot) == assigned_slots.end()) {
+            assigned_slots.push_back(slot);
+        }
+    }
+
+    // A handler that only moves state the exposed current never reads delivers nothing, on
+    // every spike, silently. Refused here for the same reason a synapse with no handler at
+    // all is: a synapse that swallows every spike is a model that runs and is wrong.
+    const bool delivers_anything =
+            any_of(assigned_slots.begin(), assigned_slots.end(),
+                   [&](usize slot) { return charge_coefficients[slot] != 0.0; });
+    if (!delivers_anything) {
+        report_error("this synapse's OnEvent handler moves only state that its exposed '" +
+                             synapse_output_variable_name +
+                             "' never depends on, so every arriving spike would deliver exactly "
+                             "zero charge",
+                     program.type->name);
+    }
+
+    const String snapshot_prefix = "synapse_state_before_";
+    for (const usize slot : assigned_slots) {
+        if (charge_coefficients[slot] == 0.0) continue;
+        body << indent(1) << "float " << snapshot_prefix
+             << sanitize_identifier(program.type->state_variable_names[slot]) << " = "
+             << storage.element(slot) << ";\n";
+    }
 
     // The local is what `weight` resolves to inside the handler, so it is declared only when
     // the handler actually reads it. A handler that ignores the arriving weight is legal now
@@ -1728,24 +2399,24 @@ String emit_synapse_deliver_body(const SynapseProgram &program,
     }
     body << arrival_body;
 
-    // The delivered current is read off the state the handler just wrote, so the derived
-    // locals feeding it are evaluated here rather than reused from the integration step.
-    SymbolTable symbols = build_synapse_symbol_table(program, false);
-    Vector<DerivedLocal> declared_locals;
-    collect_synapse_derived_variables(program, parse_result, symbols, declared_locals, 1);
-
-    if (!symbols.contains(synapse_output_variable_name)) {
-        report_error("this synapse exposes no '" + synapse_output_variable_name +
-                             "', so there is no current to deliver. A synapse's output current "
-                             "is the StateVariable or DerivedVariable of that name, which is what "
-                             "a postsynaptic cell's \"synapses[*]/i\" path selects",
-                     program.type->name);
+    // The charge this event adds: each coefficient against the change the handler made to
+    // that variable. Divided by dt where it is returned, because the ring slot the caller
+    // scatters into holds a current the target integrates over exactly one tick.
+    ostringstream delivered_charge;
+    bool has_first_term = false;
+    for (const usize slot : assigned_slots) {
+        if (charge_coefficients[slot] == 0.0) continue;
+        const String snapshot_name =
+                snapshot_prefix + sanitize_identifier(program.type->state_variable_names[slot]);
+        delivered_charge << (has_first_term ? " +\n" + indent(3) : "")
+                         << format_float_literal(charge_coefficients[slot]) << " * ("
+                         << storage.element(slot) << " - " << snapshot_name << ")";
+        has_first_term = true;
     }
 
-    const String return_statement =
-            indent(1) + "return " +
-            symbols.read_expression_for(synapse_output_variable_name) + ";\n";
-    body << emit_used_derived_locals(declared_locals, return_statement) << return_statement;
+    body << indent(1) << "float delivered_charge =\n"
+         << indent(3) << delivered_charge.str() << ";\n"
+         << indent(1) << "return delivered_charge / dt;\n";
     return body.str();
 }
 
@@ -2051,7 +2722,7 @@ String emit_tick_body(const CellTypeSpecification &cell_type,
     // ones, and only then the single write-back covering both -- so a regime-scoped
     // derivative reading a regime-free variable still sees the state as it stood at entry.
     const StateStorage storage = cell_state_storage(cell_type);
-    Vector<Pair<usize, String>> pending_state_writes;
+    Vector<PendingStateWrite> pending_state_writes;
     body << emit_unconditional_euler_temporaries(storage, cell_type.dynamics, parse_result,
                                                  symbols, 1, pending_state_writes);
     body << emit_regime_dispatched_integration(cell_type, regimes, storage, parse_result, symbols,
@@ -2253,6 +2924,8 @@ const Vector<KernelArgumentDeclaration> &kernel_argument_declarations() {
     // the engine binds) and counts float4 elements, so a row is four times that many lanes.
     static const Vector<KernelArgumentDeclaration> declarations = {
         {"cell_state", "device float       *cell_state", "float *cell_state"},
+        {"cell_state_residual", "device float       *cell_state_residual",
+         "float *cell_state_residual"},
         {"cell_parameters", "device const float *cell_parameters", "const float *cell_parameters"},
         {"network_inputs", "device float       *network_inputs", "float *network_inputs"},
         {"last_spiked", "device long        *last_spiked", "long long *last_spiked"},
@@ -2309,8 +2982,9 @@ const Vector<String> &kernel_argument_names() {
 // the storage those touch.
 const Vector<String> &device_function_parameter_names(KernelPurpose purpose) {
     static const Vector<String> tick_parameters = {
-        "cell_state",         "cell_parameters",       "network_inputs",
-        "last_spiked",        "spike_flags",           "internal_node_words",
+        "cell_state",         "cell_state_residual",   "cell_parameters",
+        "network_inputs",     "last_spiked",           "spike_flags",
+        "internal_node_words",
         "leaf_node_words",    "rank_superblock_table", "rank_subblock_table",
         "U_matrix",           "V_matrix",              "edge_weight_coefficients",
         "edge_weight_deltas", "edge_attributes",       "edge_synapse_state",
@@ -2321,8 +2995,9 @@ const Vector<String> &device_function_parameter_names(KernelPurpose purpose) {
         "ring_depth",         "dt",                    "tick",
     };
     static const Vector<String> initialize_parameters = {
-        "cell_state",     "cell_parameters", "network_inputs", "last_spiked", "spike_flags",
-        "state_base",     "parameter_base",  "neuron_index",   "dt",          "tick",
+        "cell_state",  "cell_state_residual", "cell_parameters", "network_inputs",
+        "last_spiked", "spike_flags",         "state_base",      "parameter_base",
+        "neuron_index", "dt",                 "tick",
     };
     return purpose == KernelPurpose::Tick ? tick_parameters : initialize_parameters;
 }
@@ -2736,7 +3411,8 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
         report_error("empty expression", symbols.component_type_name);
     }
 
-    ExpressionParser parser(std::move(tokens), symbols);
+    const SourceEmission semantics(symbols);
+    ExpressionParser<SourceEmission> parser(std::move(tokens), semantics);
     return parser.parse_complete_expression();
 }
 

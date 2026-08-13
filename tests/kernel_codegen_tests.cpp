@@ -401,14 +401,53 @@ void wire_one_edge(NML_ParseResult &parse_result, s64 synapse_prototype_index) {
 }
 
 // One synaptic-input cell, one alphaCurrentSynapse prototype, one edge through it.
+//
+// `step_dt` is set because a synapse's delivery is resolved against it: what an arriving
+// spike delivers is the total charge the response to that event carries, which is integrated
+// out of the synapse's own dynamics at the model's own tick.
 NML_ParseResult make_alpha_synapse_model() {
     NML_ParseResult parse_result;
+    parse_result.step_dt = 1e-4;
     parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
     parse_result.synapse_types.push_back(make_alpha_current_synapse_type());
     parse_result.synapse_prototypes.push_back(
             make_synapse_prototype("alphaSyn", 0, {1.0, 2.0e-3, 1.0e-9}));
     wire_one_edge(parse_result, 0);
     return parse_result;
+}
+
+// The charge one unit of the alpha synapse's `J` goes on to deliver, integrated the same way
+// the generator does it: forward Euler at `step_dt` until `I` has run its course. The
+// continuous answer is e * tau; this is that same quantity as the discrete scheme actually
+// produces it, which is what the generated kernel is checked against.
+//
+// 20000 steps is 2 seconds of model time at a 0.1 ms tick, a thousand time constants for the
+// 2 ms synapse below -- the tail past that is far beneath the tolerances it is compared at.
+f64 alpha_synapse_unit_charge(f64 step_dt, f64 tau) {
+    f64 current_i = 0.0;
+    f64 current_j = 1.0;
+    f64 charge = 0.0;
+    for (usize step = 0; step < 20000; ++step) {
+        charge += current_i * step_dt;
+        const f64 next_i =
+                current_i + step_dt * ((2.7182818284590451 * current_j - current_i) / tau);
+        const f64 next_j = current_j + step_dt * (-current_j / tau);
+        current_i = next_i;
+        current_j = next_j;
+    }
+    return charge;
+}
+
+// The charge coefficient the generator baked into `source`, read back out of the delivery it
+// emitted. Compared numerically rather than as text: the generator stops integrating once the
+// output has decayed and the reference above stops at a fixed step, so the two agree to far
+// more digits than they do characters.
+f64 baked_charge_coefficient(const String &source) {
+    const usize charge_position = source.find("float delivered_charge =");
+    if (charge_position == String::npos) return NAN;
+    const usize literal_start = source.find_first_not_of(" \n", source.find("\n", charge_position));
+    if (literal_start == String::npos) return NAN;
+    return stod(source.substr(literal_start));
 }
 
 // ── Metal compilation ────────────────────────────────────────────────────────
@@ -720,8 +759,9 @@ TEST(KernelCodegenSymbolResolution, UnresolvableIdentifierInAModelThrows) {
 TEST(KernelCodegenKernel, ArgumentNamesAreTheDocumentedBindingOrder) {
     const NML_ParseResult parse_result = make_two_cell_type_model();
     const Vector<String> expected_argument_names = {
-        "cell_state",           "cell_parameters",       "network_inputs",
-        "last_spiked",          "spike_flags",           "cell_state_base",
+        "cell_state",           "cell_state_residual",   "cell_parameters",
+        "network_inputs",       "last_spiked",           "spike_flags",
+        "cell_state_base",
         "cell_parameter_base",  "cell_type_index",       "neuron_count",
         "dt",                   "tick",                  "internal_node_words",
         "leaf_node_words",      "rank_superblock_table", "rank_subblock_table",
@@ -735,7 +775,7 @@ TEST(KernelCodegenKernel, ArgumentNamesAreTheDocumentedBindingOrder) {
     // Metal allows 31 buffer arguments per stage and the table used to sit at exactly 31,
     // which is why the regime index had to be squeezed into a cell_state slot. Asserted so a
     // future addition that spends the remaining headroom is a deliberate decision.
-    EXPECT_EQ(expected_argument_names.size(), 27u);
+    EXPECT_EQ(expected_argument_names.size(), 28u);
 
     const GeneratedKernel tick_kernel = generate_tick_kernel(parse_result);
     EXPECT_EQ(tick_kernel.function_name, "simulate_tick");
@@ -1219,9 +1259,10 @@ TEST(KernelCodegenPropagation, InitializeKernelNeitherPropagatesNorDrains) {
     EXPECT_EQ(source.find("network_inputs["), String::npos);
 
     // It still declares the identical argument list, so the engine binds one set for both.
-    EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(26) ]]"), String::npos);
-    EXPECT_NE(source.find("device float       *edge_synapse_state [[ buffer(20) ]]"),
-              String::npos);
+    EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(27) ]]"), String::npos)
+            << source;
+    EXPECT_NE(source.find("device float       *edge_synapse_state [[ buffer(21) ]]"), String::npos)
+            << source;
 }
 
 // ── the end-of-tick ring row clear ───────────────────────────────────────────
@@ -1300,26 +1341,42 @@ TEST(KernelCodegenSynapse, DeliveryIsOneScalarIntoOneRingSlotAtTheEdgesDelay) {
             << source;
 }
 
-TEST(KernelCodegenSynapse, ArrivalHandlerRunsBeforeTheExposedCurrentIsRead) {
+TEST(KernelCodegenSynapse, DeliveredChargeIsMeasuredAcrossTheArrivalHandler) {
     const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
+
+    // The state the handler is about to move is snapshotted first, and the delivered amount
+    // is read off the CHANGE the handler made. Sampling the `i` exposure instead delivers
+    // whatever `I` had decayed to -- exactly zero for an isolated first spike, at any weight,
+    // which reads as a plausible "the network is just weakly coupled".
+    EXPECT_EQ(source.find("float derived_i ="), String::npos) << source;
+
+    const usize snapshot_position = source.find(
+            "float synapse_state_before_J = "
+            "edge_synapse_state[edge_synapse_state_base + 1 * edge_slot_count];");
+    ASSERT_NE(snapshot_position, String::npos) << source;
 
     // `weight` inside the handler is THIS edge's weight, which is what makes the delivered
     // scalar a function of the edge rather than of a pooled arrival.
-    const usize handler_position = source.find("float synapse_arrival_weight = edge_weight;");
-    ASSERT_NE(handler_position, String::npos) << source;
-
-    // The handler is what folds `weight` into the state. Reading `i` ahead of it would make
-    // every synapse deliver only the residue of previous spikes -- and exactly zero on the
-    // first one, which reads as a plausible "the network is just weakly coupled".
+    const usize handler_position =
+            source.find("float synapse_arrival_weight = edge_weight;", snapshot_position);
     const usize assignment_position = source.find("] = (edge_synapse_state[", handler_position);
-    const usize derived_position = source.find("float derived_i =", handler_position);
-    const usize return_position = source.find("return derived_i;", handler_position);
+    const usize charge_position = source.find("float delivered_charge =", assignment_position);
+    const usize return_position = source.find("return delivered_charge / dt;", charge_position);
+    ASSERT_NE(handler_position, String::npos) << source;
     ASSERT_NE(assignment_position, String::npos) << source;
-    ASSERT_NE(derived_position, String::npos) << source;
+    ASSERT_NE(charge_position, String::npos) << source;
     ASSERT_NE(return_position, String::npos) << source;
+    EXPECT_LT(snapshot_position, handler_position);
     EXPECT_LT(handler_position, assignment_position);
-    EXPECT_LT(assignment_position, derived_position);
-    EXPECT_LT(derived_position, return_position);
+    EXPECT_LT(assignment_position, charge_position);
+    EXPECT_LT(charge_position, return_position);
+
+    // The coefficient is the charge one unit of `J` goes on to deliver, and the scalar is a
+    // CURRENT: the ring slot it lands in is integrated over exactly one tick, so charge Q is
+    // delivered as Q / dt.
+    EXPECT_NEAR(baked_charge_coefficient(source), alpha_synapse_unit_charge(1e-4, 2e-3),
+                alpha_synapse_unit_charge(1e-4, 2e-3) * 1e-6)
+            << source;
 }
 
 TEST(KernelCodegenSynapse, StateIsPerEdgeAndParametersAreBaked) {
@@ -1556,6 +1613,119 @@ TEST(KernelCodegenSynapse, SynapseExposingNoCurrentIsRefused) {
         const String message = error.what();
         EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
         EXPECT_NE(message.find("exposes no 'i'"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseWhoseHandlerCannotReachTheExposedCurrentIsRefused) {
+    // A handler that moves only state the exposed current never depends on sets nothing in
+    // motion, so every spike through it would deliver exactly zero -- silently, on every edge,
+    // for the whole run. Refused for the same reason a synapse with no handler at all is.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        // `i` exposes I, and I is fed by J. Redirect the arrival onto a third variable that
+        // nothing else reads.
+        if (instruction.stage != DynamicsStage::Arrival) continue;
+        instruction.target = "unread";
+        instruction.expression = "unread + weight * ibase";
+    }
+    parse_result.synapse_types[0].state_variable_names.push_back("unread");
+    parse_result.synapse_types[0].dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "unread",
+            "-unread / tau"));
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a handler that cannot reach the exposed current to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("zero charge"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseWhoseExposedCurrentNeverDecaysIsRefused) {
+    // Delivering the whole of an event's response at the spike needs that response to be
+    // finite. A synapse whose exposed current does not decay would deliver without end, and
+    // there is no scalar that expresses that -- so it is named rather than truncated at
+    // whatever the probe happened to reach.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    Vector<DynamicsInstruction> without_decay;
+    for (const DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        // Drop I's decay, so `i` holds whatever J drove it to, for ever.
+        if (instruction.source_tag == NML_DeclarationType::TimeDerivative &&
+            instruction.target == "I") {
+            continue;
+        }
+        without_decay.push_back(instruction);
+    }
+    parse_result.synapse_types[0].dynamics = without_decay;
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a non-decaying synapse to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("does not decay"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseNonlinearInItsStateIsRefused) {
+    // What one event delivers is precomputed as a fixed combination of the state change its
+    // handler makes, and that decomposition only exists for dynamics linear in the state.
+    // Running a nonlinear one through it anyway would deliver a plausible wrong number on
+    // every spike, so the nonlinearity is measured and named instead of assumed away.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+        if (instruction.target != "I") continue;
+        instruction.expression = "(2.7182818284590451*J - I*I/1e-9)/tau";
+    }
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse nonlinear in its state to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("not linear"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseReadingTheAbsoluteClockIsRefused) {
+    // What an arriving spike delivers is resolved once, at generation time. A synapse whose
+    // dynamics read `t` would deliver a different amount depending on when the spike arrived,
+    // which one set of precomputed coefficients cannot express.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+        if (instruction.target != "J") continue;
+        instruction.expression = "-J/tau * (1 + t/tau)";
+    }
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse reading the absolute clock to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("absolute time"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, ModelWithNoSimulationStepCannotResolveWhatASpikeDelivers) {
+    // The charge one event delivers is integrated out of the synapse's own dynamics at the
+    // model's own tick, so there is no answer without one. Named rather than divided by zero.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    parse_result.step_dt = 0.0;
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a model with no simulation step to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("simulation step"), String::npos) << message;
     }
 }
 
@@ -1916,8 +2086,11 @@ TEST(KernelCodegenRegimes, AVariableWithNoDerivativeInARegimeEmitsNothingAndSoIs
     // period. A zero derivative or a hold instruction would also freeze it, and would also
     // hide a regime that genuinely forgot to declare one.
     EXPECT_NE(body.find("float next_v = cell_state[state_base + 0];"), String::npos) << body;
-    EXPECT_NE(body.find("if (active_regime_index == 0) {\n        next_v = cell_state[state_base "
-                        "+ 0] + dt *"),
+    EXPECT_NE(body.find("if (active_regime_index == 0) {\n        float increment_v = dt *"),
+              String::npos)
+            << body;
+    EXPECT_NE(body.find("        volatile float rounded_v = cell_state[state_base + 0] + "
+                        "increment_v;\n        next_v = rounded_v;"),
               String::npos)
             << body;
     EXPECT_NE(body.find("} else {\n        // Regime 'refractory' declares no TimeDerivative for "
@@ -1940,7 +2113,7 @@ TEST(KernelCodegenRegimes, ARegimeFreeDerivativeIntegratesInEveryRegime) {
     // asc1's decay carries no regime, so it is emitted unguarded -- before the dispatch and
     // outside every branch. A GLIF3 whose after-spike currents stopped decaying during the
     // refractory period would still produce a spike train, just the wrong one.
-    const usize decay_position = body.find("float next_asc1 = cell_state[state_base + 1] + dt *");
+    const usize decay_position = body.find("float next_asc1 = rounded_asc1;");
     ASSERT_NE(decay_position, String::npos) << body;
     EXPECT_LT(decay_position, body.find("if (active_regime_index ==")) << body;
 }
@@ -2076,15 +2249,17 @@ TEST(KernelCodegenRegimes, TwoRegimesWithTheSameConditionTestKeepTheirOwnBodies)
             generate_tick_kernel(parse_result).source, "cell_type_step_sharedTestCell");
     ASSERT_FALSE(body.empty());
 
-    // Two separate guarded blocks, each carrying exactly its own assignment.
+    // Two separate guarded blocks, each carrying exactly its own assignment. The residual
+    // reset that follows each is the assignment's own: an assigned variable's outstanding
+    // accumulation belongs to a sum that no longer exists.
     EXPECT_NE(body.find("if (active_regime_index == 0 && ((cell_state[state_base + 0] > "
                         "cell_parameters[parameter_base + 0]))) {\n        cell_state[state_base + "
-                        "1] = 11.0f;\n    }"),
+                        "1] = 11.0f;\n        cell_state_residual[state_base + 1] = 0.0f;\n    }"),
               String::npos)
             << body;
     EXPECT_NE(body.find("if (active_regime_index == 1 && ((cell_state[state_base + 0] > "
                         "cell_parameters[parameter_base + 0]))) {\n        cell_state[state_base + "
-                        "1] = 22.0f;\n    }"),
+                        "1] = 22.0f;\n        cell_state_residual[state_base + 1] = 0.0f;\n    }"),
               String::npos)
             << body;
 }
@@ -2122,6 +2297,33 @@ TEST(KernelCodegenRegimes, TwoTimeDerivativesForOneVariableOutsideAnyRegimeAreRe
     EXPECT_THROW(generate_tick_kernel(parse_result), runtime_error);
 }
 
+TEST(KernelCodegenRegimes, TwoTimeDerivativesForOneVariableInsideOneRegimeAreRefused) {
+    // The regime-scoped path used to take the FIRST match and drop the rest, silently. A model
+    // splitting its membrane derivative into a leak term and a synaptic term -- which is a
+    // perfectly ordinary way to write it -- would then lose the whole of its synaptic input
+    // with no diagnostic anywhere, while the regime-free path already refused the same shape.
+    CellTypeSpecification cell_type = make_two_regime_cell_type();
+    cell_type.dynamics.push_back(make_regime_instruction(DynamicsStage::Integrate,
+                                                         NML_DeclarationType::TimeDerivative, "v",
+                                                         "iSyn / C", "integrating"));
+
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(cell_type);
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected two TimeDerivatives for one variable in one regime to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("'v'"), String::npos) << message;
+        EXPECT_NE(message.find("integrating"), String::npos) << message;
+        EXPECT_NE(message.find("glif3Cell"), String::npos) << message;
+        // Named for what it is, rather than surfacing as the unresolvable 'iSyn' the dropped
+        // expression happens to contain.
+        EXPECT_NE(message.find("more than one TimeDerivative"), String::npos) << message;
+    }
+}
+
 TEST(KernelCodegenRegimes, ASingleRegimeNeedsNoDispatchAtAll) {
     const String body = cell_device_function_body(
             generate_tick_kernel(make_one_regime_model()).source, "cell_type_step_oneRegimeCell");
@@ -2133,7 +2335,10 @@ TEST(KernelCodegenRegimes, ASingleRegimeNeedsNoDispatchAtAll) {
     // declared either. An unused local is a shader-compiler warning on every kernel a model
     // of this shape produces.
     EXPECT_EQ(body.find("int active_regime_index"), String::npos) << body;
-    EXPECT_NE(body.find("next_v = cell_state[state_base + 0] + dt *"), String::npos) << body;
+    EXPECT_NE(body.find("volatile float rounded_v = cell_state[state_base + 0] + increment_v;"),
+              String::npos)
+            << body;
+    EXPECT_NE(body.find("\n    next_v = rounded_v;"), String::npos) << body;
 }
 
 // ── Flat buffer offsets are 64-bit ───────────────────────────────────────────
@@ -2301,6 +2506,7 @@ TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetalUnderBothUpdatePoli
                              "i + weight * ibase", "in"));
 
     NML_ParseResult state_exposed_model;
+    state_exposed_model.step_dt = 1e-4;
     state_exposed_model.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
     state_exposed_model.synapse_types.push_back(exponential_current_synapse);
     state_exposed_model.synapse_prototypes.push_back(
