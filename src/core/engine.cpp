@@ -243,7 +243,8 @@ spikecorec::Vector<spikecorec::AggregatedNetworkEdge> spikecorec::aggregate_netw
                         fmt::format("SpikeEngine: neurons {} -> {} are connected by two edges "
                                     "through different synapses (prototype indices {} and {}). "
                                     "The adjacency holds one slot per ordered pair and that slot "
-                                    "carries one arrival plane, so both cannot be represented; "
+                                    "runs one lowered synapse program over one set of per-edge "
+                                    "state, so both cannot be represented; "
                                     "summing them would run one synapse's dynamics on the "
                                     "other's coupling",
                                     source_node, target_node, collapsed.synapse_prototype_index,
