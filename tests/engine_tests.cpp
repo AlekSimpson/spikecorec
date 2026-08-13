@@ -821,6 +821,151 @@ String write_glif3_refractory_model(const FixtureDirectory &fixture) {
                          glif3_refractory_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
 
+// The same glif3 model at a t_ref the f32 tick cannot express exactly. 2ms at 0.1ms is 0.63 ulp
+// short of f32(2ms) after 20 increments, so the crossing lands a tick late -- and it is the
+// value two of the checked-in network fixtures declare.
+String write_glif3_refractory_model_at_two_milliseconds(const FixtureDirectory &fixture) {
+    String network = glif3_refractory_network_nml();
+    const usize position = network.find("t_ref=\"1ms\"");
+    if (position != String::npos) network.replace(position, 11, "t_ref=\"2ms\"");
+
+    fixture.write("net.nml", network);
+    return fixture.write("model.xml",
+                         glif3_refractory_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// The same glif3 model recorded through an <OutputColumn> naming a variable the cell type does
+// not declare. Distinct from the regime-only case above: this type declares four
+// StateVariables, so falling back to slot 0 would have produced a real membrane trace under a
+// column that asked for something else entirely.
+String write_glif3_undeclared_selection_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", glif3_refractory_network_nml());
+
+    String document = glif3_refractory_lems_xml("net.nml", fixture.path_of("out.spire"));
+    const String declared_quantity = R"(quantity="popGlif[0]/v")";
+    const String undeclared_quantity = R"(quantity="popGlif[0]/membranePotential")";
+    const usize position = document.find(declared_quantity);
+    if (position != String::npos) {
+        document.replace(position, declared_quantity.length(), undeclared_quantity);
+    }
+    return fixture.write("model.xml", document);
+}
+
+// ── the two ways to write a refractory period without a Regime ────────────────────────────────
+//
+// A Heaviside-gated membrane derivative, which is what examples/glif_torus_network.h uses
+// because codegen refuses a <Regime> there. The gate, the clock's rate, the value OnStart
+// leaves and the value the spike assigns are the only difference between counting up to tRef
+// and counting down from it, so both are built from one document.
+String gated_refractory_lems_xml(const String &network_file, const String &recording_file,
+                                 const String &gate_expression, const String &clock_rate,
+                                 const String &clock_at_start, const String &clock_at_spike) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="gatedRefractoryCell" extends="baseSpikingCell"
+                   description="Leaky integrate-and-fire whose membrane derivative is gated by a
+                                Heaviside step over a clock, with no Regime anywhere.">
+        <Parameter name="C" dimension="capacitance"/>
+        <Parameter name="gL" dimension="conductance"/>
+        <Parameter name="EL" dimension="voltage"/>
+        <Parameter name="vth" dimension="voltage"/>
+        <Parameter name="vreset" dimension="voltage"/>
+        <Parameter name="tRef" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <StateVariable name="refractoryClock" dimension="time"/>
+
+            <DerivedVariable name="iSyn" dimension="current" select="synapses[*]/i" reduce="add"/>
+            <DerivedVariable name="integrating" dimension="none" value=")" + gate_expression + R"("/>
+
+            <TimeDerivative variable="refractoryClock" value=")" + clock_rate + R"("/>
+            <TimeDerivative variable="v" value="integrating * (gL * (EL - v) + iSyn) / C"/>
+
+            <OnStart>
+                <StateAssignment variable="v" value="EL"/>
+                <StateAssignment variable="refractoryClock" value=")" + clock_at_start + R"("/>
+            </OnStart>
+
+            <OnCondition test="v .gt. vth">
+                <EventOut port="spike"/>
+                <StateAssignment variable="v" value="vreset"/>
+                <StateAssignment variable="refractoryClock" value=")" + clock_at_spike + R"("/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="30ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popGated[0]/v"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String gated_refractory_network_nml() {
+    return R"(<neuroml id="gatedrefractorynet">
+    <gatedRefractoryCell id="gatedCell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"
+                         vreset="-75mV" tRef="5ms"/>
+    <pulseGenerator id="pg0" delay="0ms" duration="30ms" amplitude="1nA"/>
+
+    <network id="net1">
+        <population id="popGated" component="gatedCell" size="1"/>
+        <explicitInput target="popGated[0]" input="pg0"/>
+    </network>
+</neuroml>
+)";
+}
+
+enum class RefractoryClockDirection { CountUp, CountDown };
+
+String write_gated_refractory_model(const FixtureDirectory &fixture,
+                                    RefractoryClockDirection direction) {
+    fixture.write("net.nml", gated_refractory_network_nml());
+
+    const bool counts_up = direction == RefractoryClockDirection::CountUp;
+    return fixture.write(
+            "model.xml",
+            gated_refractory_lems_xml("net.nml", fixture.path_of("out.spire"),
+                                      counts_up ? "H(refractoryClock - tRef)"
+                                                : "H(0 - refractoryClock)",
+                                      counts_up ? "1" : "-1",
+                                      counts_up ? "tRef" : "0",
+                                      counts_up ? "0" : "tRef"));
+}
+
+// How many CONSECUTIVE samples the membrane potential holds one value, per hold. The drive is on
+// from tick 0, so v moves on every tick it is not gated: every run of equal samples is one
+// refractory hold, and its length is the held ticks plus the reset sample that started it.
+spikecorec::Vector<s64> frozen_membrane_run_lengths(SpikeEngine &engine) {
+    const s64 state_base = engine.cell_state_base.get_contents()[0];
+
+    spikecorec::Vector<s64> run_lengths;
+    s64 run_length = 1;
+    f32 previous_membrane_potential = 0.0f;
+
+    for (s64 tick = 0; tick < engine.lifetime; ++tick) {
+        engine.step_simulation(tick);
+        const f32 membrane_potential = engine.cell_state.get_contents()[state_base];
+
+        if (tick > 0 && membrane_potential == previous_membrane_potential) {
+            run_length += 1;
+        } else {
+            if (run_length > 1) run_lengths.push_back(run_length);
+            run_length = 1;
+        }
+        previous_membrane_potential = membrane_potential;
+    }
+    // A run still open when the simulation ends was cut short by the run's length, not by the
+    // refractory period, so it is not one of these measurements.
+
+    return run_lengths;
+}
+
 // The same cell at the refractory period the reference traces were captured with. 5ms at a
 // 0.1ms step is the pair the exit-model fixtures declare, and it is the one the compensated
 // accumulation has to land on the reference's tick for.
@@ -3074,6 +3219,145 @@ TEST(SpikeEngine, a_regime_refractory_period_lasts_the_ticks_the_reference_freez
     }
 
     engine.shutdown();
+}
+
+TEST(SpikeEngine, a_refractory_period_the_tick_cannot_express_is_a_tick_long_and_says_so) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The other half of the pair. t_ref = 5ms at dt = 0.1ms happens to land on the reference's
+    // tick; t_ref = 2ms at the same dt does not, and 2ms is what two of the checked-in network
+    // fixtures declare. The rule is arithmetic, not a property of any particular value:
+    //
+    //     f32(round(t_ref / dt) * f32(dt)) == f32(t_ref)
+    //
+    // What is asserted is that nml::threshold_crossing_lands_on_reference_tick agrees with what
+    // the engine MEASURABLY does, so the construction-time warning built on it is truthful.
+    FixtureDirectory fixture("neuroml_glif3_refractory_two_milliseconds");
+    String model_path = write_glif3_refractory_model_at_two_milliseconds(fixture);
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    const f64 step_dt = engine.network_details.step_dt;
+    const f64 refractory_period = 2.0e-3;
+    ASSERT_NEAR(step_dt, 1.0e-4, 1e-12);
+
+    const s64 reference_increment_count =
+            reference_refractory_increment_count(step_dt, refractory_period);
+    ASSERT_EQ(reference_increment_count, 20);
+
+    // The rule says this pair does NOT land on the reference's tick, where the 5ms pair does.
+    EXPECT_FALSE(nml::threshold_crossing_lands_on_reference_tick(step_dt, refractory_period));
+    EXPECT_TRUE(nml::threshold_crossing_lands_on_reference_tick(step_dt, 5.0e-3));
+
+    // And the compensated accumulation the engine actually performs, modelled independently,
+    // agrees with the rule rather than with the reference.
+    ASSERT_EQ(compensated_refractory_increment_count((f32)step_dt, (f32)refractory_period),
+              reference_increment_count + 1);
+
+    const nml::CellRegimeLayout regimes =
+            nml::resolve_cell_regimes(engine.network_details.cell_types[0]);
+    ASSERT_TRUE(regimes.has_regimes());
+    const s64 regime_slot =
+            engine.cell_state_base.get_contents()[0] + (s64)regimes.regime_state_slot;
+    const s64 refractory_regime_index = regimes.index_of("refractory");
+    ASSERT_GE(refractory_regime_index, 0);
+
+    spikecorec::Vector<s64> refractory_run_lengths;
+    s64 refractory_run_length = 0;
+    for (s64 tick = 0; tick < engine.lifetime; ++tick) {
+        engine.step_simulation(tick);
+        if ((s64)engine.cell_state.get_contents()[regime_slot] == refractory_regime_index) {
+            refractory_run_length += 1;
+        } else if (refractory_run_length > 0) {
+            refractory_run_lengths.push_back(refractory_run_length);
+            refractory_run_length = 0;
+        }
+    }
+
+    ASSERT_GE(refractory_run_lengths.size(), 3u)
+            << "the cell did not enter the refractory regime often enough to measure";
+    for (usize index = 0; index < refractory_run_lengths.size(); ++index) {
+        EXPECT_EQ(refractory_run_lengths[index], reference_increment_count + 1)
+                << "refractory hold " << index << " lasted " << refractory_run_lengths[index]
+                << " ticks; the rule predicted the reference's "
+                << reference_increment_count << " plus one";
+    }
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, a_refractory_countdown_holds_a_tick_longer_than_the_same_period_counted_up) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // Two ways of writing ONE 5ms refractory period without a <Regime>, which is what
+    // examples/glif_torus_network.h has to do because codegen refuses a Regime there. They are
+    // the same model in exact arithmetic and differ by a tick in f32:
+    //
+    //   counting UP    the sum of 50 increments of f32(0.1ms) is rounded to the scale of 5ms at
+    //                  every step, and lands back exactly on f32(5ms) -- the reference's tick.
+    //   counting DOWN  the same increments are subtracted AT that scale, so the residue
+    //                  f32(5ms) - 50 * f32(0.1ms) = +1.455e-11 survives, and `H(0 - clock)` is
+    //                  still zero on the tick the period should end on.
+    //
+    // The rule the warning evaluates describes the count-UP form only, which is why the
+    // examples were moved onto it rather than left counting down.
+    FixtureDirectory count_up_fixture("neuroml_gated_refractory_count_up");
+    FixtureDirectory count_down_fixture("neuroml_gated_refractory_count_down");
+    String count_up_path =
+            write_gated_refractory_model(count_up_fixture, RefractoryClockDirection::CountUp);
+    String count_down_path =
+            write_gated_refractory_model(count_down_fixture, RefractoryClockDirection::CountDown);
+
+    SpikeEngine count_up_engine(count_up_path, /*enable_hebbian_learning=*/false);
+    SpikeEngine count_down_engine(count_down_path, /*enable_hebbian_learning=*/false);
+
+    const f64 step_dt = count_up_engine.network_details.step_dt;
+    ASSERT_NEAR(step_dt, 1.0e-4, 1e-12);
+    const s64 reference_increment_count =
+            reference_refractory_increment_count(step_dt, 5.0e-3);
+    ASSERT_EQ(reference_increment_count, 50);
+
+    const spikecorec::Vector<s64> count_up_holds = frozen_membrane_run_lengths(count_up_engine);
+    const spikecorec::Vector<s64> count_down_holds =
+            frozen_membrane_run_lengths(count_down_engine);
+
+    ASSERT_GE(count_up_holds.size(), 3u) << "the count-up cell did not spike often enough";
+    ASSERT_EQ(count_down_holds.size(), count_up_holds.size());
+
+    // The recorded shape of a hold is the reset sample plus every held tick, so the count-up
+    // form gives the reference's increment count plus one and the countdown gives one more.
+    for (usize index = 0; index < count_up_holds.size(); ++index) {
+        EXPECT_EQ(count_up_holds[index], reference_increment_count + 1)
+                << "count-up hold " << index;
+        EXPECT_EQ(count_down_holds[index], reference_increment_count + 2)
+                << "count-down hold " << index;
+    }
+
+    count_up_engine.shutdown();
+    count_down_engine.shutdown();
+}
+
+TEST(SpikeEngine, recording_a_cell_type_by_a_name_it_does_not_declare_is_refused) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The last live route to the "record slot 0 instead" fallback. This cell type declares four
+    // StateVariables, so the substitution produced a REAL membrane trace under a column asking
+    // for something else -- indistinguishable downstream from the recording that was meant, and
+    // the same substitution the parser refuses one coordinate up when a column names no neuron.
+    FixtureDirectory fixture("neuroml_glif3_undeclared_selection");
+    String model_path = write_glif3_undeclared_selection_model(fixture);
+
+    try {
+        SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+        engine.shutdown();
+        FAIL() << "expected a selection naming an undeclared variable to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("membranePotential"), String::npos) << message;
+        EXPECT_NE(message.find("glif3RefractoryCell"), String::npos) << message;
+        // And it names what the type does declare, so the correction is in the message.
+        EXPECT_NE(message.find("'v'"), String::npos) << message;
+        EXPECT_NE(message.find("'asc1'"), String::npos) << message;
+    }
 }
 
 TEST(SpikeEngine, a_regime_bearing_cell_type_widens_its_state_chunk_by_one_slot) {

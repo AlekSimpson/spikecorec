@@ -172,6 +172,11 @@ namespace spikecorec {
         // (see kernel_codegen.h). An edge naming no synapse scatters its raw weight into that
         // same slot.
         //
+        // The two are dimensionally incompatible -- amps against a dimensionless weight -- and
+        // the slot sums them, so no target may receive both kinds. Codegen refuses a model
+        // where one does (see reject_mixed_delivery_targets); onto different targets they are
+        // both legal.
+        //
         // A row is emptied as a WHOLE ROW by the ring clear kernel dispatched behind the tick
         // kernel, at the end of the tick that read it -- clearing the input this tick consumed
         // while leaving every other row, which holds arrivals not yet due, untouched. Not per

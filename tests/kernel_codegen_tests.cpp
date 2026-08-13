@@ -353,6 +353,31 @@ SynapseTypeSpecification make_alpha_current_synapse_type() {
     return synapse_type;
 }
 
+// A single-state-variable current synapse: `i` exposes the state directly, the state decays
+// exponentially, and one arrival adds weight * ibase to it.
+//
+// One state variable is the shape the linearity check reduces furthest on -- with nothing to
+// combine, additivity has to be probed against a state and its negation rather than against
+// two states -- so it is what the sign probes are written against.
+SynapseTypeSpecification make_exponential_current_synapse_type() {
+    SynapseTypeSpecification synapse_type;
+    synapse_type.name = "expCurrentSynapse";
+    synapse_type.state_variable_names = {"I"};
+    synapse_type.parameter_names = {"weight", "tau", "ibase"};
+
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "i", "I"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "I", "-I / tau"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "I", "0"));
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Arrival, NML_DeclarationType::StateAssignment, "I",
+                             "I + weight * ibase", "in"));
+
+    return synapse_type;
+}
+
 // expOneSynapse: conductance-based, so it declares erev and gbase and computes
 // i = g * (erev - v) against a postsynaptic voltage it does not own.
 SynapseTypeSpecification make_conductance_synapse_type() {
@@ -414,6 +439,32 @@ NML_ParseResult make_alpha_synapse_model() {
             make_synapse_prototype("alphaSyn", 0, {1.0, 2.0e-3, 1.0e-9}));
     wire_one_edge(parse_result, 0);
     return parse_result;
+}
+
+// One synaptic-input cell, one expCurrentSynapse prototype, one edge through it.
+//
+// `tau` and `step_dt` are arguments because both the linearity probes and the probe BUDGET are
+// resolved against them: the whole point of the budget being model time is that the same tau
+// builds at any dt.
+NML_ParseResult make_exponential_synapse_model(f64 step_dt = 1.0e-4, f64 tau = 5.0e-3) {
+    NML_ParseResult parse_result;
+    parse_result.step_dt = step_dt;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+    parse_result.synapse_types.push_back(make_exponential_current_synapse_type());
+    parse_result.synapse_prototypes.push_back(
+            make_synapse_prototype("expSyn", 0, {1.0, tau, 1.0e-9}));
+    wire_one_edge(parse_result, 0);
+    return parse_result;
+}
+
+// Replaces the expression of the one instruction of `source_tag` writing `target`.
+void rewrite_synapse_expression(NML_ParseResult &parse_result, NML_DeclarationType source_tag,
+                                const String &target, const String &expression) {
+    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        if (instruction.source_tag != source_tag) continue;
+        if (instruction.target != target) continue;
+        instruction.expression = expression;
+    }
 }
 
 // The charge one unit of the alpha synapse's `J` goes on to deliver, integrated the same way
@@ -1484,9 +1535,14 @@ TEST(KernelCodegenSynapse, EdgeThroughNoSynapseKeepsThePlainDeliveredWeight) {
 TEST(KernelCodegenSynapse, MixedModelStillReadsEachEdgesProgramFromItsOwnSlot) {
     // A model where one edge names a synapse and another does not: the program index is read
     // per edge rather than assumed, so the two route differently.
+    //
+    // Onto DIFFERENT targets, because the two deliver incompatible quantities into one
+    // network_inputs slot and a target receiving both is refused -- see
+    // MixedDeliveryOntoOneTargetIsRefused.
     NML_ParseResult parse_result = make_alpha_synapse_model();
+    parse_result.neurons.push_back(Neuron{});
     NetworkEdge synapse_free_edge;
-    synapse_free_edge.target_neuron_index = 1;
+    synapse_free_edge.target_neuron_index = 2;
     synapse_free_edge.synapse_prototype_index = -1;
     parse_result.neurons[0].outgoing_edges.push_back(synapse_free_edge);
 
@@ -1675,12 +1731,15 @@ TEST(KernelCodegenSynapse, SynapseNonlinearInItsStateIsRefused) {
     // handler makes, and that decomposition only exists for dynamics linear in the state.
     // Running a nonlinear one through it anyway would deliver a plausible wrong number on
     // every spike, so the nonlinearity is measured and named instead of assumed away.
+    //
+    // The extra term is a decaying CUBIC rather than the quadratic this test used to carry.
+    // The quadratic diverged from the probe's own starting states, so the refusal it produced
+    // was the one for a response that never settles rather than the one for a nonlinear one --
+    // a correct refusal for the wrong reason, and not the refusal this test is about. Being
+    // odd, it also passes the negation probe, so what catches it is homogeneity at two.
     NML_ParseResult parse_result = make_alpha_synapse_model();
-    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
-        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
-        if (instruction.target != "I") continue;
-        instruction.expression = "(2.7182818284590451*J - I*I/1e-9)/tau";
-    }
+    rewrite_synapse_expression(parse_result, NML_DeclarationType::TimeDerivative, "I",
+                               "(2.7182818284590451*J - I - I*I*I)/tau");
 
     try {
         generate_tick_kernel(parse_result);
@@ -1690,6 +1749,217 @@ TEST(KernelCodegenSynapse, SynapseNonlinearInItsStateIsRefused) {
         EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
         EXPECT_NE(message.find("not linear"), String::npos) << message;
     }
+}
+
+TEST(KernelCodegenSynapse, LinearSingleStateVariableSynapseIsAccepted) {
+    // The control for the three refusals below: the same one-variable shape, linear, accepted,
+    // and delivering the charge the discrete scheme actually carries. A decaying exponential's
+    // Euler sum telescopes to exactly tau, which is what makes this an exact expectation rather
+    // than a calibrated one.
+    const String source = generate_tick_kernel(make_exponential_synapse_model()).source;
+
+    EXPECT_NE(source.find("synapse_deliver_expSyn("), String::npos) << source;
+    EXPECT_NEAR(baked_charge_coefficient(source), 5.0e-3, 5.0e-3 * 1e-5);
+}
+
+TEST(KernelCodegenSynapse, RectifyingSynapseIsRefusedRatherThanDeliveringTheWrongSign) {
+    // `i = I * H(I)` is positively homogeneous of degree one AND additive across the whole
+    // non-negative orthant, so a linearity check whose every probe point has all coordinates
+    // >= 0 passes it. It is not linear: an inhibitory edge drives I negative, the true charge
+    // is negative, and a coefficient measured only at positive I delivers the EXCITATORY
+    // magnitude -- the right number with the wrong sign, on every inhibitory spike.
+    //
+    // Caught by the probe at -I, which the accepted synapse above passes.
+    NML_ParseResult parse_result = make_exponential_synapse_model();
+    rewrite_synapse_expression(parse_result, NML_DeclarationType::DerivedVariable, "i",
+                               "I * H(I)");
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a rectifying synapse to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("expCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("not linear"), String::npos) << message;
+        EXPECT_NE(message.find("minus one 'I'"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseDeliveringTheMagnitudeOfItsStateIsRefused) {
+    // The other half-plane failure, and the one that is worse: `i = abs(I)` passes every
+    // non-negative probe exactly, and an inhibitory edge then delivers +Q where the model says
+    // -Q. On a 100pF target a 1nA-scale event is the difference between +50mV and -50mV in one
+    // tick.
+    NML_ParseResult parse_result = make_exponential_synapse_model();
+    rewrite_synapse_expression(parse_result, NML_DeclarationType::DerivedVariable, "i", "abs(I)");
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse delivering the magnitude of its state to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("expCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("not linear"), String::npos) << message;
+        EXPECT_NE(message.find("minus one 'I'"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseLinearOnEveryAxisButNotAtMixedSignIsRefused) {
+    // What the MIXED-SIGN pair probe adds over the single-axis ones. The cross term below is
+    // gated by H(0 - 1 - I*J), which is zero at every point the other probes visit -- each
+    // axis at one, at two and at minus one, and every variable at one -- and one at
+    // (I, J) = (1, -1), where its whole first step lands in the charge.
+    //
+    // Constructed rather than taken from a real synapse, and deliberately so: the natural
+    // half-plane nonlinearities (a rectifier, a magnitude) are already caught one probe
+    // earlier by the negation probe, so isolating the PAIR probe takes a model built for it.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    rewrite_synapse_expression(parse_result, NML_DeclarationType::TimeDerivative, "I",
+                               "(2.7182818284590451*J - I + H(0 - 1 - I*J))/tau");
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse nonlinear only at mixed sign to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("not linear"), String::npos) << message;
+        EXPECT_NE(message.find("one 'I' less one 'J'"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, ChargeProbeBudgetIsModelTimeRatherThanAStepCount) {
+    // A 200ms current synapse is entirely ordinary, and whether it BUILDS must be a property
+    // of the model rather than of the tick it is simulated at. Under a fixed 200000-step
+    // budget it built at dt = 0.1ms and threw at dt = 0.01ms, so halving the timestep to check
+    // that a result had converged turned a working model into a construction-time exception.
+    for (const f64 step_dt : {1.0e-4, 1.0e-5}) {
+        const String source =
+                generate_tick_kernel(make_exponential_synapse_model(step_dt, 0.2)).source;
+        EXPECT_NEAR(baked_charge_coefficient(source), 0.2, 0.2 * 1e-5) << "dt = " << step_dt;
+    }
+}
+
+TEST(KernelCodegenSynapse, ProbeThatDoesNotConvergeNamesTheStateVariableItProbed) {
+    // The refusal has to name the probe that ran out. A synapse whose exposed current decays
+    // perfectly well from one state variable can still have another whose probe never
+    // converges, and reporting "this synapse's 'i' does not decay" of the type as a whole
+    // sends the reader to a declaration that is fine.
+    //
+    // `i = I + W`: I decays, W grows. The probe from one 'I' converges; the one from one 'W'
+    // is the one that does not.
+    NML_ParseResult parse_result = make_exponential_synapse_model();
+    parse_result.synapse_types[0].state_variable_names.push_back("W");
+    rewrite_synapse_expression(parse_result, NML_DeclarationType::DerivedVariable, "i", "I + W");
+    parse_result.synapse_types[0].dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "W", "W / tau"));
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse whose charge does not converge to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("expCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("does not decay"), String::npos) << message;
+        EXPECT_NE(message.find("one 'W'"), String::npos) << message;
+        // And not blamed on the variable whose probe converged.
+        EXPECT_EQ(message.find("one 'I'"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, DepressingSynapseWithALongRecoveryConstantIsAccepted) {
+    // A state variable the exposed current never reads offers no output decay to measure
+    // against, so its probe ran on until the variable happened to ROUND onto its own limit --
+    // about 37 time constants, against the 16 the decay criterion needs. A Tsodyks-Markram
+    // recovery constant of 800ms was therefore refused at the project's default 0.1ms tick, on
+    // a synapse whose exposed current decays in half a millisecond, and the refusal blamed
+    // that current.
+    //
+    // The output being exactly zero for one step more than the synapse has state variables is
+    // what now ends those probes: for dynamics affine in the state -- which is what the checks
+    // beside it establish -- that many consecutive zeros force every later one.
+    NML_ParseResult parse_result;
+    parse_result.step_dt = 1.0e-4;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+
+    SynapseTypeSpecification synapse_type;
+    synapse_type.name = "depressingCurrentSynapse";
+    synapse_type.state_variable_names = {"I", "available"};
+    synapse_type.parameter_names = {"weight", "tau", "ibase", "tauRecovery", "releaseFraction"};
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "i", "I"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "I", "-I / tau"));
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative,
+                             "available", "(1 - available) / tauRecovery"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "I", "0"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "available", "1"));
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Arrival, NML_DeclarationType::StateAssignment, "I",
+                             "I + weight * ibase * available", "in"));
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Arrival, NML_DeclarationType::StateAssignment,
+                             "available", "available * (1 - releaseFraction)", "in"));
+
+    parse_result.synapse_types.push_back(synapse_type);
+    parse_result.synapse_prototypes.push_back(make_synapse_prototype(
+            "depressingSyn", 0, {1.0, 5.0e-4, 1.0e-9, /*tauRecovery=*/0.8, 0.5}));
+    wire_one_edge(parse_result, 0);
+
+    const String source = generate_tick_kernel(parse_result).source;
+
+    EXPECT_NE(source.find("synapse_deliver_depressingSyn("), String::npos) << source;
+    // `available` carries no charge of its own -- `i` never reads it -- so the only term the
+    // delivery emits is I's, and its coefficient is the exposed current's own tau.
+    EXPECT_NEAR(baked_charge_coefficient(source), 5.0e-4, 5.0e-4 * 1e-5);
+}
+
+TEST(KernelCodegenSynapse, MixedDeliveryOntoOneTargetIsRefused) {
+    // An edge through a synapse delivers a current in amps; an edge through no synapse
+    // delivers its raw dimensionless weight. Onto ONE target they sum in one network_inputs
+    // slot and are drained by one `synapses[*]/i` read as a current, so a weight of 2.5
+    // arrives as 2.5 A -- 2.5e6 V in one tick on a 100pF cell, about eight orders of magnitude
+    // past what the synapse edge beside it delivers. Refused, because the result is a
+    // plausible number rather than a crash.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    NetworkEdge synapse_free_edge;
+    synapse_free_edge.target_neuron_index = 1; // the target the synapse edge already reaches
+    synapse_free_edge.synapse_prototype_index = -1;
+    synapse_free_edge.weight = 2.5;
+    parse_result.neurons[0].outgoing_edges.push_back(synapse_free_edge);
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a target receiving both kinds of edge to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("neuron 1"), String::npos) << message;
+        EXPECT_NE(message.find("network_inputs"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegen, ThresholdCrossingRuleReproducesTheMeasuredPairs) {
+    // The rule the construction-time warning evaluates, against the pairs measured on this
+    // engine at its default tick. 5ms lands on the reference's tick; 0.5ms, 1ms and 2ms are
+    // each 0.63 ulp short and hold a tick longer.
+    EXPECT_TRUE(threshold_crossing_lands_on_reference_tick(1.0e-4, 5.0e-3));
+    EXPECT_TRUE(threshold_crossing_lands_on_reference_tick(1.0e-4, 3.0e-3));
+    EXPECT_TRUE(threshold_crossing_lands_on_reference_tick(1.0e-4, 2.5e-3));
+    EXPECT_FALSE(threshold_crossing_lands_on_reference_tick(1.0e-4, 2.0e-3));
+    EXPECT_FALSE(threshold_crossing_lands_on_reference_tick(1.0e-4, 1.0e-3));
+    EXPECT_FALSE(threshold_crossing_lands_on_reference_tick(1.0e-4, 5.0e-4));
+
+    // It is a property of the PAIR, not of the threshold: the same 2ms lands exactly at a
+    // 0.5ms tick, where four increments scale by a power of two and lose nothing.
+    EXPECT_TRUE(threshold_crossing_lands_on_reference_tick(5.0e-4, 2.0e-3));
+
+    // A threshold no tick reaches, and a step of zero, are both "nothing to report" rather
+    // than a division.
+    EXPECT_TRUE(threshold_crossing_lands_on_reference_tick(1.0e-4, 0.0));
+    EXPECT_TRUE(threshold_crossing_lands_on_reference_tick(0.0, 5.0e-3));
 }
 
 TEST(KernelCodegenSynapse, SynapseReadingTheAbsoluteClockIsRefused) {

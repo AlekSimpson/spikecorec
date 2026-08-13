@@ -26,16 +26,26 @@
 // engine's codegen does not support <Regime> yet -- it rejects those models by name -- so
 // the declarations below express the SAME refractory behaviour without one:
 //
-//     <StateVariable name="refractoryTimeRemaining" dimension="time"/>
-//     <DerivedVariable name="integrating" value="H(0 - refractoryTimeRemaining)"/>
-//     <TimeDerivative variable="refractoryTimeRemaining" value="-1"/>
+//     <StateVariable name="refractoryTimeElapsed" dimension="time"/>
+//     <DerivedVariable name="integrating" value="H(refractoryTimeElapsed - tRef)"/>
+//     <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
 //     <TimeDerivative variable="v" value="integrating * (...) / C"/>
 //
-// A spike sets refractoryTimeRemaining to tRef; it counts down at one second per second; and
+// A spike sets refractoryTimeElapsed to zero; it counts up at one second per second; and
 // `integrating` -- LEMS's Heaviside step, H(x) being 1 for x >= 0 -- gates the membrane
-// derivative to zero for exactly as long as it is positive. v therefore holds at vreset
-// through the refractory period and resumes integrating after it, which is what the regime
-// pair does. This is a real refractory period, not an omission.
+// derivative to zero until it has reached tRef. v therefore holds at vreset through the
+// refractory period and resumes integrating after it, which is what the regime pair does.
+// This is a real refractory period, not an omission.
+//
+// ── why it counts UP and not down ────────────────────────────────────────────────────────
+//
+// The same behaviour written as a countdown -- reset to tRef, integrate -1, gate on
+// `H(0 - refractoryTimeRemaining)` -- holds one tick LONGER than the reference, at every
+// tRef including this one. The engine's compensated accumulation reaches the f32 nearest the
+// exact sum, so counting up from zero lands back on f32(5 ms) exactly after 50 increments of
+// f32(0.1 ms); counting down subtracts those same increments from f32(5 ms) and keeps the
+// residue, which is +1.455e-11 rather than zero, so `H(0 - r)` is still 0 on the tick the
+// period should end on. See the compensated-accumulation section of kernel_codegen.h.
 
 namespace spikecorec::examples {
 
@@ -90,24 +100,24 @@ inline const char *glif1_component_type() {
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
-            <StateVariable name="refractoryTimeRemaining" dimension="time"/>
+            <StateVariable name="refractoryTimeElapsed" dimension="time"/>
 
             <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
                              select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="integrating" dimension="none"
-                             value="H(0 - refractoryTimeRemaining)"/>
+                             value="H(refractoryTimeElapsed - tRef)"/>
 
-            <TimeDerivative variable="refractoryTimeRemaining" value="-1"/>
+            <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
             <TimeDerivative variable="v" value="integrating * (gL * (EL - v) + iSyn) / C"/>
 
             <OnStart>
                 <StateAssignment variable="v" value="EL"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="0"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="tRef"/>
             </OnStart>
 
             <OnCondition test="v .gt. vth">
                 <StateAssignment variable="v" value="vreset"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="tRef"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="0"/>
                 <EventOut port="spike"/>
             </OnCondition>
         </Dynamics>
@@ -134,24 +144,24 @@ inline const char *glif2_component_type() {
 
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
-            <StateVariable name="refractoryTimeRemaining" dimension="time"/>
+            <StateVariable name="refractoryTimeElapsed" dimension="time"/>
 
             <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
                              select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="integrating" dimension="none"
-                             value="H(0 - refractoryTimeRemaining)"/>
+                             value="H(refractoryTimeElapsed - tRef)"/>
 
-            <TimeDerivative variable="refractoryTimeRemaining" value="-1"/>
+            <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
             <TimeDerivative variable="v" value="integrating * (gL * (EL - v) + iSyn) / C"/>
 
             <OnStart>
                 <StateAssignment variable="v" value="EL"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="0"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="tRef"/>
             </OnStart>
 
             <OnCondition test="v .gt. vth">
                 <StateAssignment variable="v" value="vreset + resetScale * (v - vth)"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="tRef"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="0"/>
                 <EventOut port="spike"/>
             </OnCondition>
         </Dynamics>
@@ -183,15 +193,15 @@ inline const char *glif3_component_type() {
             <StateVariable name="v" dimension="voltage" exposure="v"/>
             <StateVariable name="asc1" dimension="current"/>
             <StateVariable name="asc2" dimension="current"/>
-            <StateVariable name="refractoryTimeRemaining" dimension="time"/>
+            <StateVariable name="refractoryTimeElapsed" dimension="time"/>
 
             <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
                              select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
             <DerivedVariable name="integrating" dimension="none"
-                             value="H(0 - refractoryTimeRemaining)"/>
+                             value="H(refractoryTimeElapsed - tRef)"/>
 
-            <TimeDerivative variable="refractoryTimeRemaining" value="-1"/>
+            <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
             <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
             <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
             <TimeDerivative variable="v"
@@ -201,14 +211,14 @@ inline const char *glif3_component_type() {
                 <StateAssignment variable="v" value="EL"/>
                 <StateAssignment variable="asc1" value="0"/>
                 <StateAssignment variable="asc2" value="0"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="0"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="tRef"/>
             </OnStart>
 
             <OnCondition test="v .gt. vth">
                 <StateAssignment variable="v" value="vreset"/>
                 <StateAssignment variable="asc1" value="asc1 + ascAdd1"/>
                 <StateAssignment variable="asc2" value="asc2 + ascAdd2"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="tRef"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="0"/>
                 <EventOut port="spike"/>
             </OnCondition>
         </Dynamics>
@@ -237,27 +247,27 @@ inline const char *glif4_component_type() {
         <Dynamics>
             <StateVariable name="v" dimension="voltage" exposure="v"/>
             <StateVariable name="theta" dimension="voltage"/>
-            <StateVariable name="refractoryTimeRemaining" dimension="time"/>
+            <StateVariable name="refractoryTimeElapsed" dimension="time"/>
 
             <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
                              select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="integrating" dimension="none"
-                             value="H(0 - refractoryTimeRemaining)"/>
+                             value="H(refractoryTimeElapsed - tRef)"/>
 
-            <TimeDerivative variable="refractoryTimeRemaining" value="-1"/>
+            <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
             <TimeDerivative variable="theta" value="(thetaInf - theta) / tauTheta"/>
             <TimeDerivative variable="v" value="integrating * (gL * (EL - v) + iSyn) / C"/>
 
             <OnStart>
                 <StateAssignment variable="v" value="EL"/>
                 <StateAssignment variable="theta" value="thetaInf"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="0"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="tRef"/>
             </OnStart>
 
             <OnCondition test="v .gt. theta">
                 <StateAssignment variable="v" value="vreset"/>
                 <StateAssignment variable="theta" value="theta + thetaSpikeAdd"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="tRef"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="0"/>
                 <EventOut port="spike"/>
             </OnCondition>
         </Dynamics>
@@ -292,15 +302,15 @@ inline const char *glif5_component_type() {
             <StateVariable name="theta" dimension="voltage"/>
             <StateVariable name="asc1" dimension="current"/>
             <StateVariable name="asc2" dimension="current"/>
-            <StateVariable name="refractoryTimeRemaining" dimension="time"/>
+            <StateVariable name="refractoryTimeElapsed" dimension="time"/>
 
             <DerivedVariable name="iSyn" dimension="current" exposure="iSyn"
                              select="synapses[*]/i" reduce="add"/>
             <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
             <DerivedVariable name="integrating" dimension="none"
-                             value="H(0 - refractoryTimeRemaining)"/>
+                             value="H(refractoryTimeElapsed - tRef)"/>
 
-            <TimeDerivative variable="refractoryTimeRemaining" value="-1"/>
+            <TimeDerivative variable="refractoryTimeElapsed" value="1"/>
             <TimeDerivative variable="theta" value="(thetaInf - theta) / tauTheta"/>
             <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
             <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
@@ -312,7 +322,7 @@ inline const char *glif5_component_type() {
                 <StateAssignment variable="theta" value="thetaInf"/>
                 <StateAssignment variable="asc1" value="0"/>
                 <StateAssignment variable="asc2" value="0"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="0"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="tRef"/>
             </OnStart>
 
             <OnCondition test="v .gt. theta">
@@ -320,7 +330,7 @@ inline const char *glif5_component_type() {
                 <StateAssignment variable="theta" value="theta + thetaSpikeAdd"/>
                 <StateAssignment variable="asc1" value="asc1 + ascAdd1"/>
                 <StateAssignment variable="asc2" value="asc2 + ascAdd2"/>
-                <StateAssignment variable="refractoryTimeRemaining" value="tRef"/>
+                <StateAssignment variable="refractoryTimeElapsed" value="0"/>
                 <EventOut port="spike"/>
             </OnCondition>
         </Dynamics>

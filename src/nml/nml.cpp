@@ -1893,8 +1893,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                                   : output_format_for_filename(filename));
             recording_profile.recordings_count = 0;
 
-            // Collected so a file that asked for columns and got none can name what it asked
-            // for. See the throw below the loop.
+            // Collected so a file with a column that resolves to nothing can name what it
+            // asked for. See the throw below the loop.
             Vector<String> unresolved_quantity_paths;
 
             for (const String &selection_id : output.structured_instance_data) {
@@ -1916,9 +1916,6 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 recorded.neuron_index = resolve_neuron_index(recorded.quantity_path);
                 if (recorded.neuron_index < 0) {
                     unresolved_quantity_paths.push_back(recorded.quantity_path);
-                    log::logger().warn(
-                            "Recording '{}' in {} resolves to no neuron; recorded with "
-                            "index -1", recorded.quantity_path, filename);
                 } else {
                     String cell_type_name;
                     String component_instance_id;
@@ -1945,18 +1942,21 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 recording_profile.recordings_count += 1;
             }
 
-            // A file that asked for columns and resolved NONE of them is an error, not a
-            // warning. The engine's recording setup treats an empty selection list as "record
-            // every neuron's first state variable", which is the intended reading of an
-            // <OutputFile> with no columns at all -- but applied here it silently substitutes
-            // a whole-population recording of slot 0 for the one column that was asked for.
-            // One mistyped population name then produces a file of the right SHAPE (it is
-            // neuron_count columns wide, which matches whenever the request happened to be
-            // that wide) holding entirely different variables, and nothing downstream can
-            // tell it from the recording that was meant.
-            if (recording_profile.recordings_count > 0 &&
-                unresolved_quantity_paths.size() ==
-                        static_cast<usize>(recording_profile.recordings_count)) {
+            // ANY column that resolves to no neuron is an error, not a warning -- whether it
+            // is the only one or one of several.
+            //
+            // A file that resolved none of its columns falls through to the engine's "empty
+            // selection list", which records every neuron's first state variable: one mistyped
+            // population name then produces a file of the right SHAPE (it is neuron_count
+            // columns wide, which matches whenever the request happened to be that wide)
+            // holding entirely different variables.
+            //
+            // A file that resolved SOME of its columns is the same defect one column over. The
+            // engine drops the unresolved ones and writes the rest, so two columns with one
+            // mistyped yield a one-column file -- and nothing in it says which column went
+            // missing, so column 1 of the result is read as whichever column the reader
+            // expected first. Neither shape is recoverable downstream, so both are named here.
+            if (!unresolved_quantity_paths.empty()) {
                 String requested;
                 for (const String &quantity_path : unresolved_quantity_paths) {
                     if (!requested.empty()) requested += ", ";
@@ -1964,11 +1964,11 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 }
                 throw runtime_error(
                         "Output file '" + filename + "' asked for " +
-                        std::to_string(recording_profile.recordings_count) +
-                        " column(s) and not one of them names a neuron this model declares (" +
-                        requested +
-                        "); recording every neuron's first state variable instead would write "
-                        "a file of plausible shape holding entirely different variables");
+                        std::to_string(recording_profile.recordings_count) + " column(s), " +
+                        std::to_string(unresolved_quantity_paths.size()) +
+                        " of which name no neuron this model declares (" + requested +
+                        "); writing the file without them would produce a recording nothing "
+                        "downstream can tell from the one that was asked for");
             }
 
             return_value.recording_profiles.push_back(std::move(recording_profile));

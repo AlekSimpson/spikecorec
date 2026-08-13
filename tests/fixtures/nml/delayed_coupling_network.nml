@@ -105,6 +105,14 @@
     </Dynamics>
   </ComponentType>
 
+  <!--
+    t_ref="2ms" at step="0.1ms" holds 21 ticks on this engine, not the 20 a f64
+    reference holds: f32(2ms) and 20 * f32(0.1ms) are 0.63 ulp apart, so the
+    `refractoryTimeElapsed .geq. t_ref` crossing lands a tick late. Left as it is
+    because the captured jNeuroML trace under tests/fixtures/reference_data/ was
+    taken from THIS model; codegen reports the discrepancy at construction (see
+    warn_about_late_threshold_crossings). 2.5ms, 3ms and 5ms all land exactly.
+  -->
   <GLIF1Cell id="glif1CellInstance" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV" t_ref="2ms"/>
 
   <alphaCurrentSynapse id="delaySynapse" tau="2ms" ibase="50pA"/>

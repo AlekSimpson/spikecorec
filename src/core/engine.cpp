@@ -727,10 +727,25 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
             }
         }
 
-        logger->warn("Recording selects '{}' on neuron {}, which cell type '{}' does not "
-                     "declare; recording its first state variable instead",
-                     variable_name, neuron_index, cell_type.name);
-        return first_cell_state_index(neuron_index);
+        // Substituting slot 0 here writes a real membrane trace under a column that asked for
+        // something else, which is indistinguishable downstream from the recording that was
+        // meant -- the same substitution the parser refuses one coordinate up, and the last
+        // live route into the fallback that hid the populationList recording defect.
+        String declared_variable_names;
+        for (const String &declared_name : cell_type.state_variable_names) {
+            if (!declared_variable_names.empty()) declared_variable_names += ", ";
+            declared_variable_names += "'" + declared_name + "'";
+        }
+        if (declared_variable_names.empty()) declared_variable_names = "none";
+
+        log::throw_runtime_error(
+                *logger,
+                fmt::format("SpikeEngine: a recording profile selects '{}' on neuron {}, which "
+                            "cell type '{}' declares no StateVariable of that name (it declares "
+                            "{}); recording its first state variable instead would write a real "
+                            "trace under a column asking for something else",
+                            variable_name, neuron_index, cell_type.name,
+                            declared_variable_names));
     };
 
     for (const RecordingConfig &recording_profile : recording_profiles) {

@@ -2823,14 +2823,15 @@ TEST(Errors, a_negative_population_size_throws) {
     }
 }
 
-TEST(Errors, an_unresolvable_recording_path_is_marked_rather_than_read_as_neuron_zero) {
+TEST(Errors, an_output_file_that_resolves_only_some_of_its_columns_throws) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
     FixtureDirectory fixture("unresolvable_recording");
-    // A recording is read-only, so an unresolvable COLUMN of a file that still resolves
-    // something is deliberately not fatal the way a connection or a stimulus target is.
-    // What it must never do is fall back to a real neuron: index 0 would log a genuine
-    // trace under a column the document asked for somewhere else entirely.
+    // An <OutputFile> whose columns do not ALL name a cell is a mistyped request, whether it
+    // resolved none of them or only some. The partial case is the quieter of the two: the
+    // engine drops the columns that resolved to nothing and writes a file out of the rest, so
+    // four columns with three mistyped yield a ONE-column file with no error anywhere -- and
+    // whoever reads it reads column 1 as whichever column they asked for first.
     fixture.write("net.nml", R"(<neuroml id="recordingnet">
     <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
              C="0.2nF" leakConductance="0.01uS"/>
@@ -2854,22 +2855,19 @@ TEST(Errors, an_unresolvable_recording_path_is_marked_rather_than_read_as_neuron
 )");
 
     NML_Parser parser;
-    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
-
-    ASSERT_EQ(result.recording_profiles.size(), 1u);
-    const RecordingConfig &columns = result.recording_profiles[0];
-    ASSERT_EQ(columns.selections.size(), 4u);
-
-    EXPECT_EQ(columns.selections[0].neuron_index, 1);
-
-    // An unknown population, an out-of-range index, and a slash-form path with no index at
-    // all: none of the three names a cell, and all three are kept as the -1 sentinel with
-    // their raw path intact for the diagnostic.
-    for (usize selection_index = 1; selection_index < columns.selections.size();
-         ++selection_index) {
-        const RecordingSelection &selection = columns.selections[selection_index];
-        EXPECT_EQ(selection.neuron_index, -1) << selection.quantity_path;
-        EXPECT_FALSE(selection.quantity_path.empty());
+    try {
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        FAIL() << "expected a partially unresolvable output file to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        // Every column that named nothing is listed -- an unknown population, an
+        // out-of-range index, and a slash-form path carrying no index at all -- and the one
+        // that DID resolve is not, so the message says which three to correct.
+        EXPECT_NE(message.find("out.dat"), String::npos) << message;
+        EXPECT_NE(message.find("'nosuchpop[0]/v'"), String::npos) << message;
+        EXPECT_NE(message.find("'pop1[99]/v'"), String::npos) << message;
+        EXPECT_NE(message.find("'pop1/v'"), String::npos) << message;
+        EXPECT_EQ(message.find("'pop1[1]/v'"), String::npos) << message;
     }
 }
 
