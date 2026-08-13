@@ -518,6 +518,59 @@ static String leaf_id(const String &scoped_id) {
     return scoped_id.substr(separator + 1);
 }
 
+// Exactly two input shapes are modelled: a rectangular current window (`amplitude` held
+// across [delay, delay + duration]) and an explicit <spike> train. An input component that
+// is neither still parses into a profile, and that profile is quietly wrong in one of two
+// ways -- it delivers nothing, or it delivers the wrong waveform. Neither is visible
+// downstream: SpikeEngine::create_event_stream turns empty event_ticks into an empty
+// stream, so a network driven only by a spikeGeneratorPoisson runs with no input at all and
+// reads as a model whose cells simply never fire. Both are named here, where the component
+// that caused them is still in hand.
+static void report_unmodelled_input_shape(const ComponentInstance &input,
+                                          const SimulationInputConfig &profile,
+                                          const Vector<InputTarget> &targets) {
+    if (profile.continuous_current_injection) {
+        // The window is built from these three and nothing else, so every other value the
+        // instance carries is dropped: a sineGenerator's `period` and `phase` go missing and
+        // it is injected as DC at the sine's peak, and a pulseGenerator's own `weight`
+        // Property is ignored in favour of the target's <inputW weight>.
+        static const Set<String> window_attributes = {"amplitude", "delay", "duration"};
+
+        Vector<String> ignored_attributes;
+        for (const auto &[attribute_name, attribute_value] : input.instance_data) {
+            (void)attribute_value;
+            if (window_attributes.count(attribute_name) > 0) continue;
+            ignored_attributes.push_back(attribute_name);
+        }
+        // instance_data is unordered, so the message would otherwise vary run to run.
+        std::sort(ignored_attributes.begin(), ignored_attributes.end());
+
+        if (!ignored_attributes.empty()) {
+            String joined_names;
+            for (const String &attribute_name : ignored_attributes) {
+                if (!joined_names.empty()) joined_names += ", ";
+                joined_names += attribute_name;
+            }
+
+            log::logger().warn(
+                    "Input '{}' of type '{}' is injected as a rectangular pulse holding its "
+                    "amplitude across [delay, delay + duration]; it also sets {}, which that "
+                    "shape ignores, so the current delivered is not the one the model declares",
+                    input.id, input.component_type_name, joined_names);
+        }
+        return;
+    }
+
+    for (const InputTarget &target : targets) {
+        if (!target.event_ticks.empty()) return;
+    }
+
+    log::logger().warn(
+            "Input '{}' of type '{}' carries neither an amplitude nor any <spike> times, so it "
+            "delivers nothing at all: the {} target(s) wired to it receive no input",
+            input.id, input.component_type_name, targets.size());
+}
+
 
 // ── path resolution ──────────────────────────────────────────────────────────────
 //
@@ -558,15 +611,20 @@ static Vector<String> split_on_slash(const String &text) {
     return segments;
 }
 
-// `population_cell_type_name` and `population_component_instance_id` disambiguate
-// "pop1/0/x": x is the component selector in the populationList spelling, and a trailing
-// variable otherwise. Both spellings occur -- NeuroML writes the population's own
-// component INSTANCE id there ("../pop1/0/cell0"), while a document may equally name the
-// cell TYPE -- so a segment matching either is consumed as the selector. Matching only the
-// type name left the instance id in `trailing`, which turned "pop1/0/cell0/v" into the
-// variable "cell0/v" and silently recorded the neuron's first state variable instead.
-// Either may be empty when unknown, in which case a single trailing segment is read as a
-// variable.
+// `population_cell_type_name` and `population_component_instance_id` disambiguate the
+// segment that may follow the cell selector: it is the component selector in the
+// populationList spelling, and a trailing variable otherwise. Both spellings occur --
+// NeuroML writes the population's own component INSTANCE id there ("../pop1/0/cell0"),
+// while a document may equally name the cell TYPE -- so a segment matching either is
+// consumed as the selector. Matching only the type name left the instance id in
+// `trailing`, which turned "pop1/0/cell0/v" into the variable "cell0/v" and silently
+// recorded the neuron's first state variable instead. Either may be empty when unknown, in
+// which case a single trailing segment is read as a variable.
+//
+// The disambiguation is applied to whatever follows the selector in EITHER spelling. The
+// bracket form returned early before it ran, so "pop1[0]/cell0/v" kept the same "cell0/v"
+// variable the slash form was fixed for -- the neuron index still resolved, so nothing
+// downstream complained and the wrong state slot was recorded.
 static ResolvedCellPath parse_cell_path(const String &path,
                                         const String &population_cell_type_name,
                                         const String &population_component_instance_id) {
@@ -575,6 +633,10 @@ static ResolvedCellPath parse_cell_path(const String &path,
     String remaining = path;
     while (remaining.rfind("../", 0) == 0) remaining = remaining.substr(3);
     if (remaining.rfind("./", 0) == 0) remaining = remaining.substr(2);
+
+    // Everything after the cell selector, split the same way for both spellings: the
+    // segments of "pop1[0]/<here>" and of "pop1/0/<here>".
+    Vector<String> trailing_segments;
 
     usize bracket = remaining.find('[');
     if (bracket != String::npos) {
@@ -588,29 +650,30 @@ static ResolvedCellPath parse_cell_path(const String &path,
 
         String rest = remaining.substr(closing + 1);
         if (!rest.empty() && rest.front() == '/') rest = rest.substr(1);
-        resolved.trailing = rest;
-        return resolved;
+        if (!rest.empty()) trailing_segments = split_on_slash(rest);
+    } else {
+        Vector<String> segments = split_on_slash(remaining);
+        if (segments.size() < 2) return resolved;
+        if (!text_is_integer(segments[1])) return resolved;
+
+        resolved.population_name = segments[0];
+        resolved.local_index = static_cast<s64>(std::stoll(segments[1]));
+
+        trailing_segments.assign(segments.begin() + 2, segments.end());
     }
 
-    Vector<String> segments = split_on_slash(remaining);
-    if (segments.size() < 2) return resolved;
-    if (!text_is_integer(segments[1])) return resolved;
-
-    resolved.population_name = segments[0];
-    resolved.local_index = static_cast<s64>(std::stoll(segments[1]));
-
-    usize trailing_start = 2;
-    if (segments.size() > 2 &&
+    usize trailing_start = 0;
+    if (!trailing_segments.empty() &&
         ((!population_cell_type_name.empty() &&
-          segments[2] == population_cell_type_name) ||
+          trailing_segments[0] == population_cell_type_name) ||
          (!population_component_instance_id.empty() &&
-          segments[2] == population_component_instance_id))) {
-        trailing_start = 3;
+          trailing_segments[0] == population_component_instance_id))) {
+        trailing_start = 1;
     }
 
-    for (usize index = trailing_start; index < segments.size(); index += 1) {
+    for (usize index = trailing_start; index < trailing_segments.size(); index += 1) {
         if (!resolved.trailing.empty()) resolved.trailing += "/";
-        resolved.trailing += segments[index];
+        resolved.trailing += trailing_segments[index];
     }
 
     return resolved;
@@ -1204,14 +1267,6 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 specification.parameter_names = component_type.ordered_parameter_names();
                 specification.dynamics = extract_dynamics_program(component_type);
 
-                // Where this type's state begins in the engine's cell-state buffer: the
-                // running sum of the preceding types' state variable counts.
-                specification.state_offset = 0;
-                for (const CellTypeSpecification &preceding : return_value.cell_types) {
-                    specification.state_offset +=
-                            static_cast<s32>(preceding.state_variable_names.size());
-                }
-
                 return_value.cell_types.push_back(std::move(specification));
                 return type_index;
             }
@@ -1450,6 +1505,18 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
         "explicitConnection"
     };
 
+    // Connectivity this pass cannot represent. A gap junction couples two cells
+    // continuously and symmetrically, and a continuousProjection couples them through a
+    // graded synapse; neither is an event edge, so neither has a NetworkEdge to become.
+    // Both are out of Phase-1 scope, and both are refused rather than skipped: skipping
+    // one drops every edge it declares, and a network coupled only electrically then
+    // parses clean and simulates fully disconnected -- a model that looks like it works
+    // and produces the numbers of a different model. That is the same failure the
+    // network-scope <synapticConnection> drop produced, so it fails loudly here instead.
+    static const Set<String> unsupported_projection_tags = {
+        "electricalProjection", "continuousProjection"
+    };
+
     if (network) {
         // The synapse prototype an edge uses. Resolves to a prototype as well as a type,
         // since two projections may share a synapse ComponentType with different parameter
@@ -1541,6 +1608,18 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             if (connection_tags.find(child.component_type_name) != connection_tags.end()) {
                 add_connection_edge(child, network->id, -1, -1);
                 continue;
+            }
+
+            if (unsupported_projection_tags.find(child.component_type_name) !=
+                unsupported_projection_tags.end()) {
+                throw runtime_error(
+                        "Network '" + network->id + "' declares <" +
+                        child.component_type_name + "> '" + child.id +
+                        "', which is not supported: " + child.component_type_name +
+                        " describes continuous coupling (gap junctions / graded synapses), "
+                        "not the event edges this engine simulates. Every connection it "
+                        "declares would be dropped, leaving the network wired differently "
+                        "from the way the model states.");
             }
 
             if (child.component_type_name != "projection") continue;
@@ -1646,6 +1725,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                         for (InputTarget &target : targets) target.event_ticks = spike_ticks;
                     }
                 }
+
+                report_unmodelled_input_shape(input, profile, targets);
             }
 
             profile.targets = std::move(targets);

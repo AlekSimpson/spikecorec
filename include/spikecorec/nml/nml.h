@@ -330,13 +330,15 @@ struct UnitDefinition {
 // A ComponentType classified as a cell: everything that is a property of the TYPE rather
 // than of a particular instance of it. Its index in NML_ParseResult::cell_types is the
 // cell type index used everywhere else.
+// Deliberately carries no state_offset. Where a type's chunk begins inside the engine's
+// cell-state buffer depends on how many neurons each preceding type has and on how wide one
+// neuron's chunk is -- and the width is nml::cell_state_slot_count, not
+// state_variable_names.size(), because a regime-bearing type appends a regime-index slot.
+// Neither is known here, so the offset is computed once where both are: SpikeEngine's
+// state_section_start. A second, type-only copy of that arithmetic disagreed with the
+// engine's and was read by nothing.
 struct CellTypeSpecification {
     String name;
-
-    // Where this type's state variables begin inside the single engine-allocated
-    // cell-state buffer (the successor to v1's `membrane_potentials`): the running sum of
-    // the preceding types' state variable counts.
-    s32 state_offset = 0;
 
     // In declaration order; the index is the variable's slot within this type's state
     // chunk, and the count is the type's state size.

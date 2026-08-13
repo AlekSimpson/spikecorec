@@ -4,8 +4,12 @@
 #include <fstream>
 #include <stdexcept>
 
-#include <gtest/gtest.h>
+#include <sstream>
 
+#include <gtest/gtest.h>
+#include <spdlog/sinks/ostream_sink.h>
+
+#include "spikecorec/core/log.h"
 #include "spikecorec/nml/nml.h"
 
 using namespace std;
@@ -52,6 +56,35 @@ public:
 
 private:
     filesystem::path root_;
+};
+
+// Captures what the parser logs while it is alive. A diagnostic whose whole job is to stop
+// something failing silently cannot be tested by its return value -- the return value is
+// exactly the silence being complained about -- so the message itself is the observable.
+class CapturedLog {
+public:
+    CapturedLog() {
+        captured_sink_ = std::make_shared<spdlog::sinks::ostream_sink_mt>(captured_text_);
+        log::logger().sinks().push_back(captured_sink_);
+    }
+
+    ~CapturedLog() {
+        Vector<spdlog::sink_ptr> &sinks = log::logger().sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), captured_sink_), sinks.end());
+    }
+
+    CapturedLog(const CapturedLog &) = delete;
+    CapturedLog &operator=(const CapturedLog &) = delete;
+
+    String text() const { return captured_text_.str(); }
+
+    bool contains(const String &fragment) const {
+        return text().find(fragment) != String::npos;
+    }
+
+private:
+    ostringstream captured_text_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> captured_sink_;
 };
 
 bool standard_library_available() {
@@ -930,10 +963,16 @@ TEST(Export, parameters_are_converted_to_si_in_declared_column_order) {
     EXPECT_DOUBLE_EQ(value_of("leakConductance"), 0.01e-6);  // 0.01uS
 }
 
-TEST(Export, cell_state_offsets_are_the_running_sum_of_state_sizes) {
+// Replaces Export.cell_state_offsets_are_the_running_sum_of_state_sizes, which pinned a
+// state_offset field the engine never read and whose arithmetic disagreed with the layout
+// the engine actually builds (it ignored both the per-type neuron count and the regime-index
+// slot cell_state_slot_count appends). What a cell type owes the engine is its state
+// variables, in slot order -- that is what SpikeEngine's state_section_start and the
+// generated kernel are both indexed by.
+TEST(Export, cell_types_carry_their_state_variables_in_slot_order) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
-    FixtureDirectory fixture("state_offsets");
+    FixtureDirectory fixture("state_variable_slots");
     fixture.write("net.nml", two_population_network_nml());
     fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
 
@@ -942,20 +981,14 @@ TEST(Export, cell_state_offsets_are_the_running_sum_of_state_sizes) {
 
     ASSERT_EQ(result.cell_types.size(), 2u);
 
-    s32 expected_offset = 0;
-    for (const CellTypeSpecification &cell_type : result.cell_types) {
-        EXPECT_EQ(cell_type.state_offset, expected_offset) << cell_type.name;
-        expected_offset += static_cast<s32>(cell_type.state_variable_names.size());
-    }
-
-    // The first type starts at zero and the offsets strictly advance.
-    EXPECT_EQ(result.cell_types[0].state_offset, 0);
-    EXPECT_GT(expected_offset, 0);
-
-    // iafCell has one state variable (v); izhikevich2007Cell has two (v, u).
+    // iafCell has one state variable (v); izhikevich2007Cell has two, v before u.
     const CellTypeSpecification *iaf = cell_type_named(result, "iafCell");
     ASSERT_NE(iaf, nullptr);
     EXPECT_EQ(iaf->state_variable_names, (Vector<String>{"v"}));
+
+    const CellTypeSpecification *izhikevich = cell_type_named(result, "izhikevich2007Cell");
+    ASSERT_NE(izhikevich, nullptr);
+    EXPECT_EQ(izhikevich->state_variable_names, (Vector<String>{"v", "u"}));
 }
 
 TEST(Export, synapse_types_are_classified_for_storage) {
@@ -1281,7 +1314,8 @@ TEST(Export, is_deterministic_across_parses) {
     ASSERT_EQ(first.cell_types.size(), second.cell_types.size());
     for (usize index = 0; index < first.cell_types.size(); index += 1) {
         EXPECT_EQ(first.cell_types[index].name, second.cell_types[index].name);
-        EXPECT_EQ(first.cell_types[index].state_offset, second.cell_types[index].state_offset);
+        EXPECT_EQ(first.cell_types[index].state_variable_names,
+                  second.cell_types[index].state_variable_names);
         EXPECT_EQ(first.cell_types[index].parameter_names,
                   second.cell_types[index].parameter_names);
     }
@@ -2743,4 +2777,301 @@ TEST(Errors, an_unresolvable_recording_path_is_marked_rather_than_read_as_neuron
         EXPECT_EQ(selection.neuron_index, -1) << selection.quantity_path;
         EXPECT_FALSE(selection.quantity_path.empty());
     }
+}
+
+TEST(Export, a_bracket_form_recording_path_naming_the_component_resolves_its_variable) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("bracket_component_path");
+    // The same component-selector segment the slash form was taught to consume also occurs
+    // after the bracket form: "pop1[0]/cell0/v". The bracket branch returned before the
+    // disambiguation ran, so the segment stayed in the variable name ("cell0/v"). The neuron
+    // index still resolved, so nothing complained -- and the engine, finding no state
+    // variable by that name, recorded the neuron's FIRST state variable instead. On a cell
+    // with more than one that is a column silently logging a different quantity.
+    fixture.write("net.nml", R"(<neuroml id="bracketnet">
+    <izhikevich2007Cell id="cell0" C="100pF" v0="-60mV" k="0.7nS_per_mV"
+                        vr="-60mV" vt="-40mV" vpeak="35mV" a="0.03per_ms"
+                        b="-2nS" c="-50mV" d="100pA"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", R"(<Lems>
+    <Target component="sim1"/>
+    <Include file="net.nml"/>
+    <Simulation id="sim1" length="100ms" step="0.01ms" target="net1">
+        <OutputFile id="of1" fileName="out.dat">
+            <OutputColumn id="c0" quantity="pop1[0]/cell0/v"/>
+            <OutputColumn id="c1" quantity="pop1[1]/cell0/u"/>
+            <OutputColumn id="c2" quantity="pop1[1]/izhikevich2007Cell/u"/>
+            <OutputColumn id="c3" quantity="pop1[0]/u"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)");
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.recording_profiles.size(), 1u);
+    const RecordingConfig &columns = result.recording_profiles[0];
+    ASSERT_EQ(columns.selections.size(), 4u);
+
+    // The bound component INSTANCE id is consumed, as in the slash form.
+    EXPECT_EQ(columns.selections[0].neuron_index, 0);
+    EXPECT_EQ(columns.selections[0].variable_name, "v");
+
+    EXPECT_EQ(columns.selections[1].neuron_index, 1);
+    EXPECT_EQ(columns.selections[1].variable_name, "u");
+
+    // ...and so is the cell TYPE name, the other spelling of that segment.
+    EXPECT_EQ(columns.selections[2].neuron_index, 1);
+    EXPECT_EQ(columns.selections[2].variable_name, "u");
+
+    // A bracket path with no component segment still reads its one trailing segment as the
+    // variable, so the disambiguation cannot have swallowed it.
+    EXPECT_EQ(columns.selections[3].neuron_index, 0);
+    EXPECT_EQ(columns.selections[3].variable_name, "u");
+
+    // izhikevich2007Cell declares v and u. Naming a variable it does not declare is not a
+    // mislabel: it selects a different state slot.
+    const CellTypeSpecification *cell = cell_type_named(result, "izhikevich2007Cell");
+    ASSERT_NE(cell, nullptr);
+    for (const RecordingSelection &selection : columns.selections) {
+        EXPECT_NE(std::find(cell->state_variable_names.begin(),
+                            cell->state_variable_names.end(), selection.variable_name),
+                  cell->state_variable_names.end())
+                << selection.quantity_path;
+    }
+}
+
+TEST(Export, a_bracket_form_connection_endpoint_naming_the_component_still_resolves) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("bracket_component_endpoint");
+    // The same path routine resolves connection endpoints, so the disambiguation must not
+    // have cost the bracket form its neuron index on the way to fixing its variable name.
+    fixture.write("net.nml", R"(<neuroml id="bracketedgenet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <alphaCurrentSynapse id="syn0" tau="2ms" ibase="0.1nA"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="3"/>
+        <synapticConnection from="pop1[0]/cell0" to="pop1[2]/cell0" synapse="syn0"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.neurons.size(), 3u);
+    ASSERT_EQ(result.neurons[0].outgoing_edges.size(), 1u);
+    EXPECT_EQ(result.neurons[0].outgoing_edges[0].target_neuron_index, 2);
+}
+
+TEST(Errors, an_electrical_projection_is_refused_rather_than_silently_dropped) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("electrical_projection");
+    // Gap junctions are out of Phase-1 scope, and the connections an <electricalProjection>
+    // declares have no NetworkEdge to become. Skipping the element drops every one of them:
+    // this network, whose ONLY connectivity is electrical, would parse clean and simulate
+    // with no edges at all -- indistinguishable from a working model of an unconnected
+    // network. It is refused by name instead.
+    fixture.write("net.nml", R"(<neuroml id="gapnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <gapJunction id="gj1" conductance="10pS"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+        <electricalProjection id="ep1" presynapticPopulation="pop1"
+                              postsynapticPopulation="pop1">
+            <electricalConnection id="0" preCell="0" postCell="1" synapse="gj1"/>
+        </electricalProjection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    try {
+        NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+        ADD_FAILURE() << "expected an electricalProjection to be refused; instead the model "
+                         "parsed with "
+                      << build_adjacency_list(result)[0].size() << " edge(s) out of neuron 0";
+    } catch (const std::runtime_error &error) {
+        const String message(error.what());
+        EXPECT_NE(message.find("electricalProjection"), String::npos) << message;
+        EXPECT_NE(message.find("ep1"), String::npos) << message;
+        EXPECT_NE(message.find("not supported"), String::npos) << message;
+    }
+}
+
+TEST(Errors, a_continuous_projection_is_refused_rather_than_silently_dropped) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("continuous_projection");
+    // Same shape as the electrical case: continuous coupling through graded synapses is not
+    // an event edge, so every <continuousConnection> would vanish without a word.
+    fixture.write("net.nml", R"(<neuroml id="gradednet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <silentSynapse id="silent1"/>
+    <linearGradedSynapse id="graded1" conductance="10pS"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+        <continuousProjection id="cp1" presynapticPopulation="pop1"
+                              postsynapticPopulation="pop1">
+            <continuousConnection id="0" preCell="0" postCell="1"
+                                  preComponent="silent1" postComponent="graded1"/>
+        </continuousProjection>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    try {
+        NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+        ADD_FAILURE() << "expected a continuousProjection to be refused; instead the model "
+                         "parsed with "
+                      << build_adjacency_list(result)[0].size() << " edge(s) out of neuron 0";
+    } catch (const std::runtime_error &error) {
+        const String message(error.what());
+        EXPECT_NE(message.find("continuousProjection"), String::npos) << message;
+        EXPECT_NE(message.find("cp1"), String::npos) << message;
+        EXPECT_NE(message.find("not supported"), String::npos) << message;
+    }
+}
+
+TEST(Errors, a_chemical_projection_alongside_them_is_still_accepted) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("chemical_projection_still_accepted");
+    // The refusal must be of the two unsupported elements, not of projections in general.
+    fixture.write("net.nml", two_population_network_nml());
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+
+    ASSERT_EQ(result.neurons.size(), 5u);
+    EXPECT_EQ(result.neurons[0].outgoing_edges.size(), 1u);
+    EXPECT_EQ(result.neurons[2].outgoing_edges.size(), 1u);
+}
+
+TEST(Export, an_input_component_that_delivers_nothing_is_named_in_the_log) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("inert_input");
+    // Only two input shapes are modelled: a rectangular current window and an explicit
+    // <spike> train. A spikeGeneratorPoisson is neither, so it parses into a profile with no
+    // amplitude and no event ticks -- and create_event_stream turns that into an empty
+    // stream. The network then runs with NO input while looking like a model whose cells
+    // simply never fire.
+    fixture.write("net.nml", R"(<neuroml id="poissonnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <spikeGeneratorPoisson id="sg0" averageRate="50Hz"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="1"/>
+        <explicitInput target="pop1[0]" input="sg0"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    NML_ParseResult result;
+    String log_text;
+    {
+        CapturedLog captured;
+        result = parser.parse_lems(fixture.path_of("LEMS.xml"));
+        log_text = captured.text();
+    }
+
+    // The consequence being reported: a wired input that carries nothing.
+    ASSERT_EQ(result.input_profiles.size(), 1u);
+    ASSERT_EQ(result.input_profiles[0].targets.size(), 1u);
+    EXPECT_TRUE(result.input_profiles[0].targets[0].event_ticks.empty());
+    EXPECT_DOUBLE_EQ(result.input_profiles[0].amplitude, 0.0);
+
+    EXPECT_NE(log_text.find("sg0"), String::npos) << log_text;
+    EXPECT_NE(log_text.find("spikeGeneratorPoisson"), String::npos) << log_text;
+    EXPECT_NE(log_text.find("delivers nothing"), String::npos) << log_text;
+}
+
+TEST(Export, an_input_whose_waveform_is_not_a_rectangular_pulse_is_named_in_the_log) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("wrong_shape_input");
+    // A sineGenerator carries an `amplitude`, so it is lowered as a rectangular window -- DC
+    // at the sine's PEAK for the whole duration, with `period` and `phase` dropped. That
+    // runs, and produces the numbers of a model nobody wrote. The pulseGenerator's own
+    // `weight` Property is dropped the same way (only <inputW weight> is honoured).
+    fixture.write("net.nml", R"(<neuroml id="sinenet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <sineGenerator id="sine0" delay="10ms" duration="40ms" amplitude="0.5nA"
+                   period="20ms" phase="0"/>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="1"/>
+        <explicitInput target="pop1[0]" input="sine0"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    String log_text;
+    {
+        CapturedLog captured;
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        log_text = captured.text();
+    }
+
+    EXPECT_NE(log_text.find("sine0"), String::npos) << log_text;
+    EXPECT_NE(log_text.find("sineGenerator"), String::npos) << log_text;
+    EXPECT_NE(log_text.find("period"), String::npos) << log_text;
+    EXPECT_NE(log_text.find("phase"), String::npos) << log_text;
+}
+
+TEST(Export, a_faithfully_modelled_input_draws_no_complaint) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    FixtureDirectory fixture("faithful_input");
+    // The counterpart to the two above: a plain pulseGenerator IS a rectangular window and a
+    // spikeArray IS an explicit train, so neither may be reported. A diagnostic that fires on
+    // every model teaches its readers to ignore it.
+    fixture.write("net.nml", R"(<neuroml id="faithfulnet">
+    <iafCell id="cell0" leakReversal="-50mV" thresh="-55mV" reset="-70mV"
+             C="0.2nF" leakConductance="0.01uS"/>
+    <pulseGenerator id="pg0" delay="10ms" duration="40ms" amplitude="0.5nA"/>
+    <spikeArray id="sa0">
+        <spike id="0" time="15ms"/>
+        <spike id="1" time="25ms"/>
+    </spikeArray>
+    <network id="net1">
+        <population id="pop1" component="cell0" size="2"/>
+        <explicitInput target="pop1[0]" input="pg0"/>
+        <explicitInput target="pop1[1]" input="sa0"/>
+    </network>
+</neuroml>
+)");
+    fixture.write("LEMS.xml", lems_simulation_xml("net.nml"));
+
+    NML_Parser parser;
+    String log_text;
+    {
+        CapturedLog captured;
+        parser.parse_lems(fixture.path_of("LEMS.xml"));
+        log_text = captured.text();
+    }
+
+    EXPECT_EQ(log_text.find("pg0"), String::npos) << log_text;
+    EXPECT_EQ(log_text.find("sa0"), String::npos) << log_text;
 }
