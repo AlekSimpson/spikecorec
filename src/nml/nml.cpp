@@ -519,7 +519,8 @@ static String leaf_id(const String &scoped_id) {
 }
 
 // Exactly two input shapes are modelled: a rectangular current window (`amplitude` held
-// across [delay, delay + duration]) and an explicit <spike> train. An input component that
+// across [delay, delay + duration), half-open as LEMS declares it) and an explicit <spike>
+// train. An input component that
 // is neither still parses into a profile, and that profile is quietly wrong in one of two
 // ways -- it delivers nothing, or it delivers the wrong waveform. Neither is visible
 // downstream: SpikeEngine::create_event_stream turns empty event_ticks into an empty
@@ -554,7 +555,7 @@ static void report_unmodelled_input_shape(const ComponentInstance &input,
 
             log::logger().warn(
                     "Input '{}' of type '{}' is injected as a rectangular pulse holding its "
-                    "amplitude across [delay, delay + duration]; it also sets {}, which that "
+                    "amplitude across [delay, delay + duration); it also sets {}, which that "
                     "shape ignores, so the current delivered is not the one the model declares",
                     input.id, input.component_type_name, joined_names);
         }
