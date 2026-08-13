@@ -528,6 +528,13 @@ SymbolTable with_fallback_symbols(const SymbolTable &resolved_so_far,
 
 // ── Emission helpers ─────────────────────────────────────────────────────────
 
+// The type every flat offset into a model-sized buffer is computed in, typedef'd into the
+// generated source by source_preamble. 64 bits, matching the s64 the host sizes and indexes
+// those same allocations with: in `int` the two disagree silently past INT_MAX and an offset
+// wraps negative, which reads another neuron's slot rather than faulting. A ring of depth 64
+// over 4 wired synapse prototypes and 8.4M neurons already crosses it.
+const String buffer_index_type_name = "SpikecorecBufferIndex";
+
 String indent(usize level) {
     return String(level * 4, ' ');
 }
@@ -553,30 +560,136 @@ usize require_state_variable_slot(const StateStorage &storage, const String &nam
                  storage.component_type_name);
 }
 
+// ── Regimes ──────────────────────────────────────────────────────────────────
+//
+// See kernel_codegen.h for what a regime compiles into and why. Everything here answers one
+// of three questions: which regimes exist and what index each has, which regime declares a
+// TimeDerivative for a given variable, and what a regime's OnEntry body is.
+
+// The local every guard reads. Loaded once, before anything else in the cell body, so a
+// Transition taken this tick is observed from the NEXT tick on -- which is what stops the
+// regime a cell just moved INTO from also running its own OnCondition in the same tick.
+const String active_regime_local_name = "active_regime_index";
+
+// The TimeDerivative `regime_name` declares for `variable_name`, or nullptr when that regime
+// declares none -- which is exactly what freezes the variable while the regime is active.
+const DynamicsInstruction *find_regime_time_derivative(const CellTypeSpecification &cell_type,
+                                                       const String &regime_name,
+                                                       const String &variable_name) {
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Integrate) continue;
+        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+        if (instruction.regime_name != regime_name) continue;
+        if (instruction.target != variable_name) continue;
+        return &instruction;
+    }
+    return nullptr;
+}
+
+// `regime_name`'s OnEntry StateAssignments, in declaration order. An OnEntry body is located
+// by stage rather than by a gate: collect_dynamics_instructions tags what it contains as
+// RegimeEntry and clears the condition, which is what separates it from the Reset-stage
+// assignments an OnCondition fires.
+Vector<const DynamicsInstruction *> regime_entry_assignments(
+        const CellTypeSpecification &cell_type, const String &regime_name) {
+    Vector<const DynamicsInstruction *> assignments;
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.stage != DynamicsStage::RegimeEntry) continue;
+        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+        if (instruction.regime_name != regime_name) continue;
+        assignments.push_back(&instruction);
+    }
+    return assignments;
+}
+
+// Whether any regime declares a TimeDerivative for `variable_name`, which is what decides
+// that the variable is integrated through a regime dispatch rather than unconditionally.
+bool any_regime_declares_time_derivative(const CellTypeSpecification &cell_type,
+                                         const String &variable_name) {
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Integrate) continue;
+        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+        if (instruction.regime_name.empty()) continue;
+        if (instruction.target == variable_name) return true;
+    }
+    return false;
+}
+
+// The regime index, written into and read back out of the cell's own state chunk. Small
+// integers are exact in f32, so the round trip is exact and `==` against a literal index is
+// a real equality rather than an approximate one.
+String regime_state_element(const CellRegimeLayout &regimes) {
+    return "cell_state[state_base + " + to_string(regimes.regime_state_slot) + "]";
+}
+
 // Everything this generator refuses to lower, checked in one pass so a model fails at
 // generation with the construct named rather than half-generating and running wrong.
-void reject_unsupported_instructions(const CellTypeSpecification &cell_type) {
+void reject_unsupported_instructions(const CellTypeSpecification &cell_type,
+                                     const CellRegimeLayout &regimes) {
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         // A StateVariable is a declaration, not an operation: it lands on the RegimeEntry
         // stage only because that is stage_for_declaration's default. Its slot is already
         // known from state_variable_names, so it is skipped rather than rejected.
         if (instruction.source_tag == NML_DeclarationType::StateVariable) continue;
 
-        if (!instruction.regime_name.empty()) {
-            report_error("regimes are not supported: an instruction targeting '" +
-                                 instruction.target + "' sits inside Regime '" +
-                                 instruction.regime_name + "'",
+        // A regime-scoped instruction whose regime resolve_cell_regimes never saw cannot
+        // happen through the parser -- the name comes from the enclosing Regime -- but it
+        // would silently generate a guard against an index no Transition ever writes.
+        if (!instruction.regime_name.empty() &&
+            regimes.index_of(instruction.regime_name) < 0) {
+            report_error("an instruction targeting '" + instruction.target +
+                                 "' names Regime '" + instruction.regime_name +
+                                 "', which this ComponentType does not declare",
                          cell_type.name);
         }
 
         switch (instruction.source_tag) {
             case NML_DeclarationType::Regime:
-                report_error("Regime '" + instruction.target + "' is not supported", cell_type.name);
+                // LEMS has no nested regimes, and a nested one would need its own index and
+                // its own dispatch. Caught here rather than producing a flat chain that
+                // silently discards the nesting.
+                if (!instruction.regime_name.empty()) {
+                    report_error("Regime '" + instruction.target + "' is nested inside Regime '" +
+                                         instruction.regime_name + "', which is not supported",
+                                 cell_type.name);
+                }
+                continue;
             case NML_DeclarationType::Transition:
-                report_error("Transition to regime '" + instruction.target + "' is not supported",
-                             cell_type.name);
+                // A Transition compiles to a store guarded by the OnCondition that fired it.
+                // One sitting directly under a Regime has no gate at all, so it would run
+                // every tick and the cell would never stay anywhere.
+                if (instruction.regime_name.empty() || instruction.condition.empty()) {
+                    report_error("Transition to regime '" + instruction.target +
+                                         "' is not inside a Regime's OnCondition; it has no "
+                                         "gate, so it would fire on every tick",
+                                 cell_type.name);
+                }
+                if (regimes.index_of(instruction.target) < 0) {
+                    report_error("Transition names regime '" + instruction.target +
+                                         "', which this ComponentType does not declare",
+                                 cell_type.name);
+                }
+                continue;
             case NML_DeclarationType::OnEntry:
-                report_error("OnEntry is not supported", cell_type.name);
+                if (instruction.regime_name.empty()) {
+                    report_error("OnEntry is not inside a Regime, so there is no entry for it "
+                                 "to run on",
+                                 cell_type.name);
+                }
+                continue;
+            case NML_DeclarationType::DerivedVariable:
+                // A regime-scoped DerivedVariable would be emitted as an ordinary local,
+                // visible and evaluated in every regime -- which is not what declaring it
+                // inside one means.
+                if (!instruction.regime_name.empty()) {
+                    report_error("DerivedVariable '" + instruction.target +
+                                         "' is declared inside Regime '" +
+                                         instruction.regime_name +
+                                         "'; only TimeDerivative, OnCondition and OnEntry are "
+                                         "lowered inside a regime",
+                                 cell_type.name);
+                }
+                break;
             case NML_DeclarationType::OnEvent:
                 report_error("OnEvent on port '" + instruction.target + "' is not supported",
                              cell_type.name);
@@ -598,9 +711,34 @@ void reject_unsupported_instructions(const CellTypeSpecification &cell_type) {
                                  instruction.target + "')",
                          cell_type.name);
         }
+
+        // What is left on the RegimeEntry stage after the tags handled above is an OnEntry
+        // body's StateAssignments -- located by stage, since OnEntry clears the condition
+        // its children carry. Anything else there is a construct with no lowering.
         if (instruction.stage == DynamicsStage::RegimeEntry) {
-            report_error("regime entry handling is not supported (instruction targeting '" +
-                                 instruction.target + "')",
+            if (instruction.source_tag != NML_DeclarationType::StateAssignment) {
+                report_error("regime entry handling is not supported for this construct "
+                             "(instruction targeting '" +
+                                     instruction.target + "')",
+                             cell_type.name);
+            }
+            if (instruction.regime_name.empty()) {
+                report_error("StateAssignment to '" + instruction.target +
+                                     "' sits in an OnEntry outside any Regime",
+                             cell_type.name);
+            }
+            continue;
+        }
+
+        // A StateAssignment or EventOut directly under a Regime, with no OnCondition around
+        // it, has no gate. Emitting it unconditionally would run it in every regime; emitting
+        // it under the regime guard would invent a handler the document never wrote.
+        const bool is_gated_body = instruction.stage == DynamicsStage::Reset ||
+                                   instruction.stage == DynamicsStage::Emit;
+        if (is_gated_body && !instruction.regime_name.empty() && instruction.condition.empty()) {
+            report_error("an instruction targeting '" + instruction.target +
+                                 "' sits directly inside Regime '" + instruction.regime_name +
+                                 "' with no OnCondition around it, so nothing gates it",
                          cell_type.name);
         }
     }
@@ -612,11 +750,17 @@ void reject_unsupported_instructions(const CellTypeSpecification &cell_type) {
 // inside one OnCondition assign u to itself instead of swapping, and the ordering would be
 // the document's rather than the model's. This is the same treatment the TimeDerivative path
 // already gives its next_* temporaries.
+//
+// `temporary_name_prefix` separates one handler's temporaries from another's. Two handlers
+// can now land in the SAME generated block -- an OnCondition's own assignments and the
+// OnEntry assignments of the regime its Transition moves to -- and if both wrote a variable
+// the two `float assigned_v` declarations would collide.
 String emit_state_assignment_group(const StateStorage &storage,
                                    const NML_ParseResult &parse_result,
                                    const SymbolTable &symbols,
                                    const Vector<const DynamicsInstruction *> &assignments,
-                                   usize indent_level) {
+                                   usize indent_level,
+                                   const String &temporary_name_prefix = "assigned_") {
     if (assignments.empty()) return "";
 
     const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
@@ -638,7 +782,8 @@ String emit_state_assignment_group(const StateStorage &storage,
     for (const DynamicsInstruction *assignment : assignments) {
         const usize slot =
                 require_state_variable_slot(storage, assignment->target, "StateAssignment");
-        const String temporary_name = "assigned_" + sanitize_identifier(assignment->target);
+        const String temporary_name =
+                temporary_name_prefix + sanitize_identifier(assignment->target);
 
         // Two assignments to one variable in a single handler is malformed LEMS, but it must
         // not turn into a redeclaration the shader compiler rejects: the second one assigns
@@ -659,51 +804,147 @@ String emit_state_assignment_group(const StateStorage &storage,
     return group.str();
 }
 
-// Forward Euler over every TimeDerivative in `dynamics`, into a temporary per state
-// variable. Nothing is written back until every derivative has been computed, so two
+// Forward Euler over every regime-free TimeDerivative in `dynamics`, into a temporary per
+// state variable. Nothing is written back until every derivative has been computed, so two
 // variables that reference each other both integrate from the state as it stood at entry.
 //
-// `has_integrated_state` reports whether anything was written, which is what tells a caller
-// whether re-reading its derived locals would observe a different state.
-String emit_forward_euler_step(const StateStorage &storage,
-                               const Vector<DynamicsInstruction> &dynamics,
-                               const NML_ParseResult &parse_result, const SymbolTable &symbols,
-                               usize indent_level, bool &has_integrated_state) {
+// Regime-scoped derivatives are appended by emit_regime_dispatched_integration below, into
+// the same pending list, so the one write-back covers both kinds.
+String emit_unconditional_euler_temporaries(
+        const StateStorage &storage, const Vector<DynamicsInstruction> &dynamics,
+        const NML_ParseResult &parse_result, const SymbolTable &symbols, usize indent_level,
+        Vector<Pair<usize, String>> &pending_state_writes) {
+    const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
+
     ostringstream step;
-    Vector<Pair<usize, String>> pending_state_writes;
+    Set<usize> already_integrated_slots;
 
     for (const DynamicsInstruction &instruction : dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
         if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+        if (!instruction.regime_name.empty()) continue;
 
         const usize slot =
                 require_state_variable_slot(storage, instruction.target, "TimeDerivative");
-        const String temporary_name = "next_" + sanitize_identifier(instruction.target);
 
+        // Two TimeDerivatives for one variable is malformed LEMS. Left alone it emits two
+        // `float next_v` declarations and fails inside the shader compiler, far from its
+        // cause; refused here with the variable named.
+        if (!already_integrated_slots.insert(slot).second) {
+            report_error("'" + instruction.target +
+                                 "' carries more than one TimeDerivative outside any Regime",
+                         storage.component_type_name);
+        }
+
+        const String temporary_name = "next_" + sanitize_identifier(instruction.target);
         step << indent(indent_level) << "float " << temporary_name << " = "
              << storage.element(slot) << " + dt * ("
-             << translate_expression(instruction.expression,
-                                     with_fallback_symbols(symbols, parse_result))
-             << ");\n";
+             << translate_expression(instruction.expression, visible_symbols) << ");\n";
         pending_state_writes.push_back({slot, temporary_name});
     }
 
-    for (const auto &pending_write : pending_state_writes) {
-        step << indent(indent_level) << storage.element(pending_write.first) << " = "
-             << pending_write.second << ";\n";
-    }
-
-    has_integrated_state = !pending_state_writes.empty();
     return step.str();
 }
 
-// The Reset-stage StateAssignments `condition` gates, in declaration order. An empty
-// `condition` collects the ungated ones.
+// The regime dispatch, one chain per state variable any regime declares a TimeDerivative
+// for, in the type's own state variable order.
+//
+// The temporary is seeded with the variable's current value, so a regime that declares no
+// derivative for it needs to emit NOTHING in its branch: the variable simply keeps what it
+// came in with. That absence is the whole mechanism -- GLIF's refractory period is `v`
+// having no TimeDerivative in the refractory regime, not a zero derivative and not a flag.
+String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type,
+                                          const CellRegimeLayout &regimes,
+                                          const StateStorage &storage,
+                                          const NML_ParseResult &parse_result,
+                                          const SymbolTable &symbols, usize indent_level,
+                                          Vector<Pair<usize, String>> &pending_state_writes) {
+    if (!regimes.has_regimes()) return "";
+
+    const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
+
+    ostringstream dispatch;
+    for (usize slot = 0; slot < storage.state_variable_names.size(); ++slot) {
+        const String &variable_name = storage.state_variable_names[slot];
+        if (!any_regime_declares_time_derivative(cell_type, variable_name)) continue;
+
+        // Which of the two applies is not decidable from the document, and picking either
+        // silently changes how the variable moves in every regime.
+        for (const auto &pending_write : pending_state_writes) {
+            if (pending_write.first != slot) continue;
+            report_error("'" + variable_name +
+                                 "' carries both a regime-scoped TimeDerivative and one outside "
+                                 "any Regime",
+                         cell_type.name);
+        }
+
+        const String temporary_name = "next_" + sanitize_identifier(variable_name);
+        dispatch << indent(indent_level) << "float " << temporary_name << " = "
+                 << storage.element(slot) << ";\n";
+
+        // One regime's body for this variable: the Euler step it declares, or a comment
+        // recording that it declares none and the variable is therefore held.
+        auto branch_body = [&](const String &regime_name, usize body_indent) -> String {
+            const DynamicsInstruction *derivative =
+                    find_regime_time_derivative(cell_type, regime_name, variable_name);
+            if (derivative == nullptr) {
+                return indent(body_indent) + "// Regime '" + regime_name +
+                       "' declares no TimeDerivative for '" + variable_name +
+                       "', so it holds its value.\n";
+            }
+            return indent(body_indent) + temporary_name + " = " + storage.element(slot) +
+                   " + dt * (" + translate_expression(derivative->expression, visible_symbols) +
+                   ");\n";
+        };
+
+        // A single regime is always active, so its body needs no guard at all.
+        if (regimes.regime_names.size() == 1) {
+            dispatch << branch_body(regimes.regime_names[0], indent_level);
+            pending_state_writes.push_back({slot, temporary_name});
+            continue;
+        }
+
+        // The first N-1 regimes get an explicit index comparison; the last is the trailing
+        // else, so every index the slot can hold lands in exactly one branch.
+        for (usize regime_index = 0; regime_index + 1 < regimes.regime_names.size();
+             ++regime_index) {
+            dispatch << (regime_index == 0 ? indent(indent_level) : " ") << "if ("
+                     << active_regime_local_name << " == " << regime_index << ") {\n"
+                     << branch_body(regimes.regime_names[regime_index], indent_level + 1)
+                     << indent(indent_level) << "} else";
+        }
+        dispatch << " {\n" << branch_body(regimes.regime_names.back(), indent_level + 1)
+                 << indent(indent_level) << "}\n";
+
+        pending_state_writes.push_back({slot, temporary_name});
+    }
+
+    return dispatch.str();
+}
+
+String emit_euler_write_back(const StateStorage &storage,
+                             const Vector<Pair<usize, String>> &pending_state_writes,
+                             usize indent_level) {
+    ostringstream write_back;
+    for (const auto &pending_write : pending_state_writes) {
+        write_back << indent(indent_level) << storage.element(pending_write.first) << " = "
+                   << pending_write.second << ";\n";
+    }
+    return write_back.str();
+}
+
+// The Reset-stage StateAssignments the OnCondition `condition`, declared inside regime
+// `regime_name`, gates -- in declaration order. Both halves of the key matter: two regimes
+// may declare OnConditions with identical tests, and matching on the test alone would give
+// each of them the other's assignments as well. An empty pair collects the ungated,
+// regime-free ones.
 Vector<const DynamicsInstruction *> reset_assignments_gated_by(
-        const CellTypeSpecification &cell_type, const String &condition) {
+        const CellTypeSpecification &cell_type, const String &regime_name,
+        const String &condition) {
     Vector<const DynamicsInstruction *> assignments;
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Reset) continue;
+        if (instruction.regime_name != regime_name) continue;
         if (instruction.condition != condition) continue;
         assignments.push_back(&instruction);
     }
@@ -956,18 +1197,25 @@ String emit_propagation_helpers(KernelBackend backend) {
     // wired synapse prototype p's own arrival plane. The plane COUNT is baked rather than
     // passed: the master kernel's argument table is full, and it is a property of the model
     // the source was generated from.
-    helpers << function_prefix << "int network_input_ring_index(\n"
+    // The offset is computed in 64 bits, matching the host's own s64 arithmetic over the same
+    // allocation (SpikeEngine's network_input_element_count and current_ring_row_base). In
+    // `int` the two disagree silently past INT_MAX -- ring_depth 64 over 4 wired prototypes
+    // and 8.4M neurons already exceeds it -- and an arrival wraps to a negative index, which
+    // lands in another neuron's slot rather than crashing.
+    helpers << function_prefix << tick_type << " network_input_ring_index(\n"
             << indent(2) << tick_type << " tick_of_arrival,\n"
             << indent(2) << "int plane_index,\n"
             << indent(2) << "int ring_depth,\n"
             << indent(2) << "int neuron_count,\n"
             << indent(2) << "int neuron_index\n"
             << ") {\n"
-            << indent(1) << "int ring_row = (int)(tick_of_arrival % (" << tick_type
-            << ")ring_depth);\n"
+            << indent(1) << tick_type << " ring_row = tick_of_arrival % (" << tick_type
+            << ")ring_depth;\n"
             << indent(1)
-            << "return (ring_row * SPIKECOREC_NETWORK_INPUT_PLANE_COUNT + plane_index) *\n"
-            << indent(3) << "neuron_count + neuron_index;\n"
+            << "return (ring_row * SPIKECOREC_NETWORK_INPUT_PLANE_COUNT + (" << tick_type
+            << ")plane_index) *\n"
+            << indent(3) << "(" << tick_type << ")neuron_count + (" << tick_type
+            << ")neuron_index;\n"
             << "}\n\n";
 
     helpers << function_prefix << "void propagate_spike(\n"
@@ -1047,7 +1295,7 @@ String emit_propagation_helpers(KernelBackend backend) {
             // prototype its projection names, or plane 0 when it names none -- in which case
             // the raw weight is the delivered current, which is what network_inputs meant
             // before there were any synapse dynamics at all.
-            << indent(2) << "int arrival_index = network_input_ring_index(\n"
+            << indent(2) << tick_type << " arrival_index = network_input_ring_index(\n"
             << indent(4) << "tick + (" << tick_type << ")edge_delay_ticks[edge_slot],\n"
             << indent(4) << "edge_synapse_plane[edge_slot], ring_depth,\n"
             << indent(4) << "neuron_count, target_neuron_index);\n";
@@ -1077,7 +1325,8 @@ String emit_propagation_helpers(KernelBackend backend) {
 // generate_ring_row_clear_kernel.
 String emit_synaptic_input_read(usize indent_level) {
     ostringstream read;
-    read << indent(indent_level) << "int synaptic_input_index = network_input_ring_index(\n"
+    read << indent(indent_level) << buffer_index_type_name
+         << " synaptic_input_index = network_input_ring_index(\n"
          << indent(indent_level + 2)
          << "tick, 0, ring_depth, neuron_count, neuron_index);\n"
          << indent(indent_level) << "float " << synaptic_input_local_name
@@ -1272,10 +1521,12 @@ StateStorage synapse_state_storage(const SynapseTypeSpecification &synapse_type)
 }
 
 // Resolves this thread's slice of the aggregated state. Neuron-major within a prototype, so
-// one thread's state variables are contiguous.
+// one thread's state variables are contiguous. Computed 64-bit for the same reason
+// network_input_ring_index is: the host sizes synapse_state in s64.
 String emit_synapse_state_base(const WiredSynapse &wired, usize indent_level) {
-    return indent(indent_level) + "int synapse_state_base = " +
-           to_string(wired.state_variable_offset) + " * neuron_count + neuron_index * " +
+    return indent(indent_level) + buffer_index_type_name + " synapse_state_base = " +
+           to_string(wired.state_variable_offset) + " * (" + buffer_index_type_name +
+           ")neuron_count + (" + buffer_index_type_name + ")neuron_index * " +
            to_string(wired.type->state_variable_names.size()) + ";\n";
 }
 
@@ -1331,7 +1582,8 @@ String emit_synapse_tick_body(const WiredSynapse &wired, const NML_ParseResult &
     body << emit_synapse_state_base(wired, 1);
 
     // ── Stage 1, Deliver ─────────────────────────────────────────────────────
-    body << indent(1) << "int synapse_arrival_index = network_input_ring_index(\n"
+    body << indent(1) << buffer_index_type_name
+         << " synapse_arrival_index = network_input_ring_index(\n"
          << indent(3) << "tick, " << wired.plane_index
          << ", ring_depth, neuron_count, neuron_index);\n"
          << indent(1) << "float " << synapse_arrival_local_name
@@ -1374,9 +1626,13 @@ String emit_synapse_tick_body(const WiredSynapse &wired, const NML_ParseResult &
     body << emit_synapse_derived_variables(wired, parse_result, symbols, derived_variable_locals,
                                            1);
 
-    bool has_integrated_state = false;
-    body << emit_forward_euler_step(storage, wired.type->dynamics, parse_result, symbols, 1,
-                                    has_integrated_state);
+    // A synapse has no Regimes -- reject_unsupported_synapse refuses one -- so every
+    // TimeDerivative it declares integrates unconditionally.
+    Vector<Pair<usize, String>> pending_state_writes;
+    body << emit_unconditional_euler_temporaries(storage, wired.type->dynamics, parse_result,
+                                                 symbols, 1, pending_state_writes);
+    body << emit_euler_write_back(storage, pending_state_writes, 1);
+    const bool has_integrated_state = !pending_state_writes.empty();
 
     // The delivered current is this tick's, so the derived locals feeding it are re-evaluated
     // against the state Integrate just wrote -- the same post-integrate reading a cell's own
@@ -1396,7 +1652,8 @@ String emit_synapse_tick_body(const WiredSynapse &wired, const NML_ParseResult &
                      wired.type->name);
     }
 
-    body << indent(1) << "int synapse_output_index = network_input_ring_index(\n"
+    body << indent(1) << buffer_index_type_name
+         << " synapse_output_index = network_input_ring_index(\n"
          << indent(3) << "tick, 0, ring_depth, neuron_count, neuron_index);\n"
          << indent(1) << "network_inputs[synapse_output_index] += "
          << symbols.read_expression_for(synapse_output_variable_name) << ";\n";
@@ -1501,7 +1758,8 @@ String synapse_device_function_call(const WiredSynapse &wired, KernelPurpose pur
 
 String emit_tick_body(const CellTypeSpecification &cell_type,
                       const NML_ParseResult &parse_result) {
-    reject_unsupported_instructions(cell_type);
+    const CellRegimeLayout regimes = resolve_cell_regimes(cell_type);
+    reject_unsupported_instructions(cell_type, regimes);
 
     ostringstream body;
     SymbolTable symbols = build_base_symbol_table(cell_type);
@@ -1545,10 +1803,17 @@ String emit_tick_body(const CellTypeSpecification &cell_type,
         symbols.define(instruction.target, local_name);
     }
 
-    // Integrate, part 2.
-    bool has_integrated_state = false;
-    body << emit_forward_euler_step(cell_state_storage(cell_type), cell_type.dynamics,
-                                    parse_result, symbols, 1, has_integrated_state);
+    // Integrate, part 2. The regime-free TimeDerivatives first, then the regime-dispatched
+    // ones, and only then the single write-back covering both -- so a regime-scoped
+    // derivative reading a regime-free variable still sees the state as it stood at entry.
+    const StateStorage storage = cell_state_storage(cell_type);
+    Vector<Pair<usize, String>> pending_state_writes;
+    body << emit_unconditional_euler_temporaries(storage, cell_type.dynamics, parse_result,
+                                                 symbols, 1, pending_state_writes);
+    body << emit_regime_dispatched_integration(cell_type, regimes, storage, parse_result, symbols,
+                                               1, pending_state_writes);
+    body << emit_euler_write_back(storage, pending_state_writes, 1);
+    const bool has_integrated_state = !pending_state_writes.empty();
 
     // Stages 3 to 5 -- Detect, Emit, Reset -- all read the state this tick's Integrate just
     // produced, so the DerivedVariable locals they read are re-evaluated here against that
@@ -1576,31 +1841,65 @@ String emit_tick_body(const CellTypeSpecification &cell_type,
     }
 
     // Detect, then the Reset and Emit bodies each OnCondition gates. Reset and Emit
-    // instructions carry their OnCondition's test verbatim in `condition`, so that string
-    // is the join key back to the condition that fired them.
-    Set<String> emitted_condition_tests;
+    // instructions carry their OnCondition's test verbatim in `condition` and their owning
+    // regime in `regime_name`, so that PAIR is the join key back to the condition that fired
+    // them. The regime half is load-bearing: two regimes routinely declare OnConditions with
+    // the same test, and joining on the test alone would give each of them the other's
+    // assignments, its EventOut and its Transition.
+    auto condition_key = [](const DynamicsInstruction &instruction) {
+        return instruction.regime_name + "\x1f" + instruction.condition;
+    };
+
+    Set<String> emitted_condition_keys;
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Detect) continue;
 
-        // Two OnConditions with identical tests would otherwise each pick up the other's
-        // body, duplicating every assignment. They fire together by definition, so the
-        // first block already carries both.
-        if (!emitted_condition_tests.insert(instruction.expression).second) continue;
+        // Two OnConditions in one regime with identical tests would otherwise each pick up
+        // the other's body, duplicating every assignment. They fire together by definition,
+        // so the first block already carries both.
+        const String detect_key = instruction.regime_name + "\x1f" + instruction.expression;
+        if (!emitted_condition_keys.insert(detect_key).second) continue;
 
-        body << indent(1) << "if ("
-             << translate_expression(instruction.expression,
-                                     with_fallback_symbols(symbols, parse_result))
-             << ") {\n";
+        // An OnCondition declared inside a regime only applies while that regime is active,
+        // so its own test is ANDed with the regime check rather than replacing it.
+        String guard = translate_expression(instruction.expression,
+                                            with_fallback_symbols(symbols, parse_result));
+        if (!instruction.regime_name.empty()) {
+            guard = active_regime_local_name +
+                    " == " + to_string(regimes.index_of(instruction.regime_name)) + " && (" +
+                    guard + ")";
+        }
+        body << indent(1) << "if (" << guard << ") {\n";
 
         // Stage 4 before stage 5, and every StateAssignment this condition gates emitted as
         // one simultaneous group rather than one statement at a time.
         for (const DynamicsInstruction &gated : cell_type.dynamics) {
-            if (gated.condition != instruction.expression) continue;
+            if (condition_key(gated) != detect_key) continue;
             if (gated.stage == DynamicsStage::Emit) body << emit_spike(2);
         }
         body << emit_state_assignment_group(
-                cell_state_storage(cell_type), parse_result, symbols,
-                reset_assignments_gated_by(cell_type, instruction.expression), 2);
+                storage, parse_result, symbols,
+                reset_assignments_gated_by(cell_type, instruction.regime_name,
+                                           instruction.expression),
+                2);
+
+        // Then the Transitions this condition fires. Entering a regime IS the transition, so
+        // the target regime's OnEntry body is inlined right here rather than rediscovered by
+        // some later "have I just entered" check -- there is no such check anywhere.
+        //
+        // After the OnCondition's own assignments, and as its own simultaneous group: LEMS
+        // runs the handler, then enters the regime, then runs its OnEntry. A separate group
+        // also keeps the two handlers' temporaries apart, since both land in this one block.
+        for (const DynamicsInstruction &gated : cell_type.dynamics) {
+            if (gated.source_tag != NML_DeclarationType::Transition) continue;
+            if (condition_key(gated) != detect_key) continue;
+
+            body << indent(2) << regime_state_element(regimes) << " = "
+                 << to_string(regimes.index_of(gated.target)) << ".0f;\n";
+            body << emit_state_assignment_group(storage, parse_result, symbols,
+                                                regime_entry_assignments(cell_type, gated.target),
+                                                2, "entered_");
+        }
 
         body << indent(1) << "}\n";
     }
@@ -1610,19 +1909,21 @@ String emit_tick_body(const CellTypeSpecification &cell_type,
     // wrote rather than be clobbered by them. Well-formed LEMS puts every StateAssignment and
     // EventOut inside a handler, so this is close to dead, but dropping such an instruction
     // would be a silent omission and emitting it early would be a silently wrong order.
+    // Anything ungated but regime-scoped was already refused, so these are regime-free.
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (!instruction.condition.empty()) continue;
         if (instruction.stage == DynamicsStage::Emit) body << emit_spike(1);
     }
-    body << emit_state_assignment_group(cell_state_storage(cell_type), parse_result, symbols,
-                                        reset_assignments_gated_by(cell_type, ""), 1);
+    body << emit_state_assignment_group(storage, parse_result, symbols,
+                                        reset_assignments_gated_by(cell_type, "", ""), 1);
 
     // A gated instruction whose gate never appeared would silently never run.
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         const bool is_gated_body = instruction.stage == DynamicsStage::Reset ||
-                                   instruction.stage == DynamicsStage::Emit;
+                                   instruction.stage == DynamicsStage::Emit ||
+                                   instruction.source_tag == NML_DeclarationType::Transition;
         if (!is_gated_body || instruction.condition.empty()) continue;
-        if (emitted_condition_tests.count(instruction.condition) == 0) {
+        if (emitted_condition_keys.count(condition_key(instruction)) == 0) {
             report_error("instruction targeting '" + instruction.target + "' is gated by '" +
                                  instruction.condition + "', which matches no OnCondition",
                          cell_type.name);
@@ -1634,12 +1935,28 @@ String emit_tick_body(const CellTypeSpecification &cell_type,
     // that never raises the flag simply never enters the block.
     body << emit_propagation_epilogue(1);
 
-    return body.str();
+    // The active regime, read once and never re-read, prepended so every guard above sees the
+    // value the tick STARTED with. That is what keeps the regime a cell has just moved INTO
+    // from also running its own OnCondition in the same tick, off state the transition just
+    // wrote -- a Transition lands in storage and is observed from the next tick on.
+    //
+    // Prepended rather than emitted up front so it can be skipped when nothing reads it: a
+    // type whose one regime is always active needs no dispatch and no guards, and an unused
+    // local is a shader-compiler warning on every kernel the model produces.
+    const String tick_body = body.str();
+    if (!regimes.has_regimes() ||
+        tick_body.find(active_regime_local_name) == String::npos) {
+        return tick_body;
+    }
+    return indent(1) + "int " + active_regime_local_name + " = (int)" +
+           regime_state_element(regimes) + ";\n" + tick_body;
 }
 
 String emit_initialize_body(const CellTypeSpecification &cell_type,
                             const NML_ParseResult &parse_result) {
+    const CellRegimeLayout regimes = resolve_cell_regimes(cell_type);
     const SymbolTable symbols = build_base_symbol_table(cell_type);
+    const StateStorage storage = cell_state_storage(cell_type);
 
     Vector<const DynamicsInstruction *> assignments;
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
@@ -1651,9 +1968,26 @@ String emit_initialize_body(const CellTypeSpecification &cell_type,
         assignments.push_back(&instruction);
     }
 
+    ostringstream body;
+
     // One OnStart body, so the same simultaneous semantics as any other handler.
-    return emit_state_assignment_group(cell_state_storage(cell_type), parse_result, symbols,
-                                       assignments, 1);
+    body << emit_state_assignment_group(storage, parse_result, symbols, assignments, 1);
+
+    // Then the cell enters its initial regime, which is an entry like any other: the index is
+    // stored and that regime's OnEntry runs. After OnStart, because LEMS starts the component
+    // and then enters the regime -- an OnEntry writing a variable OnStart also writes is the
+    // regime's answer, not the component's.
+    if (regimes.has_regimes()) {
+        body << indent(1) << regime_state_element(regimes) << " = "
+             << to_string(regimes.initial_regime_index) << ".0f;\n";
+        body << emit_state_assignment_group(
+                storage, parse_result, symbols,
+                regime_entry_assignments(cell_type,
+                                         regimes.regime_names[(usize)regimes.initial_regime_index]),
+                1, "entered_");
+    }
+
+    return body.str();
 }
 
 // ── Kernel assembly ──────────────────────────────────────────────────────────
@@ -1772,6 +2106,8 @@ String source_preamble(KernelBackend backend, const String &generator_name) {
         preamble << "#include <metal_stdlib>\n";
         preamble << "using namespace metal;\n";
     }
+    preamble << "\ntypedef " << (backend == KernelBackend::Metal ? "long" : "long long") << " "
+             << buffer_index_type_name << ";\n";
     preamble << "\n";
     return preamble.str();
 }
@@ -2065,6 +2401,72 @@ GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBacke
 } // namespace
 
 // ── Public interface ─────────────────────────────────────────────────────────
+
+s64 CellRegimeLayout::index_of(const String &regime_name) const {
+    for (usize regime_index = 0; regime_index < regime_names.size(); ++regime_index) {
+        if (regime_names[regime_index] == regime_name) return (s64)regime_index;
+    }
+    return -1;
+}
+
+CellRegimeLayout resolve_cell_regimes(const CellTypeSpecification &cell_type) {
+    CellRegimeLayout layout;
+    layout.regime_state_slot = cell_type.state_variable_names.size();
+
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::Regime) continue;
+
+        // Two regimes of one name cannot both be reached: a Transition names a regime by
+        // name, so one of them would be unreachable and the other would silently absorb its
+        // TimeDerivatives and OnConditions.
+        if (layout.index_of(instruction.target) >= 0) {
+            report_error("Regime '" + instruction.target + "' is declared more than once",
+                         cell_type.name);
+        }
+
+        // A Regime carries its initial= attribute in `expression` -- see
+        // DynamicsInstruction. Absent or "false" means an ordinary regime.
+        const String &initial_attribute = instruction.expression;
+        const bool is_initial = initial_attribute == "true" || initial_attribute == "1";
+        const bool is_not_initial = initial_attribute.empty() || initial_attribute == "false" ||
+                                    initial_attribute == "0";
+        if (!is_initial && !is_not_initial) {
+            report_error("Regime '" + instruction.target + "' carries initial=\"" +
+                                 initial_attribute + "\", which is neither true nor false",
+                         cell_type.name);
+        }
+
+        if (is_initial) {
+            if (layout.initial_regime_index >= 0) {
+                report_error("Regime '" + instruction.target +
+                                     "' is marked initial, and so is Regime '" +
+                                     layout.regime_names[(usize)layout.initial_regime_index] +
+                                     "'; a cell can only start in one",
+                             cell_type.name);
+            }
+            layout.initial_regime_index = (s64)layout.regime_names.size();
+        }
+
+        layout.regime_names.push_back(instruction.target);
+    }
+
+    // Which regime a cell starts in decides whether it begins integrating or begins
+    // refractory, which is a different model rather than a different detail. Defaulting to
+    // the first declared one would run and be plausible, so it is refused instead.
+    if (layout.has_regimes() && layout.initial_regime_index < 0) {
+        report_error("this ComponentType declares " + to_string(layout.regime_names.size()) +
+                             " Regime(s) but none is marked initial=\"true\", so there is "
+                             "nothing to say which one a cell starts in",
+                     cell_type.name);
+    }
+
+    return layout;
+}
+
+usize cell_state_slot_count(const CellTypeSpecification &cell_type) {
+    return cell_type.state_variable_names.size() +
+           (resolve_cell_regimes(cell_type).has_regimes() ? 1u : 0u);
+}
 
 String translate_expression(const String &nml_expression, const SymbolTable &symbols) {
     Vector<Token> tokens = tokenize_nml_expression(nml_expression, symbols.component_type_name);

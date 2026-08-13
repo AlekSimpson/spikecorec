@@ -199,7 +199,10 @@ struct DynamicsInstruction {
     NML_DeclarationType source_tag;
 
     String target;       // variable written, or exposure / port name
-    String expression;   // value= / test= source expression, verbatim
+    // value= / test= source expression, verbatim. A Regime declares none of those, so it
+    // carries its initial= attribute here instead -- the only record of which regime a
+    // cell starts in, which the kernel generator needs to seed the regime index.
+    String expression;
     String regime_name;  // owning Regime, empty when the instruction is regime-free
     // What gates this instruction: the OnCondition test for a Reset/Emit, or the port
     // name for anything an OnEvent handles. Empty when nothing gates it -- which is the

@@ -15,8 +15,10 @@ namespace spikecorec::nml {
 // ── Memory layout this generator assumes ─────────────────────────────────────
 // One flat `cell_state` array sectioned by cell TYPE: every cell of type 0 first, then
 // every cell of type 1, and so on. Within a section a cell occupies
-// state_variable_names.size() floats. `cell_parameters` follows the identical scheme with
-// parameter_names.size() floats per cell.
+// cell_state_slot_count(type) floats -- its StateVariables, plus ONE appended slot holding
+// the current regime index when the type declares any Regime (see CellRegimeLayout below).
+// `cell_parameters` follows the identical scheme with parameter_names.size() floats per
+// cell.
 //
 // Global neuron indices are never renumbered. The engine precomputes each neuron's base
 // offsets on the CPU, so a kernel thread resolves its slot with one load rather than by
@@ -59,6 +61,78 @@ struct SymbolTable {
     // either reject it far from its source or, worse, bind it to something real.
     const String &read_expression_for(const String &identifier) const;
 };
+
+// ── Regimes ──────────────────────────────────────────────────────────────────
+//
+// A LEMS <Regime> is a mode the cell is in: while it is active, only the TimeDerivatives and
+// OnConditions declared inside it apply, and a <Transition> moves the cell to another one.
+// GLIF2-5 all use the same two-regime shape, where `v` has a TimeDerivative in `integrating`
+// and NONE in `refractory` -- that absence IS the refractory period, since a variable with no
+// derivative in the active regime does not move.
+//
+// There is no regime machinery in the generated kernel. Regimes are a COMPILE-TIME
+// construct: what reaches the GPU is an ordinary if/else chain over one integer, which is
+// exactly what a regime means.
+//
+//  1. One integer per neuron holds the active regime index. It lives in the cell's own state
+//     chunk, in a slot appended after every StateVariable -- see cell_state_slot_count. The
+//     master kernel's argument table is full (31 of Metal's 31), so a buffer of its own is
+//     not available; and it is per-neuron state, which is what that chunk is for. Stored as
+//     a float like everything else in cell_state: a regime index is a small integer, which
+//     f32 represents exactly, so comparing it against a literal is exact rather than
+//     approximate.
+//  2. Per state variable, an if / else-if / else chain on that integer. A regime that
+//     declares no TimeDerivative for the variable emits NOTHING in its branch, so the
+//     variable keeps the value it entered the tick with. Freezing is the absence of code,
+//     not a special case.
+//  3. A <Transition regime="X"/> compiles to a store of X's index into that slot, and X's
+//     <OnEntry> StateAssignments are inlined at the transition site. Nothing anywhere asks
+//     "did I enter a regime this tick" -- entry is the transition, so its body is emitted
+//     where the transition is.
+//
+// An OnCondition declared inside a regime is guarded by that regime being active as well as
+// by its own test. Everything outside any regime -- GLIF3's asc1/asc2 TimeDerivatives, its
+// OnStart -- stays unconditional and keeps running in every regime.
+//
+// The regime index is read ONCE, into a local, before any of the above. Every guard reads
+// that local, so a transition taken this tick is observed from the NEXT tick on, and two
+// regimes' OnConditions cannot both fire because the first one moved the cell into the
+// second's regime.
+struct CellRegimeLayout {
+    // Regime names in declaration order; the position is the regime index the generated
+    // source compares against. Empty when the ComponentType declares no Regime at all, which
+    // is what every other query here keys off.
+    Vector<String> regime_names;
+
+    // The regime marked initial="true", which is where the initialize kernel starts every
+    // neuron of the type. -1 only when there are no regimes -- a type WITH regimes and none
+    // marked initial is refused rather than defaulted, because "starts refractory" and
+    // "starts integrating" are different models and nothing in the document says which.
+    s64 initial_regime_index = -1;
+
+    // Slot of the regime index inside this type's cell_state chunk: one past the last
+    // StateVariable, so every real state variable keeps the slot it already had.
+    usize regime_state_slot = 0;
+
+    bool has_regimes() const { return !regime_names.empty(); }
+
+    // -1 when no regime carries the name.
+    s64 index_of(const String &regime_name) const;
+};
+
+// Resolves one cell type's Regime declarations. Throws naming the ComponentType on a
+// duplicate regime name, a nested Regime, an unrecognised initial= value, more than one
+// initial regime, or regimes with none marked initial.
+//
+// Public because the ENGINE needs the same answer the generator does: it sizes cell_state
+// and computes every neuron's cell_state_base, and the appended regime slot has to be part
+// of both or the two disagree about where a neuron's state begins.
+CellRegimeLayout resolve_cell_regimes(const CellTypeSpecification &cell_type);
+
+// How many floats one neuron of `cell_type` occupies in `cell_state`: its StateVariables,
+// plus one appended slot when the type declares any Regime. Derived here, once, rather than
+// recomputed on each side.
+usize cell_state_slot_count(const CellTypeSpecification &cell_type);
 
 // Generated source plus what the engine needs to bind and launch it.
 //
@@ -281,8 +355,9 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
 //  - A synapse whose SynapseTypeSpecification::requires_per_edge_state is set: its state
 //    does not superpose across converging edges, so the per-target aggregation above is
 //    invalid for it. Per-edge synapse state is a separate ticket.
-//  - Regime / Transition / OnEntry (DynamicsStage::RegimeEntry), and any instruction
-//    carrying a non-empty regime_name.
+//  - Regime / Transition / OnEntry on a SYNAPSE. Cells support them (see CellRegimeLayout);
+//    a synapse's would need the same appended state slot in `synapse_state`, and no synapse
+//    in the standard library declares one.
 //  - ConditionalDerivedVariable / Case. Not a choice: DynamicsInstruction carries a Case's
 //    `value` but not its `condition` attribute (nml.cpp's collect_dynamics_instructions
 //    reads only value/test/select), so the per-case tests never reach codegen. Emitting

@@ -390,7 +390,13 @@ static void collect_dynamics_instructions(
     // OnEvent/EventOut, `regime` on Transition.
     instruction.target =
             first_present_value(declaration, {"variable", "name", "port", "regime"});
-    instruction.expression = first_present_value(declaration, {"value", "test", "select"});
+    // A Regime carries none of value/test/select. Its one payload attribute is
+    // initial="true", which is the only record of which regime a cell starts in, so it is
+    // read into `expression` for that tag alone -- no other tag's reading changes.
+    instruction.expression =
+            declaration.tag_type == NML_DeclarationType::Regime
+                    ? first_present_value(declaration, {"initial"})
+                    : first_present_value(declaration, {"value", "test", "select"});
     instruction.regime_name = regime_name;
     instruction.condition = condition;
 
