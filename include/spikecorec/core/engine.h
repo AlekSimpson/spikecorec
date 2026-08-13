@@ -137,54 +137,50 @@ namespace spikecorec {
         GpuPointer<s32> spike_flags;         // [total_neuron_count] — this tick's emissions
 
         // The synaptic delay ring:
-        // [network_input_ring_depth * network_input_plane_count * total_neuron_count], one
-        // flat allocation indexed as [row][plane][neuron]. Propagation, generated into the
-        // cell device functions, adds an edge's weight into row (tick + that edge's delay) %
+        // [network_input_ring_depth * total_neuron_count], one flat allocation indexed as
+        // [row][neuron]. Propagation, generated into the cell device functions, adds an
+        // edge's delivered current into row (tick + that edge's delay) %
         // network_input_ring_depth; a cell reads row tick % network_input_ring_depth of its
         // own column with a plain load. External stimulus is added into the current tick's
         // row, arriving with no delay.
         //
-        // Plane 0 is the delivered current every cell reads through its "synapses[*]/i" path:
-        // where the host's stimulus lands, where the synapse stage adds each synapse's output,
-        // and where an edge naming no synapse scatters its raw weight. Plane 1 + p holds the
-        // arrivals awaiting wired synapse prototype p (see kernel_codegen.h's
-        // wired_synapse_prototype_indices, which fixes the numbering for both sides).
+        // One value per (row, neuron) and no synapse dimension: a spike delivers the whole
+        // scalar its synapse computes, in one tick, into one slot (see kernel_codegen.h). An
+        // edge naming no synapse scatters its raw weight into that same slot.
         //
-        // A row is emptied as a WHOLE ROW, every plane of it, by the ring clear kernel
-        // dispatched behind the tick kernel, at the end of the tick that read it -- clearing
-        // the input this tick consumed while leaving every other row, which holds arrivals not
-        // yet due, untouched. Not per slot as each cell reads: a cell type that never reduces
-        // over its synapses would then never clear its neurons' slots, and they would
-        // accumulate every arrival for the whole run.
+        // A row is emptied as a WHOLE ROW by the ring clear kernel dispatched behind the tick
+        // kernel, at the end of the tick that read it -- clearing the input this tick consumed
+        // while leaving every other row, which holds arrivals not yet due, untouched. Not per
+        // slot as each cell reads: a cell type that never reduces over its synapses would then
+        // never clear its neurons' slots, and they would accumulate every arrival for the
+        // whole run.
         GpuPointer<f32> network_inputs;
 
-        // [synapse_state_element_count] — synapse state, aggregated per (target neuron, wired
-        // synapse prototype). Wired prototype p's slice starts at (the preceding prototypes'
-        // total state width) * total_neuron_count, and within it a neuron occupies its type's
-        // state_variable_names.size() consecutive floats.
+        // [EDGE_ATTRIBUTE_PLANE_COUNT * weights.node_count * weights.max_neighbor_count] —
+        // three int planes over the per-edge slot convention WeightMatrix addresses an edge by
+        // (row-major by source neuron; within a row, the neighbour's position in k^2-tree
+        // traversal order). Consolidated into one allocation because they reach the generated
+        // kernel as ONE argument: three separate arrays would cost three of Metal's 31 buffer
+        // slots where one buffer with baked plane offsets costs one.
         //
-        // Aggregated rather than per-edge because these synapses superpose: many edges of one
-        // prototype converging on one target are, exactly, one synapse of their summed arrival
-        // weight. Keyed by PROTOTYPE and not merely by type because the parameters belong to
-        // the prototype -- two alphaCurrentSynapse instances with different `tau` decay at
-        // different rates, so pooling them would decay one at the other's rate.
-        GpuPointer<f32> synapse_state;
+        //   plane 0  each edge's delay in whole ticks. Flattened once at construction out of
+        //            WeightMatrix::get_edge_delay_ticks, which is where the rounding, the >= 1
+        //            floor and the constant-delay fallback are decided; the kernel then needs
+        //            one load per edge and no delay logic of its own.
+        //   plane 1  which lowered synapse program the edge runs -- its position in
+        //            nml::resolve_synapse_programs -- or -1 when the edge's projection names
+        //            no synapse, in which case its raw weight IS the delivered current.
+        //   plane 2  the tick each edge's synapse state was last advanced through, seeded to
+        //            EDGE_NEVER_ADVANCED_TICK. Read and written only under lazy synapse
+        //            updates; the eager path advances every edge every tick and never
+        //            consults it.
+        GpuPointer<s32> edge_attributes;
 
-        // [weights.node_count * weights.max_neighbor_count] — which network_inputs plane each
-        // edge's arrival lands in: 1 + the position of its synapse prototype in
-        // wired_synapse_prototype_indices, or 0 when the edge names no synapse at all, in
-        // which case its raw weight IS the delivered current. Flattened at construction into
-        // the same slot convention WeightMatrix addresses an edge by, exactly like
-        // edge_delay_ticks.
-        GpuPointer<s32> edge_synapse_plane;
-
-        // [weights.node_count * weights.max_neighbor_count] — each edge's delay in whole
-        // ticks, at the slot WeightMatrix addresses that edge by (row-major by source neuron;
-        // within a row, the neighbour's position in k^2-tree traversal order). Flattened once
-        // at construction out of WeightMatrix::get_edge_delay_ticks, which is where the
-        // rounding, the >= 1 floor and the constant-delay fallback are decided; the kernel
-        // then needs one load per edge and no delay logic of its own.
-        GpuPointer<s32> edge_delay_ticks;
+        // [5] — the k^2-tree shape scalars the generated propagation walk needs, in the order
+        // kernel_codegen.h documents: branching_factor, superblock_size_words,
+        // padded_node_count, tree_height, internal_bit_count. One buffer rather than five
+        // scalar arguments, for the same argument-table reason edge_attributes is one buffer.
+        GpuPointer<s32> k2tree_shape;
 
         // [total_neuron_count] — tick each neuron last fired. Always allocated: the
         // generated kernel writes it unconditionally on every emission, so it is a kernel
@@ -195,21 +191,39 @@ namespace spikecorec {
         // hebbian learning is enabled, which is the only thing that reads it.
         GpuPointer<s64> last_tick_updated;
 
+        // How many int planes edge_attributes packs, and which is which. Named rather than
+        // written as bare 0/1/2 at each of the places that index them: a plane mix-up reads
+        // as a wrong delay or a wrong synapse and never as a crash. The generated source
+        // carries the identical constants (kernel_codegen.cpp's
+        // emit_edge_attribute_plane_definitions), so the two must not drift.
+        static constexpr s64 EDGE_ATTRIBUTE_DELAY_PLANE = 0;
+        static constexpr s64 EDGE_ATTRIBUTE_PROGRAM_PLANE = 1;
+        static constexpr s64 EDGE_ATTRIBUTE_UPDATE_TICK_PLANE = 2;
+        static constexpr s64 EDGE_ATTRIBUTE_PLANE_COUNT = 3;
+
+        // What edge_attributes' update-tick plane holds for an edge whose synapse state has
+        // never been advanced. -1, not 0: an edge whose source spikes at tick 0 must still
+        // take the one step the eager path would have taken at tick 0, and a seed of 0 would
+        // have it take none -- which is a lazy/eager disagreement from the very first spike.
+        static constexpr s32 EDGE_NEVER_ADVANCED_TICK = -1;
+
+        // What an edge_attributes program-plane entry holds when the edge's projection names
+        // no synapse: nothing shapes its weight, so its raw weight is the delivered current.
+        static constexpr s32 EDGE_WITHOUT_SYNAPSE_PROGRAM = -1;
+
         s64 cell_state_element_count = 0;
         s64 cell_parameter_element_count = 0;
-        s64 synapse_state_element_count = 0;
+
+        // How many per-edge variable planes the model's synapse state occupies, and therefore
+        // how many matrices weights carries in its per-edge variable family. Zero for a model
+        // with no wired synapse.
+        s64 per_edge_synapse_variable_count = 0;
 
         // How many tick rows the network_inputs ring holds. Strictly greater than the
         // model's largest per-edge delay, so an arrival scheduled this tick can never land
         // in the row being read this tick, and every row is read (and then cleared) before
         // the ring wraps back onto it.
         s32 network_input_ring_depth = 1;
-
-        // How many planes wide one ring row is: the delivered-current plane, plus one arrival
-        // plane per wired synapse prototype. The generated kernels carry the same number as a
-        // baked constant, so this and the generated source must not drift -- both derive it
-        // from wired_synapse_prototype_indices.
-        s32 network_input_plane_count = 1;
 
         // The compiled generated master kernel. Held through a shared pointer so its
         // release_kernel call travels with it: the deleter is installed at compile time and
@@ -274,6 +288,21 @@ namespace spikecorec {
         bool alive = false;
         // Off on the NeuroML path: every neuron steps every tick.
         bool active_set_optimization_enabled = false;
+
+        // On by default, and the same KIND of knob active_set_optimization_enabled is: an
+        // optimization that is exact for the linear dynamics this engine supports, with the
+        // unoptimized path kept as the reference to check it against.
+        //
+        // On, an edge's synapse state is advanced only when its source spikes, catching up
+        // across the whole elapsed interval at that point -- O(spikes x fanout) rather than
+        // O(edges) per tick. Off, every edge advances one dt every tick. The two apply the
+        // same per-tick step the same number of times, so they agree to floating point rather
+        // than approximately; see kernel_codegen.h.
+        //
+        // Baked into the generated kernel at construction, so changing it afterwards would
+        // have no effect and it is not offered as a runtime setter.
+        bool use_lazy_synapse_updates = true;
+
         u64 simulation_seed = 0;
 
         SpikeEngine(const SpikeEngine &) = delete;
@@ -295,7 +324,12 @@ namespace spikecorec {
 
         SpikeEngine &operator=(SpikeEngine &&) = delete;
 
-        SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learning);
+        // `use_lazy_synapse_updates` selects how per-edge synapse state is advanced; see the
+        // field of that name. Defaulted so an existing caller keeps the (exact, cheaper) lazy
+        // behaviour without a source change, and so the eager reference path is one argument
+        // away for anything checking the two against each other.
+        SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learning,
+                    bool use_lazy_synapse_updates = true);
 
         // ── legacy, pending rework ────────────────────────────────────────────────
         // Every declaration below this line predates the NeuroML path and depends on the

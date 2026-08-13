@@ -726,12 +726,16 @@ TEST(KernelCodegenKernel, ArgumentNamesAreTheDocumentedBindingOrder) {
         "dt",                   "tick",                  "internal_node_words",
         "leaf_node_words",      "rank_superblock_table", "rank_subblock_table",
         "U_matrix",             "V_matrix",              "edge_weight_coefficients",
-        "edge_weight_deltas",   "edge_delay_ticks",      "branching_factor",
-        "superblock_size_words","padded_node_count",     "tree_height",
-        "internal_bit_count",   "rank_float4_stride",    "constant_weight",
-        "max_neighbor_count",   "ring_depth",            "synapse_state",
-        "edge_synapse_plane",
+        "edge_weight_deltas",   "edge_attributes",       "edge_synapse_state",
+        "k2tree_shape",         "rank_float4_stride",    "constant_weight",
+        "constant_weight_enabled",                       "max_neighbor_count",
+        "ring_depth",
     };
+
+    // Metal allows 31 buffer arguments per stage and the table used to sit at exactly 31,
+    // which is why the regime index had to be squeezed into a cell_state slot. Asserted so a
+    // future addition that spends the remaining headroom is a deliberate decision.
+    EXPECT_EQ(expected_argument_names.size(), 27u);
 
     const GeneratedKernel tick_kernel = generate_tick_kernel(parse_result);
     EXPECT_EQ(tick_kernel.function_name, "simulate_tick");
@@ -1003,10 +1007,10 @@ TEST(KernelCodegenSelectPath, SelectionOverSynapsesReadsTheInputAccumulator) {
     // nothing writes this tick's row while this tick's kernel runs, and the row is emptied
     // afterwards by the engine's clear kernel rather than by the reader.
     EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
-    // Plane 0: the delivered-current plane, which is where stimulus lands, where every
-    // synapse adds its output, and where a synapse-free edge scatters its raw weight.
+    // One value per (row, neuron): a spike delivers the whole scalar its synapse computed,
+    // and stimulus and synapse-free edges land in the same slot.
     EXPECT_NE(source.find("SpikecorecBufferIndex synaptic_input_index = network_input_ring_index(\n"
-                          "            tick, 0, ring_depth, neuron_count, neuron_index);"),
+                          "            tick, ring_depth, neuron_count, neuron_index);"),
               String::npos);
     EXPECT_NE(source.find("float synaptic_input_accumulator = "
                           "network_inputs[synaptic_input_index];"),
@@ -1144,22 +1148,49 @@ TEST(KernelCodegenPropagation, EveryCellDeviceFunctionEndsWithTheSpikeGuardedEpi
 TEST(KernelCodegenPropagation, ArrivalsAreRingIndexedByDelayAndAddedAtomically) {
     const String source = generate_tick_kernel(make_two_cell_type_model()).source;
 
-    // The arrival row is this tick plus the edge's own delay, the plane is whichever the edge
-    // delivers through, and many sources converge on one target in a tick, so the add has to
-    // be atomic.
-    EXPECT_NE(source.find("tick + (long)edge_delay_ticks[edge_slot],\n"
-                          "                edge_synapse_plane[edge_slot], ring_depth,"),
+    // The arrival row is this tick plus the edge's own delay, and many sources converge on
+    // one target in a tick, so the add has to be atomic.
+    EXPECT_NE(source.find("tick + (long)edge_attributes[SPIKECOREC_EDGE_ATTRIBUTE_DELAY_PLANE"
+                          " * edge_slot_count + edge_slot],\n"
+                          "                ring_depth, neuron_count, target_neuron_index);"),
               String::npos);
-    EXPECT_NE(source.find("atomic_fetch_add_explicit(arrival_slot, edge_weight, "
+    EXPECT_NE(source.find("atomic_fetch_add_explicit(arrival_slot, delivered_current, "
                           "memory_order_relaxed);"),
               String::npos);
 
-    // The per-edge slot is the source's row of the flat per-edge arrays plus this
-    // neighbour's position in the walk -- the convention WeightMatrix indexes by.
-    EXPECT_NE(source.find("int edge_slot = neuron_index * max_neighbor_count + neighbor_slot;"),
-              String::npos);
     // Walking past max_neighbor_count would read into the next source's row.
     EXPECT_NE(source.find("while (neighbor_slot < max_neighbor_count &&"), String::npos);
+}
+
+TEST(KernelCodegenPropagation, PerEdgeSlotIsComputedInSixtyFourBits) {
+    // neuron_index * max_neighbor_count overflows a signed int at ~33M neurons of degree 64,
+    // and the wrapped negative index reads another edge's delay and another edge's synapse
+    // state rather than faulting. The host computes the same product in s64.
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+
+    EXPECT_NE(source.find("SpikecorecBufferIndex edge_slot =\n"
+                          "                (SpikecorecBufferIndex)neuron_index * "
+                          "(SpikecorecBufferIndex)max_neighbor_count +\n"
+                          "                (SpikecorecBufferIndex)neighbor_slot;"),
+              String::npos)
+            << source;
+    EXPECT_EQ(source.find("int edge_slot = neuron_index"), String::npos) << source;
+
+    // The plane stride the slot is offset by is 64-bit for the same reason.
+    EXPECT_NE(source.find("SpikecorecBufferIndex edge_slot_count =\n"
+                          "            (SpikecorecBufferIndex)neuron_count * "
+                          "(SpikecorecBufferIndex)max_neighbor_count;"),
+              String::npos)
+            << source;
+}
+
+TEST(KernelCodegenPropagation, ConstantWeightIsSelectedByAnExplicitFlagNotByItsMagnitude) {
+    // A model may legitimately configure a constant weight of exactly zero. Reading the
+    // magnitude as the mode would silently hand it reconstructed U/V weights instead.
+    const String source = generate_tick_kernel(make_two_cell_type_model()).source;
+
+    EXPECT_NE(source.find("if (constant_weight_enabled == 0) {"), String::npos) << source;
+    EXPECT_EQ(source.find("if (constant_weight == 0.0f)"), String::npos) << source;
 }
 
 TEST(KernelCodegenPropagation, EdgeWeightIsTheLowRankReconstructionPlusItsSparseDelta) {
@@ -1175,49 +1206,44 @@ TEST(KernelCodegenPropagation, EdgeWeightIsTheLowRankReconstructionPlusItsSparse
               String::npos);
 
     // rank_float4_stride counts float4 elements; a row is four times that many lanes.
-    EXPECT_NE(source.find("long row_lane_count = rank_float4_stride * 4;"), String::npos);
+    EXPECT_NE(source.find("SpikecorecBufferIndex row_lane_count = rank_float4_stride * 4;"),
+              String::npos);
 }
 
 TEST(KernelCodegenPropagation, InitializeKernelNeitherPropagatesNorDrains) {
-    // OnStart runs before any tick, so scattering a spike or emptying a ring row out of it
+    // OnStart runs before any tick, so scattering a spike or draining a ring row out of it
     // would deliver current the simulation never generated.
     const String source = generate_initialize_kernel(make_two_cell_type_model()).source;
 
     EXPECT_EQ(source.find("propagate_spike"), String::npos);
-    EXPECT_EQ(source.find("k2tree_next_neighbor"), String::npos);
-    EXPECT_EQ(source.find("network_input_ring_index"), String::npos);
+    EXPECT_EQ(source.find("network_inputs["), String::npos);
 
     // It still declares the identical argument list, so the engine binds one set for both.
-    EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(28) ]]"), String::npos);
-    EXPECT_NE(source.find("device const int   *edge_synapse_plane [[ buffer(30) ]]"),
+    EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(26) ]]"), String::npos);
+    EXPECT_NE(source.find("device float       *edge_synapse_state [[ buffer(20) ]]"),
               String::npos);
 }
 
 // ── the end-of-tick ring row clear ───────────────────────────────────────────
 
 TEST(KernelCodegenRingClear, ClearsExactlyThisTicksRowAndNothingElse) {
-    const GeneratedKernel clear_kernel =
-            generate_ring_row_clear_kernel(make_two_cell_type_model());
+    const GeneratedKernel clear_kernel = generate_ring_row_clear_kernel();
 
     EXPECT_EQ(clear_kernel.function_name, "clear_network_input_ring_row");
     EXPECT_EQ(clear_kernel.argument_names,
               (Vector<String>{"network_inputs", "neuron_count", "tick", "ring_depth"}));
 
-    // One row -- this tick's -- and within it only the columns belonging to the thread's
+    // One row -- this tick's -- and within it only the column belonging to the thread's
     // neuron. Clearing more would discard arrivals already scheduled into later rows, which
     // is the one thing the ring exists to hold.
     EXPECT_NE(clear_kernel.source.find("int ring_row = (int)(tick % (long)ring_depth);"),
               String::npos);
     EXPECT_NE(clear_kernel.source.find(
-                      "int plane_base = ring_row * SPIKECOREC_NETWORK_INPUT_PLANE_COUNT;"),
-              String::npos);
-    EXPECT_NE(clear_kernel.source.find("network_inputs[(plane_base + plane_index) * "
-                                       "neuron_count + neuron_index] = 0.0f;"),
-              String::npos);
-
-    // A model with no wired synapse is one plane wide: the delivered-current plane.
-    EXPECT_NE(clear_kernel.source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 1"),
-              String::npos);
+                      "network_inputs[(SpikecorecBufferIndex)ring_row * "
+                      "(SpikecorecBufferIndex)neuron_count + "
+                      "(SpikecorecBufferIndex)neuron_index] = 0.0f;"),
+              String::npos)
+            << clear_kernel.source;
 
     // Bounds-checked like every other entry point, and it touches nothing but the ring.
     EXPECT_NE(clear_kernel.source.find("if (neuron_index >= neuron_count) return;"), String::npos);
@@ -1230,56 +1256,73 @@ TEST(KernelCodegenRingClear, GeneratedRingClearKernelCompilesAsMetal) {
     if (!metal_compiler_is_available()) GTEST_SKIP() << "the Metal shader compiler is unavailable";
 
     String compiler_output;
-    ASSERT_TRUE(compile_as_metal(
-                        generate_ring_row_clear_kernel(make_two_cell_type_model()).source,
-                        "ring_row_clear", compiler_output))
+    ASSERT_TRUE(compile_as_metal(generate_ring_row_clear_kernel().source, "ring_row_clear",
+                                 compiler_output))
             << compiler_output;
 }
 #endif
 
 // ── Synapse dynamics ─────────────────────────────────────────────────────────
 
-TEST(KernelCodegenSynapse, ArrivalIsDeliveredThenIntegratedThenAddedToTheInputPlane) {
+TEST(KernelCodegenSynapse, DeliveryIsOneScalarIntoOneRingSlotAtTheEdgesDelay) {
     const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
 
-    // Stage 1, Deliver: this tick's row of the prototype's own arrival plane, which is plane
-    // 1 -- plane 0 being the delivered current every cell reads.
-    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_arrival_index = "
-                          "network_input_ring_index(\n"
-                          "            tick, 1, ring_depth, neuron_count, neuron_index);"),
-              String::npos);
-    EXPECT_NE(source.find("float synapse_arrival_weight = "
-                          "network_inputs[synapse_arrival_index];"),
-              String::npos);
+    // The delivery runs inside the SOURCE's propagation walk, per out-edge, and its result
+    // is one scalar the walk scatters into one slot -- not a per-target accumulation the
+    // postsynaptic thread has to drain.
+    EXPECT_NE(source.find("delivered_current = synapse_deliver_alphaSyn("), String::npos)
+            << source;
+    EXPECT_NE(source.find("tick + (long)edge_attributes[SPIKECOREC_EDGE_ATTRIBUTE_DELAY_PLANE"
+                          " * edge_slot_count + edge_slot],\n"
+                          "                ring_depth, neuron_count, target_neuron_index);"),
+              String::npos)
+            << source;
+    EXPECT_NE(source.find("atomic_fetch_add_explicit(arrival_slot, delivered_current, "
+                          "memory_order_relaxed);"),
+              String::npos)
+            << source;
 
-    // The OnEvent body, gated on anything having arrived, with `weight` reading the SUMMED
-    // arrival rather than the prototype's own value: that substitution is what makes one
-    // evaluation stand in for every converging edge.
-    EXPECT_NE(source.find("if (synapse_arrival_weight != 0.0f) {"), String::npos);
-    EXPECT_NE(source.find("synapse_state[synapse_state_base + 1] = "
-                          "(synapse_state[synapse_state_base + 1] + "
-                          "(synapse_arrival_weight * 1.000000000e-09f));"),
-              String::npos);
+    // Nothing per-neuron and nothing per-prototype survives into the tick: no aggregated
+    // state buffer, no per-neuron synapse stage ahead of the cell dynamics, no ring plane
+    // dimension, no per-edge plane index.
+    EXPECT_EQ(source.find("*synapse_state,"), String::npos) << source;
+    EXPECT_EQ(source.find("synapse_step_"), String::npos) << source;
+    EXPECT_EQ(source.find("SPIKECOREC_NETWORK_INPUT_PLANE_COUNT"), String::npos) << source;
+    EXPECT_EQ(source.find("edge_synapse_plane"), String::npos) << source;
 
-    // Stage 2, Integrate: both state variables, every tick, arrival or not, and written back
-    // only once both derivatives have been computed.
-    EXPECT_NE(source.find("float next_I = synapse_state[synapse_state_base + 0] + dt *"),
-              String::npos);
-    EXPECT_NE(source.find("float next_J = synapse_state[synapse_state_base + 1] + dt *"),
-              String::npos);
-    EXPECT_LT(source.find("float next_J ="),
-              source.find("synapse_state[synapse_state_base + 0] = next_I;"));
-
-    // Delivery converges on the input buffer: `i` added into plane 0 of this tick's row,
-    // which is exactly what the cell's own "synapses[*]/i" path then reads.
-    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_output_index = "
-                          "network_input_ring_index(\n"
-                          "            tick, 0, ring_depth, neuron_count, neuron_index);"),
-              String::npos);
-    EXPECT_NE(source.find("network_inputs[synapse_output_index] += derived_i;"), String::npos);
+    // The state base is a function of the EDGE, never of the target neuron -- which is what
+    // "per edge" means here.
+    EXPECT_NE(source.find("edge_synapse_state_base = 0 * edge_slot_count + edge_slot;"),
+              String::npos)
+            << source;
+    EXPECT_EQ(source.find("edge_synapse_state_base = 0 * (SpikecorecBufferIndex)neuron_count"),
+              String::npos)
+            << source;
 }
 
-TEST(KernelCodegenSynapse, SynapseParametersAreBakedAndStateIsPerTargetNeuron) {
+TEST(KernelCodegenSynapse, ArrivalHandlerRunsBeforeTheExposedCurrentIsRead) {
+    const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
+
+    // `weight` inside the handler is THIS edge's weight, which is what makes the delivered
+    // scalar a function of the edge rather than of a pooled arrival.
+    const usize handler_position = source.find("float synapse_arrival_weight = edge_weight;");
+    ASSERT_NE(handler_position, String::npos) << source;
+
+    // The handler is what folds `weight` into the state. Reading `i` ahead of it would make
+    // every synapse deliver only the residue of previous spikes -- and exactly zero on the
+    // first one, which reads as a plausible "the network is just weakly coupled".
+    const usize assignment_position = source.find("] = (edge_synapse_state[", handler_position);
+    const usize derived_position = source.find("float derived_i =", handler_position);
+    const usize return_position = source.find("return derived_i;", handler_position);
+    ASSERT_NE(assignment_position, String::npos) << source;
+    ASSERT_NE(derived_position, String::npos) << source;
+    ASSERT_NE(return_position, String::npos) << source;
+    EXPECT_LT(handler_position, assignment_position);
+    EXPECT_LT(assignment_position, derived_position);
+    EXPECT_LT(derived_position, return_position);
+}
+
+TEST(KernelCodegenSynapse, StateIsPerEdgeAndParametersAreBaked) {
     const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
 
     // tau is a constant of the PROTOTYPE, so it is a literal rather than a buffer read --
@@ -1287,21 +1330,24 @@ TEST(KernelCodegenSynapse, SynapseParametersAreBakedAndStateIsPerTargetNeuron) {
     EXPECT_NE(source.find("2.000000000e-03f"), String::npos);
     EXPECT_EQ(source.find("synapse_parameters"), String::npos);
 
-    // One slice per (prototype, neuron): the first prototype starts at offset zero and a
-    // neuron occupies its type's two state variables.
-    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base = 0 * "
-                          "(SpikecorecBufferIndex)neuron_count + "
-                          "(SpikecorecBufferIndex)neuron_index * 2;"),
-              String::npos);
-
-    // The synapse runs ahead of the cell that reads what it delivered, in the same thread.
-    EXPECT_LT(source.find("synapse_step_alphaSyn(synapse_state"),
-              source.find("switch (cell_type_index[neuron_index])"));
+    // One plane per state variable, indexed by the edge rather than by either endpoint. The
+    // first program's planes start at zero and its two variables are one plane apart, which
+    // is exactly WeightMatrix's per-edge variable layout.
+    EXPECT_NE(source.find("SpikecorecBufferIndex edge_synapse_state_base = 0 * "
+                          "edge_slot_count + edge_slot;"),
+              String::npos)
+            << source;
+    EXPECT_NE(source.find("edge_synapse_state[edge_synapse_state_base + 0 * edge_slot_count]"),
+              String::npos)
+            << source;
+    EXPECT_NE(source.find("edge_synapse_state[edge_synapse_state_base + 1 * edge_slot_count]"),
+              String::npos)
+            << source;
 }
 
-TEST(KernelCodegenSynapse, TwoPrototypesGetTheirOwnPlaneAndTheirOwnStateSlice) {
+TEST(KernelCodegenSynapse, TwoProgramsGetTheirOwnIndexAndTheirOwnStatePlanes) {
     // Two alphaCurrentSynapse prototypes differing only in tau. Pooling them would have to
-    // decay one at the other's rate, so each gets its own arrival plane and its own state.
+    // decay one at the other's rate, so each is lowered separately and owns its own planes.
     NML_ParseResult parse_result = make_alpha_synapse_model();
     parse_result.synapse_prototypes.push_back(
             make_synapse_prototype("alphaSlow", 0, {1.0, 8.0e-3, 1.0e-9}));
@@ -1311,20 +1357,28 @@ TEST(KernelCodegenSynapse, TwoPrototypesGetTheirOwnPlaneAndTheirOwnStateSlice) {
     second_edge.synapse_prototype_index = 1;
     parse_result.neurons[0].outgoing_edges.push_back(second_edge);
 
+    const Vector<SynapseProgramLayout> programs = resolve_synapse_programs(parse_result);
+    ASSERT_EQ(programs.size(), 2u);
+    EXPECT_EQ(programs[0].state_variable_offset, 0);
+    EXPECT_EQ(programs[0].state_variable_count, 2);
+    EXPECT_EQ(programs[1].state_variable_offset, 2);
+    EXPECT_EQ(programs[1].state_variable_count, 2);
+    EXPECT_EQ(per_edge_synapse_variable_count(parse_result), 4);
+
     const String source = generate_tick_kernel(parse_result).source;
 
-    EXPECT_NE(source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 3"), String::npos);
-    EXPECT_NE(source.find("tick, 1, ring_depth, neuron_count, neuron_index);"), String::npos);
-    EXPECT_NE(source.find("tick, 2, ring_depth, neuron_count, neuron_index);"), String::npos);
+    // Each edge names one of them, and the switch is what routes it.
+    EXPECT_NE(source.find("case 0:"), String::npos);
+    EXPECT_NE(source.find("case 1:"), String::npos);
+    EXPECT_NE(source.find("delivered_current = synapse_deliver_alphaSyn("), String::npos);
+    EXPECT_NE(source.find("delivered_current = synapse_deliver_alphaSlow("), String::npos);
 
-    // The second prototype's slice starts past the first's two state variables.
-    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base = 0 * "
-                          "(SpikecorecBufferIndex)neuron_count + "
-                          "(SpikecorecBufferIndex)neuron_index * 2;"),
+    // The second program's planes start past the first's two.
+    EXPECT_NE(source.find("SpikecorecBufferIndex edge_synapse_state_base = 0 * "
+                          "edge_slot_count + edge_slot;"),
               String::npos);
-    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base = 2 * "
-                          "(SpikecorecBufferIndex)neuron_count + "
-                          "(SpikecorecBufferIndex)neuron_index * 2;"),
+    EXPECT_NE(source.find("SpikecorecBufferIndex edge_synapse_state_base = 2 * "
+                          "edge_slot_count + edge_slot;"),
               String::npos);
 
     // Each decays at its own tau, which is the whole reason they are kept apart.
@@ -1332,51 +1386,86 @@ TEST(KernelCodegenSynapse, TwoPrototypesGetTheirOwnPlaneAndTheirOwnStateSlice) {
     EXPECT_NE(source.find("8.000000000e-03f"), String::npos);
 }
 
-TEST(KernelCodegenSynapse, AnUnwiredPrototypeIsNeitherLoweredNorGivenAPlane) {
+TEST(KernelCodegenSynapse, AnUnwiredPrototypeIsNeitherLoweredNorAllocatedFor) {
     // A synapse the model declares but no edge delivers through changes nothing about a
-    // simulation, so it costs no plane, no state and no code -- and, being unreachable, is
-    // not rejected for being conductance-based either.
+    // simulation, so it costs no planes and no code -- and, being unreachable, is not
+    // rejected for being conductance-based either.
     NML_ParseResult parse_result = make_alpha_synapse_model();
     parse_result.synapse_types.push_back(make_conductance_synapse_type());
     parse_result.synapse_prototypes.push_back(
             make_synapse_prototype("unwiredConductance", 1, {1.0, 5.0e-10, 0.0, 3.0e-3}));
 
-    EXPECT_EQ(wired_synapse_prototype_indices(parse_result), (Vector<s64>{0}));
+    const Vector<SynapseProgramLayout> programs = resolve_synapse_programs(parse_result);
+    ASSERT_EQ(programs.size(), 1u);
+    EXPECT_EQ(programs[0].prototype_index, 0);
+    EXPECT_EQ(per_edge_synapse_variable_count(parse_result), 2);
 
     const String source = generate_tick_kernel(parse_result).source;
-    EXPECT_NE(source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 2"), String::npos);
     EXPECT_EQ(source.find("unwiredConductance"), String::npos);
 }
 
 TEST(KernelCodegenSynapse, EdgeThroughNoSynapseKeepsThePlainDeliveredWeight) {
     // A projection naming no synapse has no dynamics to run, so its raw weight is the
-    // delivered current: plane 0, the one every cell reads.
+    // delivered current -- which is what network_inputs meant before there were synapses.
     NML_ParseResult parse_result;
     parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
     wire_one_edge(parse_result, /*synapse_prototype_index=*/-1);
 
-    EXPECT_TRUE(wired_synapse_prototype_indices(parse_result).empty());
+    EXPECT_TRUE(resolve_synapse_programs(parse_result).empty());
+    EXPECT_EQ(per_edge_synapse_variable_count(parse_result), 0);
 
     const String source = generate_tick_kernel(parse_result).source;
-    EXPECT_NE(source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 1"), String::npos);
-    EXPECT_EQ(source.find("synapse_step_"), String::npos);
+    EXPECT_EQ(source.find("synapse_deliver_"), String::npos);
 
-    // The edge's plane is still read from the per-edge array rather than assumed, so a model
-    // mixing synapse-carrying and synapse-free edges routes each of them correctly.
-    EXPECT_NE(source.find("edge_synapse_plane[edge_slot], ring_depth,"), String::npos);
+    // Falls straight through to the raw weight, with no dispatch emitted at all.
+    EXPECT_NE(source.find("float delivered_current = edge_weight;"), String::npos) << source;
+    EXPECT_EQ(source.find("SPIKECOREC_EDGE_ATTRIBUTE_PROGRAM_PLANE * edge_slot_count"),
+              String::npos)
+            << source;
 }
 
-TEST(KernelCodegenSynapse, OnStartRunsInTheInitializeKernelAndNothingElseDoes) {
+TEST(KernelCodegenSynapse, MixedModelStillReadsEachEdgesProgramFromItsOwnSlot) {
+    // A model where one edge names a synapse and another does not: the program index is read
+    // per edge rather than assumed, so the two route differently.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    NetworkEdge synapse_free_edge;
+    synapse_free_edge.target_neuron_index = 1;
+    synapse_free_edge.synapse_prototype_index = -1;
+    parse_result.neurons[0].outgoing_edges.push_back(synapse_free_edge);
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("switch (edge_attributes[SPIKECOREC_EDGE_ATTRIBUTE_PROGRAM_PLANE "
+                          "* edge_slot_count + edge_slot]) {"),
+              String::npos)
+            << source;
+    // An edge whose slot holds no program keeps the weight the line above put there.
+    EXPECT_NE(source.find("float delivered_current = edge_weight;"), String::npos) << source;
+    EXPECT_NE(source.find("default:"), String::npos);
+}
+
+TEST(KernelCodegenSynapse, OnStartRunsInTheInitializeKernelPerEdge) {
     const String source = generate_initialize_kernel(make_alpha_synapse_model()).source;
 
-    EXPECT_NE(source.find("void synapse_initialize_alphaSyn("), String::npos);
-    EXPECT_NE(source.find("synapse_state[synapse_state_base + 0] = assigned_I;"), String::npos);
-    EXPECT_NE(source.find("synapse_state[synapse_state_base + 1] = assigned_J;"), String::npos);
+    EXPECT_NE(source.find("void synapse_initialize_alphaSyn("), String::npos) << source;
+    EXPECT_NE(source.find("edge_synapse_state[edge_synapse_state_base + 0 * edge_slot_count]"
+                          " = assigned_I;"),
+              String::npos)
+            << source;
+    EXPECT_NE(source.find("edge_synapse_state[edge_synapse_state_base + 1 * edge_slot_count]"
+                          " = assigned_J;"),
+              String::npos)
+            << source;
+
+    // Per EDGE, so it walks the adjacency the same way the tick kernel does.
+    EXPECT_NE(source.find("void initialize_out_edge_synapses("), String::npos) << source;
+    EXPECT_NE(source.find("k2tree_next_neighbor("), String::npos);
 
     // Initialisation neither integrates nor delivers: doing either before the first tick
-    // would inject current the simulation never generated.
+    // would inject current the simulation never generated. The ring helper is emitted (both
+    // entry points share one preamble) but nothing in the initialize kernel calls it.
     EXPECT_EQ(source.find("float next_I"), String::npos);
-    EXPECT_EQ(source.find("network_input_ring_index"), String::npos);
+    EXPECT_EQ(source.find("network_inputs["), String::npos) << source;
+    EXPECT_EQ(source.find("= network_input_ring_index("), String::npos) << source;
 }
 
 TEST(KernelCodegenSynapse, ConductanceBasedSynapseIsRefusedByName) {
@@ -1399,41 +1488,35 @@ TEST(KernelCodegenSynapse, ConductanceBasedSynapseIsRefusedByName) {
     }
 }
 
-TEST(KernelCodegenSynapse, PerEdgeStateSynapseIsRefusedByName) {
-    // A synapse carrying a plasticity or block mechanism does not superpose across
-    // converging edges, so the aggregated per-target state this generator emits would be the
-    // wrong model for it.
+TEST(KernelCodegenSynapse, SynapseWithAChildMechanismIsRefusedByName) {
+    // requires_per_edge_state records a <Children type="basePlasticityMechanism"/> or
+    // "baseBlockMechanism" declaration. State being per-edge is no longer the obstacle; the
+    // child structure, which this generator lowers none of, is.
     NML_ParseResult parse_result = make_alpha_synapse_model();
     parse_result.synapse_types[0].requires_per_edge_state = true;
 
     try {
         generate_tick_kernel(parse_result);
-        FAIL() << "expected a synapse needing per-edge state to be refused";
+        FAIL() << "expected a synapse with a child mechanism to be refused";
     } catch (const runtime_error &error) {
         const String message = error.what();
         EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
-        EXPECT_NE(message.find("superpose"), String::npos) << message;
+        EXPECT_NE(message.find("child component"), String::npos) << message;
     }
 }
 
-TEST(KernelCodegenSynapse, ArrivalHandlerThatIgnoresTheWeightIsRefused) {
-    // Arrivals converging on one target are summed into one weight and the handler runs
-    // once. A handler that never reads that weight would apply many spikes as one, silently,
-    // so it is refused rather than aggregated.
+TEST(KernelCodegenSynapse, ArrivalHandlerThatIgnoresTheWeightIsLoweredRatherThanRefused) {
+    // Under per-edge delivery the handler runs once per ARRIVING SPIKE on one edge, so a
+    // handler that does not read `weight` applies one spike as one spike. The refusal that
+    // used to guard the old per-target aggregation would now reject a legitimate model.
     NML_ParseResult parse_result = make_alpha_synapse_model();
     for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
         if (instruction.stage != DynamicsStage::Arrival) continue;
         instruction.expression = "J + ibase";
     }
 
-    try {
-        generate_tick_kernel(parse_result);
-        FAIL() << "expected an arrival handler ignoring 'weight' to be refused";
-    } catch (const runtime_error &error) {
-        const String message = error.what();
-        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
-        EXPECT_NE(message.find("weight"), String::npos) << message;
-    }
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("synapse_deliver_alphaSyn("), String::npos) << source;
 }
 
 TEST(KernelCodegenSynapse, SynapseWithNoArrivalHandlerIsRefused) {
@@ -1474,6 +1557,100 @@ TEST(KernelCodegenSynapse, SynapseExposingNoCurrentIsRefused) {
         EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
         EXPECT_NE(message.find("exposes no 'i'"), String::npos) << message;
     }
+}
+
+// ── Lazy vs eager synapse updates ────────────────────────────────────────────
+
+TEST(KernelCodegenSynapse, LazyUpdatesCatchUpFromTheEdgesOwnLastAdvancedTick) {
+    const String source =
+            generate_tick_kernel(make_alpha_synapse_model(), /*use_lazy_synapse_updates=*/true)
+                    .source;
+
+    // The catch-up runs from the tick the edge was last advanced THROUGH up to this tick, so
+    // an edge whose plane still holds -1 takes the one step tick 0's eager pass would have.
+    EXPECT_NE(source.find("int synapse_last_update_tick =\n"
+                          "            edge_attributes[SPIKECOREC_EDGE_ATTRIBUTE_UPDATE_TICK_PLANE"
+                          " * edge_slot_count + edge_slot];"),
+              String::npos)
+            << source;
+    EXPECT_NE(source.find("for (SpikecorecBufferIndex catch_up_tick = "
+                          "(SpikecorecBufferIndex)synapse_last_update_tick;\n"
+                          "                catch_up_tick < tick; ++catch_up_tick) {"),
+              String::npos)
+            << source;
+    EXPECT_NE(source.find("edge_attributes[SPIKECOREC_EDGE_ATTRIBUTE_UPDATE_TICK_PLANE * "
+                          "edge_slot_count + edge_slot] = (int)tick;"),
+              String::npos)
+            << source;
+
+    // Nothing walks every edge every tick under this policy -- that is the whole point.
+    EXPECT_EQ(source.find("advance_out_edge_synapses"), String::npos) << source;
+}
+
+TEST(KernelCodegenSynapse, EagerUpdatesAdvanceEveryOutEdgeEveryTickAndNeverCatchUp) {
+    const String source =
+            generate_tick_kernel(make_alpha_synapse_model(), /*use_lazy_synapse_updates=*/false)
+                    .source;
+
+    EXPECT_NE(source.find("void advance_out_edge_synapses("), String::npos) << source;
+    EXPECT_NE(source.find("synapse_advance_alphaSyn(edge_synapse_state, edge_slot, "
+                          "edge_slot_count, dt);"),
+              String::npos)
+            << source;
+
+    // The advance precedes the cell dynamics, and so precedes the propagation that reads it.
+    EXPECT_LT(source.find("advance_out_edge_synapses(internal_node_words"),
+              source.find("switch (cell_type_index[neuron_index])"));
+
+    // No catch-up at all: the state is already current, so consulting the last-advanced plane
+    // would double-count. The plane's name is still #defined -- the layout is the engine's,
+    // not the policy's -- but nothing indexes it.
+    EXPECT_EQ(source.find("catch_up_tick"), String::npos) << source;
+    EXPECT_EQ(source.find("SPIKECOREC_EDGE_ATTRIBUTE_UPDATE_TICK_PLANE * edge_slot_count"),
+              String::npos)
+            << source;
+}
+
+TEST(KernelCodegenSynapse, LazyCatchUpAppliesLiterallyTheEagerPerTickStep) {
+    // Bit-for-bit agreement between the two policies rests on them emitting the same
+    // arithmetic in the same order: the catch-up is the eager step, in a loop. Comparing the
+    // emitted step text is what stops the two drifting into "close enough".
+    const String lazy_source =
+            generate_tick_kernel(make_alpha_synapse_model(), /*use_lazy_synapse_updates=*/true)
+                    .source;
+    const String eager_source =
+            generate_tick_kernel(make_alpha_synapse_model(), /*use_lazy_synapse_updates=*/false)
+                    .source;
+
+    // Compared from the first Euler temporary to the end of the block, with leading
+    // whitespace removed: the catch-up sits one level deeper inside its loop, and the
+    // indentation is the only thing about it that is allowed to differ.
+    auto integration_step_text = [](const String &source) {
+        const usize step_start = source.find("float next_I = ");
+        if (step_start == String::npos) return String();
+        const usize step_end = source.find("next_J;", step_start);
+        if (step_end == String::npos) return String();
+
+        String stripped;
+        bool at_line_start = true;
+        for (const char character : source.substr(step_start, step_end - step_start)) {
+            if (character == '\n') {
+                at_line_start = true;
+                stripped.push_back(character);
+                continue;
+            }
+            if (at_line_start && character == ' ') continue;
+            at_line_start = false;
+            stripped.push_back(character);
+        }
+        return stripped;
+    };
+
+    const String lazy_step_text = integration_step_text(lazy_source);
+    const String eager_step_text = integration_step_text(eager_source);
+    ASSERT_FALSE(lazy_step_text.empty()) << lazy_source;
+    ASSERT_FALSE(eager_step_text.empty()) << eager_source;
+    EXPECT_EQ(lazy_step_text, eager_step_text);
 }
 
 // ── Unsupported constructs ───────────────────────────────────────────────────
@@ -1962,17 +2139,20 @@ TEST(KernelCodegenRegimes, ASingleRegimeNeedsNoDispatchAtAll) {
 // ── Flat buffer offsets are 64-bit ───────────────────────────────────────────
 
 TEST(KernelCodegenBufferIndex, RingAndSynapseOffsetsAreComputedInSixtyFourBits) {
-    // The host sizes and indexes network_inputs and synapse_state in s64. In `int` the two
-    // disagree silently past INT_MAX -- ring_depth 64 over four wired prototypes and 8.4M
-    // neurons already crosses it -- and an arrival wraps to a negative offset, which lands in
-    // another neuron's slot rather than faulting.
+    // The host sizes and indexes network_inputs and the per-edge planes in s64. In `int` the
+    // two disagree silently past INT_MAX -- 33M neurons of degree 64 already crosses it for
+    // the per-edge slot -- and an offset wraps to a negative value, which lands in another
+    // edge's or another neuron's slot rather than faulting.
     const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
 
     EXPECT_NE(source.find("typedef long SpikecorecBufferIndex;"), String::npos) << source;
     EXPECT_NE(source.find("inline long network_input_ring_index("), String::npos) << source;
     EXPECT_EQ(source.find("inline int network_input_ring_index("), String::npos) << source;
-    EXPECT_NE(source.find("SpikecorecBufferIndex synapse_state_base ="), String::npos) << source;
-    EXPECT_EQ(source.find("int synapse_state_base ="), String::npos) << source;
+    EXPECT_NE(source.find("SpikecorecBufferIndex edge_synapse_state_base ="), String::npos)
+            << source;
+    EXPECT_EQ(source.find("int edge_synapse_state_base ="), String::npos) << source;
+    EXPECT_EQ(source.find("int edge_slot ="), String::npos) << source;
+    EXPECT_EQ(source.find("int edge_slot_count ="), String::npos) << source;
     EXPECT_EQ(source.find("int arrival_index ="), String::npos) << source;
     EXPECT_EQ(source.find("int synaptic_input_index ="), String::npos) << source;
 }
@@ -2080,10 +2260,12 @@ TEST(KernelCodegenMetal, PropagatingCellCompilesAsMetal) {
             << source;
 }
 
-TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetal) {
-    // The synapse stage adds a second storage layout, a plane-indexed ring and a device
-    // function called from the master kernel ahead of the cell switch. Only the real shader
-    // compiler settles whether all of that is well formed together.
+TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetalUnderBothUpdatePolicies) {
+    // The synapse path adds a per-edge storage layout, a per-edge program switch inside the
+    // propagation walk and a second adjacency walk under the eager policy. Only the real
+    // shader compiler settles whether all of that is well formed together, and warnings are
+    // failures: a warning on every generated kernel is what stops anyone reading the ones
+    // that matter.
     ASSERT_TRUE(metal_compiler_is_available())
             << "xcrun metal is unavailable, so the generated source was never compiled";
 
@@ -2096,24 +2278,29 @@ TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetal) {
     second_edge.synapse_prototype_index = 1;
     parse_result.neurons[0].outgoing_edges.push_back(second_edge);
 
-    String compiler_output;
-    const String tick_source = generate_tick_kernel(parse_result).source;
-    EXPECT_TRUE(compile_as_metal(tick_source, "synapse_tick", compiler_output))
-            << "generated Metal source failed to compile:\n"
-            << compiler_output << "\n--- source ---\n"
-            << tick_source;
+    struct GeneratedCase {
+        String case_name;
+        String source;
+    };
+    const Vector<GeneratedCase> generated_cases = {
+        {"synapse_tick_lazy", generate_tick_kernel(parse_result, true).source},
+        {"synapse_tick_eager", generate_tick_kernel(parse_result, false).source},
+        {"synapse_initialize", generate_initialize_kernel(parse_result).source},
+        {"synapse_ring_clear", generate_ring_row_clear_kernel().source},
+    };
 
-    const String initialize_source = generate_initialize_kernel(parse_result).source;
-    EXPECT_TRUE(compile_as_metal(initialize_source, "synapse_initialize", compiler_output))
-            << "generated Metal source failed to compile:\n"
-            << compiler_output << "\n--- source ---\n"
-            << initialize_source;
-
-    const String clear_source = generate_ring_row_clear_kernel(parse_result).source;
-    EXPECT_TRUE(compile_as_metal(clear_source, "synapse_ring_clear", compiler_output))
-            << "generated Metal source failed to compile:\n"
-            << compiler_output << "\n--- source ---\n"
-            << clear_source;
+    for (const GeneratedCase &generated_case : generated_cases) {
+        String compiler_output;
+        EXPECT_TRUE(compile_as_metal(generated_case.source, generated_case.case_name,
+                                     compiler_output))
+                << generated_case.case_name << ": generated Metal source failed to compile:\n"
+                << compiler_output << "\n--- source ---\n"
+                << generated_case.source;
+        EXPECT_TRUE(compiler_output.empty())
+                << generated_case.case_name << ": the shader compiler warned:\n"
+                << compiler_output << "\n--- source ---\n"
+                << generated_case.source;
+    }
 }
 
 TEST(KernelCodegenMetal, GeneratedMathHeavyKernelCompilesAsMetal) {

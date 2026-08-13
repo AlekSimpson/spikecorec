@@ -2091,3 +2091,275 @@ TEST(WeightMatrix, load_from_disk_leaves_exact_mode_off_after_reallocating) {
     loading_matrix.load_from_disk(path);
     EXPECT_FALSE(loading_matrix.using_exact_edge_weights);
 }
+
+// ── per-edge synapse state (the peredge family) ──────────────────────────────
+
+TEST(WeightMatrix, configure_per_edge_variable_count_registers_one_matrix_per_variable) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+
+    const s64 matrix_count_before = weight_matrix.matrix_count();
+    weight_matrix.configure_per_edge_variable_count(3);
+
+    EXPECT_EQ(weight_matrix.per_edge_variable_count, 3);
+    EXPECT_EQ(weight_matrix.matrix_count(), matrix_count_before + 3);
+    EXPECT_EQ(weight_matrix.per_edge_variable_matrix_base, matrix_count_before);
+    ASSERT_NE(weight_matrix.per_edge_variable_values.pointer, nullptr);
+
+    for (s64 variable_index = 0; variable_index < 3; ++variable_index) {
+        const s64 matrix_index = weight_matrix.per_edge_variable_matrix_index(variable_index);
+        EXPECT_EQ(matrix_index, matrix_count_before + variable_index);
+        EXPECT_TRUE(weight_matrix.is_per_edge_variable_matrix(matrix_index));
+    }
+    EXPECT_FALSE(weight_matrix.is_per_edge_variable_matrix(WeightMatrix::DEFAULT_MATRIX_INDEX));
+
+    // Idempotent for the same count; a DIFFERENT non-zero count would orphan the matrices
+    // already registered and move every plane offset, so it is refused rather than silently
+    // reallocated.
+    weight_matrix.configure_per_edge_variable_count(3);
+    EXPECT_EQ(weight_matrix.matrix_count(), matrix_count_before + 3);
+    EXPECT_THROW(weight_matrix.configure_per_edge_variable_count(4), std::invalid_argument);
+    EXPECT_THROW(weight_matrix.configure_per_edge_variable_count(-1), std::invalid_argument);
+}
+
+TEST(WeightMatrix, per_edge_variables_round_trip_exactly_at_realistic_si_magnitudes) {
+    // The whole point of pinning these matrices' Ck to all-zero. Expressed as a delta on top
+    // of an order-1 low-rank reconstruction, a 1e-12 synapse state is rounded away entirely
+    // and reads back as the reconstruction itself -- a network that looks mis-modelled rather
+    // than mis-rounded.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/23);
+    weight_matrix.configure_per_edge_variable_count(2);
+
+    const vector<f32> magnitudes = {1e-12f, 2.5e-9f, -7.5e-11f, 0.0f, 1e3f, -1.0f};
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    vector<f32> expected_values;
+    usize magnitude_position = 0;
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        const s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            for (s64 variable_index = 0; variable_index < 2; ++variable_index) {
+                const f32 value = magnitudes[magnitude_position % magnitudes.size()] *
+                                  (f32)(1 + variable_index);
+                magnitude_position += 1;
+                weight_matrix.set_edge_variable(variable_index, (s32)node_index,
+                                                neighbor_buffer[(usize)slot], value);
+                expected_values.push_back(value);
+            }
+        }
+    }
+
+    usize expected_position = 0;
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        const s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            for (s64 variable_index = 0; variable_index < 2; ++variable_index) {
+                const f32 stored = weight_matrix.get_edge_variable(
+                        variable_index, (s32)node_index, neighbor_buffer[(usize)slot]);
+                EXPECT_EQ(float_bit_pattern(stored),
+                          float_bit_pattern(expected_values[expected_position]))
+                        << "variable " << variable_index << " on edge " << node_index << " -> "
+                        << neighbor_buffer[(usize)slot];
+                ++expected_position;
+            }
+        }
+    }
+}
+
+TEST(WeightMatrix, per_edge_variables_are_addressed_by_edge_not_by_endpoint) {
+    // Two out-edges of one source, and the same target reached from two sources: a layout
+    // keyed on either endpoint rather than on the edge would have these overwrite each other.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    weight_matrix.configure_per_edge_variable_count(1);
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    const s64 degree = weight_matrix.get_neighbors(0, neighbor_buffer.data());
+    ASSERT_GE(degree, 2);
+
+    weight_matrix.set_edge_variable(0, 0, neighbor_buffer[0], 3.0e-9f);
+    weight_matrix.set_edge_variable(0, 0, neighbor_buffer[1], 7.0e-9f);
+    EXPECT_FLOAT_EQ(weight_matrix.get_edge_variable(0, 0, neighbor_buffer[0]), 3.0e-9f);
+    EXPECT_FLOAT_EQ(weight_matrix.get_edge_variable(0, 0, neighbor_buffer[1]), 7.0e-9f);
+
+    // A second source reaching the first target keeps its own slot.
+    vector<s32> predecessor_buffer((usize)weight_matrix.max_neighbor_count);
+    const s64 predecessor_count =
+            weight_matrix.get_predecessors(neighbor_buffer[0], predecessor_buffer.data());
+    ASSERT_GE(predecessor_count, 2);
+    s32 other_source = -1;
+    for (s64 slot = 0; slot < predecessor_count; ++slot) {
+        if (predecessor_buffer[(usize)slot] != 0) other_source = predecessor_buffer[(usize)slot];
+    }
+    ASSERT_GE(other_source, 0);
+
+    weight_matrix.set_edge_variable(0, other_source, neighbor_buffer[0], 1.1e-9f);
+    EXPECT_FLOAT_EQ(weight_matrix.get_edge_variable(0, 0, neighbor_buffer[0]), 3.0e-9f);
+    EXPECT_FLOAT_EQ(weight_matrix.get_edge_variable(0, other_source, neighbor_buffer[0]), 1.1e-9f);
+}
+
+TEST(WeightMatrix, per_edge_variables_survive_refit) {
+    // Folding a 1e-12 synapse state into the lossy low-rank plane would round it away, so
+    // these matrices are exempt from the fit AND from the Sk clear -- the same trade per-edge
+    // delay and exact weights already make. Missing either exemption is silent.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true,
+                               /*max_neighbor_count=*/-1, /*weight_seed=*/31);
+    weight_matrix.configure_per_edge_variable_count(2);
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    vector<f32> expected_values;
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        const s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            // Realistic weights too, so the fit has a full point cloud and genuinely moves
+            // the shared basis under the per-edge variables.
+            weight_matrix.set_edge_weight((s32)node_index, neighbor_buffer[(usize)slot],
+                                          2.5e-9f * (f32)(1 + node_index));
+            for (s64 variable_index = 0; variable_index < 2; ++variable_index) {
+                const f32 value = 1e-12f * (f32)(1 + slot) + 3e-10f * (f32)variable_index;
+                weight_matrix.set_edge_variable(variable_index, (s32)node_index,
+                                                neighbor_buffer[(usize)slot], value);
+                expected_values.push_back(value);
+            }
+        }
+    }
+
+    const f32 basis_value_before = weight_matrix.U_matrix.get_contents()[0].x;
+    weight_matrix.refit(/*sweep_count=*/2);
+    EXPECT_NE(float_bit_pattern(basis_value_before),
+              float_bit_pattern(weight_matrix.U_matrix.get_contents()[0].x))
+            << "refit did not move the shared basis, so surviving it proves nothing";
+
+    usize expected_position = 0;
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        const s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            for (s64 variable_index = 0; variable_index < 2; ++variable_index) {
+                EXPECT_EQ(float_bit_pattern(weight_matrix.get_edge_variable(
+                                  variable_index, (s32)node_index,
+                                  neighbor_buffer[(usize)slot])),
+                          float_bit_pattern(expected_values[expected_position]))
+                        << "variable " << variable_index << " on edge " << node_index << " -> "
+                        << neighbor_buffer[(usize)slot] << " did not survive refit";
+                ++expected_position;
+            }
+        }
+    }
+
+    // Their Ck stayed pinned to all-zero, which is what the survival above rests on: any
+    // non-zero lane would put an order-1 low-rank term on top of a 1e-12 value.
+    for (s64 variable_index = 0; variable_index < 2; ++variable_index) {
+        const s64 matrix_index = weight_matrix.per_edge_variable_matrix_index(variable_index);
+        const f32 *coefficients =
+                weight_matrix.coefficient_vectors[(usize)matrix_index].get_contents();
+        for (s64 lane_index = 0; lane_index < weight_matrix.rank_float4_stride * 4; ++lane_index) {
+            EXPECT_EQ(float_bit_pattern(coefficients[lane_index]), float_bit_pattern(0.0f))
+                    << "variable " << variable_index << " lane " << lane_index;
+        }
+    }
+}
+
+TEST(WeightMatrix, per_edge_variables_are_excluded_from_the_refit_occupancy_trigger) {
+    // Their planes hold the model's live state permanently, not drift awaiting a refit.
+    // Counting them would pin the occupancy fraction near 100% forever and make the trigger
+    // fire on every tick, exactly as it would for the delay and exact-weight planes.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    weight_matrix.configure_per_edge_variable_count(1);
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    for (s64 node_index = 0; node_index < weight_matrix.node_count; ++node_index) {
+        const s64 degree = weight_matrix.get_neighbors(node_index, neighbor_buffer.data());
+        for (s64 slot = 0; slot < degree; ++slot) {
+            weight_matrix.set_edge_variable(0, (s32)node_index, neighbor_buffer[(usize)slot],
+                                            4.0e-10f);
+        }
+    }
+
+    EXPECT_FLOAT_EQ(weight_matrix.max_sparse_delta_occupancy_fraction(), 0.0f);
+
+    weight_matrix.refit_occupancy_threshold_fraction = 0.5f;
+    weight_matrix.refit_every_n_ticks = 1000000;
+    EXPECT_FALSE(weight_matrix.is_refit_due());
+}
+
+TEST(WeightMatrix, set_coefficient_vector_refuses_a_per_edge_variable_matrix) {
+    // Writing any Ck onto one -- including the neutral 1.0f this method puts in the padding
+    // lanes -- restores an order-1 low-rank term on top of values that are routinely 1e-12,
+    // corrupting every per-edge synapse state at once with no diagnostic.
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    weight_matrix.configure_per_edge_variable_count(1);
+
+    const s64 matrix_index = weight_matrix.per_edge_variable_matrix_index(0);
+    EXPECT_THROW(weight_matrix.set_coefficient_vector(
+                         matrix_index, vector<f32>((usize)weight_matrix.rank, 0.5f)),
+                 std::invalid_argument);
+}
+
+TEST(WeightMatrix, per_edge_variable_accessors_reject_non_edges_and_bad_indices) {
+    auto network = square_torus(4);
+    WeightMatrix weight_matrix(network, /*rank=*/8);
+    weight_matrix.configure_per_edge_variable_count(1);
+
+    vector<s32> neighbor_buffer((usize)weight_matrix.max_neighbor_count);
+    const s64 degree = weight_matrix.get_neighbors(0, neighbor_buffer.data());
+    ASSERT_GT(degree, 0);
+
+    EXPECT_THROW(weight_matrix.set_edge_variable(1, 0, neighbor_buffer[0], 1.0f),
+                 std::invalid_argument);
+    EXPECT_THROW((void)weight_matrix.get_edge_variable(-1, 0, neighbor_buffer[0]),
+                 std::invalid_argument);
+    EXPECT_THROW(weight_matrix.set_edge_variable(0, -1, neighbor_buffer[0], 1.0f),
+                 std::invalid_argument);
+
+    // A pair that is not a real edge: loadedge/accedge are edge-scoped operations.
+    s32 non_neighbor = -1;
+    for (s32 candidate = 0; candidate < (s32)weight_matrix.node_count; ++candidate) {
+        if (weight_matrix.k2tree.adjacent(0, candidate)) continue;
+        non_neighbor = candidate;
+        break;
+    }
+    ASSERT_GE(non_neighbor, 0);
+    EXPECT_THROW(weight_matrix.set_edge_variable(0, 0, non_neighbor, 1.0f),
+                 std::invalid_argument);
+    EXPECT_THROW((void)weight_matrix.get_edge_variable(0, 0, non_neighbor),
+                 std::invalid_argument);
+}
+
+TEST(WeightMatrix, per_edge_variables_survive_move_assignment) {
+    auto network = square_torus(4);
+    WeightMatrix source_matrix(network, /*rank=*/8);
+    source_matrix.configure_per_edge_variable_count(2);
+    source_matrix.set_edge_variable(1, 0, network[0][0], 6.25e-12f);
+
+    WeightMatrix destination_matrix(network, /*rank=*/8);
+    destination_matrix = std::move(source_matrix);
+
+    EXPECT_EQ(destination_matrix.per_edge_variable_count, 2);
+    EXPECT_EQ(float_bit_pattern(destination_matrix.get_edge_variable(1, 0, network[0][0])),
+              float_bit_pattern(6.25e-12f));
+}
+
+TEST(WeightMatrix, per_edge_variables_are_unregistered_when_load_from_disk_reallocates) {
+    // Reallocating resets the whole matrix family, so a per_edge_variable_matrix_base left
+    // pointing into it would have is_per_edge_variable_matrix claim the fresh default slot --
+    // and refit would then stop clearing it.
+    auto network = square_torus(4);
+    WeightMatrix saved_matrix(network, /*rank=*/4); // rank_float4_stride 1
+    const char *path = "/tmp/spikecorec_test_wm_per_edge_realloc.bin";
+    saved_matrix.save(path);
+
+    WeightMatrix loading_matrix(network, /*rank=*/8); // rank_float4_stride 2
+    loading_matrix.configure_per_edge_variable_count(2);
+    ASSERT_EQ(loading_matrix.per_edge_variable_count, 2);
+
+    loading_matrix.load_from_disk(path);
+    EXPECT_EQ(loading_matrix.per_edge_variable_count, 0);
+    EXPECT_EQ(loading_matrix.per_edge_variable_matrix_base, -1);
+    EXPECT_FALSE(
+            loading_matrix.is_per_edge_variable_matrix(WeightMatrix::DEFAULT_MATRIX_INDEX));
+}
