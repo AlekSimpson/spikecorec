@@ -60,6 +60,10 @@ namespace spikecorec {
         s32 target_node = -1;
         f32 summed_weight = 0.0f;
         s32 delay_tick_count = 1;
+
+        // Which synapse prototype the collapsed edges deliver through, -1 when they name
+        // none. Like the delay, it cannot be collapsed: the slot carries one arrival plane.
+        s64 synapse_prototype_index = -1;
     };
 
     // Collapses parallel edges -- two projections between one cell pair, which is an
@@ -77,6 +81,11 @@ namespace spikecorec {
     // since nothing is lost. `default_delay_tick_count` is what an edge declaring no delay
     // of its own resolves to, so "declares none" and "declares the default" do not read as a
     // conflict.
+    //
+    // The SYNAPSE is the same story for the same reason: the slot carries one arrival plane,
+    // so two parallel edges through different synapses (an AMPA and an NMDA between one cell
+    // pair) cannot both be represented, and summing their weights into whichever plane came
+    // first would run one synapse's dynamics on the other's coupling. That throws too.
     //
     // Returned in first-appearance order, so the wiring it drives is deterministic.
     Vector<AggregatedNetworkEdge> aggregate_network_edges(
@@ -127,20 +136,47 @@ namespace spikecorec {
         GpuPointer<s32> cell_type_index;     // [total_neuron_count]
         GpuPointer<s32> spike_flags;         // [total_neuron_count] — this tick's emissions
 
-        // The synaptic delay ring: [network_input_ring_depth * total_neuron_count], one flat
-        // allocation indexed as [row][neuron]. Propagation, generated into the cell device
-        // functions, adds an edge's weight into row (tick + that edge's delay) %
+        // The synaptic delay ring:
+        // [network_input_ring_depth * network_input_plane_count * total_neuron_count], one
+        // flat allocation indexed as [row][plane][neuron]. Propagation, generated into the
+        // cell device functions, adds an edge's weight into row (tick + that edge's delay) %
         // network_input_ring_depth; a cell reads row tick % network_input_ring_depth of its
         // own column with a plain load. External stimulus is added into the current tick's
         // row, arriving with no delay.
         //
-        // A row is emptied as a WHOLE ROW, by the ring clear kernel dispatched behind the
-        // tick kernel, at the end of the tick that read it -- clearing the input this tick
-        // consumed while leaving every other row, which holds arrivals not yet due,
-        // untouched. Not per slot as each cell reads: a cell type that never reduces over its
-        // synapses would then never clear its neurons' slots, and they would accumulate every
-        // arrival for the whole run.
+        // Plane 0 is the delivered current every cell reads through its "synapses[*]/i" path:
+        // where the host's stimulus lands, where the synapse stage adds each synapse's output,
+        // and where an edge naming no synapse scatters its raw weight. Plane 1 + p holds the
+        // arrivals awaiting wired synapse prototype p (see kernel_codegen.h's
+        // wired_synapse_prototype_indices, which fixes the numbering for both sides).
+        //
+        // A row is emptied as a WHOLE ROW, every plane of it, by the ring clear kernel
+        // dispatched behind the tick kernel, at the end of the tick that read it -- clearing
+        // the input this tick consumed while leaving every other row, which holds arrivals not
+        // yet due, untouched. Not per slot as each cell reads: a cell type that never reduces
+        // over its synapses would then never clear its neurons' slots, and they would
+        // accumulate every arrival for the whole run.
         GpuPointer<f32> network_inputs;
+
+        // [synapse_state_element_count] — synapse state, aggregated per (target neuron, wired
+        // synapse prototype). Wired prototype p's slice starts at (the preceding prototypes'
+        // total state width) * total_neuron_count, and within it a neuron occupies its type's
+        // state_variable_names.size() consecutive floats.
+        //
+        // Aggregated rather than per-edge because these synapses superpose: many edges of one
+        // prototype converging on one target are, exactly, one synapse of their summed arrival
+        // weight. Keyed by PROTOTYPE and not merely by type because the parameters belong to
+        // the prototype -- two alphaCurrentSynapse instances with different `tau` decay at
+        // different rates, so pooling them would decay one at the other's rate.
+        GpuPointer<f32> synapse_state;
+
+        // [weights.node_count * weights.max_neighbor_count] — which network_inputs plane each
+        // edge's arrival lands in: 1 + the position of its synapse prototype in
+        // wired_synapse_prototype_indices, or 0 when the edge names no synapse at all, in
+        // which case its raw weight IS the delivered current. Flattened at construction into
+        // the same slot convention WeightMatrix addresses an edge by, exactly like
+        // edge_delay_ticks.
+        GpuPointer<s32> edge_synapse_plane;
 
         // [weights.node_count * weights.max_neighbor_count] — each edge's delay in whole
         // ticks, at the slot WeightMatrix addresses that edge by (row-major by source neuron;
@@ -161,12 +197,19 @@ namespace spikecorec {
 
         s64 cell_state_element_count = 0;
         s64 cell_parameter_element_count = 0;
+        s64 synapse_state_element_count = 0;
 
         // How many tick rows the network_inputs ring holds. Strictly greater than the
         // model's largest per-edge delay, so an arrival scheduled this tick can never land
         // in the row being read this tick, and every row is read (and then cleared) before
         // the ring wraps back onto it.
         s32 network_input_ring_depth = 1;
+
+        // How many planes wide one ring row is: the delivered-current plane, plus one arrival
+        // plane per wired synapse prototype. The generated kernels carry the same number as a
+        // baked constant, so this and the generated source must not drift -- both derive it
+        // from wired_synapse_prototype_indices.
+        s32 network_input_plane_count = 1;
 
         // The compiled generated master kernel. Held through a shared pointer so its
         // release_kernel call travels with it: the deleter is installed at compile time and

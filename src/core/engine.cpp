@@ -220,7 +220,8 @@ spikecorec::Vector<spikecorec::AggregatedNetworkEdge> spikecorec::aggregate_netw
             if (existing == position_of_pair.end()) {
                 position_of_pair.emplace(pair_key, aggregated_edges.size());
                 aggregated_edges.push_back(AggregatedNetworkEdge{
-                        source_node, target_node, (f32)edge.weight, delay_tick_count});
+                        source_node, target_node, (f32)edge.weight, delay_tick_count,
+                        edge.synapse_prototype_index});
                 continue;
             }
 
@@ -235,6 +236,18 @@ spikecorec::Vector<spikecorec::AggregatedNetworkEdge> spikecorec::aggregate_netw
                                     "delay",
                                     source_node, target_node, collapsed.delay_tick_count,
                                     delay_tick_count));
+            }
+            if (collapsed.synapse_prototype_index != edge.synapse_prototype_index) {
+                log::throw_runtime_error(
+                        engine_logger,
+                        fmt::format("SpikeEngine: neurons {} -> {} are connected by two edges "
+                                    "through different synapses (prototype indices {} and {}). "
+                                    "The adjacency holds one slot per ordered pair and that slot "
+                                    "carries one arrival plane, so both cannot be represented; "
+                                    "summing them would run one synapse's dynamics on the "
+                                    "other's coupling",
+                                    source_node, target_node, collapsed.synapse_prototype_index,
+                                    edge.synapse_prototype_index));
             }
             collapsed.summed_weight += (f32)edge.weight;
         }
@@ -326,8 +339,31 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     // slot convention is WeightMatrix's own: row-major by source neuron, and within a row
     // the neighbour's position in the order get_neighbors enumerates it -- which is the
     // order the generated kernel's k^2-tree walk reproduces.
+    //
+    // The arrival PLANE is flattened in the same pass and by the same slot convention. It
+    // does not come from the weight matrix -- the adjacency stores weights and delays, not
+    // which synapse an edge runs through -- so it is looked up from the aggregated edges by
+    // ordered pair.
     const s64 edge_slot_count = weights.node_count * weights.max_neighbor_count;
     Vector<s32> staged_edge_delay_ticks((usize)(edge_slot_count > 0 ? edge_slot_count : 0), 0);
+    Vector<s32> staged_edge_synapse_plane((usize)(edge_slot_count > 0 ? edge_slot_count : 0), 0);
+
+    // Position + 1 is the prototype's plane, exactly as codegen numbers them.
+    const Vector<s64> wired_prototype_indices =
+            wired_synapse_prototype_indices(network_details);
+    UnorderedMap<s64, s32> plane_of_synapse_prototype;
+    for (usize position = 0; position < wired_prototype_indices.size(); ++position) {
+        plane_of_synapse_prototype.emplace(wired_prototype_indices[position],
+                                           (s32)position + 1);
+    }
+    network_input_plane_count = (s32)wired_prototype_indices.size() + 1;
+
+    UnorderedMap<s64, s64> synapse_prototype_of_pair;
+    for (const AggregatedNetworkEdge &edge : aggregated_edges) {
+        synapse_prototype_of_pair.emplace(
+                (s64)edge.source_node * total_neuron_count + (s64)edge.target_node,
+                edge.synapse_prototype_index);
+    }
 
     s32 maximum_edge_delay_ticks = 0;
     if (edge_slot_count > 0) {
@@ -355,11 +391,56 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
                                         delay_tick_count));
                 }
 
-                staged_edge_delay_ticks[(usize)(source_node * weights.max_neighbor_count + slot)] =
-                        delay_tick_count;
+                const usize edge_slot =
+                        (usize)(source_node * weights.max_neighbor_count + slot);
+                staged_edge_delay_ticks[edge_slot] = delay_tick_count;
                 maximum_edge_delay_ticks = std::max(maximum_edge_delay_ticks, delay_tick_count);
+
+                // Plane 0 -- deliver the raw weight -- for an edge whose projection names no
+                // synapse. That is what network_inputs meant before there were any synapse
+                // dynamics, and an edge with no synapse component has none to run.
+                const auto declared_synapse = synapse_prototype_of_pair.find(
+                        source_node * total_neuron_count + neighbor_indices[(usize)slot]);
+                if (declared_synapse == synapse_prototype_of_pair.end() ||
+                    declared_synapse->second < 0) {
+                    continue;
+                }
+
+                const auto plane = plane_of_synapse_prototype.find(declared_synapse->second);
+                if (plane == plane_of_synapse_prototype.end()) {
+                    log::throw_runtime_error(
+                            *logger,
+                            fmt::format("SpikeEngine: edge {} -> {} names synapse prototype {}, "
+                                        "which is not one of the {} prototypes this model "
+                                        "declares",
+                                        source_node, neighbor_indices[(usize)slot],
+                                        declared_synapse->second,
+                                        network_details.synapse_prototypes.size()));
+                }
+                staged_edge_synapse_plane[edge_slot] = plane->second;
             }
         }
+    }
+
+    // Aggregated per (target neuron, wired synapse prototype), so one prototype costs its
+    // type's state width per neuron -- two floats a neuron for an alphaCurrentSynapse.
+    for (const s64 prototype_index : wired_prototype_indices) {
+        const ComponentPrototype &prototype =
+                network_details.synapse_prototypes[(usize)prototype_index];
+        if (prototype.type_index < 0 ||
+            prototype.type_index >= (s64)network_details.synapse_types.size()) {
+            log::throw_runtime_error(
+                    *logger,
+                    fmt::format("SpikeEngine: synapse prototype '{}' has type index {}, which "
+                                "names no synapse type ({} declared)",
+                                prototype.instance_id, prototype.type_index,
+                                network_details.synapse_types.size()));
+        }
+
+        const SynapseTypeSpecification &synapse_type =
+                network_details.synapse_types[(usize)prototype.type_index];
+        synapse_state_element_count +=
+                (s64)synapse_type.state_variable_names.size() * total_neuron_count;
     }
 
     // Strictly greater than the largest delay, so an arrival scheduled this tick never lands
@@ -367,7 +448,7 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     // tick, so a single-row ring could not represent even the shortest edge.
     network_input_ring_depth = std::max(maximum_edge_delay_ticks + 1, 2);
     const s64 network_input_element_count =
-            (s64)network_input_ring_depth * total_neuron_count;
+            (s64)network_input_ring_depth * (s64)network_input_plane_count * total_neuron_count;
 
     // ── 3. arena ─────────────────────────────────────────────────────────────
     // Sized to exactly what is allocated below, rounding each sub-range up to the arena's
@@ -378,7 +459,8 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
             arena_cost_of(sizeof(f32) * (u64)cell_state_element_count) +
             arena_cost_of(sizeof(f32) * (u64)cell_parameter_element_count) +
             arena_cost_of(sizeof(f32) * (u64)network_input_element_count) +
-            arena_cost_of(sizeof(s32) * (u64)edge_slot_count) +          // edge_delay_ticks
+            arena_cost_of(sizeof(f32) * (u64)synapse_state_element_count) +
+            arena_cost_of(sizeof(s32) * (u64)edge_slot_count) * 2 +     // delays, arrival planes
             arena_cost_of(sizeof(s32) * (u64)total_neuron_count) * 4 +  // bases, type, flags
             arena_cost_of(sizeof(s64) * (u64)total_neuron_count);       // last_spiked
     if (hebbian_learning_enabled) {
@@ -390,7 +472,9 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     cell_state = allocate_engine_buffer<f32>(allocator, cell_state_element_count);
     cell_parameters = allocate_engine_buffer<f32>(allocator, cell_parameter_element_count);
     network_inputs = allocate_engine_buffer<f32>(allocator, network_input_element_count);
+    synapse_state = allocate_engine_buffer<f32>(allocator, synapse_state_element_count);
     edge_delay_ticks = allocate_engine_buffer<s32>(allocator, edge_slot_count);
+    edge_synapse_plane = allocate_engine_buffer<s32>(allocator, edge_slot_count);
     cell_state_base = allocate_engine_buffer<s32>(allocator, total_neuron_count);
     cell_parameter_base = allocate_engine_buffer<s32>(allocator, total_neuron_count);
     cell_type_index = allocate_engine_buffer<s32>(allocator, total_neuron_count);
@@ -403,12 +487,15 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     zero_fill_engine_buffer(cell_state, cell_state_element_count);
     zero_fill_engine_buffer(cell_parameters, cell_parameter_element_count);
     zero_fill_engine_buffer(network_inputs, network_input_element_count);
+    zero_fill_engine_buffer(synapse_state, synapse_state_element_count);
     zero_fill_engine_buffer(spike_flags, total_neuron_count);
     zero_fill_engine_buffer(last_spiked, total_neuron_count);
     zero_fill_engine_buffer(last_tick_updated, total_neuron_count);
 
     if (edge_slot_count > 0) {
         memcpy(edge_delay_ticks.get_contents(), staged_edge_delay_ticks.data(),
+               (usize)edge_slot_count * sizeof(s32));
+        memcpy(edge_synapse_plane.get_contents(), staged_edge_synapse_plane.data(),
                (usize)edge_slot_count * sizeof(s32));
     }
 
@@ -529,7 +616,8 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     // The end-of-tick ring clear, dispatched behind the master kernel every tick. Model
     // independent -- it zeroes one row of network_inputs and reads none of the dynamics --
     // so it is generated from nothing but the backend.
-    const GeneratedKernel ring_row_clear_kernel_source = generate_ring_row_clear_kernel();
+    const GeneratedKernel ring_row_clear_kernel_source =
+            generate_ring_row_clear_kernel(network_details);
     ring_row_clear_kernel_argument_names = ring_row_clear_kernel_source.argument_names;
     ring_row_clear_kernel = compile_and_own(ring_row_clear_kernel_source);
 
@@ -640,6 +728,7 @@ void SpikeEngine::dispatch_master_kernel(
     f32 *cell_state_contents = buffer_contents_or_null(cell_state);
     f32 *cell_parameters_contents = buffer_contents_or_null(cell_parameters);
     f32 *network_inputs_contents = buffer_contents_or_null(network_inputs);
+    f32 *synapse_state_contents = buffer_contents_or_null(synapse_state);
     s64 *last_spiked_contents = buffer_contents_or_null(last_spiked);
     s32 *spike_flags_contents = buffer_contents_or_null(spike_flags);
     s32 *cell_state_base_contents = buffer_contents_or_null(cell_state_base);
@@ -661,6 +750,7 @@ void SpikeEngine::dispatch_master_kernel(
     float4 *u_matrix_contents = buffer_contents_or_null(weights.U_matrix);
     float4 *v_matrix_contents = buffer_contents_or_null(weights.V_matrix);
     s32 *edge_delay_ticks_contents = buffer_contents_or_null(edge_delay_ticks);
+    s32 *edge_synapse_plane_contents = buffer_contents_or_null(edge_synapse_plane);
 
     // The default matrix's Ck and Sk: the kernel reconstructs an edge as
     // Σ U·Ck·V + Sk, which is exactly what WeightMatrix::get() reports on the host, and
@@ -721,6 +811,9 @@ void SpikeEngine::dispatch_master_kernel(
         {"constant_weight", {&constant_weight_value, sizeof(constant_weight_value)}},
         {"max_neighbor_count", {&max_neighbor_count_value, sizeof(max_neighbor_count_value)}},
         {"ring_depth", {&ring_depth_value, sizeof(ring_depth_value)}},
+        {"synapse_state", {&synapse_state_contents, sizeof(synapse_state_contents)}},
+        {"edge_synapse_plane",
+         {&edge_synapse_plane_contents, sizeof(edge_synapse_plane_contents)}},
     };
 
     Vector<const void *> argument_storage;
@@ -762,10 +855,12 @@ void SpikeEngine::step_simulation(s64 tick) {
     // `tick`. A stream shorter than the simulation has already finished.
     //
     // External stimulus carries no synaptic delay, so it goes straight into the row the
-    // kernel is about to read -- this tick's.
+    // kernel is about to read -- this tick's -- and into plane 0 of it, the delivered-current
+    // plane, because injected current IS delivered current rather than something a synapse
+    // still has to shape.
     f32 *network_input_values = buffer_contents_or_null(network_inputs);
-    const s64 current_ring_row_base =
-            (tick % (s64)network_input_ring_depth) * total_neuron_count;
+    const s64 current_ring_row_base = (tick % (s64)network_input_ring_depth) *
+                                      (s64)network_input_plane_count * total_neuron_count;
     for (const NeuronInputStream &input_stream : input_event_streams) {
         if (tick < 0 || tick >= (s64)input_stream.values.size()) continue;
 

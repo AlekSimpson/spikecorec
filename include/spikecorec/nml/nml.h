@@ -352,8 +352,16 @@ struct SynapseTypeSpecification {
     Vector<String> parameter_names;
     Vector<DynamicsInstruction> dynamics;
 
-    // Carries a driving force g*(erev - v), so it needs the postsynaptic voltage.
-    bool is_conductance_based = false;
+    // TODO(conductance-based synapses, deferred): re-enable alongside the driving-force
+    // lowering. A conductance-based synapse computes i = g * (erev - v) -- a force that
+    // depends on the POSTSYNAPTIC voltage and reverses sign as v crosses erev -- where a
+    // current-based one injects a fixed current profile. Those are different models, not
+    // an approximation of each other, so until the lowering exists the generator refuses
+    // a conductance-based synapse by name rather than carrying a flag nothing acts on.
+    // None of GLIF1-5 uses one. See src/nml/nml.cpp's own commented-out
+    // is_conductance_based() for the detection this field was set from.
+    //
+    // bool is_conductance_based = false;
 
     // State does not superpose across converging edges, so it cannot be aggregated into
     // a single per-target accumulator. The default is aggregate.

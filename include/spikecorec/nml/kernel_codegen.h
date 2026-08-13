@@ -95,10 +95,16 @@ struct SymbolTable {
 //   26 constant_weight          constant float &
 //   27 max_neighbor_count       constant int &
 //   28 ring_depth               constant int &
+//   29 synapse_state            device float *        -- aggregated synapse state, see below
+//   30 edge_synapse_plane       device const int *    -- per-edge, which ring plane it feeds
 //
 // Arguments 11-19 are the adjacency and per-edge state stage 6 (Propagate) walks; 20-28
 // describe their shape. The initialize kernel takes the identical list so the engine binds
 // one argument set for both entry points, and simply never reads the propagation half.
+//
+// That is 31 arguments, which is exactly Metal's per-stage buffer argument table limit.
+// Anything added from here on has to consolidate two logical arrays into one buffer with
+// baked offsets, the way the network_inputs ring already packs its planes.
 //
 // U_matrix / V_matrix are the host's float4 buffers declared as plain floats -- identical
 // bytes, and scalar lanes make the on-device reconstruction the same arithmetic
@@ -158,23 +164,71 @@ struct GeneratedKernel {
 // supporting engine infrastructure is identical for every cell type, and the engine must
 // therefore NOT dispatch a propagation kernel of its own.
 //
-// `network_inputs` is a delay ring: one flat allocation of ring_depth * neuron_count floats
-// indexed as [row][neuron]. An arrival lands in row (tick + edge delay) % ring_depth and a
-// cell reads row tick % ring_depth. Arrivals are atomic -- many sources converge on one
-// target -- but the READ is a plain load, and it does not clear anything: the row is zeroed
-// as a whole row after the dispatch, by generate_ring_row_clear_kernel below.
+// `network_inputs` is a delay ring: one flat allocation of
+// ring_depth * plane_count * neuron_count floats indexed as [row][plane][neuron]. An arrival
+// lands in row (tick + edge delay) % ring_depth and a cell reads row tick % ring_depth.
+// Arrivals are atomic -- many sources converge on one target -- but the READ is a plain
+// load, and it does not clear anything: the row is zeroed as a whole row after the dispatch,
+// by generate_ring_row_clear_kernel below.
 //
 // `ring_depth` exceeds the model's largest per-edge delay -- the engine computes it -- so an
 // arrival can never land in the row being read this tick.
 //
+// ── The ring's planes, and stage 2 for synapses ──────────────────────────────
+// A ring row is `plane_count` = 1 + wired_synapse_prototype_indices().size() planes wide:
+//
+//   plane 0        the DELIVERED CURRENT every cell reads through its `synapses[*]/i` path.
+//                  External stimulus is added here by the host, synapse outputs by the
+//                  synapse stage, and an edge that names no synapse scatters its raw weight
+//                  straight into it -- which is the pre-synapse behaviour, kept because an
+//                  edge with no synapse component has no dynamics to run.
+//   plane 1 + p    arrivals awaiting wired synapse prototype p. An edge whose projection
+//                  names that prototype scatters its weight here instead, and the synapse
+//                  stage drains it.
+//
+// Synapse state is aggregated PER (target neuron, synapse prototype), not per edge. A sum
+// of same-prototype synapses is a single synapse of the summed arrival weight -- their state
+// equations are linear and share one parameter set -- so many converging edges of one
+// prototype share one state. Keyed by PROTOTYPE rather than by type because the parameters
+// are a property of the prototype: two alphaCurrentSynapse instances with different `tau`
+// decay at different rates and must not share a state or a plane. That is also what stops
+// two current-based synapses on one target from being silently pooled: they land in
+// different planes and integrate separately.
+//
+// `synapse_state` is that storage: wired prototype p's slice starts at
+// (sum of the preceding prototypes' state variable counts) * neuron_count, and within it a
+// neuron occupies its type's state_variable_names.size() consecutive floats. The offsets are
+// baked into the generated source, so no per-prototype descriptor buffer is needed; so are
+// the prototypes' parameter values, which are constants of the prototype.
+//
+// Per tick, per neuron, ahead of the cell dynamics and in the same thread (so the write and
+// the cell's read need no synchronisation -- one thread owns one target's slots):
+//
+//   1. Deliver: read plane 1+p of this tick's row. Non-zero means arrivals are due, and the
+//      OnEvent handler runs once with `weight` bound to the SUMMED arrival weight. For a
+//      handler affine in `weight` -- every current-based synapse in the standard library --
+//      that is exactly the sum of the individual arrivals' effects.
+//   2. Integrate one dt, forward Euler, same simultaneous write-back as a cell.
+//   3. Add the synapse's `i` exposure into plane 0 of this tick's row.
+//
 // Throws, naming the construct and the ComponentType, on anything below.
 GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result);
 
-// OnStart bodies only, run once at initialisation. Skips every other stage.
+// The synapse prototypes at least one edge actually delivers through, in prototype order.
+// A declared-but-unwired synapse contributes nothing to a simulation, so it is neither
+// lowered nor allocated for.
+//
+// The engine and this generator must agree on this list exactly: a prototype's POSITION in
+// it selects its slice of `synapse_state`, and that position + 1 is its plane in the
+// network_inputs ring. Derived here, once, rather than computed independently on each side.
+Vector<s64> wired_synapse_prototype_indices(const NML_ParseResult &parse_result);
+
+// OnStart bodies only -- every cell type's, and every wired synapse prototype's -- run once
+// at initialisation. Skips every other stage.
 GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result);
 
-// Zeroes row `tick % ring_depth` of `network_inputs`, one thread per neuron. The engine
-// dispatches it immediately behind the tick kernel, in the same command batch, so within
+// Zeroes every plane of row `tick % ring_depth` of `network_inputs`, one thread per neuron.
+// The engine dispatches it immediately behind the tick kernel, in the same command batch, so within
 // tick T the order is: host adds T's stimulus into row T % ring_depth -> the tick kernel
 // reads that row and propagates into rows (T + delay) % ring_depth -> this kernel zeroes row
 // T % ring_depth.
@@ -197,8 +251,10 @@ GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result);
 // it flattens the per-edge delays.
 //
 // `argument_names` is a subset of the master kernel's, bound by the same machinery:
-// network_inputs, neuron_count, tick, ring_depth.
-GeneratedKernel generate_ring_row_clear_kernel();
+// network_inputs, neuron_count, tick, ring_depth. It takes the model because the row's
+// plane count comes out of it and is baked into the source rather than passed -- the
+// argument table has no slot left to spend on a scalar.
+GeneratedKernel generate_ring_row_clear_kernel(const NML_ParseResult &parse_result);
 
 // NML/LEMS expression syntax -> C-family syntax, via a tokenizer and a recursive-descent
 // parser. Textual substitution cannot do this correctly: `^` is exponentiation and
@@ -214,7 +270,17 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
 // Phase 1 is GLIF, which needs none of these. They throw rather than being skipped: a
 // silently omitted transition or arrival handler is a model that runs and is wrong.
 //
-//  - OnEvent (DynamicsStage::Arrival) -- incoming-spike handlers.
+//  - OnEvent (DynamicsStage::Arrival) on a CELL. Synapses lower theirs -- it is how a spike
+//    arrival reaches a synapse, so there is no synapse support without it -- but a cell's
+//    would need an incoming-event source the engine does not model.
+//  - A CONDUCTANCE-BASED synapse, i.e. one declaring erev / gbase / gbase1 / gbase2. It
+//    computes i = g * (erev - v), a driving force that depends on the postsynaptic voltage
+//    and reverses sign as v crosses erev, where a current-based synapse injects a fixed
+//    current profile. Those are different models, not approximations of each other, so the
+//    generator names the synapse type and stops rather than running it as current-based.
+//  - A synapse whose SynapseTypeSpecification::requires_per_edge_state is set: its state
+//    does not superpose across converging edges, so the per-target aggregation above is
+//    invalid for it. Per-edge synapse state is a separate ticket.
 //  - Regime / Transition / OnEntry (DynamicsStage::RegimeEntry), and any instruction
 //    carrying a non-empty regime_name.
 //  - ConditionalDerivedVariable / Case. Not a choice: DynamicsInstruction carries a Case's

@@ -194,6 +194,95 @@ NML_ParseResult make_derived_threshold_model() {
     return parse_result;
 }
 
+// ── Synapse fixtures ─────────────────────────────────────────────────────────
+//
+// alphaCurrentSynapse, verbatim from third_party/neuroml2/std_lib/Synapses.xml: two coupled
+// state variables integrated every tick, an OnEvent on port "in" bumping one of them by
+// weight * ibase, and a DerivedVariable `i` exposing the other as the delivered current.
+SynapseTypeSpecification make_alpha_current_synapse_type() {
+    SynapseTypeSpecification synapse_type;
+    synapse_type.name = "alphaCurrentSynapse";
+    synapse_type.state_variable_names = {"I", "J"};
+    synapse_type.parameter_names = {"weight", "tau", "ibase"};
+
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "i", "I"));
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "I",
+                             "(2.7182818284590451*J - I)/tau"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "J", "-J/tau"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "I", "0"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Initialize, NML_DeclarationType::StateAssignment, "J", "0"));
+    // An OnEvent handler's `condition` carries the port it hangs off, which is how the
+    // arrival body is found again after the dynamics are flattened.
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Arrival, NML_DeclarationType::StateAssignment, "J",
+                             "J + weight * ibase", "in"));
+
+    return synapse_type;
+}
+
+// expOneSynapse: conductance-based, so it declares erev and gbase and computes
+// i = g * (erev - v) against a postsynaptic voltage it does not own.
+SynapseTypeSpecification make_conductance_synapse_type() {
+    SynapseTypeSpecification synapse_type;
+    synapse_type.name = "expOneSynapse";
+    synapse_type.state_variable_names = {"g"};
+    synapse_type.parameter_names = {"weight", "gbase", "erev", "tauDecay"};
+
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::DerivedVariable, "i", "g * (erev - v)"));
+    synapse_type.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "g", "-g / tauDecay"));
+    synapse_type.dynamics.push_back(
+            make_instruction(DynamicsStage::Arrival, NML_DeclarationType::StateAssignment, "g",
+                             "g + (weight * gbase)", "in"));
+
+    return synapse_type;
+}
+
+ComponentPrototype make_synapse_prototype(const String &instance_id, s64 type_index,
+                                          const Vector<f64> &parameter_values) {
+    ComponentPrototype prototype;
+    prototype.instance_id = instance_id;
+    prototype.type_index = type_index;
+    for (const f64 parameter_value : parameter_values) {
+        Real resolved;
+        resolved.float64 = parameter_value;
+        prototype.starting_parameters.push_back(resolved);
+    }
+    return prototype;
+}
+
+// Two neurons, one edge, delivering through `synapse_prototype_index` -- or through nothing
+// when that is -1, which is what makes a prototype unwired.
+void wire_one_edge(NML_ParseResult &parse_result, s64 synapse_prototype_index) {
+    parse_result.neurons.clear();
+
+    Neuron source_neuron;
+    NetworkEdge edge;
+    edge.target_neuron_index = 1;
+    edge.synapse_prototype_index = synapse_prototype_index;
+    source_neuron.outgoing_edges.push_back(edge);
+
+    parse_result.neurons.push_back(source_neuron);
+    parse_result.neurons.push_back(Neuron{});
+}
+
+// One synaptic-input cell, one alphaCurrentSynapse prototype, one edge through it.
+NML_ParseResult make_alpha_synapse_model() {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+    parse_result.synapse_types.push_back(make_alpha_current_synapse_type());
+    parse_result.synapse_prototypes.push_back(
+            make_synapse_prototype("alphaSyn", 0, {1.0, 2.0e-3, 1.0e-9}));
+    wire_one_edge(parse_result, 0);
+    return parse_result;
+}
+
 // ── Metal compilation ────────────────────────────────────────────────────────
 // Guarded on the Metal build rather than on the host OS: shelling out to xcrun from a CUDA
 // build is exactly the defect tracked as issue #117.
@@ -512,7 +601,8 @@ TEST(KernelCodegenKernel, ArgumentNamesAreTheDocumentedBindingOrder) {
         "edge_weight_deltas",   "edge_delay_ticks",      "branching_factor",
         "superblock_size_words","padded_node_count",     "tree_height",
         "internal_bit_count",   "rank_float4_stride",    "constant_weight",
-        "max_neighbor_count",   "ring_depth",
+        "max_neighbor_count",   "ring_depth",            "synapse_state",
+        "edge_synapse_plane",
     };
 
     const GeneratedKernel tick_kernel = generate_tick_kernel(parse_result);
@@ -785,8 +875,10 @@ TEST(KernelCodegenSelectPath, SelectionOverSynapsesReadsTheInputAccumulator) {
     // nothing writes this tick's row while this tick's kernel runs, and the row is emptied
     // afterwards by the engine's clear kernel rather than by the reader.
     EXPECT_NE(source.find("float derived_iSyn = synaptic_input_accumulator;"), String::npos);
+    // Plane 0: the delivered-current plane, which is where stimulus lands, where every
+    // synapse adds its output, and where a synapse-free edge scatters its raw weight.
     EXPECT_NE(source.find("int synaptic_input_index = network_input_ring_index(\n"
-                          "            tick, ring_depth, neuron_count, neuron_index);"),
+                          "            tick, 0, ring_depth, neuron_count, neuron_index);"),
               String::npos);
     EXPECT_NE(source.find("float synaptic_input_accumulator = "
                           "network_inputs[synaptic_input_index];"),
@@ -924,9 +1016,12 @@ TEST(KernelCodegenPropagation, EveryCellDeviceFunctionEndsWithTheSpikeGuardedEpi
 TEST(KernelCodegenPropagation, ArrivalsAreRingIndexedByDelayAndAddedAtomically) {
     const String source = generate_tick_kernel(make_two_cell_type_model()).source;
 
-    // The arrival row is this tick plus the edge's own delay, and many sources converge on
-    // one target in a tick, so the add has to be atomic.
-    EXPECT_NE(source.find("tick + (long)edge_delay_ticks[edge_slot], ring_depth,"), String::npos);
+    // The arrival row is this tick plus the edge's own delay, the plane is whichever the edge
+    // delivers through, and many sources converge on one target in a tick, so the add has to
+    // be atomic.
+    EXPECT_NE(source.find("tick + (long)edge_delay_ticks[edge_slot],\n"
+                          "                edge_synapse_plane[edge_slot], ring_depth,"),
+              String::npos);
     EXPECT_NE(source.find("atomic_fetch_add_explicit(arrival_slot, edge_weight, "
                           "memory_order_relaxed);"),
               String::npos);
@@ -966,26 +1061,35 @@ TEST(KernelCodegenPropagation, InitializeKernelNeitherPropagatesNorDrains) {
 
     // It still declares the identical argument list, so the engine binds one set for both.
     EXPECT_NE(source.find("constant int       &ring_depth [[ buffer(28) ]]"), String::npos);
+    EXPECT_NE(source.find("device const int   *edge_synapse_plane [[ buffer(30) ]]"),
+              String::npos);
 }
 
 // ── the end-of-tick ring row clear ───────────────────────────────────────────
 
 TEST(KernelCodegenRingClear, ClearsExactlyThisTicksRowAndNothingElse) {
-    const GeneratedKernel clear_kernel = generate_ring_row_clear_kernel();
+    const GeneratedKernel clear_kernel =
+            generate_ring_row_clear_kernel(make_two_cell_type_model());
 
     EXPECT_EQ(clear_kernel.function_name, "clear_network_input_ring_row");
     EXPECT_EQ(clear_kernel.argument_names,
               (Vector<String>{"network_inputs", "neuron_count", "tick", "ring_depth"}));
 
-    // One row -- this tick's -- and within it only the slot belonging to the thread's neuron.
-    // Clearing more would discard arrivals already scheduled into later rows, which is the
-    // one thing the ring exists to hold.
+    // One row -- this tick's -- and within it only the columns belonging to the thread's
+    // neuron. Clearing more would discard arrivals already scheduled into later rows, which
+    // is the one thing the ring exists to hold.
     EXPECT_NE(clear_kernel.source.find("int ring_row = (int)(tick % (long)ring_depth);"),
               String::npos);
     EXPECT_NE(clear_kernel.source.find(
-                      "network_inputs[ring_row * neuron_count + neuron_index] = 0.0f;"),
+                      "int plane_base = ring_row * SPIKECOREC_NETWORK_INPUT_PLANE_COUNT;"),
               String::npos);
-    EXPECT_EQ(clear_kernel.source.find("for ("), String::npos);
+    EXPECT_NE(clear_kernel.source.find("network_inputs[(plane_base + plane_index) * "
+                                       "neuron_count + neuron_index] = 0.0f;"),
+              String::npos);
+
+    // A model with no wired synapse is one plane wide: the delivered-current plane.
+    EXPECT_NE(clear_kernel.source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 1"),
+              String::npos);
 
     // Bounds-checked like every other entry point, and it touches nothing but the ring.
     EXPECT_NE(clear_kernel.source.find("if (neuron_index >= neuron_count) return;"), String::npos);
@@ -998,11 +1102,243 @@ TEST(KernelCodegenRingClear, GeneratedRingClearKernelCompilesAsMetal) {
     if (!metal_compiler_is_available()) GTEST_SKIP() << "the Metal shader compiler is unavailable";
 
     String compiler_output;
-    ASSERT_TRUE(compile_as_metal(generate_ring_row_clear_kernel().source, "ring_row_clear",
-                                 compiler_output))
+    ASSERT_TRUE(compile_as_metal(
+                        generate_ring_row_clear_kernel(make_two_cell_type_model()).source,
+                        "ring_row_clear", compiler_output))
             << compiler_output;
 }
 #endif
+
+// ── Synapse dynamics ─────────────────────────────────────────────────────────
+
+TEST(KernelCodegenSynapse, ArrivalIsDeliveredThenIntegratedThenAddedToTheInputPlane) {
+    const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
+
+    // Stage 1, Deliver: this tick's row of the prototype's own arrival plane, which is plane
+    // 1 -- plane 0 being the delivered current every cell reads.
+    EXPECT_NE(source.find("int synapse_arrival_index = network_input_ring_index(\n"
+                          "            tick, 1, ring_depth, neuron_count, neuron_index);"),
+              String::npos);
+    EXPECT_NE(source.find("float synapse_arrival_weight = "
+                          "network_inputs[synapse_arrival_index];"),
+              String::npos);
+
+    // The OnEvent body, gated on anything having arrived, with `weight` reading the SUMMED
+    // arrival rather than the prototype's own value: that substitution is what makes one
+    // evaluation stand in for every converging edge.
+    EXPECT_NE(source.find("if (synapse_arrival_weight != 0.0f) {"), String::npos);
+    EXPECT_NE(source.find("synapse_state[synapse_state_base + 1] = "
+                          "(synapse_state[synapse_state_base + 1] + "
+                          "(synapse_arrival_weight * 1.000000000e-09f));"),
+              String::npos);
+
+    // Stage 2, Integrate: both state variables, every tick, arrival or not, and written back
+    // only once both derivatives have been computed.
+    EXPECT_NE(source.find("float next_I = synapse_state[synapse_state_base + 0] + dt *"),
+              String::npos);
+    EXPECT_NE(source.find("float next_J = synapse_state[synapse_state_base + 1] + dt *"),
+              String::npos);
+    EXPECT_LT(source.find("float next_J ="),
+              source.find("synapse_state[synapse_state_base + 0] = next_I;"));
+
+    // Delivery converges on the input buffer: `i` added into plane 0 of this tick's row,
+    // which is exactly what the cell's own "synapses[*]/i" path then reads.
+    EXPECT_NE(source.find("int synapse_output_index = network_input_ring_index(\n"
+                          "            tick, 0, ring_depth, neuron_count, neuron_index);"),
+              String::npos);
+    EXPECT_NE(source.find("network_inputs[synapse_output_index] += derived_i;"), String::npos);
+}
+
+TEST(KernelCodegenSynapse, SynapseParametersAreBakedAndStateIsPerTargetNeuron) {
+    const String source = generate_tick_kernel(make_alpha_synapse_model()).source;
+
+    // tau is a constant of the PROTOTYPE, so it is a literal rather than a buffer read --
+    // which is what keeps the argument table from needing a synapse-parameter buffer.
+    EXPECT_NE(source.find("2.000000000e-03f"), String::npos);
+    EXPECT_EQ(source.find("synapse_parameters"), String::npos);
+
+    // One slice per (prototype, neuron): the first prototype starts at offset zero and a
+    // neuron occupies its type's two state variables.
+    EXPECT_NE(source.find("int synapse_state_base = 0 * neuron_count + neuron_index * 2;"),
+              String::npos);
+
+    // The synapse runs ahead of the cell that reads what it delivered, in the same thread.
+    EXPECT_LT(source.find("synapse_step_alphaSyn(synapse_state"),
+              source.find("switch (cell_type_index[neuron_index])"));
+}
+
+TEST(KernelCodegenSynapse, TwoPrototypesGetTheirOwnPlaneAndTheirOwnStateSlice) {
+    // Two alphaCurrentSynapse prototypes differing only in tau. Pooling them would have to
+    // decay one at the other's rate, so each gets its own arrival plane and its own state.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    parse_result.synapse_prototypes.push_back(
+            make_synapse_prototype("alphaSlow", 0, {1.0, 8.0e-3, 1.0e-9}));
+
+    NetworkEdge second_edge;
+    second_edge.target_neuron_index = 1;
+    second_edge.synapse_prototype_index = 1;
+    parse_result.neurons[0].outgoing_edges.push_back(second_edge);
+
+    const String source = generate_tick_kernel(parse_result).source;
+
+    EXPECT_NE(source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 3"), String::npos);
+    EXPECT_NE(source.find("tick, 1, ring_depth, neuron_count, neuron_index);"), String::npos);
+    EXPECT_NE(source.find("tick, 2, ring_depth, neuron_count, neuron_index);"), String::npos);
+
+    // The second prototype's slice starts past the first's two state variables.
+    EXPECT_NE(source.find("int synapse_state_base = 0 * neuron_count + neuron_index * 2;"),
+              String::npos);
+    EXPECT_NE(source.find("int synapse_state_base = 2 * neuron_count + neuron_index * 2;"),
+              String::npos);
+
+    // Each decays at its own tau, which is the whole reason they are kept apart.
+    EXPECT_NE(source.find("2.000000000e-03f"), String::npos);
+    EXPECT_NE(source.find("8.000000000e-03f"), String::npos);
+}
+
+TEST(KernelCodegenSynapse, AnUnwiredPrototypeIsNeitherLoweredNorGivenAPlane) {
+    // A synapse the model declares but no edge delivers through changes nothing about a
+    // simulation, so it costs no plane, no state and no code -- and, being unreachable, is
+    // not rejected for being conductance-based either.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    parse_result.synapse_types.push_back(make_conductance_synapse_type());
+    parse_result.synapse_prototypes.push_back(
+            make_synapse_prototype("unwiredConductance", 1, {1.0, 5.0e-10, 0.0, 3.0e-3}));
+
+    EXPECT_EQ(wired_synapse_prototype_indices(parse_result), (Vector<s64>{0}));
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 2"), String::npos);
+    EXPECT_EQ(source.find("unwiredConductance"), String::npos);
+}
+
+TEST(KernelCodegenSynapse, EdgeThroughNoSynapseKeepsThePlainDeliveredWeight) {
+    // A projection naming no synapse has no dynamics to run, so its raw weight is the
+    // delivered current: plane 0, the one every cell reads.
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+    wire_one_edge(parse_result, /*synapse_prototype_index=*/-1);
+
+    EXPECT_TRUE(wired_synapse_prototype_indices(parse_result).empty());
+
+    const String source = generate_tick_kernel(parse_result).source;
+    EXPECT_NE(source.find("#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT 1"), String::npos);
+    EXPECT_EQ(source.find("synapse_step_"), String::npos);
+
+    // The edge's plane is still read from the per-edge array rather than assumed, so a model
+    // mixing synapse-carrying and synapse-free edges routes each of them correctly.
+    EXPECT_NE(source.find("edge_synapse_plane[edge_slot], ring_depth,"), String::npos);
+}
+
+TEST(KernelCodegenSynapse, OnStartRunsInTheInitializeKernelAndNothingElseDoes) {
+    const String source = generate_initialize_kernel(make_alpha_synapse_model()).source;
+
+    EXPECT_NE(source.find("void synapse_initialize_alphaSyn("), String::npos);
+    EXPECT_NE(source.find("synapse_state[synapse_state_base + 0] = assigned_I;"), String::npos);
+    EXPECT_NE(source.find("synapse_state[synapse_state_base + 1] = assigned_J;"), String::npos);
+
+    // Initialisation neither integrates nor delivers: doing either before the first tick
+    // would inject current the simulation never generated.
+    EXPECT_EQ(source.find("float next_I"), String::npos);
+    EXPECT_EQ(source.find("network_input_ring_index"), String::npos);
+}
+
+TEST(KernelCodegenSynapse, ConductanceBasedSynapseIsRefusedByName) {
+    NML_ParseResult parse_result;
+    parse_result.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+    parse_result.synapse_types.push_back(make_conductance_synapse_type());
+    parse_result.synapse_prototypes.push_back(
+            make_synapse_prototype("condSyn", 0, {1.0, 5.0e-10, 0.0, 3.0e-3}));
+    wire_one_edge(parse_result, 0);
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a conductance-based synapse to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("expOneSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("conductance-based"), String::npos) << message;
+        // Named for what it is, not reported as an unresolvable 'v'.
+        EXPECT_NE(message.find("erev"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, PerEdgeStateSynapseIsRefusedByName) {
+    // A synapse carrying a plasticity or block mechanism does not superpose across
+    // converging edges, so the aggregated per-target state this generator emits would be the
+    // wrong model for it.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    parse_result.synapse_types[0].requires_per_edge_state = true;
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse needing per-edge state to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("superpose"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, ArrivalHandlerThatIgnoresTheWeightIsRefused) {
+    // Arrivals converging on one target are summed into one weight and the handler runs
+    // once. A handler that never reads that weight would apply many spikes as one, silently,
+    // so it is refused rather than aggregated.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        if (instruction.stage != DynamicsStage::Arrival) continue;
+        instruction.expression = "J + ibase";
+    }
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected an arrival handler ignoring 'weight' to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("weight"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseWithNoArrivalHandlerIsRefused) {
+    // Nothing routes a spike anywhere but the "in" port, so a synapse with no handler there
+    // would swallow every spike delivered through it.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    Vector<DynamicsInstruction> without_arrival;
+    for (const DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        if (instruction.stage == DynamicsStage::Arrival) continue;
+        without_arrival.push_back(instruction);
+    }
+    parse_result.synapse_types[0].dynamics = without_arrival;
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse with no OnEvent handler to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("OnEvent"), String::npos) << message;
+    }
+}
+
+TEST(KernelCodegenSynapse, SynapseExposingNoCurrentIsRefused) {
+    // `i` is what a postsynaptic cell's "synapses[*]/i" path selects, so a synapse without
+    // one has nothing to deliver.
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    for (DynamicsInstruction &instruction : parse_result.synapse_types[0].dynamics) {
+        if (instruction.source_tag != NML_DeclarationType::DerivedVariable) continue;
+        instruction.target = "notTheCurrent";
+    }
+
+    try {
+        generate_tick_kernel(parse_result);
+        FAIL() << "expected a synapse exposing no current to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("alphaCurrentSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("exposes no 'i'"), String::npos) << message;
+    }
+}
 
 // ── Unsupported constructs ───────────────────────────────────────────────────
 
@@ -1181,6 +1517,42 @@ TEST(KernelCodegenMetal, PropagatingCellCompilesAsMetal) {
             << "generated Metal source failed to compile:\n"
             << compiler_output << "\n--- source ---\n"
             << source;
+}
+
+TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetal) {
+    // The synapse stage adds a second storage layout, a plane-indexed ring and a device
+    // function called from the master kernel ahead of the cell switch. Only the real shader
+    // compiler settles whether all of that is well formed together.
+    ASSERT_TRUE(metal_compiler_is_available())
+            << "xcrun metal is unavailable, so the generated source was never compiled";
+
+    NML_ParseResult parse_result = make_alpha_synapse_model();
+    parse_result.synapse_prototypes.push_back(
+            make_synapse_prototype("alphaSlow", 0, {1.0, 8.0e-3, 1.0e-9}));
+
+    NetworkEdge second_edge;
+    second_edge.target_neuron_index = 1;
+    second_edge.synapse_prototype_index = 1;
+    parse_result.neurons[0].outgoing_edges.push_back(second_edge);
+
+    String compiler_output;
+    const String tick_source = generate_tick_kernel(parse_result).source;
+    EXPECT_TRUE(compile_as_metal(tick_source, "synapse_tick", compiler_output))
+            << "generated Metal source failed to compile:\n"
+            << compiler_output << "\n--- source ---\n"
+            << tick_source;
+
+    const String initialize_source = generate_initialize_kernel(parse_result).source;
+    EXPECT_TRUE(compile_as_metal(initialize_source, "synapse_initialize", compiler_output))
+            << "generated Metal source failed to compile:\n"
+            << compiler_output << "\n--- source ---\n"
+            << initialize_source;
+
+    const String clear_source = generate_ring_row_clear_kernel(parse_result).source;
+    EXPECT_TRUE(compile_as_metal(clear_source, "synapse_ring_clear", compiler_output))
+            << "generated Metal source failed to compile:\n"
+            << compiler_output << "\n--- source ---\n"
+            << clear_source;
 }
 
 TEST(KernelCodegenMetal, GeneratedMathHeavyKernelCompilesAsMetal) {
