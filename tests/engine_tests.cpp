@@ -1678,6 +1678,154 @@ String two_tau_per_edge_network_nml() {
 )";
 }
 
+// A synapse whose OnStart leaves its state NON-ZERO, so the state is already moving before
+// the first spike ever arrives.
+//
+// That is the only shape in which the seed of the last-advanced-tick plane is observable at
+// all: with an all-zero OnStart and a homogeneous derivative, a state of zero decays to zero
+// however many steps are applied, so seeding "never advanced" as tick 0 rather than -1 costs
+// exactly one step of nothing and both policies agree anyway. Here the missing step is one
+// step of a real decay, and the two disagree by that factor.
+String priming_synapse_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="twoShotCell" extends="baseSpikingCell"
+                   description="Emits exactly two spikes, at fireTimeOne and fireTimeTwo.">
+        <Parameter name="fireTimeOne" dimension="time"/>
+        <Parameter name="fireTimeTwo" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="firedCount" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="firedCount" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. fireTimeOne .and. firedCount .lt. 0.5">
+                <StateAssignment variable="firedCount" value="1"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+
+            <OnCondition test="t .geq. fireTimeTwo .and. firedCount .lt. 1.5">
+                <StateAssignment variable="firedCount" value="2"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="traceCell" extends="baseCell"
+                   description="Records what its synapses delivered, on every tick.">
+        <Dynamics>
+            <StateVariable name="lastInput" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="lastInput" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. 0">
+                <StateAssignment variable="lastInput" value="iSyn"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="primedCurrentSynapse" extends="baseCurrentBasedSynapse"
+                   description="Exponentially decaying current-based synapse, primed at OnStart.">
+        <Property name="weight" dimension="none" defaultValue="1"/>
+        <Parameter name="tau" dimension="time"/>
+        <Parameter name="ibase" dimension="current"/>
+
+        <Dynamics>
+            <StateVariable name="I" dimension="current"/>
+
+            <DerivedVariable name="i" exposure="i" dimension="current" value="I"/>
+
+            <TimeDerivative variable="I" value="-I / tau"/>
+
+            <OnStart>
+                <StateAssignment variable="I" value="ibase"/>
+            </OnStart>
+
+            <OnEvent port="in">
+                <StateAssignment variable="I" value="I + weight * ibase"/>
+            </OnEvent>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="4ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popTarget[0]/lastInput"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String priming_synapse_network_nml() {
+    return R"(<neuroml id="primingsynapsenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <traceCell id="target0"/>
+    <primedCurrentSynapse id="primedSyn" tau="0.5ms" ibase="1nA"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="primedSyn">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+// One source, two targets: one edge through a synapse and one through none at all. The
+// per-edge program plane is the only thing that tells them apart, so a slot flattened for
+// the wrong edge -- or a "no synapse" edge that picks up a program anyway -- shows up as
+// synapse dynamics running on a connection that declared none.
+String mixed_synapse_network_nml() {
+    return R"(<neuroml id="mixedsynapsenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <traceCell id="target0"/>
+    <expCurrentSynapse id="expSyn" tau="0.5ms" ibase="1nA"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="2"/>
+
+        <projection id="projSynapse" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="expSyn">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+        <projection id="projPlain" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[1]"
+                          weight="2.5" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+String write_mixed_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", mixed_synapse_network_nml());
+    return fixture.write("model.xml",
+                         per_edge_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+String write_priming_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", priming_synapse_network_nml());
+    return fixture.write("model.xml",
+                         priming_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
 String write_two_tau_per_edge_model(const FixtureDirectory &fixture) {
     fixture.write("net.nml", two_tau_per_edge_network_nml());
     return fixture.write("model.xml",
@@ -1926,6 +2074,155 @@ TEST(SpikeEngine, lazy_and_eager_synapse_updates_produce_identical_results) {
                     std::fabs(eager_state_by_edge[edge_position]) * 1e-5f + 1e-18f)
                 << "edge " << edge_position << " at its own last spike";
     }
+
+    lazy_engine.shutdown();
+    eager_engine.shutdown();
+}
+
+TEST(SpikeEngine, the_edge_attribute_plane_layout_matches_the_generated_source) {
+    // The engine fills these planes and the generated kernel indexes them, each from its own
+    // copy of the layout. A disagreement reads as a wrong delay or a wrong synapse program on
+    // every edge at once, and never as a crash -- so the two copies are compared directly.
+    nml::NML_ParseResult parse_result;
+    nml::CellTypeSpecification cell_type;
+    cell_type.name = "plainCell";
+    cell_type.state_variable_names = {"v"};
+    parse_result.cell_types.push_back(cell_type);
+    parse_result.neurons.push_back(nml::Neuron{});
+
+    const String tick_source = nml::generate_tick_kernel(parse_result).source;
+    EXPECT_NE(tick_source.find("#define SPIKECOREC_EDGE_ATTRIBUTE_DELAY_PLANE " +
+                               to_string(SpikeEngine::EDGE_ATTRIBUTE_DELAY_PLANE)),
+              String::npos)
+            << tick_source;
+    EXPECT_NE(tick_source.find("#define SPIKECOREC_EDGE_ATTRIBUTE_PROGRAM_PLANE " +
+                               to_string(SpikeEngine::EDGE_ATTRIBUTE_PROGRAM_PLANE)),
+              String::npos)
+            << tick_source;
+    EXPECT_NE(tick_source.find("#define SPIKECOREC_EDGE_ATTRIBUTE_UPDATE_TICK_PLANE " +
+                               to_string(SpikeEngine::EDGE_ATTRIBUTE_UPDATE_TICK_PLANE)),
+              String::npos)
+            << tick_source;
+
+    // And the count covers every plane the generated source names.
+    EXPECT_EQ(SpikeEngine::EDGE_ATTRIBUTE_PLANE_COUNT, 3);
+}
+
+TEST(SpikeEngine, an_edge_through_no_synapse_delivers_its_raw_weight_beside_one_that_does_not) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // A model mixing the two kinds of edge, which is what makes the per-edge program plane
+    // load-bearing rather than decorative: an edge whose projection names no synapse must
+    // deliver its raw weight, and an edge that names one must deliver its synapse's scalar,
+    // in the same walk of the same source's row. Getting the plane wrong runs synapse
+    // dynamics on a plain connection -- a plausible number on a connection that declared no
+    // dynamics at all.
+    FixtureDirectory fixture("neuroml_mixed_synapse");
+    String model_path = write_mixed_synapse_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    ASSERT_EQ(engine.total_neuron_count, 3);
+    EXPECT_EQ(engine.per_edge_synapse_variable_count, 1);
+
+    const s64 first_spike_tick = 3;
+    for (s64 tick = 0; tick <= first_spike_tick; ++tick) engine.step_simulation(tick);
+    ASSERT_EQ(engine.spike_flags.get_contents()[0], 1);
+
+    // Two arrivals, both in the row for tick + 1, one per target.
+    const spikecorec::Vector<RingArrival> arrivals = non_zero_ring_arrivals(engine);
+    ASSERT_EQ(arrivals.size(), 2u);
+
+    f32 synapse_target_arrival = 0.0f;
+    f32 plain_target_arrival = 0.0f;
+    for (const RingArrival &arrival : arrivals) {
+        if (arrival.element_index == ring_element_index(engine, first_spike_tick + 1, 1)) {
+            synapse_target_arrival = arrival.value;
+        }
+        if (arrival.element_index == ring_element_index(engine, first_spike_tick + 1, 2)) {
+            plain_target_arrival = arrival.value;
+        }
+    }
+
+    // The plain edge delivers exactly its declared weight, untouched by any synapse.
+    EXPECT_FLOAT_EQ(plain_target_arrival, 2.5f);
+    // The synapse edge delivers its handler's `weight * ibase` at SI magnitude, which the
+    // plain weight would swamp by nine orders of magnitude if the two were confused.
+    EXPECT_NEAR(synapse_target_arrival, 1.0e-9f, 1.0e-13f);
+
+    // And the synapse-free edge left no per-edge state behind: nothing ran on it.
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, /*source_node=*/0, /*target_node=*/2),
+                    0.0f);
+    EXPECT_NEAR(engine.weights.get_edge_variable(0, /*source_node=*/0, /*target_node=*/1),
+                1.0e-9f, 1.0e-13f);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, lazy_and_eager_agree_for_a_synapse_whose_state_starts_non_zero) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // What pins down the seed of the last-advanced-tick plane. An edge that has never been
+    // advanced is seeded to -1, not 0, because at tick 0 the eager pass takes one step and
+    // the catch-up has to take the same one. With an all-zero OnStart that step is a step of
+    // nothing and both seeds agree, which is why this needs a synapse whose OnStart leaves
+    // real state behind -- its first spike then lands on a value the two policies have
+    // decayed a DIFFERENT number of times if the seed is wrong.
+    FixtureDirectory lazy_fixture("neuroml_priming_lazy");
+    FixtureDirectory eager_fixture("neuroml_priming_eager");
+    String lazy_model_path = write_priming_synapse_model(lazy_fixture);
+    String eager_model_path = write_priming_synapse_model(eager_fixture);
+
+    SpikeEngine lazy_engine(lazy_model_path, /*enable_hebbian_learning=*/false,
+                            /*use_lazy_synapse_updates=*/true);
+    SpikeEngine eager_engine(eager_model_path, /*enable_hebbian_learning=*/false,
+                             /*use_lazy_synapse_updates=*/false);
+
+    const s64 first_spike_tick = 3;
+    const s64 second_spike_tick = 9;
+
+    // The reference the seed decides: I starts at ibase and takes one step per tick from tick
+    // 0, so by the first spike it has taken first_spike_tick + 1 of them.
+    const f32 step_dt = (f32)lazy_engine.network_details.step_dt;
+    const f32 tau = 5.0e-4f;
+    f32 expected_state = 1.0e-9f;
+    for (s64 tick = 0; tick <= first_spike_tick; ++tick) {
+        expected_state = expected_state + step_dt * (-expected_state / tau);
+    }
+    const f32 expected_first_delivery = expected_state + 1.0e-9f;
+
+    f32 lazy_first_delivery = 0.0f;
+    f32 eager_first_delivery = 0.0f;
+
+    for (s64 tick = 0; tick <= second_spike_tick; ++tick) {
+        lazy_engine.step_simulation(tick);
+        eager_engine.step_simulation(tick);
+
+        if (tick != first_spike_tick && tick != second_spike_tick) continue;
+
+        const spikecorec::Vector<RingArrival> lazy_arrivals =
+                non_zero_ring_arrivals(lazy_engine);
+        const spikecorec::Vector<RingArrival> eager_arrivals =
+                non_zero_ring_arrivals(eager_engine);
+        ASSERT_EQ(lazy_arrivals.size(), 1u) << "tick " << tick;
+        ASSERT_EQ(eager_arrivals.size(), 1u) << "tick " << tick;
+
+        EXPECT_NEAR(lazy_arrivals[0].value, eager_arrivals[0].value,
+                    std::fabs(eager_arrivals[0].value) * 1e-5f + 1e-18f)
+                << "tick " << tick << ": the catch-up applied a different number of steps than "
+                << "the eager pass";
+
+        if (tick == first_spike_tick) {
+            lazy_first_delivery = lazy_arrivals[0].value;
+            eager_first_delivery = eager_arrivals[0].value;
+        }
+    }
+
+    // And both agree with the step count derived above, so this is not two policies agreeing
+    // on the same wrong number.
+    EXPECT_NEAR(eager_first_delivery, expected_first_delivery,
+                std::fabs(expected_first_delivery) * 1e-4f);
+    EXPECT_NEAR(lazy_first_delivery, expected_first_delivery,
+                std::fabs(expected_first_delivery) * 1e-4f);
 
     lazy_engine.shutdown();
     eager_engine.shutdown();

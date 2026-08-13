@@ -62,7 +62,8 @@ namespace spikecorec {
         s32 delay_tick_count = 1;
 
         // Which synapse prototype the collapsed edges deliver through, -1 when they name
-        // none. Like the delay, it cannot be collapsed: the slot carries one arrival plane.
+        // none. Like the delay, it cannot be collapsed: the slot runs one lowered synapse
+        // program and carries one set of per-edge state.
         s64 synapse_prototype_index = -1;
     };
 
@@ -82,10 +83,11 @@ namespace spikecorec {
     // of its own resolves to, so "declares none" and "declares the default" do not read as a
     // conflict.
     //
-    // The SYNAPSE is the same story for the same reason: the slot carries one arrival plane,
-    // so two parallel edges through different synapses (an AMPA and an NMDA between one cell
-    // pair) cannot both be represented, and summing their weights into whichever plane came
-    // first would run one synapse's dynamics on the other's coupling. That throws too.
+    // The SYNAPSE is the same story for the same reason: the slot runs one lowered synapse
+    // program over one set of per-edge state, so two parallel edges through different
+    // synapses (an AMPA and an NMDA between one cell pair) cannot both be represented, and
+    // summing their weights into whichever program came first would run one synapse's
+    // dynamics on the other's coupling. That throws too.
     //
     // Returned in first-appearance order, so the wiring it drives is deterministic.
     Vector<AggregatedNetworkEdge> aggregate_network_edges(

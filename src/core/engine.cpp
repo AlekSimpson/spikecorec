@@ -384,6 +384,22 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     // convention. It does not come from the weight matrix -- the adjacency stores weights and
     // delays, not which synapse an edge runs through -- so it is looked up from the
     // aggregated edges by ordered pair.
+    // The generated kernel computes one plane's size as neuron_count * max_neighbor_count,
+    // because those are the two arguments it is handed; the host sizes and fills the same
+    // planes as weights.node_count * weights.max_neighbor_count. The two agree only while the
+    // weight matrix has exactly one node per neuron -- which weight_matrix_network_for
+    // guarantees today, build_adjacency_list returning one row per neuron. Asserted rather
+    // than assumed: if it ever stopped holding, every plane but the first would be read at
+    // the wrong base on device and nothing would fault.
+    if (weights.node_count != total_neuron_count) {
+        log::throw_runtime_error(
+                *logger,
+                fmt::format("SpikeEngine: the weight matrix has {} nodes for {} neurons; the "
+                            "generated kernel derives its per-edge plane stride from the neuron "
+                            "count, so the two must match",
+                            weights.node_count, total_neuron_count));
+    }
+
     const s64 edge_slot_count = weights.node_count * weights.max_neighbor_count;
     const s64 edge_attribute_element_count =
             EDGE_ATTRIBUTE_PLANE_COUNT * (edge_slot_count > 0 ? edge_slot_count : 0);

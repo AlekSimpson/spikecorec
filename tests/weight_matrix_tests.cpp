@@ -2128,7 +2128,11 @@ TEST(WeightMatrix, per_edge_variables_round_trip_exactly_at_realistic_si_magnitu
     // and reads back as the reconstruction itself -- a network that looks mis-modelled rather
     // than mis-rounded.
     auto network = square_torus(4);
-    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true,
+    // rank 6 -> rank_float4_stride 2 -> eight effective lanes, so two of them are PADDING
+    // beyond the logical rank. add_coefficient_vector fills padding with the neutral 1.0f,
+    // which is exactly where a pinning that only covered the logical lanes would leak an
+    // order-1 low-rank term back in.
+    WeightMatrix weight_matrix(network, /*rank=*/6, /*check_indexing=*/true,
                                /*max_neighbor_count=*/-1, /*weight_seed=*/23);
     weight_matrix.configure_per_edge_variable_count(2);
 
@@ -2161,6 +2165,19 @@ TEST(WeightMatrix, per_edge_variables_round_trip_exactly_at_realistic_si_magnitu
                 EXPECT_EQ(float_bit_pattern(stored),
                           float_bit_pattern(expected_values[expected_position]))
                         << "variable " << variable_index << " on edge " << node_index << " -> "
+                        << neighbor_buffer[(usize)slot];
+
+                // The generic family accessor, which DOES add the low-rank reconstruction,
+                // has to agree. That agreement is the whole of what the all-zero Ck buys: a
+                // single non-zero lane -- including one of the padding lanes the logical rank
+                // does not cover -- puts an order-1 term on top of a 1e-12 value here and
+                // nowhere else.
+                EXPECT_EQ(float_bit_pattern(weight_matrix.get_for_matrix(
+                                  (s32)node_index, neighbor_buffer[(usize)slot],
+                                  weight_matrix.per_edge_variable_matrix_index(variable_index))),
+                          float_bit_pattern(expected_values[expected_position]))
+                        << "variable " << variable_index << " read back through the family "
+                        << "accessor on edge " << node_index << " -> "
                         << neighbor_buffer[(usize)slot];
                 ++expected_position;
             }
@@ -2205,7 +2222,8 @@ TEST(WeightMatrix, per_edge_variables_survive_refit) {
     // these matrices are exempt from the fit AND from the Sk clear -- the same trade per-edge
     // delay and exact weights already make. Missing either exemption is silent.
     auto network = square_torus(4);
-    WeightMatrix weight_matrix(network, /*rank=*/8, /*check_indexing=*/true,
+    // rank 6, so two of the eight effective lanes are padding -- see the round-trip test.
+    WeightMatrix weight_matrix(network, /*rank=*/6, /*check_indexing=*/true,
                                /*max_neighbor_count=*/-1, /*weight_seed=*/31);
     weight_matrix.configure_per_edge_variable_count(2);
 

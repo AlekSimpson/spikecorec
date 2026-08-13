@@ -1716,9 +1716,17 @@ String emit_synapse_deliver_body(const SynapseProgram &program,
     const Vector<const DynamicsInstruction *> arrival_assignments =
             arrival_assignments_on_port(*program.type, "in");
 
-    body << indent(1) << "float " << synapse_arrival_local_name << " = edge_weight;\n"
-         << emit_state_assignment_group(storage, parse_result, arrival_symbols,
-                                        arrival_assignments, 1);
+    // The local is what `weight` resolves to inside the handler, so it is declared only when
+    // the handler actually reads it. A handler that ignores the arriving weight is legal now
+    // that delivery is per edge -- it applies one spike as one spike -- and declaring the
+    // local anyway is an unused-variable warning on every kernel such a model produces.
+    const String arrival_body = emit_state_assignment_group(storage, parse_result,
+                                                            arrival_symbols, arrival_assignments,
+                                                            1);
+    if (text_reads_identifier(arrival_body, synapse_arrival_local_name)) {
+        body << indent(1) << "float " << synapse_arrival_local_name << " = edge_weight;\n";
+    }
+    body << arrival_body;
 
     // The delivered current is read off the state the handler just wrote, so the derived
     // locals feeding it are evaluated here rather than reused from the integration step.

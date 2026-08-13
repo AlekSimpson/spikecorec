@@ -2278,6 +2278,35 @@ TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetalUnderBothUpdatePoli
     second_edge.synapse_prototype_index = 1;
     parse_result.neurons[0].outgoing_edges.push_back(second_edge);
 
+    // A handler that never reads `weight` is legal now that delivery is per edge, and it is
+    // the shape that leaves the arrival local declared and unread.
+    NML_ParseResult weight_ignoring_model = make_alpha_synapse_model();
+    for (DynamicsInstruction &instruction : weight_ignoring_model.synapse_types[0].dynamics) {
+        if (instruction.stage != DynamicsStage::Arrival) continue;
+        instruction.expression = "J + ibase";
+    }
+
+    // A synapse whose `i` is a StateVariable rather than a DerivedVariable, so the delivery
+    // returns a storage read with no local in front of it -- and one that declares no
+    // DerivedVariable at all, so the "drop the locals nothing reads" pass has nothing to
+    // keep.
+    SynapseTypeSpecification exponential_current_synapse;
+    exponential_current_synapse.name = "expCurrentSynapse";
+    exponential_current_synapse.state_variable_names = {"i"};
+    exponential_current_synapse.parameter_names = {"weight", "tau", "ibase"};
+    exponential_current_synapse.dynamics.push_back(make_instruction(
+            DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative, "i", "-i / tau"));
+    exponential_current_synapse.dynamics.push_back(
+            make_instruction(DynamicsStage::Arrival, NML_DeclarationType::StateAssignment, "i",
+                             "i + weight * ibase", "in"));
+
+    NML_ParseResult state_exposed_model;
+    state_exposed_model.cell_types.push_back(make_synaptic_input_cell_type("synapses[*]/i"));
+    state_exposed_model.synapse_types.push_back(exponential_current_synapse);
+    state_exposed_model.synapse_prototypes.push_back(
+            make_synapse_prototype("expSyn", 0, {1.0, 5.0e-4, 1.0e-9}));
+    wire_one_edge(state_exposed_model, 0);
+
     struct GeneratedCase {
         String case_name;
         String source;
@@ -2287,6 +2316,8 @@ TEST(KernelCodegenMetal, SynapseCarryingKernelCompilesAsMetalUnderBothUpdatePoli
         {"synapse_tick_eager", generate_tick_kernel(parse_result, false).source},
         {"synapse_initialize", generate_initialize_kernel(parse_result).source},
         {"synapse_ring_clear", generate_ring_row_clear_kernel().source},
+        {"synapse_weight_ignoring", generate_tick_kernel(weight_ignoring_model, true).source},
+        {"synapse_state_exposed", generate_tick_kernel(state_exposed_model, true).source},
     };
 
     for (const GeneratedCase &generated_case : generated_cases) {
