@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "spikecorec/core/backend.h"
@@ -42,13 +43,26 @@ namespace spikecorec::examples {
 //
 // Every quantity in these models is SI, because that is what NeuroML resolves to and what the
 // engine holds: a `<pulseGenerator amplitude="0.6nA">` is 6e-10 A by the time it reaches the
-// synaptic accumulator, so a connection weight summed into that same accumulator has to be in
-// amperes too. A synaptic current is naturally 1e-9-ish, which is unreadable written out, so
-// the examples spell those magnitudes as `25.0 * NANOAMPERE` rather than as `2.5e-8`.
+// synaptic accumulator, and an `<alphaCurrentSynapse ibase="1nA">` is 1e-9 A when its arrival
+// handler steps the synapse. A synaptic current is naturally 1e-9-ish, which is unreadable
+// written out, so the examples spell those magnitudes as `1.0 * NANOAMPERE` rather than as
+// `1e-9`, and emit them into the model with their unit attached (`1nA`).
 //
 // Nothing about the storage needs the numbers to be large: WeightMatrix::set_edge_weight
 // stores a weight exactly, at any magnitude (see examples/README.md).
 constexpr f64 NANOAMPERE = 1e-9;
+
+// A current in amperes, spelled the way NeuroML wants to read it: a magnitude with its unit
+// attached, e.g. 1e-9 -> "1nA". Every current these examples put into a model goes through
+// here, so a dimensionless bare number can never reach an attribute declaring
+// dimension="current".
+inline std::string nanoampere_attribute(f64 amperes) {
+    std::ostringstream text;
+    // The `+ 0.0` normalises a negated zero (IEEE: -0.0 + 0.0 is +0.0), so a switched-off
+    // current renders as "0nA" rather than "-0nA".
+    text << (amperes / NANOAMPERE + 0.0) << "nA";
+    return text.str();
+}
 
 // Owns the GPU context for the whole program.
 //
@@ -83,14 +97,15 @@ struct ExampleOptions {
     // Torus edge length; the generated network holds side_length^2 neurons.
     s64 torus_side_length = 8;
 
-    // The per-connection synaptic weight, in AMPERES -- the models here read their synaptic
-    // accumulator as a current in SI, like every other quantity NeuroML resolves. Delivered as
-    // a single-tick impulse; see the "synaptic weight" note in examples/README.md for why the
-    // projection's declared synapse ComponentType does not (yet) shape it.
+    // How hard one arriving spike drives its target, in AMPERES: the `ibase` of the
+    // alphaCurrentSynapse every projection here names. The synapse's OWN dynamics are run, so
+    // this is the PEAK of the alpha current profile a single arrival injects, reached one
+    // `tau` later -- not a single-tick impulse. See the "synaptic strength" note in
+    // examples/README.md.
     //
-    // `--weight` is typed in nanoamps because 25 is easier to type and read than 2.5e-8, and
-    // parse_example_options converts it here, once.
-    f64 connection_weight = 0.0;
+    // `--synapse-current` is typed in nanoamps because 1 is easier to type and read than 1e-9,
+    // and parse_example_options converts it here, once.
+    f64 synapse_peak_current = 0.0;
 
     // Where a model's <OutputFile> recordings are written.
     std::string recording_directory = "recordings";
@@ -106,7 +121,8 @@ struct ExampleOptions {
 
 inline void print_common_option_help(std::ostream &output) {
     output << "  --ticks <count>       run this many ticks instead of the model's own length\n"
-              "  --weight <nA>         per-connection synaptic weight (single-tick impulse)\n"
+              "  --synapse-current <nA>  peak current one arriving spike injects (the "
+              "synapse's ibase)\n"
               "  --side <length>       torus edge length; the network holds length^2 neurons\n"
               "  --record-dir <path>   where .spire recordings are written\n"
               "  --pattern <bits>      the 0/1 sequence discrete_spike_input_example drives with\n"
@@ -116,12 +132,12 @@ inline void print_common_option_help(std::ostream &output) {
 // Throws on an unrecognised flag rather than ignoring it: a mistyped `--tikcs 100` that
 // silently ran the default length would be reported as a result.
 //
-// `default_connection_weight` is in AMPERES (the caller writes `25.0 * NANOAMPERE`); the
-// `--weight` flag is typed in nanoamps and converted here.
+// `default_synapse_peak_current` is in AMPERES (the caller writes `1.0 * NANOAMPERE`); the
+// `--synapse-current` flag is typed in nanoamps and converted here.
 inline ExampleOptions parse_example_options(int argument_count, char **argument_values,
-                                            f64 default_connection_weight) {
+                                            f64 default_synapse_peak_current) {
     ExampleOptions options;
-    options.connection_weight = default_connection_weight;
+    options.synapse_peak_current = default_synapse_peak_current;
 
     for (int index = 1; index < argument_count; ++index) {
         const std::string flag = argument_values[index];
@@ -133,8 +149,8 @@ inline ExampleOptions parse_example_options(int argument_count, char **argument_
             options.tick_count = std::atoll(argument_values[++index]);
         } else if (flag == "--side" && has_value) {
             options.torus_side_length = std::atoll(argument_values[++index]);
-        } else if (flag == "--weight" && has_value) {
-            options.connection_weight = std::atof(argument_values[++index]) * NANOAMPERE;
+        } else if (flag == "--synapse-current" && has_value) {
+            options.synapse_peak_current = std::atof(argument_values[++index]) * NANOAMPERE;
         } else if (flag == "--record-dir" && has_value) {
             options.recording_directory = argument_values[++index];
         } else if (flag == "--pattern" && has_value) {

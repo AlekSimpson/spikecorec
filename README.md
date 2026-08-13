@@ -124,6 +124,15 @@ make test-metal    # Metal backend explicitly
 make test-cuda     # CUDA backend explicitly
 ```
 
+`make test` compiles nothing under `examples/`, so an example can break without the suite
+noticing. `make check` is the wider gate — the suite **and** every example, built and run,
+failing if any of them exits non-zero:
+
+```bash
+make check         # make test + make run-examples
+make run-examples  # just the examples (recordings go to build/example_runs/)
+```
+
 To run a subset after the initial build, invoke the runner directly with `--gtest_filter`:
 
 ```bash

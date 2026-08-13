@@ -23,7 +23,7 @@ int main(int argument_count, char **argument_values) {
     try {
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/25.0 * NANOAMPERE);
+                                      /*default_synapse_peak_current=*/1.0 * NANOAMPERE);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.
@@ -33,7 +33,7 @@ int main(int argument_count, char **argument_values) {
 
         TorusNetworkOptions torus;
         torus.side_length = options.torus_side_length;
-        torus.connection_weight = options.connection_weight;
+        torus.synapse_peak_current = options.synapse_peak_current;
         torus.membrane_recording_path =
                 options.recording_directory + "/glif2_torus_membrane.spire";
         torus.spike_recording_path = options.recording_directory + "/glif2_torus_spikes.spire";
@@ -75,10 +75,12 @@ int main(int argument_count, char **argument_values) {
         }
         std::cout << "\n    Every one is strictly positive, where GLIF1 would print 0.0 every\n"
                      "    time. Each is resetScale (0.4) times the overshoot past vth on the\n"
-                     "    tick that fired -- and one 0.1ms tick of a 0.6nA drive only carries a\n"
-                     "    100pF membrane a few hundred microvolts past threshold, so the\n"
-                     "    surviving fraction is small. It is the RULE that differs, not its\n"
-                     "    size: shorten dt and it shrinks, lengthen dt and it grows.\n";
+                     "    tick that fired -- and one 0.1ms tick only carries a 100pF membrane a\n"
+                     "    few hundred microvolts to a couple of millivolts past threshold,\n"
+                     "    depending on how much synaptic current happened to be flowing, so the\n"
+                     "    surviving fraction is small and it varies spike to spike. It is the\n"
+                     "    RULE that differs, not its size: shorten dt and it shrinks, lengthen\n"
+                     "    dt and it grows.\n";
 
         std::cout << "\n  Recorded to " << torus.membrane_recording_path << " and\n              "
                   << torus.spike_recording_path << "\n";

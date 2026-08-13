@@ -8,6 +8,8 @@
 #   make python       — build Python extension (pip editable install)
 #   make test         — build and run C++ tests
 #   make examples     — build examples
+#   make run-examples — build AND run every example, failing on any non-zero exit
+#   make check        — the full gate: make test + make run-examples
 #   make clean        — remove build artifacts
 #   make info         — show detected platform/toolchain
 # ============================================================
@@ -154,7 +156,7 @@ PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('
 PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
 
 # ── Top-level targets ────────────────────────────────────────
-.PHONY: all cuda metal python test examples clean info
+.PHONY: all cuda metal python test examples run-examples check clean info
 
 all: $(BACKEND)
 
@@ -281,6 +283,45 @@ $(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) | $(METAL_LIB)
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
 	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
 endif
+
+# ── Running the examples ─────────────────────────────────────
+# `make test` compiles and runs the test suite and nothing else -- not one line of
+# examples/ is even compiled by it, which is how every example in this directory can be
+# broken while the suite reports a full pass. `make run-examples` closes that hole: it
+# builds every example AND runs it, and fails if any of them exits non-zero.
+#
+# Each example is run with its recordings pointed into build/example_runs/<name>/ so a
+# check never writes into the working tree, and its console output is kept alongside in
+# <name>.log so a failure can be read after the fact.
+EXAMPLE_RUN_DIR := $(BUILD_DIR)/example_runs
+
+# The full gate. Split across two sub-makes rather than named as prerequisites so the
+# tests always run before the examples, whatever -j the caller passed.
+check:
+	$(MAKE) test
+	$(MAKE) run-examples
+
+run-examples: examples
+	@rm -rf $(EXAMPLE_RUN_DIR)
+	@mkdir -p $(EXAMPLE_RUN_DIR)
+	@failed_examples=""; \
+	for example_binary in $(EX_BINS); do \
+	    example_name=`basename $$example_binary`; \
+	    printf '[spikecorec] %-32s ' "$$example_name"; \
+	    if $$example_binary --record-dir $(abspath $(EXAMPLE_RUN_DIR))/$$example_name \
+	            > $(EXAMPLE_RUN_DIR)/$$example_name.log 2>&1; then \
+	        echo "ok"; \
+	    else \
+	        echo "FAILED"; \
+	        tail -12 $(EXAMPLE_RUN_DIR)/$$example_name.log | sed 's/^/                 | /'; \
+	        failed_examples="$$failed_examples $$example_name"; \
+	    fi; \
+	done; \
+	if [ -n "$$failed_examples" ]; then \
+	    echo "[spikecorec] examples that did not exit 0:$$failed_examples"; \
+	    exit 1; \
+	fi; \
+	echo "[spikecorec] all $(words $(EX_BINS)) examples ran to completion"
 
 # ── Utilities ────────────────────────────────────────────────
 info:

@@ -15,13 +15,17 @@
 //     first, then every GLIF3 cell's, each neuron occupying one slot per state variable ITS
 //     type declares (2 for GLIF1, 4 for GLIF3).
 //   * inhibition actually inhibiting. The run builds the same network twice, once with the
-//     inhibitory weight zeroed and once with it live, and reports the excitatory
+//     inhibitory synapse's ibase zeroed and once with it live, and reports the excitatory
 //     population's spike count both times. The difference is the whole point of the motif.
 //
-// Sign is the only thing that makes a connection inhibitory here: an arriving weight is
-// summed into the target's synaptic accumulator, so a negative one drives v away from
-// threshold. There is no separate inhibitory synapse mechanism, because synapse
-// ComponentTypes are not lowered yet -- see examples/README.md.
+// Sign is the only thing that makes a connection inhibitory here, and it lives in the
+// SYNAPSE: both projections run an alphaCurrentSynapse, and the inhibitory one's `ibase` is
+// negative, so the current it injects drives v away from threshold instead of towards it.
+// That is what a current-based inhibitory synapse is. It is NOT the conductance-based
+// inhibition of a real cortical model, where i = g * (erev - v) with erev below rest and the
+// drive therefore shrinks as v approaches erev -- the engine refuses conductance-based
+// synapses rather than run them as if they were current-based, so this example demonstrates
+// the mechanism it can actually run. See examples/README.md.
 
 #include "glif_torus_network.h"
 
@@ -33,17 +37,27 @@ namespace {
 constexpr s64 EXCITATORY_NEURON_COUNT = 8;
 constexpr s64 INHIBITORY_NEURON_COUNT = 2;
 
-// Weights are in amperes, like everything else the synaptic accumulator holds. 25nA is one
-// full recruiting event (see glif_torus_network.h).
-constexpr f64 EXCITATORY_WEIGHT = 25.0 * NANOAMPERE;
+// The excitatory synapse's `ibase`, in amperes: the peak of the alpha current profile one
+// arriving spike injects. 1nA is one full recruiting event (see glif_torus_network.h).
+constexpr f64 EXCITATORY_PEAK_CURRENT = 1.0 * NANOAMPERE;
 
-std::string excitatory_inhibitory_network_nml(f64 inhibitory_weight) {
+// Both synapses' `tau`. The inhibitory one is the slower of the two, as inhibition usually
+// is: the same peak current spread over a longer window delivers more charge, so a single
+// inhibitory arrival outlasts the excitatory arrival that caused it.
+const char *const EXCITATORY_TIME_CONSTANT = "2ms";
+const char *const INHIBITORY_TIME_CONSTANT = "8ms";
+
+std::string excitatory_inhibitory_network_nml(f64 inhibitory_peak_current) {
     std::ostringstream document;
     document << R"XML(<neuroml id="excitatoryInhibitoryNetwork">
     )XML" << glif_cell_instance(GlifVariant::Glif1, "excitatoryCell") << R"XML(
     )XML" << glif_cell_instance(GlifVariant::Glif3, "inhibitoryCell") << R"XML(
-    <expOneSynapse id="excitatorySynapse" gbase="10nS" erev="0mV" tauDecay="3ms"/>
-    <expOneSynapse id="inhibitorySynapse" gbase="10nS" erev="-80mV" tauDecay="8ms"/>
+    <alphaCurrentSynapse id="excitatorySynapse" tau=")XML"
+             << EXCITATORY_TIME_CONSTANT << R"XML(" ibase=")XML"
+             << nanoampere_attribute(EXCITATORY_PEAK_CURRENT) << R"XML("/>
+    <alphaCurrentSynapse id="inhibitorySynapse" tau=")XML"
+             << INHIBITORY_TIME_CONSTANT << R"XML(" ibase=")XML"
+             << nanoampere_attribute(-inhibitory_peak_current) << R"XML("/>
     <pulseGenerator id="excitatoryDrive" delay="20ms" duration="1000ms" amplitude="0.6nA"/>
 
     <network id="excitatoryInhibitoryNet">
@@ -62,7 +76,7 @@ std::string excitatory_inhibitory_network_nml(f64 inhibitory_weight) {
         const s64 target_index = (source_index + 1) % EXCITATORY_NEURON_COUNT;
         document << "            <connectionWD id=\"" << source_index << "\" preCellId=\"../ExcPop["
                  << source_index << "]\" postCellId=\"../ExcPop[" << target_index
-                 << "]\" weight=\"" << EXCITATORY_WEIGHT << "\" delay=\"1ms\"/>\n";
+                 << "]\" weight=\"1\" delay=\"1ms\"/>\n";
     }
     document << "        </projection>\n\n";
 
@@ -73,14 +87,14 @@ std::string excitatory_inhibitory_network_nml(f64 inhibitory_weight) {
     for (s64 source_index = 0; source_index < EXCITATORY_NEURON_COUNT; ++source_index) {
         document << "            <connectionWD id=\"" << source_index << "\" preCellId=\"../ExcPop["
                  << source_index << "]\" postCellId=\"../InhPop["
-                 << source_index % INHIBITORY_NEURON_COUNT << "]\" weight=\"" << EXCITATORY_WEIGHT
-                 << "\" delay=\"1ms\"/>\n";
+                 << source_index % INHIBITORY_NEURON_COUNT << "]\" weight=\"1\" delay=\"1ms\"/>\n";
     }
     document << "        </projection>\n\n";
 
-    // Feedback inhibition onto every excitatory cell. A NEGATIVE weight is the whole
-    // mechanism; with inhibitory_weight == 0 these connections still exist and still deliver,
-    // they just deliver nothing.
+    // Feedback inhibition onto every excitatory cell. The inhibitorySynapse's NEGATIVE ibase
+    // is the whole mechanism; with inhibitory_peak_current == 0 these connections still
+    // exist, still arrive on the tick they are due, and still step the synapse -- the synapse
+    // simply has nothing to inject.
     document << "        <projection id=\"inhToExc\" presynapticPopulation=\"InhPop\"\n"
                 "                    postsynapticPopulation=\"ExcPop\" "
                 "synapse=\"inhibitorySynapse\">\n";
@@ -89,8 +103,7 @@ std::string excitatory_inhibitory_network_nml(f64 inhibitory_weight) {
         for (s64 target_index = 0; target_index < EXCITATORY_NEURON_COUNT; ++target_index) {
             document << "            <connectionWD id=\"" << connection_id++
                      << "\" preCellId=\"../InhPop[" << source_index << "]\" postCellId=\"../ExcPop["
-                     << target_index << "]\" weight=\"" << -inhibitory_weight
-                     << "\" delay=\"1ms\"/>\n";
+                     << target_index << "]\" weight=\"1\" delay=\"1ms\"/>\n";
         }
     }
     document << "        </projection>\n\n";
@@ -121,11 +134,12 @@ struct RunOutcome {
 // One complete build-run-report cycle. The engine is scoped so it is destroyed -- and its
 // recorder closed -- before the next run constructs another one.
 RunOutcome run_one_configuration(const GeneratedModelDirectory &model_directory,
-                                 const std::string &configuration_name, f64 inhibitory_weight,
-                                 const std::string &recording_path, s64 tick_count,
-                                 bool print_layout) {
+                                 const std::string &configuration_name,
+                                 f64 inhibitory_peak_current, const std::string &recording_path,
+                                 s64 tick_count, bool print_layout) {
     const std::string network_file_name = configuration_name + "_network.nml";
-    model_directory.write(network_file_name, excitatory_inhibitory_network_nml(inhibitory_weight));
+    model_directory.write(network_file_name,
+                          excitatory_inhibitory_network_nml(inhibitory_peak_current));
     String model_path = model_directory.write(
             configuration_name + "_model.xml",
             excitatory_inhibitory_lems_document(network_file_name, recording_path));
@@ -172,9 +186,15 @@ RunOutcome run_one_configuration(const GeneratedModelDirectory &model_directory,
 
 int main(int argument_count, char **argument_values) {
     try {
+        // The INHIBITORY synapse's peak current; the excitatory one is fixed at
+        // EXCITATORY_PEAK_CURRENT. A twentieth of that still roughly halves the excitatory
+        // population's output, because the inhibitory synapse is the slower of the two (8ms
+        // against 2ms) and so delivers four times the charge per arriving spike, and because
+        // every one of the two inhibitory cells projects to every one of the eight excitatory
+        // cells.
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/60.0 * NANOAMPERE);
+                                      /*default_synapse_peak_current=*/0.05 * NANOAMPERE);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.
@@ -184,24 +204,24 @@ int main(int argument_count, char **argument_values) {
         const GeneratedModelDirectory model_directory("glif_ei_network");
 
         const RunOutcome without_inhibition = run_one_configuration(
-                model_directory, "without_inhibition", /*inhibitory_weight=*/0.0,
+                model_directory, "without_inhibition", /*inhibitory_peak_current=*/0.0,
                 options.recording_directory + "/glif_ei_without_inhibition.spire",
                 options.tick_count, /*print_layout=*/true);
 
         const RunOutcome with_inhibition = run_one_configuration(
-                model_directory, "with_inhibition", options.connection_weight,
+                model_directory, "with_inhibition", options.synapse_peak_current,
                 options.recording_directory + "/glif_ei_with_inhibition.spire",
                 options.tick_count, /*print_layout=*/false);
 
         print_heading("Does the inhibitory population actually inhibit?");
-        std::cout << "  Same network, same drive, same 200ms. The only difference is the weight\n"
-                     "  on the InhPop -> ExcPop projection.\n\n"
-                  << "                             ExcPop spikes   InhPop spikes\n"
-                  << "    inhibitory weight " << std::setw(6) << 0.0 << " nA" << std::setw(14)
+        std::cout << "  Same network, same drive, same 200ms. The only difference is the ibase\n"
+                     "  of the synapse the InhPop -> ExcPop projection runs.\n\n"
+                  << "                            ExcPop spikes   InhPop spikes\n"
+                  << "    inhibitory ibase " << std::setw(6) << 0.0 << " nA" << std::setw(14)
                   << without_inhibition.excitatory_spike_count << std::setw(16)
                   << without_inhibition.inhibitory_spike_count << "\n"
-                  << "    inhibitory weight " << std::setw(6)
-                  << -options.connection_weight / NANOAMPERE << " nA" << std::setw(14)
+                  << "    inhibitory ibase " << std::setw(6)
+                  << -options.synapse_peak_current / NANOAMPERE << " nA" << std::setw(14)
                   << with_inhibition.excitatory_spike_count << std::setw(16)
                   << with_inhibition.inhibitory_spike_count << "\n\n";
 
@@ -214,8 +234,8 @@ int main(int argument_count, char **argument_values) {
                          "  -> ExcPop, so it is genuine network-scale propagation and not the\n"
                          "  directly-driven cell talking to itself.\n";
         } else {
-            std::cout << "  Inhibition did not reduce excitatory firing at this weight. Raise it\n"
-                         "  with --weight.\n";
+            std::cout << "  Inhibition did not reduce excitatory firing at this ibase. Raise it\n"
+                         "  with --synapse-current.\n";
         }
     } catch (const std::exception &error) {
         std::cerr << "glif_ei_network_example: " << error.what() << "\n";

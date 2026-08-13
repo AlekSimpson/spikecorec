@@ -33,7 +33,7 @@ int main(int argument_count, char **argument_values) {
     try {
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/0.0);
+                                      /*default_synapse_peak_current=*/0.0);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.

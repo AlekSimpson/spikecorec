@@ -24,7 +24,7 @@ int main(int argument_count, char **argument_values) {
     try {
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/25.0 * NANOAMPERE);
+                                      /*default_synapse_peak_current=*/1.0 * NANOAMPERE);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.
@@ -34,7 +34,7 @@ int main(int argument_count, char **argument_values) {
 
         TorusNetworkOptions torus;
         torus.side_length = options.torus_side_length;
-        torus.connection_weight = options.connection_weight;
+        torus.synapse_peak_current = options.synapse_peak_current;
         torus.membrane_recording_path =
                 options.recording_directory + "/glif5_torus_membrane.spire";
         torus.spike_recording_path = options.recording_directory + "/glif5_torus_spikes.spire";

@@ -14,9 +14,14 @@
 // This measures the delivery offset directly rather than describing it. One source drives
 // three otherwise-untouched targets over three connections declaring 1ms, 5ms and 10ms. Each
 // target's membrane potential is watched tick by tick; the tick it first moves is the tick
-// the spike landed. The weight is deliberately subthreshold, so a target's v jumps and then
+// the spike landed. The synapse is deliberately subthreshold, so a target's v rises and then
 // decays back without firing -- an arrival is a clean, isolated event rather than something
 // that has to be inferred from a spike train.
+//
+// A target's v is bit-exactly its resting EL until its own arrival: nothing else touches it,
+// and a resting cell's membrane derivative is exactly zero. So "the first tick v moved" is an
+// exact statement, not a threshold crossing, and the ARRIVAL_MOVEMENT_THRESHOLD below only
+// has to be small enough to catch the first tick of an alpha current's rise (see its note).
 
 #include "glif_torus_network.h"
 
@@ -29,17 +34,29 @@ namespace {
 constexpr s64 NEURON_COUNT = 4;
 const char *const DECLARED_DELAYS[] = {"1ms", "5ms", "10ms"};
 
-// Amperes, like everything else in the accumulator. 5nA over one 0.1ms tick moves a 100pF
-// membrane 5mV -- unmistakable against a resting cell, and a quarter of the 20mV it would
-// take to actually fire one.
-constexpr f64 SUBTHRESHOLD_WEIGHT = 5.0 * NANOAMPERE;
+// The delay synapse's `ibase`, in amperes: the peak of the alpha current profile one arriving
+// spike injects. 0.2nA delivers e * ibase * tau = 1.1pC into a 100pF membrane leaking with a
+// 10ms time constant, which peaks at about 6.5mV -- unmistakable against a resting cell, and
+// a third of the 20mV it would take to actually fire one.
+constexpr f64 SUBTHRESHOLD_PEAK_CURRENT = 0.2 * NANOAMPERE;
+
+// Rise and decay time of that alpha profile.
+const char *const SYNAPSE_TIME_CONSTANT = "2ms";
+
+// How far v has to move in one tick to count as "the arrival landed", in volts.
+//
+// An alpha current starts at zero and ramps, so the first tick after an arrival is the
+// smallest step there is: the synapse integrates one dt to i = dt * e * ibase / tau = 27pA,
+// which moves a 100pF membrane by dt * 27pA / 100pF = 27uV. This threshold sits 27x below
+// that, and infinitely above what precedes it -- v does not move at all until the arrival.
+constexpr f32 ARRIVAL_MOVEMENT_THRESHOLD = 1e-6f;
 
 std::string delayed_coupling_network_nml() {
     std::ostringstream document;
     document << "<neuroml id=\"delayedCouplingNetwork\">\n    "
              << glif_cell_instance(GlifVariant::Glif1, "delayCell") << "\n"
-             << "    <expOneSynapse id=\"delaySynapse\" gbase=\"10nS\" erev=\"0mV\" "
-                "tauDecay=\"3ms\"/>\n"
+             << "    <alphaCurrentSynapse id=\"delaySynapse\" tau=\"" << SYNAPSE_TIME_CONSTANT
+             << "\" ibase=\"" << nanoampere_attribute(SUBTHRESHOLD_PEAK_CURRENT) << "\"/>\n"
                 "    <pulseGenerator id=\"sourceDrive\" delay=\"20ms\" duration=\"1000ms\" "
                 "amplitude=\"0.6nA\"/>\n\n"
                 "    <network id=\"delayedCouplingNet\">\n"
@@ -51,9 +68,8 @@ std::string delayed_coupling_network_nml() {
                  << "\" presynapticPopulation=\"pop\"\n"
                     "                    postsynapticPopulation=\"pop\" synapse=\"delaySynapse\">\n"
                     "            <connectionWD id=\"0\" preCellId=\"../pop[0]\" postCellId=\"../pop["
-                 << delay_index + 1 << "]\"\n                          weight=\""
-                 << SUBTHRESHOLD_WEIGHT << "\" delay=\"" << DECLARED_DELAYS[delay_index]
-                 << "\"/>\n        </projection>\n\n";
+                 << delay_index + 1 << "]\"\n                          weight=\"1\" delay=\""
+                 << DECLARED_DELAYS[delay_index] << "\"/>\n        </projection>\n\n";
     }
 
     document << "        <explicitInput target=\"pop[0]\" input=\"sourceDrive\"/>\n"
@@ -77,7 +93,7 @@ int main(int argument_count, char **argument_values) {
     try {
         const ExampleOptions options =
                 parse_example_options(argument_count, argument_values,
-                                      /*default_connection_weight=*/SUBTHRESHOLD_WEIGHT);
+                                      /*default_synapse_peak_current=*/SUBTHRESHOLD_PEAK_CURRENT);
         configure_logging(options);
 
         // The first local owning anything GPU-backed, so it destructs last.
@@ -121,7 +137,8 @@ int main(int argument_count, char **argument_values) {
             for (s64 neuron_index = 1; neuron_index < NEURON_COUNT; ++neuron_index) {
                 const f32 potential = read_cell_state(engine, neuron_index, "v");
                 if (arrival_tick[(usize)neuron_index] < 0 &&
-                    potential - previous_potential[(usize)neuron_index] > 1e-3f) {
+                    potential - previous_potential[(usize)neuron_index] >
+                            ARRIVAL_MOVEMENT_THRESHOLD) {
                     arrival_tick[(usize)neuron_index] = tick;
                 }
                 previous_potential[(usize)neuron_index] = potential;

@@ -343,9 +343,9 @@ inline const char *glif_component_type_declaration(GlifVariant variant) {
 //
 // `iSyn` reduces over the synaptic accumulator and is used as a current directly, with no
 // scale parameter in between: the accumulator holds AMPERES, like every other quantity the
-// engine works in, so a connection weight and an injected pulseGenerator amplitude are the
-// same kind of number and are written the same way. That is also why the weights below are
-// spelled `25.0 * NANOAMPERE` rather than as a bare 25 -- see TorusNetworkOptions.
+// engine works in, so what a synapse delivers and what an injected pulseGenerator amplitude
+// adds are the same kind of number and are written the same way -- with their units attached.
+// See TorusNetworkOptions.
 inline std::string glif_cell_instance(GlifVariant variant, const std::string &instance_id) {
     const std::string membrane =
             R"( C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" tRef="5ms")";
@@ -383,18 +383,25 @@ inline std::string glif_cell_instance(GlifVariant variant, const std::string &in
 struct TorusNetworkOptions {
     s64 side_length = 8;
 
-    // The <connectionWD weight="..."> every lateral connection carries, in AMPERES -- the
-    // cells read their synaptic accumulator as a current in SI. 25nA over one 0.1ms tick
-    // moves a 100pF membrane by 25mV -- just past the 20mV a resting cell needs to reach
-    // threshold, so one arriving spike recruits its target. Halve it and a cell needs two
-    // neighbours firing together instead.
+    // The lateral synapse's `ibase`, in AMPERES: the PEAK of the alpha current profile one
+    // arriving spike injects, reached one `synapse_time_constant` after it lands.
     //
-    // A NeuroML <connectionWD weight="..."> is dimensionless in the schema (xs:float), a
-    // multiplier on the synapse's own contribution. The engine delivers that multiplier
-    // itself and runs no synapse dynamics behind it (see the projection comment in
-    // torus_network_nml), so here the multiplier IS the current, and it is written out in
-    // SI as 2.5e-08 to keep the accumulator's units consistent with the pulseGenerator's.
-    f64 connection_weight = 25.0 * NANOAMPERE;
+    // 1nA peaks at 1nA and delivers e * ibase * tau = 5.4pC of charge into a 100pF membrane
+    // leaking with a 10ms time constant, which works out to a ~33mV depolarization -- past
+    // the 20mV a resting cell needs to reach threshold, so one arriving spike recruits its
+    // target. Halve it and a cell needs two neighbours firing together instead.
+    //
+    // The magnitude lives HERE rather than in <connectionWD weight="...">, which is
+    // dimensionless in the schema (xs:float) and stays 1: now that the engine runs the
+    // synapse's own dynamics, `weight` is the multiplier LEMS says it is and `ibase` -- which
+    // declares dimension="current" -- is what carries the amperes.
+    f64 synapse_peak_current = 1.0 * NANOAMPERE;
+
+    // The lateral synapse's `tau`: an alphaCurrentSynapse rises to its peak over exactly this
+    // long and decays over the same again, so it is what turns an arrival into a shaped
+    // current rather than a one-tick impulse. Short against the 10ms membrane time constant,
+    // so most of the injected charge is still there when the membrane integrates it.
+    std::string synapse_time_constant = "2ms";
 
     // Conduction delay on every lateral connection. Long enough that one hop is visible as
     // its own step in the first-spike grid rather than the whole torus lighting up at once.
@@ -431,14 +438,17 @@ inline std::string torus_network_nml(GlifVariant variant, const TorusNetworkOpti
                 "amplitude=\"0.6nA\"/>\n";
 
     if (options.include_lateral_connections) {
-        // NeuroML requires a <projection> to name a synapse instance, so one is declared.
-        // Its OWN dynamics are not run: the engine does not lower synapse ComponentTypes
-        // yet, so each arriving spike delivers the connection's `weight` straight into the
-        // target's synaptic accumulator, with no exponential decay shaping it.
-        // gbase/erev/tauDecay below are therefore inert, and `weight` -- in amperes, since
-        // that is what the accumulator holds -- is the whole magnitude. See examples/README.md.
-        document << "    <expOneSynapse id=\"lateralSynapse\" gbase=\"10nS\" erev=\"0mV\" "
-                    "tauDecay=\"3ms\"/>\n";
+        // A <projection> must name a synapse instance, and this one's dynamics ARE run: on
+        // each arrival the engine steps `J += weight * ibase`, integrates the alpha pair one
+        // dt, and adds the exposed `i` into the target's synaptic accumulator.
+        //
+        // Current-based on purpose. A conductance-based synapse (expOneSynapse and friends)
+        // computes i = g * (erev - v), a driving force that depends on the postsynaptic
+        // voltage and reverses sign as v crosses erev; the engine refuses those by name
+        // rather than run them as if they were current-based. See examples/README.md.
+        document << "    <alphaCurrentSynapse id=\"lateralSynapse\" tau=\""
+                 << options.synapse_time_constant << "\" ibase=\""
+                 << nanoampere_attribute(options.synapse_peak_current) << "\"/>\n";
     }
 
     document << "\n    <network id=\"torusNet\">\n"
@@ -467,8 +477,7 @@ inline std::string torus_network_nml(GlifVariant variant, const TorusNetworkOpti
                              << torus_neuron_index(row, column, side_length)
                              << "]\" postCellId=\"../torusPop["
                              << torus_neuron_index(neighbor_row, neighbor_column, side_length)
-                             << "]\"\n                          weight=\""
-                             << options.connection_weight << "\" delay=\""
+                             << "]\"\n                          weight=\"1\" delay=\""
                              << options.connection_delay << "\"/>\n";
                 }
             }
@@ -580,8 +589,9 @@ inline void print_torus_run_header(GlifVariant variant, const TorusNetworkOption
               << (options.include_lateral_connections ? options.side_length * options.side_length * 4
                                                       : 0)
               << " connections, corner neuron 0 driven by a 0.6nA step\n"
-              << "  connection weight " << options.connection_weight / NANOAMPERE
-              << " nA, delay " << options.connection_delay << "\n";
+              << "  alphaCurrentSynapse ibase " << options.synapse_peak_current / NANOAMPERE
+              << " nA, tau " << options.synapse_time_constant << ", connection delay "
+              << options.connection_delay << "\n";
 }
 
 } // namespace spikecorec::examples
