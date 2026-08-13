@@ -1,0 +1,29 @@
+<Lems>
+  <!--
+    The file the engine is actually handed. Nightly's file of this name was a thin
+    <neuroml><include/></neuroml> wrapper whose only job was to keep the raw LEMS
+    ComponentType in glif3_ring_network.nml away from the NeuroML XSD validator, which only
+    ever validates the TOP-LEVEL file it is given. That job still needs doing, and this file
+    still does it: a <Lems> root has no declaration in the NeuroML schema at all, so
+    SpikeEngine skips XSD validation for it entirely (src/core/engine.cpp,
+    document_root_is_neuroml).
+
+    What is new is the <Simulation>. The engine now takes dt and the run length from the
+    model rather than from a dt_seconds constructor argument, so they have to be stated
+    somewhere, and a <Simulation> is not valid inside a <neuroml> root. Same shape as
+    examples/glif_torus_network.h's own generated LEMS document.
+
+    step="0.1ms" is 1e-4 s per tick, which is the dt nightly's test passed explicitly.
+    length="300ms" is 3000 ticks, which is the tick count it ran.
+
+    No <OutputFile> on purpose: this fixture is loaded by tests that must not write anything
+    into the working tree. test_glif_network.py's recording test generates its own LEMS
+    wrapper, with recording paths inside pytest's tmp_path, and includes the same network
+    file this one does.
+  -->
+  <Target component="ringSimulation"/>
+
+  <Include file="glif3_ring_network.nml"/>
+
+  <Simulation id="ringSimulation" length="300ms" step="0.1ms" target="Glif3RingNet"/>
+</Lems>

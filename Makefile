@@ -6,6 +6,7 @@
 #   make cuda         — build CUDA backend
 #   make metal        — build Metal backend
 #   make python       — build Python extension (pip editable install)
+#   make python-test  — build the extension AND run python/tests (needs PYTHON=, see below)
 #   make test         — build and run C++ tests
 #   make examples     — build examples
 #   make run-examples — build AND run every example, failing on any non-zero exit
@@ -165,12 +166,17 @@ DEPFLAGS    := -MMD -MP
 ALL_DEP_FILES := $(patsubst %.o,%.d,$(CORE_OBJS) $(NML_OBJS) $(METAL_OBJS))
 
 # ── Python toolchain ─────────────────────────────────────────
+# Building the extension needs pybind11; running python/tests additionally needs numpy and
+# pytest. None of the three is needed by the C++/Metal/CUDA build, so point this at whatever
+# interpreter has them:
+#     make python PYTHON=/path/to/venv/bin/python
+#     make python-test PYTHON=/path/to/venv/bin/python
 PYTHON     ?= python3
 PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null)
 PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
 
 # ── Top-level targets ────────────────────────────────────────
-.PHONY: all cuda metal python test examples run-examples check clean info
+.PHONY: all cuda metal python python-test test examples run-examples check clean info
 
 all: $(BACKEND)
 
@@ -246,6 +252,18 @@ ifeq ($(BACKEND),metal)
 endif
 	@echo "[spikecorec] Python extension installed (backend=$(BACKEND))"
 
+# Builds the extension and runs python/tests against it. A few seconds: the fixture is an
+# 8-neuron ring run for a few thousand ticks.
+#
+# Deliberately NOT wired into `make check`. `make check` has to stay runnable with no
+# arguments, and this cannot be: PYTHON defaults to `python3`, and whether that particular
+# interpreter has pybind11, numpy and pytest is a property of the machine rather than of the
+# repository. A `make check` that failed on a missing pytest would be reporting the
+# environment instead of the code. Run it explicitly:
+#     make python-test PYTHON=/path/to/venv/bin/python
+python-test: python
+	$(PYTHON) -m pytest python/tests
+
 # ── Tests ────────────────────────────────────────────────────
 .PHONY: test test-cuda test-metal
 
@@ -284,14 +302,22 @@ examples-cuda: check-cuda $(CUDA_LIB) $(EX_BINS)
 
 examples-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(EX_BINS)
 
+# The library is a NORMAL prerequisite, not an order-only one (it used to sit after a `|`).
+# Order-only means "build this first, but never let its timestamp make me out of date", so a
+# rebuilt libspikecorec_*.a did not relink a single example: every binary here kept whatever
+# it had linked against last, and `make examples` reported success while producing nothing.
+# What that looks like from the outside is an example failing on a bug that was fixed several
+# merges ago, or -- worse -- an example agreeing with a measurement that is no longer true.
+# Same class as the -MMD -MP header tracking above, one level up: the objects are correct and
+# the binaries linking them are not.
 ifeq ($(BACKEND),cuda)
-$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) | $(CUDA_LIB)
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) $(CUDA_LIB)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) \
 	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
 else
-$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) | $(METAL_LIB)
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HDRS) $(METAL_LIB)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \
@@ -375,14 +401,16 @@ demos-cuda: check-cuda $(CUDA_LIB) $(DEMO_BINS)
 
 demos-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(DEMO_BINS)
 
+# Normal prerequisite, not order-only, for the same reason as the examples rule above: a
+# rebuilt library has to relink these or a demo video is rendered from stale dynamics.
 ifeq ($(BACKEND),cuda)
-$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HDRS) | $(CUDA_LIB)
+$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HDRS) $(CUDA_LIB)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) \
 	    $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread -o $@
 else
-$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HDRS) | $(METAL_LIB)
+$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HDRS) $(METAL_LIB)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) \

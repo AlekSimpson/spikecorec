@@ -377,12 +377,20 @@ logs a warning. `izhikevich_network_example` trips this, so its two recorded col
 
 ## Python
 
-`demo_script.py` predates the NeuroML path entirely: it drives the original hardcoded-LIF engine
-through the pybind11 bindings (`SpikeEngine(network, shape=…, rank=…)`, `set_input_neurons`,
-`step_simulation([values], tick=…)`). None of those constructors or methods exist on this branch
-— they are commented out in `include/spikecorec/core/engine.h` pending rework — and
-`src/bindings/bindings.cpp` still references them, so `make python` does not build here. The
-script is kept as-is rather than rewritten against an API that has not been decided.
+`demo_script.py` is the C++ examples' shape, in Python: hand a model file to a `SpikeEngine`,
+step it, read the state and the recordings back. It used to drive the pre-NeuroML engine
+(`SpikeEngine(network, shape=…, rank=…)`, `set_input_neurons`, `step_simulation([values],
+tick=…)`); none of those exist any more, so it was rewritten against the bindings this branch
+actually has. It generates a LEMS wrapper around `python/tests/fixtures/glif3_ring_network.nml`
+in a scratch directory and prints the wiring, the spike counts, the final state and the
+recorded frame count.
 
-`render_spire_video.py` is the only Python that works today, and it needs nothing from
-spikecorec but the `.spire` files themselves.
+```bash
+make python PYTHON=/path/to/python
+/path/to/python examples/demo_script.py
+```
+
+See `python/docs/README.md` for the walkthrough and `python/docs/API_REFERENCE.md` for the
+per-method reference.
+
+`render_spire_video.py` needs nothing from spikecorec but the `.spire` files themselves.
