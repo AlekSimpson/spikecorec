@@ -2,6 +2,7 @@
 // Created by Alek Simpson on 5/30/26.
 //
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -175,7 +176,9 @@ spikecorec::Vector<f64> spikecorec::create_event_stream(
 
     if (continuous_current_injection) {
         // {start_tick, end_tick}: one window with current flowing across all of it, not
-        // two isolated impulses.
+        // two isolated impulses. CLOSED at both ends -- the `tick <= last_event_tick`
+        // below is the whole convention, and the producer of the pair owes it an
+        // inclusive last tick (see create_event_stream in engine.h).
         const s64 first_event_tick = event_ticks.front() < 0 ? 0 : static_cast<s64>(event_ticks.front());
         for (s64 tick = first_event_tick; tick <= last_event_tick; ++tick) {
             stream[static_cast<usize>(tick)] = event_magnitude;
@@ -547,8 +550,17 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
     zero_fill_engine_buffer(cell_parameters, cell_parameter_element_count);
     zero_fill_engine_buffer(network_inputs, network_input_element_count);
     zero_fill_engine_buffer(spike_flags, total_neuron_count);
-    zero_fill_engine_buffer(last_spiked, total_neuron_count);
     zero_fill_engine_buffer(last_tick_updated, total_neuron_count);
+
+    // NOT zero-filled: 0 is a tick a neuron can genuinely fire on, so a zero fill would make
+    // "has never fired" indistinguishable from "fired on tick 0" and every last_spiked >= 0
+    // test would read true on a network that never fired at all. See
+    // NEURON_NEVER_SPIKED_TICK.
+    s64 *last_spiked_values = buffer_contents_or_null(last_spiked);
+    if (last_spiked_values != nullptr) {
+        std::fill(last_spiked_values, last_spiked_values + total_neuron_count,
+                  NEURON_NEVER_SPIKED_TICK);
+    }
 
     memcpy(k2tree_shape.get_contents(), staged_k2tree_shape.data(),
            staged_k2tree_shape.size() * sizeof(s32));
@@ -913,6 +925,21 @@ void SpikeEngine::step_simulation(s64 tick) {
     if (!alive || !tick_kernel || !ring_row_clear_kernel) {
         log::throw_runtime_error(
                 *logger, fmt::format("step_simulation: engine is not running (tick={})", tick));
+    }
+
+    // Refused rather than clamped or ignored, because a negative tick is not a wrong answer,
+    // it is a WRITE OUT OF BOUNDS. Every ring index -- the host's current_ring_row_base
+    // below and the generated kernel's network_input_ring_index -- is (tick % ring_depth) *
+    // neuron_count in signed arithmetic, and C's % keeps the sign of its left operand, so a
+    // negative tick indexes network_inputs before its first element. Nothing faults; the
+    // engine corrupts whatever the allocator put in front of the ring.
+    if (tick < 0) {
+        log::throw_runtime_error(
+                *logger,
+                fmt::format("step_simulation: tick must be >= 0 (got {}); the network_inputs "
+                            "ring is indexed by (tick % ring_depth) * neuron_count, which a "
+                            "negative tick drives before the start of the allocation",
+                            tick));
     }
 
     logger->trace("step_simulation: tick={}", tick);

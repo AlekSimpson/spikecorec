@@ -144,7 +144,7 @@ usize cell_state_slot_count(const CellTypeSpecification &cell_type);
 //   1  cell_state_residual      device float *        -- compensated accumulation, see below
 //   2  cell_parameters          device const float *
 //   3  network_inputs           device float *        -- the delay ring, see below
-//   4  last_spiked              device long *
+//   4  last_spiked              device long *         -- WRITE ONLY, see below
 //   5  spike_flags              device int *
 //   6  cell_state_base          device const int *
 //   7  cell_parameter_base      device const int *
@@ -184,6 +184,14 @@ usize cell_state_slot_count(const CellTypeSpecification &cell_type);
 //
 //   k2tree_shape packs the five k^2-tree shape scalars, in order: branching_factor,
 //   superblock_size_words, padded_node_count, tree_height, internal_bit_count.
+//
+// last_spiked is WRITTEN and never read: the generated source stores the current tick into
+// it on every emission (emit_spike) and no emitted expression loads it. That is what lets
+// the engine seed it with SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1) as a "has never fired"
+// sentinel -- a neuron that has not spiked still holds the seed, because nothing on device
+// overwrites it with anything but a real, non-negative spike tick. Anything that later
+// emits a READ of last_spiked owes that sentinel a `< 0` guard, or it will compute an
+// interval against tick -1.
 //
 // constant_weight_enabled is a flag rather than `constant_weight != 0`: a model may set a
 // constant weight of exactly zero, and a magnitude cannot double as a mode.

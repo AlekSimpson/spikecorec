@@ -39,6 +39,14 @@ namespace spikecorec {
     // exactly two entries, {start_tick, end_tick}, denoting a window over which current
     // flows continuously rather than two isolated impulses -- so it needs a flag the tick
     // list alone cannot carry. A spikeArray carries real, isolated spike ticks.
+    //
+    // THE WINDOW IS CLOSED AT BOTH ENDS: the fill below runs `tick <= end_tick`, so
+    // end_tick is the last tick current is delivered on and the window is end_tick -
+    // start_tick + 1 ticks long. Whatever computes the pair owes this an INCLUSIVE last
+    // tick -- nml.cpp's build_input_profile converts LEMS's half-open
+    // `t .lt. delay + duration` by subtracting one there, and the two must not drift
+    // apart: an exclusive end here would inject one extra tick of charge, which is 10% of
+    // a 1ms pulse at a 0.1ms step.
     Vector<f64> create_event_stream(
         f64 rate,
         f64 amplitude,
@@ -198,9 +206,10 @@ namespace spikecorec {
         // scalar arguments, for the same argument-table reason edge_attributes is one buffer.
         GpuPointer<s32> k2tree_shape;
 
-        // [total_neuron_count] — tick each neuron last fired. Always allocated: the
-        // generated kernel writes it unconditionally on every emission, so it is a kernel
-        // output rather than a plasticity-only buffer.
+        // [total_neuron_count] — tick each neuron last fired, or NEURON_NEVER_SPIKED_TICK
+        // for one that has not fired at all. Always allocated: the generated kernel writes
+        // it unconditionally on every emission, so it is a kernel output rather than a
+        // plasticity-only buffer.
         GpuPointer<s64> last_spiked;
 
         // [total_neuron_count] — tick each neuron last received input. Allocated only when
@@ -226,6 +235,15 @@ namespace spikecorec {
         // What an edge_attributes program-plane entry holds when the edge's projection names
         // no synapse: nothing shapes its weight, so its raw weight is the delivered current.
         static constexpr s32 EDGE_WITHOUT_SYNAPSE_PROGRAM = -1;
+
+        // What last_spiked holds for a neuron that has never fired. NEGATIVE, and that is the
+        // whole point: tick 0 is a real tick a neuron can fire on, so a zero fill makes "never
+        // fired" and "fired on tick 0" the same value and every "has this network fired at
+        // all" test reads true on a completely dead network. The generated kernel only ever
+        // WRITES last_spiked -- it stores the current tick on an emission, which is never
+        // negative -- so the sentinel survives untouched until the neuron's first spike, and
+        // `last_spiked < 0` is the never-fired test for every consumer.
+        static constexpr s64 NEURON_NEVER_SPIKED_TICK = -1;
 
         s64 cell_state_element_count = 0;
         s64 cell_parameter_element_count = 0;
