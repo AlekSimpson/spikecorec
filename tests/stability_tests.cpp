@@ -49,14 +49,22 @@ using namespace spikecorec;
 //     tolerance at all.
 //   * It grew without bound, so it was visible in any statistic compared across time, and
 //     invisible in any statistic taken at one instant. Every verdict below is therefore a
-//     comparison of the run against ITSELF at a different time.
+//     comparison of the run against ITSELF at a different time -- with the one exception noted
+//     next, which is exact and needs no window at all.
+//   * A defect of the same shape that SETTLES rather than growing defeats every comparison
+//     across time, because a run at a fixed multiple of its intended drive is stationary at
+//     every multiple. That is why the accumulator carries two exact verdicts rather than one:
+//     `synaptic_accumulator_is_drained_every_tick` says the ring empties, and
+//     `no_arrival_appears_in_the_ring_without_an_emission` says nothing enters it that no spike
+//     put there. The first alone accepts a defect delivering a hundred times the intended
+//     current on every one of 8000 ticks.
 //
 // ── HOW THE ASSERTIONS ARE BUILT ────────────────────────────────────────────────────────────
 // The hard part is asserting something an accumulating defect cannot satisfy without being so
 // loose it catches nothing or so tight it fails on a legitimate transient. Three rules:
 //
-//   1. Measure only the SETTLED portion. Every verdict discards the first half of the run. All
-//      four models here settle inside a few hundred ticks; half a run is three to four thousand.
+//   1. Measure only settled behaviour. All four models here settle inside a few hundred ticks;
+//      the earliest window any verdict opens is at a quarter of the run, which is two thousand.
 //   2. Compare later against earlier, not against a constant. A drift bound survives a
 //      parameter change; a magic number pins today's behaviour and has to be re-measured every
 //      time a fixture moves.
@@ -64,15 +72,99 @@ using namespace spikecorec;
 //      `EL`, `t_ref` as the .nml declares them -- never from a measured value. A bound read off
 //      today's run is not a test, it is a snapshot.
 //
-// The statistic every state-variable verdict uses is the (min, max) PAIR over each half of the
-// settled run, not the mean. The mean is unusable here: a window holding three spikes and a
-// window holding two have visibly different means, purely because the window boundary and the
-// inter-spike interval beat against each other, and that beat is 1.4% of the variable's own
-// magnitude on the driven single cell -- the same order as the drift a real defect would
-// produce. The extremes have no such sensitivity: a settled periodic trajectory reaches the
-// same floor and the same ceiling in every half whether that half holds two cycles or three.
-// Measured margins under this statistic are 12x to 2700x (see each test's own comment), where
-// the mean would have left less than 2x.
+// Two window choices, and the difference between them is deliberate:
+//
+//   * The RATE and ACCUMULATOR comparisons use the SECOND and FOURTH quarters, because the
+//     reason is arithmetic. A quantity growing linearly from tick zero has a window mean set by
+//     the window's midpoint, so two adjacent settled halves (midpoints 5N/8 and 7N/8) differ by
+//     a*N/4 while the second and fourth quarters (midpoints 3N/8 and 7N/8) differ by a*N/2 --
+//     twice the signal against the same band. On the firing rate that is the difference between
+//     rejecting a ramp once it has grown 1.6x across the run and letting it reach 3.7x, measured
+//     (see a_linearly_ramping_firing_rate_is_rejected, which the settled-halves windows read at
+//     a ratio of 1.197 and accepted).
+//   * The STATE comparison keeps the two halves of the settled run, because its tightest real
+//     margin belongs to glif5's asc1, which is still converging by a few parts in 10^4 at the
+//     half-way point. Opening its early window at a quarter of the run would measure that
+//     convergence rather than any drift, and would spend the margin on it.
+//
+// The statistic every state-variable verdict uses is the (min, max) PAIR over each half, not
+// the mean. The mean is unusable here: a window holding three spikes and a window holding two
+// have visibly different means, purely because the window boundary and the inter-spike interval
+// beat against each other, and that beat is 1.4% of the variable's own magnitude on the driven
+// single cell -- the same order as the drift a real defect would produce. The extremes have no
+// such sensitivity: a settled periodic trajectory reaches the same floor and the same ceiling in
+// every half whether that half holds two cycles or three.
+//
+// ── WHERE THE STATE-VARIABLE VERDICT ACTUALLY DISCRIMINATES ─────────────────────────────────
+// The (min, max) statistic needs the extremes to be FREE. Where the model pins an extreme, the
+// verdict measures the pin and not the trajectory, and its reported margin is not sensitivity.
+// The distinction is not cosmetic: only 4 of this file's 36 state slots have both extremes free,
+// so they are listed here rather than left to be rediscovered.
+//
+//   LOAD-BEARING (extremes free, a defect can move them) -- 4 slots:
+//     driven single cell   theta, asc1, asc2 -- continuous, no reset touches them. asc1 is the
+//                          tightest real margin in the file at 11.6x, and it is tight because it
+//                          is still settling by a few parts in 10^4, not because it drifts. asc2
+//                          has converged to within f32 rounding by the settle point and so reads
+//                          bit-identical across the halves, but nothing about the model pins it:
+//                          a defect can still move it, and the drift falsification confirms the
+//                          verdict rejects one when it does.
+//     delayed coupling     the target cell's v, over its [-67.4mV, -64.7mV] settled span. It
+//                          never reaches threshold, so both ends are set by the leak against the
+//                          arriving current. The only membrane potential here of which that is
+//                          true.
+//
+//   PINNED BY CONSTRUCTION (no engine defect can move them) -- the other 32 slots:
+//     every spiking cell's v         10 slots. The window minimum is bit-identically `vreset`,
+//                                    because the reset assignment writes exactly that value --
+//                                    measured, it does not move by one bit in either half of any
+//                                    model here. The maximum is whichever sample first landed
+//                                    past `vth`, so it moves only by where in the tick grid the
+//                                    crossing fell. That is sub-tick crossing jitter, and the
+//                                    recurrent network's worst reported margin of 20x is 20x the
+//                                    jitter -- not a safety factor, and it does not become one by
+//                                    being large.
+//     refractoryTimeElapsed          11 slots, cycling [0, t_ref] by the regime machinery's own
+//                                    definition, or frozen at 0 for a cell that never fires.
+//     the regime index               11 slots, cycling {0, 1} for the same reason.
+//
+// The recurrent network's state test is kept anyway, because the pinning is itself worth
+// asserting -- a `vreset` that moved is a real change -- but it is NOT counted as coverage of
+// state drift, and its name says what it checks.
+//
+// One further caution on every margin quoted in this file: they are drawn from a chaotic
+// quantity and are not monotone in anything. Scaling the recurrent fixture's drive moves the
+// worst state-stationarity ratio to 0.976 of its allowance at 4x, then back to 0.257 at 5x and
+// 0.310 at 6x -- on a correct engine, every time. Headroom here is the current draw of a chaotic
+// system, not a safety factor, and a fixture amplitude change can push a ratio past 1.0 with
+// nothing wrong. Re-measure after any fixture edit; do not reason from these numbers.
+//
+// ── WHAT THIS SUITE DOES NOT COVER ──────────────────────────────────────────────────────────
+// Stated because a suite whose claimed coverage exceeds its real coverage is worse than no suite:
+// it converts absence of evidence into apparent evidence of absence, which is the exact failure
+// mode the section above describes.
+//
+//   * A CONSTANT-FACTOR ERROR IN DELIVERED CURRENT. Not covered, and not coverable here.
+//     Scaling every pulseGenerator amplitude on the recurrent model gives 696 spikes at 1.0x,
+//     773 at 1.1x, 1253 at 2.0x and 1795 at 4.0x, and every verdict in this file passes at every
+//     one of them. That is correct behaviour on this suite's part: a network at 1.1x its
+//     intended drive is genuinely stable -- it settles, it stays settled, nothing accumulates --
+//     so there is no stability property left to violate. Delivering the wrong AMOUNT is a
+//     correctness property with no stability signature.
+//     The 1.1x row is not hypothetical: the pulseGenerator defect fixed alongside this file's own
+//     first version delivered 10% too much charge. This suite would not have caught it. What did
+//     catch it is reference validation -- tests/exit_model_validation_tests.cpp, comparing whole
+//     trajectories against recorded jLEMS output, where it read as a 600uV deviation. Anything
+//     about the SIZE of a delivered quantity belongs there, not here.
+//     The one part of the level this file can reach is the saturated end, where the physics
+//     itself provides a bound: see evaluate_firing_rate_stays_below_the_refractory_ceiling.
+//
+//   * THE SIZE OF A SYNAPTIC ARRIVAL. Same reason. The accumulator verdicts establish that
+//     charge appears in network_inputs only where a spike put it and leaves on schedule; they
+//     say nothing about how much of it there is. An edge weight scaled wrongly is invisible here.
+//
+//   * STATE DRIFT ON A SPIKING CELL'S MEMBRANE POTENTIAL. Pinned by reset and threshold, as
+//     above. Runaway on such a cell appears in the RATE, which is where it is checked.
 //
 // ── FALSIFICATION ───────────────────────────────────────────────────────────────────────────
 // A stability suite that passes on a broken engine is worse than none. Every verdict function
@@ -83,13 +175,30 @@ using namespace spikecorec;
 //   * `undrained_synaptic_accumulator_is_rejected` re-injects the running total of everything
 //     delivered so far into the ring row the engine just cleared, after every tick -- the
 //     shipped defect, reconstructed, driving a real simulation.
+//   * `input_carried_forward_into_the_next_ring_row_is_rejected` carries a fraction of each
+//     tick's input into the NEXT row instead of dropping it, so every row still drains to
+//     exactly zero while the network runs at a hundred times its intended current. It is the
+//     accumulator defect the drained-row check cannot see, and it is why that check has a
+//     whole-ring counterpart next to it.
+//   * `an_arrival_scheduled_deep_in_the_delay_ring_is_rejected` puts an arrival no spike asked
+//     for 50 rows ahead in the 101-row delay ring -- the furthest a defect can get from the one
+//     row the drained-row check inspects on any given tick, and still drained on schedule.
 //   * `arithmetic_overflow_is_rejected` drives a real cell with a current large enough to
 //     overflow f32, so the non-finite samples the finiteness verdict rejects are ones the
 //     engine really produced.
-//   * `silenced_network_is_rejected` runs a real model whose drive stops midway.
-//   * the remaining three perturb a REAL recorded trajectory (a linear ramp; a one-tick shift)
-//     rather than a synthetic one, so the verdict is rejecting a shape it would meet in
-//     practice rather than an artificial one.
+//   * `silenced_network_is_rejected` runs a real model whose drive stops between the two
+//     measurement windows, against both the rate comparison's falling direction and the growth
+//     comparison's shrinking one.
+//   * `an_unclosed_output_block_is_refused_rather_than_left_in_place` covers a fixture-
+//     preparation step rather than a verdict, and is here because it used to fail silently and
+//     the consequence was a recording written into the shared working directory of this binary.
+//   * the raster falsifications perturb a REAL recorded raster -- thinned into a linear rate
+//     ramp, or replaced by the maximal train its own t_ref permits -- so what a verdict rejects
+//     is a shape it would meet in practice, and so the perturbation cannot violate a DIFFERENT
+//     verdict and be rejected for the wrong reason. Each one asserts the verdicts it must not
+//     trip, which is what attributes the rejection to the verdict under test.
+//   * the remaining two perturb a real recorded trajectory (a linear ramp on one state variable;
+//     a one-tick shift) for the same reason.
 //
 // ── MODELS ──────────────────────────────────────────────────────────────────────────────────
 //   driven single cell   tests/fixtures/nml/glif5_single_cell.nml, lengthened. The richest
@@ -116,11 +225,14 @@ using namespace spikecorec;
 // today. The generated network above is the current-based recurrent model this suite needs.
 //
 // ── COST ────────────────────────────────────────────────────────────────────────────────────
-// Four 8000-tick runs plus three short falsification runs, about 11s wall clock. A tick is one
-// Metal command buffer committed and waited on, ~0.27ms, independent of neuron count -- so
-// duration is bought in ticks and networks are nearly free. LONG_RUN_TICK_COUNT below is the
-// one knob; every tolerance is relative, so lowering it costs sensitivity to slow drift (the
+// Four 8000-tick runs plus five short falsification runs, about 12s wall clock for 35 tests. A
+// tick is one Metal command buffer committed and waited on, ~0.27ms, independent of neuron count
+// -- so duration is bought in ticks and networks are nearly free. LONG_RUN_TICK_COUNT below is
+// the one knob; every tolerance is relative, so lowering it costs sensitivity to slow drift (the
 // detectable per-tick drift scales as 1/LONG_RUN_TICK_COUNT) and nothing else.
+//
+// The whole-ring statistic adds one pass over ring_depth * neuron_count floats per tick, which is
+// 202 on the deepest model here and does not register against the command buffer.
 
 namespace {
 
@@ -139,6 +251,8 @@ constexpr s64 LONG_RUN_TICK_COUNT = 8000;
 constexpr f64 SETTLE_FRACTION = 0.5;
 
 // ── how much a state variable is allowed to move between the two halves of the settled run ───
+// Applies to evaluate_state_is_stationary only; the rate and accumulator comparisons use the
+// second and fourth quarters and their own bands. See "HOW THE ASSERTIONS ARE BUILT" above.
 // Both are fractions, of the variable's OWN settled dynamic range and of its OWN largest
 // magnitude respectively, so neither pins a number and neither needs revisiting when a fixture
 // parameter changes. The range term carries the bound for an oscillating variable; the
@@ -223,8 +337,15 @@ String substitute_once(const String &text, const String &original, const String 
 
 // Drops every <OutputFile>/<EventOutputFile> block. The checked-in fixtures name their outputs
 // RELATIVELY, so leaving them in would have the engine's recorders write into whatever working
-// directory this binary happens to be in. Nothing here reads a recording -- every verdict reads
-// engine buffers directly -- so the whole recording path is simply removed.
+// directory this binary happens to be in -- which is the shared working directory of every other
+// suite in this binary, and two suites writing the same relative .dat name is a collision, not a
+// diagnostic. Nothing here reads a recording -- every verdict reads engine buffers directly -- so
+// the whole recording path is simply removed.
+//
+// Throws, like substitute_once and for the same reason, when an opening tag is found with no
+// matching close: a self-closing <OutputFile .../> or a reformatted fixture would otherwise leave
+// the block in place and silently re-enable the very recording this exists to remove. Failing to
+// find the element at all is NOT an error -- a fixture is allowed to declare no outputs.
 String remove_element_blocks(const String &text, const String &element_name) {
     String result = text;
     const String open_tag = "<" + element_name;
@@ -233,7 +354,13 @@ String remove_element_blocks(const String &text, const String &element_name) {
         const usize start = result.find(open_tag);
         if (start == String::npos) break;
         const usize end = result.find(close_tag, start);
-        if (end == String::npos) break;
+        if (end == String::npos) {
+            throw std::runtime_error("stability_tests: fixture opens '" + open_tag +
+                                     "' with no matching '" + close_tag +
+                                     "' -- this suite cannot strip the block, and leaving it in "
+                                     "would have the engine write a recording into the shared "
+                                     "working directory of the test binary");
+        }
         result.erase(start, end + close_tag.size() - start);
     }
     return result;
@@ -281,6 +408,15 @@ struct StabilityRun {
     // end-of-tick ring clear ran. The engine's own invariant says this is exactly zero.
     Vector<f32> drained_row_residual;
 
+    // [tick] largest change, anywhere in the ring OUTSIDE the row this tick drained, between the
+    // end of the previous tick and the end of this one. This is the whole-ring statistic: every
+    // element of every not-yet-due row is differenced, not just the one row `drained_row_residual`
+    // reads. A non-zero entry means this tick scheduled a new arrival, and the engine schedules an
+    // arrival only from the propagate stage, which runs only for a neuron whose spike flag this
+    // same tick raised -- so a non-zero entry on a tick where nothing emitted is charge the engine
+    // invented. See evaluate_ring_arrivals_follow_emissions.
+    Vector<f32> largest_pending_row_change;
+
     // [tick][neuron], 1 where the neuron emitted on that tick.
     Vector<Vector<u8>> spike_flags;
 
@@ -293,6 +429,22 @@ struct StabilityRun {
 
     s64 settle_tick() const { return (s64)((f64)tick_count * SETTLE_FRACTION); }
     s64 midpoint_tick() const { return settle_tick() + (tick_count - settle_tick()) / 2; }
+
+    // The two windows every across-time comparison in this file uses. See
+    // evaluate_synaptic_accumulator_does_not_grow for why they are the second and fourth
+    // quarters rather than the two halves of the settled run.
+    s64 quarter_tick_count() const { return tick_count / 4; }
+    s64 early_window_first_tick() const { return quarter_tick_count(); }
+    s64 early_window_last_tick() const { return 2 * quarter_tick_count(); }
+    s64 late_window_first_tick() const { return 3 * quarter_tick_count(); }
+    s64 late_window_last_tick() const { return tick_count; }
+
+    bool any_neuron_emitted(s64 tick) const {
+        for (u8 flag : spike_flags[(usize)tick]) {
+            if (flag != 0u) return true;
+        }
+        return false;
+    }
 };
 
 // Runs after every tick and BEFORE that tick is sampled, with the engine's buffers in the state
@@ -356,8 +508,14 @@ StabilityRun run_long_simulation(const String &label, const String &model_path, 
     run.spike_flags.reserve((usize)tick_count);
     run.largest_ring_magnitude.reserve((usize)tick_count);
     run.drained_row_residual.reserve((usize)tick_count);
+    run.largest_pending_row_change.reserve((usize)tick_count);
 
     const s64 ring_element_count = (s64)engine.network_input_ring_depth * run.neuron_count;
+
+    // The whole ring as the previous tick left it, so this tick's arrivals can be isolated by
+    // difference. Seeded with zeros because SpikeEngine's constructor zero-fills network_inputs,
+    // which makes tick 0's difference as meaningful as every later one.
+    Vector<f32> previous_ring((usize)ring_element_count, 0.0f);
 
     for (s64 tick = 0; tick < tick_count; tick += 1) {
         // commit_command_batch waits for the command buffer, so by the time this returns every
@@ -400,6 +558,22 @@ StabilityRun run_long_simulation(const String &label, const String &model_path, 
             if (!(magnitude <= largest_in_drained_row)) largest_in_drained_row = magnitude;
         }
         run.drained_row_residual.push_back(largest_in_drained_row);
+
+        // Every element of every OTHER row, differenced against what the previous tick left
+        // there. The drained row is excluded because two engine-owned writes land in it during
+        // this tick by design -- the host's external stimulus, added before the dispatch, and
+        // the end-of-tick clear -- so its change says nothing about scheduling.
+        f32 largest_change = 0.0f;
+        for (s64 index = 0; index < ring_element_count; index += 1) {
+            if (index >= drained_row_base && index < drained_row_base + run.neuron_count) continue;
+            const f32 change = std::fabs(ring[index] - previous_ring[(usize)index]);
+            if (!(change <= largest_change)) largest_change = change;
+        }
+        run.largest_pending_row_change.push_back(largest_change);
+
+        for (s64 index = 0; index < ring_element_count; index += 1) {
+            previous_ring[(usize)index] = ring[index];
+        }
     }
 
     engine.shutdown();
@@ -640,11 +814,19 @@ MembranePotentialBoundsVerdict evaluate_membrane_potential_within_model_bounds(
     return result;
 }
 
-// The exact one. The engine clears the network_inputs row a tick read at the end of that same
-// tick, behind the tick kernel in the same command batch, so once step_simulation returns that
-// row holds literally nothing -- no tolerance, no settle period, no statistic. This is the
-// assertion the shipped defect fails on its first delivered input, and it fails on EVERY tick
-// after that rather than needing a long run to accumulate into view.
+// Exact, and exactly one half of the accumulator's contract. The engine clears the
+// network_inputs row a tick read at the end of that same tick, behind the tick kernel in the
+// same command batch, so once step_simulation returns that row holds literally nothing -- no
+// tolerance, no settle period, no statistic. This is the assertion the shipped defect fails on
+// its first delivered input, and it fails on EVERY tick after that rather than needing a long
+// run to accumulate into view.
+//
+// What it CANNOT see, and the reason evaluate_ring_arrivals_follow_emissions exists next to it:
+// it is a check that the ring EMPTIES, not a check that what the ring holds got there honestly.
+// Charge written into a row that is not yet due is drained on schedule by the tick that row
+// belongs to, so it never appears as a residual here no matter where it came from. A defect that
+// carries a fraction of each tick's input forward into the next row satisfies this verdict on
+// every one of 8000 ticks while delivering a hundred times the intended current.
 Verdict evaluate_synaptic_accumulator_is_drained(const StabilityRun &run) {
     for (s64 tick = 0; tick < run.tick_count; tick += 1) {
         const f32 residual = run.drained_row_residual[(usize)tick];
@@ -662,6 +844,70 @@ Verdict evaluate_synaptic_accumulator_is_drained(const StabilityRun &run) {
                           " ticks left its network_inputs row at exactly zero"};
 }
 
+// The accumulator's other half, and the only whole-ring assertion in this file: charge appears in
+// network_inputs ONLY where a spike put it.
+//
+// The engine has exactly three writers of the ring, and each is pinned to one place:
+//   * the host's Stage-1 stimulus add, into the row this tick is about to read;
+//   * the end-of-tick clear kernel, over that same row;
+//   * the generated propagate stage, into row (tick + edge delay) % ring_depth -- and the master
+//     kernel gates the whole call on `if (spike_flags[neuron_index] != 0)`, with every delay at
+//     least one tick, so it writes only to rows other than the current one and only on a tick
+//     that emitted.
+// The first two both act on the row `drained_row_residual` already covers, which is why
+// `largest_pending_row_change` excludes it. Everything left is the third writer. So on a tick
+// where NO neuron emitted, the whole not-yet-due part of the ring must be bit-identical to what
+// the previous tick left there, and the assertion is `== 0` with no tolerance.
+//
+// This is what rejects an arrival the engine invented rather than delivered: a fraction of each
+// tick's input carried forward into the next row, an edge double-counted because a padding lane
+// of the k2-tree walk was read as a real neighbour, a synapse delivering an unscaled Q. Every one
+// of those writes charge on a tick that scheduled nothing, and this verdict rejects the first
+// such tick rather than waiting for a statistic to move.
+//
+// What it does NOT see: a wrong AMOUNT written on a tick that legitimately emitted. Sizing a
+// delivery is a correctness property with no stability signature -- see "WHAT THIS SUITE DOES NOT
+// COVER" in this file's header.
+struct RingArrivalAccountingVerdict {
+    Verdict verdict;
+    // Ticks on which nothing emitted, so the ring was required to stand still. Zero of these
+    // makes the verdict vacuous, which is why callers assert on it.
+    s64 quiet_tick_count = 0;
+    // Ticks on which the ring did gain content. Zero of these means the model routes nothing
+    // through the not-yet-due rows at all, so the verdict is auditing an always-empty buffer.
+    s64 arrival_tick_count = 0;
+};
+
+RingArrivalAccountingVerdict evaluate_ring_arrivals_follow_emissions(const StabilityRun &run) {
+    RingArrivalAccountingVerdict result;
+    for (s64 tick = 0; tick < run.tick_count; tick += 1) {
+        const f32 change = run.largest_pending_row_change[(usize)tick];
+        const bool emitted = run.any_neuron_emitted(tick);
+
+        if (!(change == 0.0f)) result.arrival_tick_count += 1;
+        if (emitted) continue;
+        result.quiet_tick_count += 1;
+
+        if (!(change == 0.0f)) {
+            std::ostringstream detail;
+            detail.precision(9);
+            detail << run.label << ": no neuron emitted at tick " << tick
+                   << ", yet network_inputs gained " << (f64)change
+                   << " outside the row that tick drained -- charge appeared in the accumulator "
+                      "that no spike scheduled";
+            result.verdict = {false, detail.str()};
+            return result;
+        }
+    }
+
+    result.verdict = {true, run.label + ": over " + to_string(result.quiet_tick_count) +
+                                    " ticks with no emission the whole not-yet-due ring stood "
+                                    "exactly still, and " +
+                                    to_string(result.arrival_tick_count) +
+                                    " tick(s) scheduled an arrival"};
+    return result;
+}
+
 // The rows a tick did NOT read hold arrivals that are not due yet, and those are bounded by the
 // model's fan-in and per-spike charge rather than by anything the engine clears. Their bound is
 // therefore a comparison against the run's own earlier self.
@@ -676,17 +922,22 @@ Verdict evaluate_synaptic_accumulator_is_drained(const StabilityRun &run) {
 //
 // 1.25 is loose against measurement, not against theory: this peak is BIT-IDENTICAL between the
 // two windows in all three models, because it is the peak of a settled synaptic response.
+//
+// Two-sided, and the shrinking direction is not symmetry for its own sake: delivery that STOPS
+// half way through the run leaves a settled-looking ring for the whole first half and an empty
+// one afterwards, which a one-sided growth bound accepts. The emptiness check below covers the
+// same failure at the other end -- traffic that existed only in the first quarter and had already
+// stopped by the early window -- which is what an anti-vacuity guard taken over the WHOLE run
+// misses.
 Verdict evaluate_synaptic_accumulator_does_not_grow(const StabilityRun &run) {
     constexpr f64 ALLOWED_GROWTH_FACTOR = 1.25;
 
-    const s64 quarter = run.tick_count / 4;
-
     f32 early_largest = 0.0f;
-    for (s64 tick = quarter; tick < 2 * quarter; tick += 1) {
+    for (s64 tick = run.early_window_first_tick(); tick < run.early_window_last_tick(); tick += 1) {
         early_largest = std::max(early_largest, run.largest_ring_magnitude[(usize)tick]);
     }
     f32 late_largest = 0.0f;
-    for (s64 tick = 3 * quarter; tick < run.tick_count; tick += 1) {
+    for (s64 tick = run.late_window_first_tick(); tick < run.late_window_last_tick(); tick += 1) {
         late_largest = std::max(late_largest, run.largest_ring_magnitude[(usize)tick]);
     }
 
@@ -695,60 +946,83 @@ Verdict evaluate_synaptic_accumulator_does_not_grow(const StabilityRun &run) {
     detail << run.label << ": largest pending network_inputs magnitude was " << (f64)early_largest
            << " over the second quarter of the run and " << (f64)late_largest << " over the fourth";
 
+    if (!(early_largest > 0.0f)) {
+        return {false, detail.str() +
+                               " -- nothing was pending in the ring over the second quarter, so "
+                               "this comparison has no baseline and would accept any fourth "
+                               "quarter at all"};
+    }
     if ((f64)late_largest > ALLOWED_GROWTH_FACTOR * (f64)early_largest) {
         return {false, detail.str() + " -- growth beyond the allowed " +
                                to_string(ALLOWED_GROWTH_FACTOR) + "x"};
     }
+    if ((f64)late_largest * ALLOWED_GROWTH_FACTOR < (f64)early_largest) {
+        return {false, detail.str() + " -- a fall beyond the allowed " +
+                               to_string(ALLOWED_GROWTH_FACTOR) +
+                               "x, so delivery is dying out rather than settling"};
+    }
     return {true, detail.str()};
 }
 
-// Not runaway and not dying out, over the two halves of the settled run.
+// Not runaway and not dying out, over the SECOND and FOURTH quarters of the run.
+//
+// The windows are the ones evaluate_synaptic_accumulator_does_not_grow uses, and for the same
+// arithmetic, which matters more here than it does there because the band is wider. A rate
+// growing as r0(1 + a*t) has a window mean set by the window's midpoint, so two adjacent settled
+// halves (midpoints at 5N/8 and 7N/8) differ by only a*N/4 while the second and fourth quarters
+// (midpoints at 3N/8 and 7N/8) differ by a*N/2. Against the 25% floor below that is the
+// difference between rejecting a ramp once it has grown 2x across the run and letting it reach
+// 3.7x -- and 3.7x is not a subtle defect, it is the accumulating-input failure this file was
+// written for, seen through the rate instead of through the ring.
 //
 // The band is derived from the statistic rather than picked, because the statistic is a spike
-// COUNT and a count is coarse: a settled train whose period does not divide the half-run length
+// COUNT and a count is coarse: a settled train whose period does not divide the window length
 // lands one spike either side of its own average no matter how perfectly periodic it is. Three
-// spikes of slack covers that on both halves at once, so the allowance is 3/N of the first
-// half's count -- 43% where N is the driven single cell's 7, and 1.7% where N is the recurrent
-// network's 178. The 25% floor is what stops the large-N case from becoming a periodicity test:
+// spikes of slack covers that on both windows at once, so the allowance is 3/N of the early
+// window's count. The 25% floor is what stops the large-N case from becoming a periodicity test:
 // a recurrent network is entitled to some structure over time, and a quarter is still far below
 // the halving or doubling that extinction and self-amplification produce.
 //
-// Measured ratios: 0.857 on the driven single cell (6 spikes against 7, inside a band of
-// [0.57, 1.43]), 0.989 on the recurrent network and 1.000 on the delayed-coupling network,
-// both inside [0.75, 1.25].
+// It bounds the rate's SHAPE over time and nothing about its LEVEL: a network driven at any
+// constant multiple of its intended current is stationary at every multiple. The level is
+// covered, from the one side stability can reach, by
+// evaluate_firing_rate_stays_below_the_refractory_ceiling; from the other side it is not covered
+// here at all (see this file's header).
 Verdict evaluate_firing_rate_is_stationary(const StabilityRun &run) {
     constexpr f64 SMALLEST_ALLOWED_DEVIATION = 0.25;
     constexpr f64 COUNT_GRANULARITY_SPIKES = 3.0;
     // Below this the count is too coarse for a ratio to mean anything, so the run is reported as
     // unusable rather than passed.
-    constexpr s64 MINIMUM_FIRST_HALF_SPIKES = 4;
+    constexpr s64 MINIMUM_EARLY_WINDOW_SPIKES = 4;
 
-    const s64 settle = run.settle_tick();
-    const s64 midpoint = run.midpoint_tick();
-
-    s64 first_half_spikes = 0;
-    s64 second_half_spikes = 0;
-    for (s64 tick = settle; tick < run.tick_count; tick += 1) {
-        for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
-            const s64 flag = run.spike_flags[(usize)tick][(usize)neuron_index];
-            if (tick < midpoint) first_half_spikes += flag;
-            else second_half_spikes += flag;
+    auto window_spike_count = [&](s64 first_tick, s64 last_tick) {
+        s64 count = 0;
+        for (s64 tick = first_tick; tick < last_tick; tick += 1) {
+            for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
+                count += run.spike_flags[(usize)tick][(usize)neuron_index];
+            }
         }
+        return count;
+    };
+
+    const s64 early_spikes =
+            window_spike_count(run.early_window_first_tick(), run.early_window_last_tick());
+    const s64 late_spikes =
+            window_spike_count(run.late_window_first_tick(), run.late_window_last_tick());
+
+    const String counts = run.label + ": " + to_string(early_spikes) +
+                          " spikes over the second quarter of the run, " + to_string(late_spikes) +
+                          " over the fourth";
+
+    if (early_spikes < MINIMUM_EARLY_WINDOW_SPIKES) {
+        return {false, counts + " -- fewer than " + to_string(MINIMUM_EARLY_WINDOW_SPIKES) +
+                               " spikes in the second quarter, so the model is either silent or "
+                               "too slow for a rate comparison to say anything"};
     }
 
-    const String counts = run.label + ": " + to_string(first_half_spikes) +
-                          " spikes over the first settled half, " + to_string(second_half_spikes) +
-                          " over the second";
-
-    if (first_half_spikes < MINIMUM_FIRST_HALF_SPIKES) {
-        return {false, counts + " -- fewer than " + to_string(MINIMUM_FIRST_HALF_SPIKES) +
-                               " spikes in the first half, so the model is either silent or too "
-                               "slow for a rate comparison to say anything"};
-    }
-
-    const f64 allowed_deviation = std::max(SMALLEST_ALLOWED_DEVIATION,
-                                           COUNT_GRANULARITY_SPIKES / (f64)first_half_spikes);
-    const f64 ratio = (f64)second_half_spikes / (f64)first_half_spikes;
+    const f64 allowed_deviation =
+            std::max(SMALLEST_ALLOWED_DEVIATION, COUNT_GRANULARITY_SPIKES / (f64)early_spikes);
+    const f64 ratio = (f64)late_spikes / (f64)early_spikes;
     if (ratio < 1.0 - allowed_deviation) {
         return {false, counts + " -- the rate fell to " + to_string(ratio) +
                                " of its earlier value, past the allowed " +
@@ -767,36 +1041,124 @@ Verdict evaluate_firing_rate_is_stationary(const StabilityRun &run) {
 // t_ref after each emission cannot emit more often than once per t_ref. Unlike the ratio above
 // this needs no settled baseline and no tolerance -- it is violated the moment the regime
 // machinery stops holding, which is the mechanism that makes every rate in this engine finite.
+//
+// `checked_neuron_count` counts neurons whose type DECLARES a usable t_ref, which is not the same
+// thing as neurons this verdict actually said anything about: a neuron that never emitted
+// respects any refractory period at all. `emitting_neuron_count` is the one callers must guard
+// on for the pass to mean something.
 struct RefractoryCeilingVerdict {
     Verdict verdict;
     s64 checked_neuron_count = 0;
+    s64 emitting_neuron_count = 0;
 };
+
+// A t_ref shorter than one tick floors to zero refractory ticks, which makes the comparison below
+// vacuous and is a division by zero for anything that computes a rate ceiling from it. No fixture
+// here declares one; a fixture edit that did should skip the neuron rather than crash or quietly
+// pass, and should be visible as a shortfall in checked_neuron_count.
+s64 refractory_tick_count(const StabilityRun &run, s64 neuron_index) {
+    const f32 refractory_period = run.refractory_period[(usize)neuron_index];
+    if (!std::isfinite(refractory_period) || refractory_period <= 0.0f) return 0;
+    return (s64)std::floor((f64)refractory_period / run.step_dt);
+}
 
 RefractoryCeilingVerdict evaluate_firing_rate_respects_refractory_ceiling(const StabilityRun &run) {
     RefractoryCeilingVerdict result;
     for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
-        const f32 refractory_period = run.refractory_period[(usize)neuron_index];
-        if (!std::isfinite(refractory_period) || refractory_period <= 0.0f) continue;
+        const s64 refractory_ticks = refractory_tick_count(run, neuron_index);
+        if (refractory_ticks <= 0) continue;
         result.checked_neuron_count += 1;
 
-        const s64 refractory_ticks = (s64)std::floor((f64)refractory_period / run.step_dt);
         s64 previous_spike_tick = -1;
         for (s64 tick = 0; tick < run.tick_count; tick += 1) {
             if (run.spike_flags[(usize)tick][(usize)neuron_index] == 0) continue;
+            if (previous_spike_tick < 0) result.emitting_neuron_count += 1;
             if (previous_spike_tick >= 0 && tick - previous_spike_tick < refractory_ticks) {
-                return {{false, run.label + ": neuron " + to_string(neuron_index) +
-                                        " emitted at ticks " + to_string(previous_spike_tick) +
-                                        " and " + to_string(tick) + ", " +
-                                        to_string(tick - previous_spike_tick) +
-                                        " ticks apart, inside its own " +
-                                        to_string(refractory_ticks) + "-tick refractory period"},
-                        result.checked_neuron_count};
+                result.verdict = {false, run.label + ": neuron " + to_string(neuron_index) +
+                                                 " emitted at ticks " +
+                                                 to_string(previous_spike_tick) + " and " +
+                                                 to_string(tick) + ", " +
+                                                 to_string(tick - previous_spike_tick) +
+                                                 " ticks apart, inside its own " +
+                                                 to_string(refractory_ticks) +
+                                                 "-tick refractory period"};
+                return result;
             }
             previous_spike_tick = tick;
         }
     }
     result.verdict = {true, run.label + ": " + to_string(result.checked_neuron_count) +
-                                    " neuron(s) respected their declared refractory period"};
+                                    " neuron(s) respected their declared refractory period, " +
+                                    to_string(result.emitting_neuron_count) + " of which emitted"};
+    return result;
+}
+
+// The ceiling above says a cell cannot fire faster than once per t_ref. This says it is not
+// sitting ON that ceiling -- and it exists because saturation is the one runaway the rate
+// comparison is structurally blind to.
+//
+// A network driven so hard that every cell re-fires the instant its refractory clamp releases has
+// a rate that is not merely stationary but EXACTLY constant, tick for tick, so
+// evaluate_firing_rate_is_stationary reports a ratio of 1.000 and passes -- most confidently at
+// the point where things have gone worst. Measured on a reconstructed defect the population sat
+// at about 91% of this ceiling and every rate statistic in the file read as a clean steady state.
+//
+// Both ends are model-derived, in the sense rule 3 of this file's header means: the ceiling is
+// the window length over the cell's own declared t_ref, and never a measured rate. The one
+// judgement is the fraction of it a healthy run may occupy. A quarter of the ceiling is where the
+// fixtures actually sit (see the measured figures on each test), which leaves this bound a factor
+// of three above a correct engine and a factor of 1.2 below the saturated one.
+//
+// Measured over the fourth quarter alone rather than the whole settled run, so that a network
+// that saturates only at the end -- the shape a self-amplifying loop produces -- cannot average
+// itself back under the bound.
+struct RefractoryHeadroomVerdict {
+    Verdict verdict;
+    s64 checked_neuron_count = 0;
+    s64 emitting_neuron_count = 0;
+};
+
+RefractoryHeadroomVerdict evaluate_firing_rate_stays_below_the_refractory_ceiling(
+        const StabilityRun &run) {
+    constexpr f64 LARGEST_ALLOWED_CEILING_FRACTION = 0.75;
+
+    RefractoryHeadroomVerdict result;
+    const s64 window_tick_count = run.late_window_last_tick() - run.late_window_first_tick();
+
+    for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
+        const s64 refractory_ticks = refractory_tick_count(run, neuron_index);
+        if (refractory_ticks <= 0) continue;
+        result.checked_neuron_count += 1;
+
+        s64 window_spikes = 0;
+        for (s64 tick = run.late_window_first_tick(); tick < run.late_window_last_tick();
+             tick += 1) {
+            window_spikes += run.spike_flags[(usize)tick][(usize)neuron_index];
+        }
+        if (window_spikes > 0) result.emitting_neuron_count += 1;
+
+        const f64 ceiling_spikes = (f64)window_tick_count / (f64)refractory_ticks;
+        const f64 occupied_fraction = (f64)window_spikes / ceiling_spikes;
+        if (occupied_fraction > LARGEST_ALLOWED_CEILING_FRACTION) {
+            std::ostringstream detail;
+            detail.precision(4);
+            detail << run.label << ": neuron " << neuron_index << " emitted " << window_spikes
+                   << " times over the fourth quarter of the run against a refractory ceiling of "
+                   << ceiling_spikes << " (" << window_tick_count << " ticks / "
+                   << refractory_ticks << "-tick t_ref) -- " << occupied_fraction
+                   << " of the ceiling, past the allowed "
+                   << LARGEST_ALLOWED_CEILING_FRACTION
+                   << ", so the population is firing as fast as the refractory clamp permits "
+                      "rather than settling";
+            result.verdict = {false, detail.str()};
+            return result;
+        }
+    }
+
+    result.verdict = {true, run.label + ": " + to_string(result.checked_neuron_count) +
+                                    " neuron(s) stayed clear of their refractory ceiling over the "
+                                    "fourth quarter, " +
+                                    to_string(result.emitting_neuron_count) + " of which emitted"};
     return result;
 }
 
@@ -932,9 +1294,18 @@ TEST(StabilityDrivenSingleCell, every_state_sample_is_finite) {
     EXPECT_TRUE(verdict.passed) << verdict.report;
 }
 
+// This is where the state-stationarity verdict earns its place: `theta`, `asc1` and `asc2` are
+// continuous variables with no reset pinning either end of them, so their window extremes are
+// free to move and a defect that inflates any of them shows up here and nowhere else in the file.
+// See "WHAT THIS SUITE DOES NOT COVER" in the header for the models where that is NOT true.
+//
 // Measured margins under this verdict, worst variable first: asc1 11.6x its allowance, theta
-// 17.6x, v 18.4x, and asc2 / refractoryTimeElapsed / the regime index all exactly stationary.
+// 26.4x, v 27.6x, and asc2 / refractoryTimeElapsed / the regime index all exactly stationary.
 // asc1 is the tightest because it is the slowest to settle, not because it drifts.
+//
+// `v`'s margin is the one to discount: its window minimum is bit-identically vreset in both
+// halves, exactly as on the recurrent network, so only the crossing sample moves. theta, asc1 and
+// asc2 are the slots this test is really covering.
 TEST(StabilityDrivenSingleCell, state_is_stationary_across_the_settled_run) {
     if (!standard_library_available()) GTEST_SKIP();
     ASSERT_GT(narrowest_membrane_potential_range(driven_single_cell_run()), 0.0)
@@ -959,6 +1330,22 @@ TEST(StabilityDrivenSingleCell, synaptic_accumulator_is_drained_every_tick) {
     EXPECT_TRUE(verdict.passed) << verdict.report;
 }
 
+// The other half of the accumulator contract on the simplest possible ring: this model has no
+// out-edges at all, so the propagate stage never runs and NOTHING may ever appear outside the row
+// the current tick is reading. Any arrival at all here is charge the engine invented.
+TEST(StabilityDrivenSingleCell, no_arrival_appears_in_the_ring_without_an_emission) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const RingArrivalAccountingVerdict result =
+            evaluate_ring_arrivals_follow_emissions(driven_single_cell_run());
+    ASSERT_GT(result.quiet_tick_count, 0)
+            << "every tick of this run emitted, so there was no tick on which the ring was "
+               "required to stand still and this verdict checked nothing";
+    EXPECT_EQ(result.arrival_tick_count, 0)
+            << "this model has no synapses, so the propagate stage has no edge to write down and "
+               "the not-yet-due rows must stay empty for the whole run: " << result.verdict.report;
+    EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
+}
+
 TEST(StabilityDrivenSingleCell, firing_rate_is_stationary) {
     if (!standard_library_available()) GTEST_SKIP();
     const Verdict verdict = evaluate_firing_rate_is_stationary(driven_single_cell_run());
@@ -972,6 +1359,21 @@ TEST(StabilityDrivenSingleCell, firing_rate_respects_the_refractory_ceiling) {
     EXPECT_EQ(result.checked_neuron_count, driven_single_cell_run().neuron_count)
             << "every neuron in this model declares t_ref, so a skipped one means the parameter "
                "is no longer being resolved";
+    EXPECT_EQ(result.emitting_neuron_count, driven_single_cell_run().neuron_count)
+            << "a neuron that never emitted respects any refractory period at all, so a shortfall "
+               "here means the verdict passed without examining an interval";
+    EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
+}
+
+// Measured: 6 emissions over the fourth quarter against a ceiling of 40.8 (2000 ticks over a
+// 50-tick t_ref) -- 0.147 of the ceiling, against an allowance of 0.75.
+TEST(StabilityDrivenSingleCell, firing_rate_stays_clear_of_the_refractory_ceiling) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const RefractoryHeadroomVerdict result =
+            evaluate_firing_rate_stays_below_the_refractory_ceiling(driven_single_cell_run());
+    ASSERT_GT(result.emitting_neuron_count, 0)
+            << "no neuron emitted over the fourth quarter, so every one of them is trivially "
+               "clear of its ceiling and this verdict checked nothing";
     EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
 }
 
@@ -986,10 +1388,24 @@ TEST(StabilityRecurrentNetwork, every_state_sample_is_finite) {
     EXPECT_TRUE(verdict.passed) << verdict.report;
 }
 
-// Measured margins: the tightest of the 24 state slots is neuron 3's v at 20x its allowance,
-// the loosest cells' v at over 2500x, and every refractoryTimeElapsed and regime index exactly
-// stationary.
-TEST(StabilityRecurrentNetwork, state_is_stationary_across_the_settled_run) {
+// Read this one for what it is, not for the margins it reports. Every one of this model's 24
+// state slots has extremes PINNED BY CONSTRUCTION, so none of them can register the drift the
+// verdict is written to catch:
+//
+//   * `v` -- every cell here spikes, and a spiking cell's window minimum is bit-identically
+//     `vreset` (the reset assignment writes it) and its maximum is whichever sample first landed
+//     past `vth`. The minimum cannot move at all. The maximum moves only by where in the tick
+//     grid the crossing fell, which is sub-tick jitter of the crossing and not a measure of
+//     anything the engine got wrong -- so the margin this test reports is jitter headroom, NOT
+//     sensitivity, and it does not become a safety factor by being large.
+//   * `refractoryTimeElapsed` -- cycles between 0 and t_ref by the regime machinery's own
+//     definition.
+//   * the regime index -- cycles over {0, 1} for the same reason.
+//
+// It is kept because the pinning itself is worth asserting: a `vreset` that moved, or a
+// threshold-crossing sample that landed somewhere new, is a real change. It is NOT counted as
+// coverage of state drift. The slots that carry that are named in this file's header.
+TEST(StabilityRecurrentNetwork, state_extremes_stay_pinned_across_the_settled_run) {
     if (!standard_library_available()) GTEST_SKIP();
     ASSERT_GT(narrowest_membrane_potential_range(recurrent_network_run()), 0.0)
             << "at least one neuron's membrane potential never moved over the settled run";
@@ -1007,32 +1423,60 @@ TEST(StabilityRecurrentNetwork, membrane_potential_stays_within_model_derived_bo
     EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
 }
 
+// The anti-vacuity guard the single cell's counterpart has and this one used to be missing: a
+// ring nothing ever passes through is drained on every tick of the most broken engine imaginable.
 TEST(StabilityRecurrentNetwork, synaptic_accumulator_is_drained_every_tick) {
     if (!standard_library_available()) GTEST_SKIP();
-    const Verdict verdict = evaluate_synaptic_accumulator_is_drained(recurrent_network_run());
+    const StabilityRun &run = recurrent_network_run();
+    ASSERT_GT(total_spike_count(run), 0)
+            << "no cell fired, so no edge ever delivered and this test would be checking an "
+               "accumulator that is empty for a different reason";
+    const Verdict verdict = evaluate_synaptic_accumulator_is_drained(run);
     EXPECT_TRUE(verdict.passed) << verdict.report;
 }
 
+// The whole-ring half of the same contract, and the one that discriminates on this model: with
+// out-degree 2 and roughly nine ticks in ten carrying no emission at all, an arrival the engine
+// invented has thousands of ticks on which to show itself.
+//
+// Measured: 7422 of the 8000 ticks carried no emission and the ring stood exactly still on every
+// one of them; the other 578 scheduled an arrival.
+TEST(StabilityRecurrentNetwork, no_arrival_appears_in_the_ring_without_an_emission) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const RingArrivalAccountingVerdict result =
+            evaluate_ring_arrivals_follow_emissions(recurrent_network_run());
+    ASSERT_GT(result.quiet_tick_count, 0)
+            << "every tick emitted, so the ring was never required to stand still";
+    ASSERT_GT(result.arrival_tick_count, 0)
+            << "no tick ever scheduled an arrival into a not-yet-due row, so this verdict is "
+               "auditing a buffer nothing passes through";
+    EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
+}
+
 // The anti-vacuity guard matters more here than anywhere else in the file: on a model whose
-// ring never holds anything, "it did not grow" is true of a completely broken engine too.
+// ring never holds anything, "it did not grow" is true of a completely broken engine too. It is
+// taken over the verdict's own EARLY window rather than over the whole run, because traffic that
+// existed only in the first quarter and had already stopped satisfies a whole-run guard while
+// leaving the comparison itself with no baseline.
 TEST(StabilityRecurrentNetwork, synaptic_accumulator_does_not_grow_with_tick_count) {
     if (!standard_library_available()) GTEST_SKIP();
     const StabilityRun &run = recurrent_network_run();
 
     f32 largest_pending = 0.0f;
-    for (f32 magnitude : run.largest_ring_magnitude) {
-        largest_pending = std::max(largest_pending, magnitude);
+    for (s64 tick = run.early_window_first_tick(); tick < run.early_window_last_tick(); tick += 1) {
+        largest_pending = std::max(largest_pending, run.largest_ring_magnitude[(usize)tick]);
     }
     ASSERT_GT(largest_pending, 0.0f)
-            << "no synaptic arrival was ever pending in network_inputs, so there is nothing here "
-               "for a growth check to be checking";
+            << "no synaptic arrival was pending in network_inputs anywhere in the second quarter "
+               "of the run, so there is nothing here for a growth check to be checking";
 
     const Verdict verdict = evaluate_synaptic_accumulator_does_not_grow(run);
     EXPECT_TRUE(verdict.passed) << verdict.report;
 }
 
-// Measured: 178 spikes over the first settled half, 176 over the second -- a ratio of 0.989
-// against a band of [0.5, 2.0].
+// Measured: 173 spikes over the second quarter of the run, 176 over the fourth -- a ratio of
+// 1.017 against a band of [0.75, 1.25]. The driven single cell measures 6 against 6 in a band of
+// [0.5, 1.5], its 3-spike granularity allowance being the wider term at that count.
 TEST(StabilityRecurrentNetwork, firing_rate_is_stationary) {
     if (!standard_library_available()) GTEST_SKIP();
     const Verdict verdict = evaluate_firing_rate_is_stationary(recurrent_network_run());
@@ -1044,6 +1488,30 @@ TEST(StabilityRecurrentNetwork, firing_rate_respects_the_refractory_ceiling) {
     const RefractoryCeilingVerdict result =
             evaluate_firing_rate_respects_refractory_ceiling(recurrent_network_run());
     EXPECT_EQ(result.checked_neuron_count, recurrent_network_run().neuron_count);
+    EXPECT_EQ(result.emitting_neuron_count, recurrent_network_run().neuron_count)
+            << "a neuron that never emitted respects any refractory period at all, so a shortfall "
+               "here means the verdict passed without examining an interval";
+    EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
+}
+
+// The saturation check. This is the model it exists for: a recurrent loop is the thing that can
+// drive itself into firing as fast as the refractory clamp permits, and that is the state the
+// rate comparison above reports as a perfect 1.000.
+//
+// Measured: the eight cells occupy 0.19 to 0.26 of their ceiling (19 to 26 emissions over the
+// fourth quarter against 2000 ticks / a 20-tick t_ref = 100), against an allowance of 0.75.
+//
+// That margin is a property of THIS fixture's drive, and it closes as the drive rises: at six
+// times the fixture's pulseGenerator amplitudes the same measurement reads 0.65. A fixture change
+// that raised the amplitudes materially would need this bound re-derived rather than assumed --
+// the same caution the header attaches to every margin quoted in this file.
+TEST(StabilityRecurrentNetwork, firing_rate_stays_clear_of_the_refractory_ceiling) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const RefractoryHeadroomVerdict result =
+            evaluate_firing_rate_stays_below_the_refractory_ceiling(recurrent_network_run());
+    ASSERT_GT(result.emitting_neuron_count, 0)
+            << "no neuron emitted over the fourth quarter, so every one of them is trivially "
+               "clear of its ceiling and this verdict checked nothing";
     EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
 }
 
@@ -1055,6 +1523,16 @@ TEST(StabilityRecurrentNetwork, lazy_and_eager_synapse_updates_agree_bitwise) {
     ASSERT_GT(recurrent_network_run().per_edge_synapse_variable_count, 0)
             << "this model carries no per-edge synapse state, so the lazy and eager paths have "
                "nothing to disagree about and this test would pass on any engine";
+    // Per-edge state that was never advanced past its seed is identical under both paths for a
+    // reason that has nothing to do with either being right: a lazy catch-up of zero ticks and an
+    // eager advance of zero ticks are the same arithmetic. Both paths must actually have carried
+    // an edge for the agreement to be evidence.
+    ASSERT_GT(total_spike_count(recurrent_network_run()), 0)
+            << "no cell fired under the lazy path, so no edge was ever driven and both paths sit "
+               "at the seed value";
+    ASSERT_GT(total_spike_count(recurrent_network_eager_run()), 0)
+            << "no cell fired under the eager path, so no edge was ever driven and both paths sit "
+               "at the seed value";
     const Verdict verdict = evaluate_trajectories_are_identical(recurrent_network_run(),
                                                                 recurrent_network_eager_run());
     EXPECT_TRUE(verdict.passed) << verdict.report;
@@ -1072,8 +1550,14 @@ TEST(StabilityDelayedCouplingNetwork, every_state_sample_is_finite) {
     EXPECT_TRUE(verdict.passed) << verdict.report;
 }
 
+// The other model whose state stationarity means something. The target cell never crosses its
+// threshold, so neither end of its `v` is pinned by a reset -- both are set by the leak against
+// the arriving current, and both are free to move if anything about that delivery changes. It is
+// the only membrane potential in this file of which that is true.
+//
 // Measured: every one of the 6 state slots exactly stationary between the two settled halves,
-// both extremes bit-identical.
+// both extremes bit-identical -- including the target cell's `v` over its [-67.4mV, -64.7mV]
+// settled span.
 TEST(StabilityDelayedCouplingNetwork, state_is_stationary_across_the_settled_run) {
     if (!standard_library_available()) GTEST_SKIP();
     ASSERT_GT(narrowest_membrane_potential_range(delayed_coupling_run()), 0.0)
@@ -1098,15 +1582,35 @@ TEST(StabilityDelayedCouplingNetwork, delay_ring_is_drained_and_does_not_grow) {
                                     "ring case; a depth of 2 means the delay stopped resolving";
 
     f32 largest_pending = 0.0f;
-    for (f32 magnitude : run.largest_ring_magnitude) {
-        largest_pending = std::max(largest_pending, magnitude);
+    for (s64 tick = run.early_window_first_tick(); tick < run.early_window_last_tick(); tick += 1) {
+        largest_pending = std::max(largest_pending, run.largest_ring_magnitude[(usize)tick]);
     }
-    ASSERT_GT(largest_pending, 0.0f) << "no arrival was ever pending in the delay ring";
+    ASSERT_GT(largest_pending, 0.0f) << "no arrival was pending in the delay ring anywhere in the "
+                                        "second quarter of the run, which is the window the "
+                                        "growth comparison takes as its baseline";
 
     const Verdict drained = evaluate_synaptic_accumulator_is_drained(run);
     EXPECT_TRUE(drained.passed) << drained.report;
     const Verdict bounded = evaluate_synaptic_accumulator_does_not_grow(run);
     EXPECT_TRUE(bounded.passed) << bounded.report;
+}
+
+// The deep ring is where the drained-row check is at its weakest -- it inspects one row in 101 on
+// any given tick -- and so it is where the whole-ring check matters most. Every one of the 100
+// not-yet-due rows is differenced here on every tick.
+//
+// Measured: 7890 of the 8000 ticks carried no emission and all 100 not-yet-due rows stood exactly
+// still on every one of them; the other 110 scheduled an arrival.
+TEST(StabilityDelayedCouplingNetwork, no_arrival_appears_in_the_ring_without_an_emission) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const RingArrivalAccountingVerdict result =
+            evaluate_ring_arrivals_follow_emissions(delayed_coupling_run());
+    ASSERT_GT(result.quiet_tick_count, 0)
+            << "every tick emitted, so the ring was never required to stand still";
+    ASSERT_GT(result.arrival_tick_count, 0)
+            << "no tick ever scheduled an arrival into a not-yet-due row, so the delayed "
+               "connection is delivering nothing and this verdict is auditing an empty buffer";
+    EXPECT_TRUE(result.verdict.passed) << result.verdict.report;
 }
 
 // ── falsification ────────────────────────────────────────────────────────────────────────────
@@ -1131,6 +1635,54 @@ AfterTickMutation reinject_accumulated_input(f32 per_tick_amount) {
                 (tick % (s64)engine.network_input_ring_depth) * engine.total_neuron_count;
         for (s64 neuron_index = 0; neuron_index < engine.total_neuron_count; neuron_index += 1) {
             ring[row_base + neuron_index] = *running_total;
+        }
+    };
+}
+
+// The other shape of accumulator defect, and the one the drained-row check cannot see: instead of
+// leaving charge in the row it just read, the engine carries a fraction of what that row held
+// forward into the NEXT row, where it is delivered on schedule one tick later along with that
+// tick's own input. Every row still drains to exactly zero on the tick that reads it; the
+// accumulator's residual is exactly zero on all 8000 ticks; and the network receives roughly
+// 1/(1-retained_fraction) times the current the model asked for.
+//
+// This is the bounded form of the shipped defect. The unbounded one grew without limit and was
+// visible in any statistic taken across time; this one settles to a fixed multiple of the
+// intended drive within a few hundred ticks and is invisible in every such statistic, because a
+// network at a hundred times its intended drive is perfectly stable -- just wrong.
+//
+// `retained_fraction` is what survives each hand-off, so the carried amount converges on
+// per_tick_amount * retained_fraction / (1 - retained_fraction) rather than growing without
+// bound: at 0.99 that is ninety-nine extra copies of every tick's input, arriving forever.
+AfterTickMutation carry_a_fraction_of_each_tick_forward(f32 per_tick_amount,
+                                                        f32 retained_fraction) {
+    auto carried = std::make_shared<f32>(0.0f);
+    return [per_tick_amount, retained_fraction, carried](SpikeEngine &engine, s64 tick) {
+        *carried = retained_fraction * (*carried + per_tick_amount);
+        f32 *ring = engine.network_inputs.get_contents();
+        const s64 next_row_base =
+                ((tick + 1) % (s64)engine.network_input_ring_depth) * engine.total_neuron_count;
+        for (s64 neuron_index = 0; neuron_index < engine.total_neuron_count; neuron_index += 1) {
+            ring[next_row_base + neuron_index] += *carried;
+        }
+    };
+}
+
+// An arrival scheduled `rows_ahead` rows into the future that no spike asked for. On a deep ring
+// this is the defect the drained-row check is furthest from being able to see: the row it lands
+// in is not the row that check inspects on this tick, and by the time it IS that row the arrival
+// has been delivered and cleared on schedule, so the residual is zero at every instant the check
+// looks.
+//
+// It is the shape a mis-computed delay produces -- an edge scheduling into the wrong row, or a
+// ring index wrapping one period out.
+AfterTickMutation schedule_an_unearned_arrival(s64 rows_ahead, f32 amount) {
+    return [rows_ahead, amount](SpikeEngine &engine, s64 tick) {
+        f32 *ring = engine.network_inputs.get_contents();
+        const s64 row_base = ((tick + rows_ahead) % (s64)engine.network_input_ring_depth) *
+                             engine.total_neuron_count;
+        for (s64 neuron_index = 0; neuron_index < engine.total_neuron_count; neuron_index += 1) {
+            ring[row_base + neuron_index] += amount;
         }
     };
 }
@@ -1166,9 +1718,11 @@ StabilityRun with_saturated_firing_in_second_half(const StabilityRun &run) {
     saturated.label = run.label + " [firing saturated in the second half]";
 
     for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
-        const f32 refractory_period = run.refractory_period[(usize)neuron_index];
-        if (!std::isfinite(refractory_period) || refractory_period <= 0.0f) continue;
-        const s64 refractory_ticks = (s64)std::floor((f64)refractory_period / run.step_dt);
+        // Zero refractory ticks is a modulo by zero below, so it is refused rather than skipped:
+        // a fixture whose t_ref fell under one step would otherwise turn this falsification into
+        // a crash, and the falsification tests are the ones that must not fail obscurely.
+        const s64 refractory_ticks = refractory_tick_count(run, neuron_index);
+        if (refractory_ticks <= 0) continue;
 
         // The synthetic train starts one whole refractory period after the midpoint, not at it:
         // the last REAL emission before the midpoint can be as late as midpoint - 1, and a
@@ -1180,6 +1734,26 @@ StabilityRun with_saturated_firing_in_second_half(const StabilityRun &run) {
             const bool on_the_train = tick >= first_synthetic_tick &&
                                       (tick - first_synthetic_tick) % refractory_ticks == 0;
             saturated.spike_flags[(usize)tick][(usize)neuron_index] = on_the_train ? 1u : 0u;
+        }
+    }
+    return saturated;
+}
+
+// A copy of `run` firing at its refractory ceiling for the WHOLE run rather than only the second
+// half. The distinction is the entire point of the headroom verdict: a network that saturates
+// abruptly half way through moves its rate and the rate comparison rejects it, but one that is
+// already saturated when the first measurement window opens has a rate that is exactly constant,
+// and every comparison of the run against its own earlier self reports a clean steady state.
+StabilityRun with_firing_saturated_throughout(const StabilityRun &run) {
+    StabilityRun saturated = run;
+    saturated.label = run.label + " [firing saturated for the whole run]";
+
+    for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
+        const s64 refractory_ticks = refractory_tick_count(run, neuron_index);
+        if (refractory_ticks <= 0) continue;
+        for (s64 tick = 0; tick < run.tick_count; tick += 1) {
+            saturated.spike_flags[(usize)tick][(usize)neuron_index] =
+                    tick % refractory_ticks == 0 ? 1u : 0u;
         }
     }
     return saturated;
@@ -1205,6 +1779,40 @@ StabilityRun with_linear_drift_on_slot(const StabilityRun &run, usize slot_index
         drifting.state_samples[(usize)tick][slot_index] = lowest + fraction * (highest - lowest);
     }
     return drifting;
+}
+
+// A copy of `run` whose firing rate grows LINEARLY across the run by `growth_factor`, built by
+// dropping real emissions rather than by inventing any. Dropping is what makes it usable: the
+// result is still a real raster, it cannot violate the refractory ceiling, and the rate
+// comparison is therefore the only verdict it can be rejected by.
+//
+// A linear rate ramp is the raster this file's founding defect produces -- an input accumulating
+// with tick count drives an ever-shorter interval between crossings -- and it is the shape the
+// two-window choice is sized against.
+//
+// The thinning is deterministic, not sampled: each neuron carries a credit that gains
+// keep_fraction per real emission and spends one whole unit per emission it keeps, so the kept
+// density tracks keep_fraction with no run-to-run variation for a bound to have to absorb.
+StabilityRun with_rate_ramped_by_dropping_emissions(const StabilityRun &run, f64 growth_factor) {
+    StabilityRun ramping = run;
+    ramping.label = run.label + " [rate ramped " + to_string(growth_factor) + "x across the run]";
+
+    const f64 earliest_keep_fraction = 1.0 / growth_factor;
+    for (s64 neuron_index = 0; neuron_index < run.neuron_count; neuron_index += 1) {
+        f64 credit = 0.0;
+        for (s64 tick = 0; tick < run.tick_count; tick += 1) {
+            if (ramping.spike_flags[(usize)tick][(usize)neuron_index] == 0) continue;
+
+            const f64 position = (f64)tick / (f64)run.tick_count;
+            credit += earliest_keep_fraction + (1.0 - earliest_keep_fraction) * position;
+            if (credit >= 1.0) {
+                credit -= 1.0;
+            } else {
+                ramping.spike_flags[(usize)tick][(usize)neuron_index] = 0u;
+            }
+        }
+    }
+    return ramping;
 }
 
 } // namespace
@@ -1241,6 +1849,73 @@ TEST(StabilityFalsification, undrained_synaptic_accumulator_is_rejected) {
     const RefractoryCeilingVerdict ceiling =
             evaluate_firing_rate_respects_refractory_ceiling(run);
     EXPECT_TRUE(ceiling.verdict.passed) << ceiling.verdict.report;
+}
+
+// The accumulator defect the drained-row check is structurally blind to, reconstructed inside a
+// real recurrent network: a fraction of every tick's input carried forward into the next ring row
+// instead of dropped. It settles at about a hundred extra copies of the drive, and the network
+// runs at roughly that multiple of its intended current for the whole run.
+//
+// Measured on this exact run, with every other verdict in the file applied to it:
+//     drained row        PASS -- all 3000 ticks left their row at exactly zero
+//     ring not growing   PASS -- 4.39491146e-08 in the second quarter, bit-identical in the
+//                                fourth, because a geometric carry converges long before either
+//     rate stationary    PASS -- 272 spikes against 272, ratio 1.000000
+//     state stationary   PASS -- worst of 24 slots at 0.000000 of its allowance
+// against a raster carrying 1088 emissions where the same model unmutated carries about 260.
+// Every verdict this file had before agrees the engine is healthy.
+//
+// Those four are not asserted on here. A later strengthening of any of them would be an
+// improvement, not a regression, and an assertion that a defect slips past a verdict turns that
+// improvement into a failure. They are recorded above instead, where a reader can check them.
+//
+// The whole-ring check is the one that rejects it, and it does so on the first tick where nothing
+// emitted, not after a statistic has moved.
+TEST(StabilityFalsification, input_carried_forward_into_the_next_ring_row_is_rejected) {
+    if (!standard_library_available()) GTEST_SKIP();
+    FixtureDirectory fixture("falsify_carried_forward");
+    // 0.4nA per tick is this model's own pulseGenerator amplitude, so the carried total settles
+    // at about a hundred times the current the fixture asks for.
+    const StabilityRun run = run_long_simulation(
+            "input carried forward", write_recurrent_network_model(fixture, 8, 300, 300), 3000,
+            /*use_lazy_synapse_updates=*/true,
+            carry_a_fraction_of_each_tick_forward(4e-10f, 0.99f));
+
+    const RingArrivalAccountingVerdict arrivals = evaluate_ring_arrivals_follow_emissions(run);
+    EXPECT_FALSE(arrivals.verdict.passed)
+            << "charge appearing in the ring on ticks where nothing emitted was accepted: "
+            << arrivals.verdict.report;
+
+    // The same isolation the other accumulator falsification makes: this defect must not also be
+    // breaking the refractory machinery, or the rejection would not be attributable to the ring.
+    const RefractoryCeilingVerdict ceiling = evaluate_firing_rate_respects_refractory_ceiling(run);
+    EXPECT_TRUE(ceiling.verdict.passed) << ceiling.verdict.report;
+}
+
+// The same accounting on the DEEP ring, which is where the coverage argument is sharpest. The
+// delayed-coupling fixture's 10ms connection delay makes the ring 101 rows deep, so a per-tick
+// inspection of the one row the current tick drained sees 1/101 of the buffer; the arrival here
+// is placed 50 rows ahead, in a row that is drained -- to exactly zero, on schedule -- fifty ticks
+// after it appears. Every residual this file used to measure is zero for the whole run.
+//
+// Measured on this exact run: the drained-row check passes on all 3000 ticks, and the growth
+// check reads 2.76828183e-09 in the second quarter and the same to the bit in the fourth.
+//
+// The whole-ring difference sees it on the first tick that emitted nothing.
+TEST(StabilityFalsification, an_arrival_scheduled_deep_in_the_delay_ring_is_rejected) {
+    if (!standard_library_available()) GTEST_SKIP();
+    FixtureDirectory fixture("falsify_deep_ring_arrival");
+    const StabilityRun run = run_long_simulation(
+            "unearned deep-ring arrival", write_delayed_coupling_model(fixture, 300), 3000,
+            /*use_lazy_synapse_updates=*/true,
+            schedule_an_unearned_arrival(/*rows_ahead=*/50, 5e-11f));
+    ASSERT_GT(run.ring_depth, 50) << "the ring is no longer deep enough for an arrival 50 rows "
+                                     "ahead to be a different row from the one being drained";
+
+    const RingArrivalAccountingVerdict arrivals = evaluate_ring_arrivals_follow_emissions(run);
+    EXPECT_FALSE(arrivals.verdict.passed)
+            << "an arrival scheduled into a not-yet-due row by no spike at all was accepted: "
+            << arrivals.verdict.report;
 }
 
 TEST(StabilityFalsification, arithmetic_overflow_is_rejected) {
@@ -1280,19 +1955,117 @@ TEST(StabilityFalsification, runaway_firing_is_rejected) {
     EXPECT_TRUE(ceiling.verdict.passed) << ceiling.verdict.report;
 }
 
+// The blind spot the headroom verdict was added for, and the whole reason it is not redundant
+// with the rate comparison above. The raster here is at the refractory ceiling for the ENTIRE
+// run, not just the second half, so there is no moment at which the rate changes.
+//
+// The two EXPECT_TRUEs are the demonstration, not incidental checks:
+//   * the rate comparison passes, and MUST pass -- an exactly constant rate is stationary, which
+//     is precisely what that verdict means. No tightening of it could reject this run without
+//     making it wrong. This is the sense in which the rate statistic is blindest exactly where
+//     the network has gone worst.
+//   * the refractory ceiling passes, because one emission per t_ref is the ceiling and not a
+//     breach of it.
+// Only the headroom verdict rejects, which is what says the two refractory verdicts are asking
+// different questions rather than the same one twice.
+TEST(StabilityFalsification, firing_at_the_refractory_ceiling_is_rejected) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const StabilityRun saturated = with_firing_saturated_throughout(recurrent_network_run());
+
+    const RefractoryHeadroomVerdict headroom =
+            evaluate_firing_rate_stays_below_the_refractory_ceiling(saturated);
+    EXPECT_FALSE(headroom.verdict.passed)
+            << "a network emitting as often as its own t_ref permits was accepted as leaving "
+               "headroom below its ceiling: "
+            << headroom.verdict.report;
+
+    const Verdict rate = evaluate_firing_rate_is_stationary(saturated);
+    EXPECT_TRUE(rate.passed)
+            << "a rate that is exactly constant was rejected as non-stationary, which means the "
+               "rate verdict no longer means what this file says it means: "
+            << rate.report;
+
+    const RefractoryCeilingVerdict ceiling =
+            evaluate_firing_rate_respects_refractory_ceiling(saturated);
+    EXPECT_TRUE(ceiling.verdict.passed) << ceiling.verdict.report;
+}
+
+// The rate comparison's own sensitivity, at the shape it is sized for. A real raster thinned so
+// its rate grows linearly by 2.5x across the run is rejected by the second-quarter-against-fourth
+// windows this verdict uses; the two settled HALVES it used to compare put the same raster at a
+// ratio of about 1.19 and accepted it, and would have gone on accepting it up to a growth of
+// roughly 3.7x across the run.
+//
+// Only dropping emissions, never adding any, so the refractory verdicts must both still pass --
+// which is what says the rejection came from the rate comparison and not from the raster having
+// been made physically impossible.
+TEST(StabilityFalsification, a_linearly_ramping_firing_rate_is_rejected) {
+    if (!standard_library_available()) GTEST_SKIP();
+    const StabilityRun ramping =
+            with_rate_ramped_by_dropping_emissions(recurrent_network_run(), 2.5);
+
+    const Verdict rate = evaluate_firing_rate_is_stationary(ramping);
+    EXPECT_FALSE(rate.passed) << "a firing rate growing by 2.5x across the run was accepted as "
+                                 "stationary: "
+                              << rate.report;
+
+    const RefractoryCeilingVerdict ceiling =
+            evaluate_firing_rate_respects_refractory_ceiling(ramping);
+    EXPECT_TRUE(ceiling.verdict.passed) << ceiling.verdict.report;
+    const RefractoryHeadroomVerdict headroom =
+            evaluate_firing_rate_stays_below_the_refractory_ceiling(ramping);
+    EXPECT_TRUE(headroom.verdict.passed) << headroom.verdict.report;
+}
+
 // The rate verdict's other direction: a network whose drive stops part way through goes silent,
 // and silence is not stationarity.
+//
+// The drive outlasts the verdict's early window and stops before its late one -- 120ms of a 200ms
+// run, against windows at 50-100ms and 150-200ms -- so the rejection comes from the ratio itself
+// having collapsed, with a real spike count on both sides of it. A drive that stopped before the
+// early window too would leave that window empty, and the verdict would refuse the run as
+// unusable rather than reject it as non-stationary: a true answer to a different question, and
+// one that would leave the falling branch of the comparison untested.
 TEST(StabilityFalsification, silenced_network_is_rejected) {
     if (!standard_library_available()) GTEST_SKIP();
     FixtureDirectory fixture("falsify_silenced");
     const StabilityRun run = run_long_simulation(
             "silenced network",
-            write_recurrent_network_model(fixture, 8, /*duration=*/200, /*stimulus_duration=*/30),
+            write_recurrent_network_model(fixture, 8, /*duration=*/200, /*stimulus_duration=*/120),
             2000, /*use_lazy_synapse_updates=*/true);
 
     const Verdict verdict = evaluate_firing_rate_is_stationary(run);
     EXPECT_FALSE(verdict.passed)
             << "a network that fell silent was accepted as stationary: " << verdict.report;
+    EXPECT_NE(verdict.report.find("the rate fell to"), String::npos)
+            << "the rejection did not come from the rate comparison itself, so the falling branch "
+               "of the band is still untested: "
+            << verdict.report;
+
+    // Delivery that stops half way is also what the growth check's shrinking direction is for,
+    // and it used to be one-sided.
+    const Verdict bounded = evaluate_synaptic_accumulator_does_not_grow(run);
+    EXPECT_FALSE(bounded.passed)
+            << "synaptic delivery that stopped half way through the run was accepted: "
+            << bounded.report;
+}
+
+// Not a verdict but a fixture-preparation step, and falsified for the same reason the verdicts
+// are: it used to fail SILENTLY. An <OutputFile> whose close tag it cannot find is left in the
+// model, and both checked-in fixtures name their recordings relatively, so the engine then writes
+// a .dat file into the working directory this binary shares with every other suite in it.
+TEST(StabilityFalsification, an_unclosed_output_block_is_refused_rather_than_left_in_place) {
+    const String self_closing =
+            "<Simulation id=\"sim1\"><OutputFile id=\"trace\" fileName=\"trace.dat\"/>"
+            "</Simulation>";
+    EXPECT_THROW(remove_element_blocks(self_closing, "OutputFile"), std::runtime_error);
+
+    // The shapes it must still handle: a real block is removed, and a fixture declaring no
+    // outputs at all is passed through untouched.
+    EXPECT_EQ(remove_element_blocks("<a/><OutputFile id=\"t\"><OutputColumn/></OutputFile><b/>",
+                                    "OutputFile"),
+              "<a/><b/>");
+    EXPECT_EQ(remove_element_blocks("<a/><b/>", "OutputFile"), "<a/><b/>");
 }
 
 // The state-stationarity verdict, fed each state variable of a real run in turn with that one
