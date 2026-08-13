@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -263,6 +264,162 @@ String format_float_literal(f64 value) {
     return stream.str();
 }
 
+// ── Expression semantics ─────────────────────────────────────────────────────
+//
+// The grammar below is folded by one of two semantics: SourceEmission, which produces the
+// C-family text a kernel is built out of, and NumericEvaluation, which produces the value
+// the same expression takes for one set of variable values.
+//
+// Both are needed, because this generator does not only emit a synapse's dynamics: it also
+// integrates them on the host to work out how much charge one arriving event delivers (see
+// synapse_event_charge_coefficients). A second, evaluating parser would be a second
+// precedence table, a second dotted-operator mapping and a second `^`-associativity rule to
+// keep in step with this one -- and every way they could drift is a silently different
+// number rather than a compile error.
+
+// One NML standard-library function: the name a document writes it by, the C-family name the
+// generated source calls, and the host function computing the same thing. Declared once so a
+// name cannot mean one function in the emitted kernel and another on the host.
+struct BuiltinFunctionEntry {
+    String nml_name;
+    String c_name;
+    f64 (*host_function)(f64);
+};
+
+// `ln` and `log` are the trap: LEMS's `log` is base 10 and its natural log is `ln`, which is
+// the reverse of C.
+const Vector<BuiltinFunctionEntry> &builtin_function_table() {
+    static const Vector<BuiltinFunctionEntry> table = {
+        {"exp", "exp", [](f64 value) { return std::exp(value); }},
+        {"ln", "log", [](f64 value) { return std::log(value); }},
+        {"log", "log10", [](f64 value) { return std::log10(value); }},
+        {"sin", "sin", [](f64 value) { return std::sin(value); }},
+        {"cos", "cos", [](f64 value) { return std::cos(value); }},
+        {"tan", "tan", [](f64 value) { return std::tan(value); }},
+        {"sinh", "sinh", [](f64 value) { return std::sinh(value); }},
+        {"cosh", "cosh", [](f64 value) { return std::cosh(value); }},
+        {"tanh", "tanh", [](f64 value) { return std::tanh(value); }},
+        {"sqrt", "sqrt", [](f64 value) { return std::sqrt(value); }},
+        {"abs", "fabs", [](f64 value) { return std::fabs(value); }},
+        {"ceil", "ceil", [](f64 value) { return std::ceil(value); }},
+        {"floor", "floor", [](f64 value) { return std::floor(value); }},
+    };
+    return table;
+}
+
+const BuiltinFunctionEntry *find_builtin_function(const String &nml_name) {
+    for (const BuiltinFunctionEntry &entry : builtin_function_table()) {
+        if (entry.nml_name == nml_name) return &entry;
+    }
+    return nullptr;
+}
+
+// Folds the grammar into generated C source. Identifiers resolve through the SymbolTable,
+// which is what binds a name to the buffer element or local that holds it.
+class SourceEmission {
+public:
+    using Value = String;
+
+    explicit SourceEmission(const SymbolTable &symbols) : symbols_(symbols) {}
+
+    const String &component_type_name() const { return symbols_.component_type_name; }
+
+    Value number(const String &literal_text) const { return to_float_literal(literal_text); }
+
+    Value identifier(const String &name) const { return symbols_.read_expression_for(name); }
+
+    Value binary(const String &operator_text, const Value &left, const Value &right) const {
+        return "(" + left + " " + operator_text + " " + right + ")";
+    }
+
+    Value negate(const Value &operand) const { return "(-" + operand + ")"; }
+
+    Value power(const Value &base, const Value &exponent) const {
+        return "pow(" + base + ", " + exponent + ")";
+    }
+
+    Value heaviside(const Value &operand) const {
+        return "((" + operand + ") >= 0.0f ? 1.0f : 0.0f)";
+    }
+
+    Value builtin(const BuiltinFunctionEntry &entry, const Value &operand) const {
+        return entry.c_name + "(" + operand + ")";
+    }
+
+private:
+    const SymbolTable &symbols_;
+};
+
+// A name -> value binding, with SymbolTable's first-definition-wins rule so the two resolve
+// the same identifier to the same thing: the emitted kernel and the host integration have to
+// agree about which `tau` an expression means.
+struct ValueTable {
+    UnorderedMap<String, f64> identifier_values;
+    String component_type_name;
+
+    void define(const String &identifier, f64 value) {
+        identifier_values.emplace(identifier, value);
+    }
+
+    bool contains(const String &identifier) const {
+        return identifier_values.find(identifier) != identifier_values.end();
+    }
+
+    f64 value_for(const String &identifier) const {
+        const auto entry = identifier_values.find(identifier);
+        if (entry == identifier_values.end()) {
+            throw runtime_error("kernel_codegen: unknown identifier '" + identifier +
+                                "' in ComponentType '" + component_type_name + "'");
+        }
+        return entry->second;
+    }
+};
+
+// Folds the same grammar into a number. Comparisons and connectives yield 1.0 / 0.0, which is
+// what the emitted C's own comparisons yield once they are used as floats.
+class NumericEvaluation {
+public:
+    using Value = f64;
+
+    explicit NumericEvaluation(const ValueTable &values) : values_(values) {}
+
+    const String &component_type_name() const { return values_.component_type_name; }
+
+    Value number(const String &literal_text) const { return stod(literal_text); }
+
+    Value identifier(const String &name) const { return values_.value_for(name); }
+
+    Value binary(const String &operator_text, Value left, Value right) const {
+        if (operator_text == "+") return left + right;
+        if (operator_text == "-") return left - right;
+        if (operator_text == "*") return left * right;
+        if (operator_text == "/") return left / right;
+        if (operator_text == ">") return left > right ? 1.0 : 0.0;
+        if (operator_text == "<") return left < right ? 1.0 : 0.0;
+        if (operator_text == ">=") return left >= right ? 1.0 : 0.0;
+        if (operator_text == "<=") return left <= right ? 1.0 : 0.0;
+        if (operator_text == "==") return left == right ? 1.0 : 0.0;
+        if (operator_text == "!=") return left != right ? 1.0 : 0.0;
+        if (operator_text == "&&") return (left != 0.0 && right != 0.0) ? 1.0 : 0.0;
+        if (operator_text == "||") return (left != 0.0 || right != 0.0) ? 1.0 : 0.0;
+        report_error("no host evaluation for operator '" + operator_text + "'",
+                     values_.component_type_name);
+    }
+
+    Value negate(Value operand) const { return -operand; }
+
+    Value power(Value base, Value exponent) const { return std::pow(base, exponent); }
+
+    Value heaviside(Value operand) const { return operand >= 0.0 ? 1.0 : 0.0; }
+
+    Value builtin(const BuiltinFunctionEntry &entry, Value operand) const {
+        return entry.host_function(operand);
+    }
+
+private:
+    const ValueTable &values_;
+};
+
 // ── Expression parser ────────────────────────────────────────────────────────
 //
 // Recursive descent, lowest precedence outermost:
@@ -270,13 +427,16 @@ String format_float_literal(f64 value) {
 // Each binary result is parenthesised, so the emitted C reproduces the parse regardless of
 // how C would have grouped it.
 
+template <typename Semantics>
 class ExpressionParser {
 public:
-    ExpressionParser(Vector<Token> tokens, const SymbolTable &symbols)
-        : tokens_(std::move(tokens)), symbols_(symbols) {}
+    using Value = typename Semantics::Value;
 
-    String parse_complete_expression() {
-        String result = parse_logical_or();
+    ExpressionParser(Vector<Token> tokens, const Semantics &semantics)
+        : tokens_(std::move(tokens)), semantics_(semantics) {}
+
+    Value parse_complete_expression() {
+        Value result = parse_logical_or();
         if (current().kind != TokenKind::EndOfInput) {
             fail("unexpected trailing token '" + current().text + "'");
         }
@@ -284,10 +444,10 @@ public:
     }
 
 private:
-    using ParseFunction = String (ExpressionParser::*)();
+    using ParseFunction = Value (ExpressionParser::*)();
 
     Vector<Token> tokens_;
-    const SymbolTable &symbols_;
+    const Semantics &semantics_;
     usize position_ = 0;
 
     const Token &current() const { return tokens_[position_]; }
@@ -297,7 +457,7 @@ private:
     }
 
     [[noreturn]] void fail(const String &message) const {
-        report_error(message, symbols_.component_type_name);
+        report_error(message, semantics_.component_type_name());
     }
 
     bool current_matches(const Vector<String> &operators) const {
@@ -308,71 +468,71 @@ private:
         return false;
     }
 
-    String parse_left_associative(ParseFunction next_level, const Vector<String> &operators) {
-        String left = (this->*next_level)();
+    Value parse_left_associative(ParseFunction next_level, const Vector<String> &operators) {
+        Value left = (this->*next_level)();
         while (current_matches(operators)) {
             const String operator_text = current().text;
             advance();
-            const String right = (this->*next_level)();
-            left = "(" + left + " " + operator_text + " " + right + ")";
+            const Value right = (this->*next_level)();
+            left = semantics_.binary(operator_text, left, right);
         }
         return left;
     }
 
-    String parse_logical_or() {
+    Value parse_logical_or() {
         return parse_left_associative(&ExpressionParser::parse_logical_and, {"||"});
     }
 
-    String parse_logical_and() {
+    Value parse_logical_and() {
         return parse_left_associative(&ExpressionParser::parse_equality, {"&&"});
     }
 
-    String parse_equality() {
+    Value parse_equality() {
         return parse_left_associative(&ExpressionParser::parse_relational, {"==", "!="});
     }
 
-    String parse_relational() {
+    Value parse_relational() {
         return parse_left_associative(&ExpressionParser::parse_additive, {">", "<", ">=", "<="});
     }
 
-    String parse_additive() {
+    Value parse_additive() {
         return parse_left_associative(&ExpressionParser::parse_multiplicative, {"+", "-"});
     }
 
-    String parse_multiplicative() {
+    Value parse_multiplicative() {
         return parse_left_associative(&ExpressionParser::parse_unary, {"*", "/"});
     }
 
-    String parse_unary() {
+    Value parse_unary() {
         if (current_matches({"-", "+"})) {
             const String operator_text = current().text;
             advance();
-            const String operand = parse_unary();
+            const Value operand = parse_unary();
             // Unary plus on a float is a no-op, so it is dropped rather than emitted.
             if (operator_text == "+") return operand;
-            return "(-" + operand + ")";
+            return semantics_.negate(operand);
         }
         return parse_power();
     }
 
     // `^` binds tighter than unary minus and is right-associative: `-x^2` is -(x^2) and
     // `a^b^c` is a^(b^c). The exponent re-enters at parse_unary so `2^-1` parses.
-    String parse_power() {
-        String base = parse_primary();
+    Value parse_power() {
+        Value base = parse_primary();
         if (current_matches({"^"})) {
             advance();
-            const String exponent = parse_unary();
-            return "pow(" + base + ", " + exponent + ")";
+            const Value exponent = parse_unary();
+            return semantics_.power(base, exponent);
         }
         return base;
     }
 
-    String parse_primary() {
+    Value parse_primary() {
         const Token token = current();
 
         if (token.kind == TokenKind::Number) {
             advance();
-            return to_float_literal(token.text);
+            return semantics_.number(token.text);
         }
 
         if (token.kind == TokenKind::Identifier) {
@@ -380,12 +540,12 @@ private:
             if (current().kind == TokenKind::LeftParenthesis) {
                 return parse_function_call(token.text);
             }
-            return symbols_.read_expression_for(token.text);
+            return semantics_.identifier(token.text);
         }
 
         if (token.kind == TokenKind::LeftParenthesis) {
             advance();
-            const String inner = parse_logical_or();
+            const Value inner = parse_logical_or();
             if (current().kind != TokenKind::RightParenthesis) {
                 fail("expected ')' in expression");
             }
@@ -399,10 +559,10 @@ private:
         fail("expected a value but found '" + token.text + "'");
     }
 
-    String parse_function_call(const String &function_name) {
+    Value parse_function_call(const String &function_name) {
         advance(); // past '('
 
-        Vector<String> arguments;
+        Vector<Value> arguments;
         if (current().kind != TokenKind::RightParenthesis) {
             arguments.push_back(parse_logical_or());
             while (current().kind == TokenKind::Comma) {
@@ -416,39 +576,28 @@ private:
         }
         advance();
 
-        return emit_function_call(function_name, arguments);
+        return apply_function(function_name, arguments);
     }
 
-    String emit_function_call(const String &function_name, const Vector<String> &arguments) const {
+    Value apply_function(const String &function_name, const Vector<Value> &arguments) const {
         if (function_name == "random") {
             fail("unsupported function 'random': a deterministic per-neuron stream needs a "
                  "seed argument the generated kernels do not take");
         }
 
-        // NeuroML's standard library onto the C-family names. `ln` and `log` are the trap:
-        // LEMS's `log` is base 10 and its natural log is `ln`, which is the reverse of C.
-        static const UnorderedMap<String, String> single_argument_functions = {
-            {"exp", "exp"},   {"ln", "log"},    {"log", "log10"}, {"sin", "sin"},
-            {"cos", "cos"},   {"tan", "tan"},   {"sinh", "sinh"}, {"cosh", "cosh"},
-            {"tanh", "tanh"}, {"sqrt", "sqrt"}, {"abs", "fabs"},  {"ceil", "ceil"},
-            {"floor", "floor"},
-        };
-
         if (function_name == "H") {
             require_argument_count(function_name, arguments, 1);
-            return "((" + arguments[0] + ") >= 0.0f ? 1.0f : 0.0f)";
+            return semantics_.heaviside(arguments[0]);
         }
 
-        const auto entry = single_argument_functions.find(function_name);
-        if (entry == single_argument_functions.end()) {
-            fail("unknown function '" + function_name + "'");
-        }
+        const BuiltinFunctionEntry *entry = find_builtin_function(function_name);
+        if (entry == nullptr) fail("unknown function '" + function_name + "'");
 
         require_argument_count(function_name, arguments, 1);
-        return entry->second + "(" + arguments[0] + ")";
+        return semantics_.builtin(*entry, arguments[0]);
     }
 
-    void require_argument_count(const String &function_name, const Vector<String> &arguments,
+    void require_argument_count(const String &function_name, const Vector<Value> &arguments,
                                 usize expected_count) const {
         if (arguments.size() != expected_count) {
             fail("function '" + function_name + "' takes " + to_string(expected_count) +
@@ -456,6 +605,17 @@ private:
         }
     }
 };
+
+// Evaluates one NML expression against a set of numeric bindings, through exactly the
+// grammar translate_expression emits with.
+f64 evaluate_expression(const String &nml_expression, const ValueTable &values) {
+    Vector<Token> tokens = tokenize_nml_expression(nml_expression, values.component_type_name);
+    if (tokens.size() == 1) report_error("empty expression", values.component_type_name);
+
+    const NumericEvaluation semantics(values);
+    ExpressionParser<NumericEvaluation> parser(std::move(tokens), semantics);
+    return parser.parse_complete_expression();
+}
 
 // ── Symbol tables ────────────────────────────────────────────────────────────
 
@@ -466,17 +626,40 @@ private:
 struct StateStorage {
     String component_type_name;
     Vector<String> state_variable_names;
-    String array_name; // "cell_state" / "synapse_state"
-    String base_name;  // "state_base" / "synapse_state_base"
+    String array_name; // "cell_state" / "edge_synapse_state"
+    String base_name;  // "state_base" / "edge_synapse_state_base"
+
+    // How far apart two consecutive state variables of one component sit, as a generated
+    // expression. Empty means adjacent, which is how a cell's own chunk is laid out. A
+    // per-edge synapse variable is stored one PLANE apart instead -- the WeightMatrix
+    // sparse-delta convention this state shares -- so its stride is the plane size.
+    String element_stride_expression;
+
+    // Where this storage's accumulation residuals live, or empty when it keeps none. See
+    // "Compensated accumulation" below. Laid out exactly parallel to `array_name` -- same
+    // size, same base, same slot -- so nothing has to be indexed twice.
+    String residual_array_name;
 
     String element(usize slot) const {
-        return array_name + "[" + base_name + " + " + to_string(slot) + "]";
+        if (element_stride_expression.empty()) {
+            return array_name + "[" + base_name + " + " + to_string(slot) + "]";
+        }
+        return array_name + "[" + base_name + " + " + to_string(slot) + " * " +
+               element_stride_expression + "]";
+    }
+
+    bool keeps_residuals() const { return !residual_array_name.empty(); }
+
+    String residual_element(usize slot) const {
+        return residual_array_name + "[" + base_name + " + " + to_string(slot) + "]";
     }
 };
 
 StateStorage cell_state_storage(const CellTypeSpecification &cell_type) {
-    return StateStorage{cell_type.name, cell_type.state_variable_names, "cell_state",
-                        "state_base"};
+    // Empty stride: a cell's state variables are adjacent inside its own cell_state chunk.
+    return StateStorage{cell_type.name,     cell_type.state_variable_names,
+                        "cell_state",       "state_base",
+                        "",                 "cell_state_residual"};
 }
 
 SymbolTable build_base_symbol_table(const CellTypeSpecification &cell_type) {
@@ -573,17 +756,31 @@ const String active_regime_local_name = "active_regime_index";
 
 // The TimeDerivative `regime_name` declares for `variable_name`, or nullptr when that regime
 // declares none -- which is exactly what freezes the variable while the regime is active.
+//
+// Two of them in one regime is malformed LEMS and is refused, exactly as
+// emit_unconditional_euler_temporaries refuses the same shape outside any regime. Returning
+// the first and dropping the rest is what a model splitting its leak and its synaptic term
+// into two TimeDerivatives would silently lose -- the whole of its synaptic input, with no
+// diagnostic anywhere.
 const DynamicsInstruction *find_regime_time_derivative(const CellTypeSpecification &cell_type,
                                                        const String &regime_name,
                                                        const String &variable_name) {
+    const DynamicsInstruction *found = nullptr;
     for (const DynamicsInstruction &instruction : cell_type.dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
         if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
         if (instruction.regime_name != regime_name) continue;
         if (instruction.target != variable_name) continue;
-        return &instruction;
+
+        if (found != nullptr) {
+            report_error("'" + variable_name +
+                                 "' carries more than one TimeDerivative inside Regime '" +
+                                 regime_name + "'",
+                         cell_type.name);
+        }
+        found = &instruction;
     }
-    return nullptr;
+    return found;
 }
 
 // `regime_name`'s OnEntry StateAssignments, in declaration order. An OnEntry body is located
@@ -744,6 +941,96 @@ void reject_unsupported_instructions(const CellTypeSpecification &cell_type,
     }
 }
 
+// ── Compensated accumulation ─────────────────────────────────────────────────
+//
+// Forward Euler is a running sum, and a running sum in f32 loses the low bits of every
+// increment that is small beside the total. Fifty f32 additions of a 0.1 ms dt reach
+// 4.9999989569e-03 where f32(5 ms) is 4.9999998882e-03, so a `refractoryTimeElapsed .geq.
+// t_ref` fires on the fifty-FIRST tick and the refractory period is one tick longer than the
+// model declares. At dt = 0.1 ms that is +1 tick for essentially every t_ref, and at a 0.5 ms
+// t_ref it is a 20% error in the refractory period.
+//
+// The fix cannot be "accumulate in f64": Metal has no double precision. Instead each state
+// variable carries an f32 RESIDUAL -- the part of the last increment that did not fit -- which
+// is folded into the next one (Kahan compensated summation). The accumulated error stops
+// growing with the number of steps and stays at the order of one ulp of the value itself, so
+// the sum after n steps rounds to the correctly rounded n * dt and the comparison lands where
+// a f64 accumulation lands it.
+//
+// This is general rather than aimed at a refractory counter: it applies to every state
+// variable of every ComponentType, whatever its TimeDerivative, and it is the accumulation it
+// repairs rather than any particular comparison.
+//
+// Two things this depends on, both of which the engine's own tests hold it to:
+//  - The residual must be discarded whenever the variable is ASSIGNED (OnStart, an
+//    OnCondition's reset, a regime's OnEntry): it describes a sum that no longer exists. That
+//    is emit_residual_reset, called from every state write that is not an Euler step.
+//  - The compensation is an exact-arithmetic identity that a reassociating optimiser can fold
+//    to zero, and Metal compiles with fast math on by default. Nothing here can turn that off
+//    -- the compile options are the engine's -- so the guard is a test on the OBSERVED
+//    refractory length rather than on the emitted text: see the engine's
+//    a_regime_refractory_period_lasts_the_ticks_the_reference_freezes_for.
+String emit_residual_reset(const StateStorage &storage, usize slot, usize indent_level) {
+    if (!storage.keeps_residuals()) return "";
+    return indent(indent_level) + storage.residual_element(slot) + " = 0.0f;\n";
+}
+
+// What one Euler step writes back: the integrated value, and (where the storage keeps them)
+// the residual that step left behind.
+struct PendingStateWrite {
+    usize slot = 0;
+    String next_value_name;
+    String residual_name; // empty when this storage keeps no residual
+};
+
+// One forward-Euler step of `derivative_expression` into `next_value_name`, compensated
+// against `residual_name` where the storage keeps residuals. `declares_result` distinguishes
+// the unconditional path (which declares the temporary here) from a regime branch (where it
+// was declared once, ahead of the chain, and each branch only assigns it).
+String emit_compensated_euler_step(const StateStorage &storage, usize slot,
+                                   const String &variable_name,
+                                   const String &derivative_expression,
+                                   const String &next_value_name, const String &residual_name,
+                                   bool declares_result, usize indent_level) {
+    const String declaration = declares_result ? "float " : "";
+
+    if (!storage.keeps_residuals()) {
+        return indent(indent_level) + declaration + next_value_name + " = " +
+               storage.element(slot) + " + dt * (" + derivative_expression + ");\n";
+    }
+
+    const String sanitized_name = sanitize_identifier(variable_name);
+    const String increment_name = "increment_" + sanitized_name;
+    const String rounded_name = "rounded_" + sanitized_name;
+    const String rounding_loss_name = "rounding_loss_" + sanitized_name;
+
+    // The two `volatile` locals are load-bearing, not defensive.
+    //
+    // The residual is `((x + increment) - x) - increment`: zero in exact arithmetic, and the
+    // whole of the rounding loss in floating point. Metal compiles with fast math ON by
+    // default -- and the compile options belong to the engine's backend, not to this
+    // generator -- so the optimiser is free to apply that exact-arithmetic identity and fold
+    // the residual to a literal zero. It does: with neither barrier the emitted AIR stores a
+    // constant 0.0 into the residual, and the refractory hold stays exactly where it was.
+    //
+    // ONE barrier is not enough, which is the part worth writing down. Making only the sum
+    // opaque leaves `(next - x) - increment` reassociable into `next - (x + increment)`, and
+    // the recomputed sum is bit-identical to `next`, so the residual is zero at run time even
+    // though the arithmetic survived in the IR. The difference that recovers the rounding loss
+    // therefore has to be forced to happen on its own, before anything is subtracted from it.
+    //
+    // Both were checked in the emitted AIR (xcrun metal -S) and against the observed
+    // refractory length, not reasoned about.
+    return indent(indent_level) + "float " + increment_name + " = dt * (" +
+           derivative_expression + ") - " + residual_name + ";\n" + indent(indent_level) +
+           "volatile float " + rounded_name + " = " + storage.element(slot) + " + " +
+           increment_name + ";\n" + indent(indent_level) + declaration + next_value_name + " = " +
+           rounded_name + ";\n" + indent(indent_level) + "volatile float " + rounding_loss_name +
+           " = " + next_value_name + " - " + storage.element(slot) + ";\n" +
+           indent(indent_level) + residual_name + " = " + rounding_loss_name + " - " +
+           increment_name + ";\n";
+}
+
 // One handler's StateAssignments, emitted with LEMS's simultaneous semantics: every
 // right-hand side is evaluated against the state as it stood when the handler fired, and
 // only then is anything written back. Emitting them sequentially would make "v = u; u = v"
@@ -772,11 +1059,12 @@ String emit_state_assignment_group(const StateStorage &storage,
         const usize slot = require_state_variable_slot(storage, assignments.front()->target,
                                                        "StateAssignment");
         return indent(indent_level) + storage.element(slot) + " = " +
-               translate_expression(assignments.front()->expression, visible_symbols) + ";\n";
+               translate_expression(assignments.front()->expression, visible_symbols) + ";\n" +
+               emit_residual_reset(storage, slot, indent_level);
     }
 
     ostringstream group;
-    Vector<Pair<usize, String>> pending_state_writes;
+    Vector<PendingStateWrite> pending_state_writes;
     Set<String> declared_temporaries;
 
     for (const DynamicsInstruction *assignment : assignments) {
@@ -793,12 +1081,15 @@ String emit_state_assignment_group(const StateStorage &storage,
               << temporary_name << " = "
               << translate_expression(assignment->expression, visible_symbols) << ";\n";
 
-        if (is_first_assignment_to_target) pending_state_writes.push_back({slot, temporary_name});
+        if (is_first_assignment_to_target) {
+            pending_state_writes.push_back({slot, temporary_name, String()});
+        }
     }
 
-    for (const auto &pending_write : pending_state_writes) {
-        group << indent(indent_level) << storage.element(pending_write.first) << " = "
-              << pending_write.second << ";\n";
+    for (const PendingStateWrite &pending_write : pending_state_writes) {
+        group << indent(indent_level) << storage.element(pending_write.slot) << " = "
+              << pending_write.next_value_name << ";\n";
+        group << emit_residual_reset(storage, pending_write.slot, indent_level);
     }
 
     return group.str();
@@ -813,7 +1104,7 @@ String emit_state_assignment_group(const StateStorage &storage,
 String emit_unconditional_euler_temporaries(
         const StateStorage &storage, const Vector<DynamicsInstruction> &dynamics,
         const NML_ParseResult &parse_result, const SymbolTable &symbols, usize indent_level,
-        Vector<Pair<usize, String>> &pending_state_writes) {
+        Vector<PendingStateWrite> &pending_state_writes) {
     const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
 
     ostringstream step;
@@ -836,11 +1127,22 @@ String emit_unconditional_euler_temporaries(
                          storage.component_type_name);
         }
 
-        const String temporary_name = "next_" + sanitize_identifier(instruction.target);
-        step << indent(indent_level) << "float " << temporary_name << " = "
-             << storage.element(slot) << " + dt * ("
-             << translate_expression(instruction.expression, visible_symbols) << ");\n";
-        pending_state_writes.push_back({slot, temporary_name});
+        const String sanitized_name = sanitize_identifier(instruction.target);
+        const String temporary_name = "next_" + sanitized_name;
+        const String residual_name =
+                storage.keeps_residuals() ? "residual_" + sanitized_name : String();
+        const String derivative_expression =
+                translate_expression(instruction.expression, visible_symbols);
+
+        if (storage.keeps_residuals()) {
+            step << indent(indent_level) << "float " << residual_name << " = "
+                 << storage.residual_element(slot) << ";\n";
+        }
+        step << emit_compensated_euler_step(storage, slot, instruction.target,
+                                            derivative_expression, temporary_name, residual_name,
+                                            /*declares_result=*/true, indent_level);
+
+        pending_state_writes.push_back({slot, temporary_name, residual_name});
     }
 
     return step.str();
@@ -858,7 +1160,7 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
                                           const StateStorage &storage,
                                           const NML_ParseResult &parse_result,
                                           const SymbolTable &symbols, usize indent_level,
-                                          Vector<Pair<usize, String>> &pending_state_writes) {
+                                          Vector<PendingStateWrite> &pending_state_writes) {
     if (!regimes.has_regimes()) return "";
 
     const SymbolTable visible_symbols = with_fallback_symbols(symbols, parse_result);
@@ -870,17 +1172,28 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
 
         // Which of the two applies is not decidable from the document, and picking either
         // silently changes how the variable moves in every regime.
-        for (const auto &pending_write : pending_state_writes) {
-            if (pending_write.first != slot) continue;
+        for (const PendingStateWrite &pending_write : pending_state_writes) {
+            if (pending_write.slot != slot) continue;
             report_error("'" + variable_name +
                                  "' carries both a regime-scoped TimeDerivative and one outside "
                                  "any Regime",
                          cell_type.name);
         }
 
-        const String temporary_name = "next_" + sanitize_identifier(variable_name);
+        const String sanitized_name = sanitize_identifier(variable_name);
+        const String temporary_name = "next_" + sanitized_name;
+        const String residual_name =
+                storage.keeps_residuals() ? "residual_" + sanitized_name : String();
+
         dispatch << indent(indent_level) << "float " << temporary_name << " = "
                  << storage.element(slot) << ";\n";
+        // Read once, outside the chain, and written back whatever branch runs. A regime that
+        // declares no derivative for this variable leaves it untouched, so a variable frozen
+        // for a while resumes with the residual it was frozen holding.
+        if (storage.keeps_residuals()) {
+            dispatch << indent(indent_level) << "float " << residual_name << " = "
+                     << storage.residual_element(slot) << ";\n";
+        }
 
         // One regime's body for this variable: the Euler step it declares, or a comment
         // recording that it declares none and the variable is therefore held.
@@ -892,15 +1205,16 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
                        "' declares no TimeDerivative for '" + variable_name +
                        "', so it holds its value.\n";
             }
-            return indent(body_indent) + temporary_name + " = " + storage.element(slot) +
-                   " + dt * (" + translate_expression(derivative->expression, visible_symbols) +
-                   ");\n";
+            return emit_compensated_euler_step(
+                    storage, slot, variable_name,
+                    translate_expression(derivative->expression, visible_symbols), temporary_name,
+                    residual_name, /*declares_result=*/false, body_indent);
         };
 
         // A single regime is always active, so its body needs no guard at all.
         if (regimes.regime_names.size() == 1) {
             dispatch << branch_body(regimes.regime_names[0], indent_level);
-            pending_state_writes.push_back({slot, temporary_name});
+            pending_state_writes.push_back({slot, temporary_name, residual_name});
             continue;
         }
 
@@ -916,19 +1230,22 @@ String emit_regime_dispatched_integration(const CellTypeSpecification &cell_type
         dispatch << " {\n" << branch_body(regimes.regime_names.back(), indent_level + 1)
                  << indent(indent_level) << "}\n";
 
-        pending_state_writes.push_back({slot, temporary_name});
+        pending_state_writes.push_back({slot, temporary_name, residual_name});
     }
 
     return dispatch.str();
 }
 
 String emit_euler_write_back(const StateStorage &storage,
-                             const Vector<Pair<usize, String>> &pending_state_writes,
+                             const Vector<PendingStateWrite> &pending_state_writes,
                              usize indent_level) {
     ostringstream write_back;
-    for (const auto &pending_write : pending_state_writes) {
-        write_back << indent(indent_level) << storage.element(pending_write.first) << " = "
-                   << pending_write.second << ";\n";
+    for (const PendingStateWrite &pending_write : pending_state_writes) {
+        write_back << indent(indent_level) << storage.element(pending_write.slot) << " = "
+                   << pending_write.next_value_name << ";\n";
+        if (pending_write.residual_name.empty()) continue;
+        write_back << indent(indent_level) << storage.residual_element(pending_write.slot)
+                   << " = " << pending_write.residual_name << ";\n";
     }
     return write_back.str();
 }
@@ -1045,32 +1362,161 @@ void require_synaptic_select_path(const String &path, const String &head_name,
     }
 }
 
-// ── Stage 6, Propagate ───────────────────────────────────────────────────────
+// ── Per-edge passes: the shared k^2-tree row walk ────────────────────────────
 //
-// Propagation is generated into every cell device function as a fixed epilogue rather than
-// dispatched as a kernel of its own: the supporting engine infrastructure -- the k^2-tree
-// adjacency, the shared U/V basis, the delay ring -- is identical for every cell type, so
-// the same boilerplate serves all of them.
+// Three generated passes walk a neuron's out-edges: propagation (stage 6), the eager
+// synapse advance, and the one-shot per-edge synapse initialisation. All three are emitted
+// into device functions rather than dispatched as kernels of their own, because the
+// supporting engine infrastructure -- the k^2-tree adjacency, the shared U/V basis, the
+// delay ring, the per-edge state block -- is identical for every cell type.
 //
-// `network_inputs` is a ring of `ring_depth` rows of `neuron_count` floats. A spiking source
-// adds each edge's weight into row (tick + edge delay) % ring_depth of the target's column;
-// a cell reads and clears row tick % ring_depth of its own column. `ring_depth` exceeds the
-// model's largest per-edge delay (the engine computes it), so an arrival can never land in
-// the row being drained this tick, and every row is cleared by its reader before the ring
-// wraps back onto it.
+// `network_inputs` is a ring of `ring_depth` rows of `neuron_count` floats. A spiking
+// source adds each edge's delivered current into row (tick + edge delay) % ring_depth of
+// the target's column; a cell reads row tick % ring_depth of its own column. `ring_depth`
+// exceeds the model's largest per-edge delay (the engine computes it), so an arrival can
+// never land in the row being drained this tick, and every row is cleared by the engine's
+// own clear kernel before the ring wraps back onto it.
 //
 // The row walk below is the same iterative DFS kernels.metal's k2t_next_neighbor performs,
 // and enumerates a row's neighbours in exactly the order K2Tree::get_neighbors does on the
 // host (both descend column offsets 0..branching_factor-1 depth first). That is what makes
-// `neighbor_slot` address the same per-edge slot the host indexes the sparse delta and
-// per-edge delay arrays by.
+// `neighbor_slot` address the same per-edge slot the host indexes the sparse delta, the
+// per-edge delay and the per-edge synapse state planes by.
+
+// The three int planes packed into `edge_attributes`, in order. Baked as names rather than
+// written as bare 0/1/2 at the eight places that index them, because a plane mix-up reads
+// as a wrong delay or a wrong program and never as a crash.
+const String edge_attribute_delay_plane_name = "SPIKECOREC_EDGE_ATTRIBUTE_DELAY_PLANE";
+const String edge_attribute_program_plane_name = "SPIKECOREC_EDGE_ATTRIBUTE_PROGRAM_PLANE";
+const String edge_attribute_update_tick_plane_name = "SPIKECOREC_EDGE_ATTRIBUTE_UPDATE_TICK_PLANE";
+
+String emit_edge_attribute_plane_definitions() {
+    return "#define " + edge_attribute_delay_plane_name + " 0\n" + "#define " +
+           edge_attribute_program_plane_name + " 1\n" + "#define " +
+           edge_attribute_update_tick_plane_name + " 2\n\n";
+}
+
+// One edge's slot in `edge_attributes` plane `plane_name`.
+String edge_attribute_element(const String &plane_name) {
+    return "edge_attributes[" + plane_name + " * edge_slot_count + edge_slot]";
+}
+
+// The k^2-tree shape scalars, unpacked out of the one buffer they are bound through. Their
+// names are the ones k2tree_next_neighbor's parameter list already uses, so the walk below
+// reads exactly as it did when each arrived as its own kernel argument.
+String emit_k2tree_shape_unpack(usize indent_level) {
+    return indent(indent_level) + "int branching_factor = k2tree_shape[0];\n" +
+           indent(indent_level) + "int superblock_size_words = k2tree_shape[1];\n" +
+           indent(indent_level) + "int padded_node_count = k2tree_shape[2];\n" +
+           indent(indent_level) + "int tree_height = k2tree_shape[3];\n" +
+           indent(indent_level) + "int internal_bit_count = k2tree_shape[4];\n";
+}
+
+// The walk itself, with `per_edge_body` emitted once per real out-edge. The body sees
+// `edge_slot` (this edge's slot in every per-edge plane, 64-bit), `edge_slot_count` (one
+// plane's size, so a plane index scales by it), `target_neuron_index` and `neighbor_slot`.
+//
+// `edge_slot` is deliberately 64-bit: neuron_index * max_neighbor_count overflows a signed
+// int at ~33M neurons of degree 64, and the wrapped negative index lands in another edge's
+// slot rather than faulting. The host computes the same product in s64.
+String emit_out_edge_walk(const String &per_edge_body, KernelBackend backend,
+                          usize indent_level) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const String thread_qualifier = is_metal ? "thread " : "";
+
+    ostringstream walk;
+    walk << emit_k2tree_shape_unpack(indent_level) << "\n"
+         << indent(indent_level) << thread_qualifier
+         << "int stack_row_base[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+         << indent(indent_level) << thread_qualifier
+         << "int stack_column_base[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+         << indent(indent_level) << thread_qualifier
+         << "int stack_block_size[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+         << indent(indent_level) << thread_qualifier
+         << "int stack_bit_offset[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+         << indent(indent_level) << thread_qualifier
+         << "int stack_next_column[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
+         << indent(indent_level) << "stack_row_base[0] = 0;\n"
+         << indent(indent_level) << "stack_column_base[0] = 0;\n"
+         << indent(indent_level) << "stack_block_size[0] = padded_node_count;\n"
+         << indent(indent_level) << "stack_bit_offset[0] = 0;\n"
+         << indent(indent_level) << "stack_next_column[0] = 0;\n"
+         << indent(indent_level) << "int stack_top = (tree_height > 0 && neuron_index >= 0 &&\n"
+         << indent(indent_level + 3) << "neuron_index < neuron_count) ? 0 : -1;\n\n"
+         << indent(indent_level) << buffer_index_type_name << " edge_slot_count =\n"
+         << indent(indent_level + 2) << "(" << buffer_index_type_name << ")neuron_count * ("
+         << buffer_index_type_name << ")max_neighbor_count;\n"
+         << indent(indent_level) << "int neighbor_slot = 0;\n"
+         << indent(indent_level) << "int target_neuron_index = 0;\n\n"
+         // A degree above max_neighbor_count has no slot in the per-edge planes at all (the
+         // host cannot address one either), so the walk stops rather than reading into the
+         // next source's row.
+         << indent(indent_level) << "while (neighbor_slot < max_neighbor_count &&\n"
+         << indent(indent_level + 2) << "(target_neuron_index = k2tree_next_neighbor(\n"
+         << indent(indent_level + 4) << "internal_node_words, leaf_node_words, rank_superblock_table,\n"
+         << indent(indent_level + 4) << "rank_subblock_table, branching_factor, superblock_size_words,\n"
+         << indent(indent_level + 4) << "neuron_count, tree_height, internal_bit_count, neuron_index,\n"
+         << indent(indent_level + 4) << "stack_row_base, stack_column_base, stack_block_size,\n"
+         << indent(indent_level + 4) << "stack_bit_offset, stack_next_column, stack_top)) >= 0) {\n"
+         << indent(indent_level + 1) << buffer_index_type_name << " edge_slot =\n"
+         << indent(indent_level + 3) << "(" << buffer_index_type_name << ")neuron_index * ("
+         << buffer_index_type_name << ")max_neighbor_count +\n"
+         << indent(indent_level + 3) << "(" << buffer_index_type_name << ")neighbor_slot;\n\n"
+         << per_edge_body << indent(indent_level + 1) << "neighbor_slot += 1;\n"
+         << indent(indent_level) << "}\n";
+    return walk.str();
+}
+
+// The adjacency-walking parameters every one of the three passes takes, in one place so
+// their signatures and their call sites cannot drift.
+String emit_adjacency_parameters(KernelBackend backend, bool include_network_inputs,
+                                 bool include_weight_basis) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const String device_qualifier = is_metal ? "device " : "";
+    const String unsigned_integer_type = is_metal ? "uint" : "unsigned int";
+    const String unsigned_short_type = is_metal ? "ushort" : "unsigned short";
+
+    ostringstream parameters;
+    if (include_network_inputs) {
+        parameters << indent(2) << device_qualifier << "float *network_inputs,\n";
+    }
+    parameters << indent(2) << device_qualifier << "const " << unsigned_integer_type
+               << " *internal_node_words,\n"
+               << indent(2) << device_qualifier << "const " << unsigned_integer_type
+               << " *leaf_node_words,\n"
+               << indent(2) << device_qualifier << "const " << unsigned_integer_type
+               << " *rank_superblock_table,\n"
+               << indent(2) << device_qualifier << "const " << unsigned_short_type
+               << " *rank_subblock_table,\n";
+    if (include_weight_basis) {
+        parameters << indent(2) << device_qualifier << "const float *U_matrix,\n"
+                   << indent(2) << device_qualifier << "const float *V_matrix,\n"
+                   << indent(2) << device_qualifier << "const float *edge_weight_coefficients,\n"
+                   << indent(2) << device_qualifier << "const float *edge_weight_deltas,\n";
+    }
+    parameters << indent(2) << device_qualifier << "int *edge_attributes,\n"
+               << indent(2) << device_qualifier << "float *edge_synapse_state,\n"
+               << indent(2) << device_qualifier << "const int *k2tree_shape,\n";
+    return parameters.str();
+}
+
+const String &adjacency_argument_list(bool include_network_inputs, bool include_weight_basis) {
+    static const String with_everything =
+            "network_inputs, internal_node_words, leaf_node_words, rank_superblock_table, "
+            "rank_subblock_table, U_matrix, V_matrix, edge_weight_coefficients, "
+            "edge_weight_deltas, edge_attributes, edge_synapse_state, k2tree_shape";
+    static const String adjacency_only =
+            "internal_node_words, leaf_node_words, rank_superblock_table, "
+            "rank_subblock_table, edge_attributes, edge_synapse_state, k2tree_shape";
+    return (include_network_inputs && include_weight_basis) ? with_everything : adjacency_only;
+}
 
 // Reconstruction reads U/V as plain floats rather than as float4: the buffers are the same
 // bytes either way, and scalar lanes make the arithmetic identical to WeightMatrix's own
 // host-side reconstruct_entry, which is what `weights.get()` reports. `rank_float4_stride`
 // keeps its name because that is the argument the engine binds; a row is
 // rank_float4_stride * 4 scalar lanes wide.
-String emit_propagation_helpers(KernelBackend backend) {
+String emit_k2tree_helpers(KernelBackend backend) {
     const bool is_metal = backend == KernelBackend::Metal;
     const String function_prefix = is_metal ? "inline " : "__device__ inline ";
     const String device_qualifier = is_metal ? "device " : "";
@@ -1191,127 +1637,25 @@ String emit_propagation_helpers(KernelBackend backend) {
             << indent(1) << "return -1;\n"
             << "}\n\n";
 
-    // The ring is one flat allocation indexed as [row][plane][neuron]. `tick_of_arrival` is
-    // the tick whose row is wanted -- `tick` for a drain, `tick + delay` for an arrival --
-    // and `plane_index` is 0 for the delivered-current plane every cell reads, or 1 + p for
-    // wired synapse prototype p's own arrival plane. The plane COUNT is baked rather than
-    // passed: the master kernel's argument table is full, and it is a property of the model
-    // the source was generated from.
-    // The offset is computed in 64 bits, matching the host's own s64 arithmetic over the same
-    // allocation (SpikeEngine's network_input_element_count and current_ring_row_base). In
-    // `int` the two disagree silently past INT_MAX -- ring_depth 64 over 4 wired prototypes
-    // and 8.4M neurons already exceeds it -- and an arrival wraps to a negative index, which
-    // lands in another neuron's slot rather than crashing.
+    // The ring is one flat allocation indexed as [row][neuron]. `tick_of_arrival` is the
+    // tick whose row is wanted -- `tick` for a drain, `tick + that edge's delay` for an
+    // arrival.
+    //
+    // The offset is computed in 64 bits, matching the host's own s64 arithmetic over the
+    // same allocation (SpikeEngine's network_input_element_count and
+    // current_ring_row_base). In `int` the two disagree silently past INT_MAX and an
+    // arrival wraps to a negative index, which lands in another neuron's slot rather than
+    // crashing.
     helpers << function_prefix << tick_type << " network_input_ring_index(\n"
             << indent(2) << tick_type << " tick_of_arrival,\n"
-            << indent(2) << "int plane_index,\n"
             << indent(2) << "int ring_depth,\n"
             << indent(2) << "int neuron_count,\n"
             << indent(2) << "int neuron_index\n"
             << ") {\n"
             << indent(1) << tick_type << " ring_row = tick_of_arrival % (" << tick_type
             << ")ring_depth;\n"
-            << indent(1)
-            << "return (ring_row * SPIKECOREC_NETWORK_INPUT_PLANE_COUNT + (" << tick_type
-            << ")plane_index) *\n"
-            << indent(3) << "(" << tick_type << ")neuron_count + (" << tick_type
+            << indent(1) << "return ring_row * (" << tick_type << ")neuron_count + (" << tick_type
             << ")neuron_index;\n"
-            << "}\n\n";
-
-    helpers << function_prefix << "void propagate_spike(\n"
-            << indent(2) << device_qualifier << "float *network_inputs,\n"
-            << indent(2) << device_qualifier << "const " << unsigned_integer_type
-            << " *internal_node_words,\n"
-            << indent(2) << device_qualifier << "const " << unsigned_integer_type
-            << " *leaf_node_words,\n"
-            << indent(2) << device_qualifier << "const " << unsigned_integer_type
-            << " *rank_superblock_table,\n"
-            << indent(2) << device_qualifier << "const " << unsigned_short_type
-            << " *rank_subblock_table,\n"
-            << indent(2) << device_qualifier << "const float *U_matrix,\n"
-            << indent(2) << device_qualifier << "const float *V_matrix,\n"
-            << indent(2) << device_qualifier << "const float *edge_weight_coefficients,\n"
-            << indent(2) << device_qualifier << "const float *edge_weight_deltas,\n"
-            << indent(2) << device_qualifier << "const int *edge_delay_ticks,\n"
-            << indent(2) << device_qualifier << "const int *edge_synapse_plane,\n"
-            << indent(2) << "int branching_factor,\n"
-            << indent(2) << "int superblock_size_words,\n"
-            << indent(2) << "int padded_node_count,\n"
-            << indent(2) << "int tree_height,\n"
-            << indent(2) << "int internal_bit_count,\n"
-            << indent(2) << tick_type << " rank_float4_stride,\n"
-            << indent(2) << "float constant_weight,\n"
-            << indent(2) << "int max_neighbor_count,\n"
-            << indent(2) << "int ring_depth,\n"
-            << indent(2) << "int neuron_count,\n"
-            << indent(2) << "int neuron_index,\n"
-            << indent(2) << tick_type << " tick\n"
-            << ") {\n"
-            << indent(1) << thread_qualifier
-            << "int stack_row_base[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
-            << indent(1) << thread_qualifier
-            << "int stack_column_base[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
-            << indent(1) << thread_qualifier
-            << "int stack_block_size[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
-            << indent(1) << thread_qualifier
-            << "int stack_bit_offset[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
-            << indent(1) << thread_qualifier
-            << "int stack_next_column[SPIKECOREC_MAXIMUM_K2TREE_HEIGHT];\n"
-            << indent(1) << "stack_row_base[0] = 0;\n"
-            << indent(1) << "stack_column_base[0] = 0;\n"
-            << indent(1) << "stack_block_size[0] = padded_node_count;\n"
-            << indent(1) << "stack_bit_offset[0] = 0;\n"
-            << indent(1) << "stack_next_column[0] = 0;\n"
-            << indent(1) << "int stack_top = (tree_height > 0 && neuron_index >= 0 &&\n"
-            << indent(4) << "neuron_index < neuron_count) ? 0 : -1;\n\n"
-            << indent(1) << tick_type << " row_lane_count = rank_float4_stride * 4;\n"
-            << indent(1) << tick_type
-            << " source_lane_base = (" << tick_type << ")neuron_index * row_lane_count;\n"
-            << indent(1) << "int neighbor_slot = 0;\n"
-            << indent(1) << "int target_neuron_index = 0;\n\n"
-            // A degree above max_neighbor_count has no slot in the per-edge arrays at all
-            // (the host cannot address one either), so the walk stops rather than reading
-            // into the next source's row.
-            << indent(1) << "while (neighbor_slot < max_neighbor_count &&\n"
-            << indent(3) << "(target_neuron_index = k2tree_next_neighbor(\n"
-            << indent(5) << "internal_node_words, leaf_node_words, rank_superblock_table,\n"
-            << indent(5) << "rank_subblock_table, branching_factor, superblock_size_words,\n"
-            << indent(5) << "neuron_count, tree_height, internal_bit_count, neuron_index,\n"
-            << indent(5) << "stack_row_base, stack_column_base, stack_block_size,\n"
-            << indent(5) << "stack_bit_offset, stack_next_column, stack_top)) >= 0) {\n"
-            << indent(2) << "int edge_slot = neuron_index * max_neighbor_count + neighbor_slot;\n\n"
-            << indent(2) << "float edge_weight = constant_weight;\n"
-            << indent(2) << "if (constant_weight == 0.0f) {\n"
-            << indent(3) << tick_type << " target_lane_base = (" << tick_type
-            << ")target_neuron_index * row_lane_count;\n"
-            << indent(3) << "float reconstructed_weight = 0.0f;\n"
-            << indent(3) << "for (" << tick_type << " lane = 0; lane < row_lane_count; ++lane) {\n"
-            << indent(4) << "reconstructed_weight += U_matrix[source_lane_base + lane] *\n"
-            << indent(6) << "(edge_weight_coefficients[lane] * V_matrix[target_lane_base + lane]);\n"
-            << indent(3) << "}\n"
-            << indent(3) << "edge_weight = reconstructed_weight + edge_weight_deltas[edge_slot];\n"
-            << indent(2) << "}\n\n"
-            // Which plane the arrival lands in is a property of the EDGE: the synapse
-            // prototype its projection names, or plane 0 when it names none -- in which case
-            // the raw weight is the delivered current, which is what network_inputs meant
-            // before there were any synapse dynamics at all.
-            << indent(2) << tick_type << " arrival_index = network_input_ring_index(\n"
-            << indent(4) << "tick + (" << tick_type << ")edge_delay_ticks[edge_slot],\n"
-            << indent(4) << "edge_synapse_plane[edge_slot], ring_depth,\n"
-            << indent(4) << "neuron_count, target_neuron_index);\n";
-
-    // Many sources converge on one target in the same tick, so the arrival has to be atomic.
-    if (is_metal) {
-        helpers << indent(2) << "device atomic_float *arrival_slot =\n"
-                << indent(4) << "(device atomic_float *)(network_inputs + arrival_index);\n"
-                << indent(2)
-                << "atomic_fetch_add_explicit(arrival_slot, edge_weight, memory_order_relaxed);\n";
-    } else {
-        helpers << indent(2) << "atomicAdd(network_inputs + arrival_index, edge_weight);\n";
-    }
-
-    helpers << indent(2) << "neighbor_slot += 1;\n"
-            << indent(1) << "}\n"
             << "}\n\n";
 
     return helpers.str();
@@ -1327,45 +1671,23 @@ String emit_synaptic_input_read(usize indent_level) {
     ostringstream read;
     read << indent(indent_level) << buffer_index_type_name
          << " synaptic_input_index = network_input_ring_index(\n"
-         << indent(indent_level + 2)
-         << "tick, 0, ring_depth, neuron_count, neuron_index);\n"
+         << indent(indent_level + 2) << "tick, ring_depth, neuron_count, neuron_index);\n"
          << indent(indent_level) << "float " << synaptic_input_local_name
          << " = network_inputs[synaptic_input_index];\n";
     return read.str();
 }
 
-// The fixed epilogue every cell device function ends with.
-String emit_propagation_epilogue(usize indent_level) {
-    ostringstream epilogue;
-    epilogue << indent(indent_level) << "if (spike_flags[neuron_index] != 0) {\n"
-             << indent(indent_level + 1) << "propagate_spike(\n"
-             << indent(indent_level + 3)
-             << "network_inputs, internal_node_words, leaf_node_words, rank_superblock_table,\n"
-             << indent(indent_level + 3)
-             << "rank_subblock_table, U_matrix, V_matrix, edge_weight_coefficients,\n"
-             << indent(indent_level + 3)
-             << "edge_weight_deltas, edge_delay_ticks, edge_synapse_plane, branching_factor,\n"
-             << indent(indent_level + 3) << "superblock_size_words,\n"
-             << indent(indent_level + 3)
-             << "padded_node_count, tree_height, internal_bit_count, rank_float4_stride,\n"
-             << indent(indent_level + 3)
-             << "constant_weight, max_neighbor_count, ring_depth, neuron_count, neuron_index,\n"
-             << indent(indent_level + 3) << "tick);\n"
-             << indent(indent_level) << "}\n";
-    return epilogue.str();
-}
-
 // ── Synapse dynamics ─────────────────────────────────────────────────────────
 //
-// One wired synapse prototype, resolved once so nothing downstream re-derives an index.
-// `state_variable_offset` is in state variables, not floats: the runtime base is
-// state_variable_offset * neuron_count + neuron_index * state variable count, and
-// neuron_count is only known to the kernel.
-struct WiredSynapse {
+// One lowered synapse program, resolved once so nothing downstream re-derives an index.
+// `state_variable_offset` is in per-edge variable PLANES: the runtime base is
+// state_variable_offset * edge_slot_count + edge_slot, and edge_slot_count is only known
+// to the kernel.
+struct SynapseProgram {
     const SynapseTypeSpecification *type = nullptr;
     const ComponentPrototype *prototype = nullptr;
-    usize plane_index = 0;            // 1 + position in the wired list
-    usize state_variable_offset = 0;  // running sum of the preceding prototypes' state widths
+    usize program_index = 0;
+    usize state_variable_offset = 0;
 };
 
 // The one local an OnEvent handler reads its arriving weight through. Bound to `weight`
@@ -1405,25 +1727,30 @@ Vector<const DynamicsInstruction *> arrival_assignments_on_port(
 
 // Everything the synapse path refuses, checked in one pass so a model fails at generation
 // with the construct named rather than half-generating and running wrong.
-void reject_unsupported_synapse(const WiredSynapse &wired) {
-    const SynapseTypeSpecification &synapse_type = *wired.type;
+void reject_unsupported_synapse(const SynapseProgram &program) {
+    const SynapseTypeSpecification &synapse_type = *program.type;
 
     if (declares_conductance_parameter(synapse_type)) {
         report_error("conductance-based synapses are not supported yet. This type declares a "
                      "reversal potential / baseline conductance, so it computes "
                      "i = g * (erev - v) -- a driving force that depends on the postsynaptic "
-                     "voltage and reverses sign as v crosses erev. Running it as a "
-                     "current-based synapse would be a different model, not an approximation, "
-                     "so it is refused. Use a current-based synapse (alphaCurrentSynapse and "
-                     "friends), which is what GLIF1-5 use",
+                     "voltage and reverses sign as v crosses erev, where a current-based "
+                     "synapse injects a fixed current profile. Running it as a current-based "
+                     "synapse would be a different model, not an approximation, so it is "
+                     "refused. Use a current-based synapse (alphaCurrentSynapse and friends), "
+                     "which is what GLIF1-5 use",
                      synapse_type.name);
     }
 
+    // Per-edge state is no longer the obstacle -- every synapse's state is per-edge now.
+    // What this flag records is a <Children type="basePlasticityMechanism"/> or
+    // "baseBlockMechanism" declaration (see nml.cpp's requires_per_edge_state), and this
+    // generator lowers no child-component structure at all.
     if (synapse_type.requires_per_edge_state) {
-        report_error("this synapse's state does not superpose across converging edges (it "
-                     "carries a plasticity or block mechanism), so it cannot share one "
-                     "aggregated state per target neuron. Per-edge synapse state is a "
-                     "separate ticket",
+        report_error("this synapse declares a plasticity or block mechanism as a child "
+                     "component, and no child-component structure is lowered. Running the "
+                     "parent's dynamics on their own would silently drop the mechanism that "
+                     "makes the synapse depress, facilitate or block",
                      synapse_type.name);
     }
 
@@ -1474,18 +1801,27 @@ void reject_unsupported_synapse(const WiredSynapse &wired) {
     }
 }
 
-// State variables read from the aggregated per-(target, prototype) slice; parameters read as
-// the prototype's own resolved values, baked as literals because they are constants of the
-// prototype rather than of any neuron.
+// No residual array: a per-edge variable is one compressed plane per state variable across
+// every edge in the model, so carrying residuals for them would double the largest allocation
+// the engine makes. What the residuals buy -- a threshold crossed on the tick the reference
+// crosses it -- is a property of a CELL's OnConditions; a synapse declares none (they are
+// refused), and its state is only ever read as the size of the charge one event delivers.
+StateStorage synapse_state_storage(const SynapseTypeSpecification &synapse_type) {
+    return StateStorage{synapse_type.name,      synapse_type.state_variable_names,
+                        "edge_synapse_state",   "edge_synapse_state_base",
+                        "edge_slot_count",      ""};
+}
+
+// State variables read from this EDGE's own per-edge variable planes; parameters read as the
+// prototype's own resolved values, baked as literals because they are constants of the
+// prototype rather than of any edge.
 //
-// `weight` is the exception and the whole point of the aggregation: inside the OnEvent
-// handler it names the SUMMED weight of the arrivals due this tick, so one evaluation of the
-// handler stands in for every converging edge's. Outside the handler it keeps the prototype's
-// own value, because a TimeDerivative reading "this tick's arrival" would be nonsense.
-SymbolTable build_synapse_symbol_table(const WiredSynapse &wired, bool bind_weight_to_arrival) {
-    const SynapseTypeSpecification &synapse_type = *wired.type;
-    const StateStorage storage{synapse_type.name, synapse_type.state_variable_names,
-                               "synapse_state", "synapse_state_base"};
+// `weight` is the exception: inside the OnEvent handler it names the weight of the edge the
+// arriving spike travelled down. Outside the handler it keeps the prototype's own parameter
+// of that name, because a TimeDerivative reading "this arrival's weight" would be nonsense.
+SymbolTable build_synapse_symbol_table(const SynapseProgram &program, bool bind_weight_to_arrival) {
+    const SynapseTypeSpecification &synapse_type = *program.type;
+    const StateStorage storage = synapse_state_storage(synapse_type);
 
     SymbolTable symbols;
     symbols.component_type_name = synapse_type.name;
@@ -1498,9 +1834,9 @@ SymbolTable build_synapse_symbol_table(const WiredSynapse &wired, bool bind_weig
         symbols.define(synapse_type.state_variable_names[slot], storage.element(slot));
     }
 
-    if (wired.prototype->starting_parameters.size() != synapse_type.parameter_names.size()) {
-        report_error("synapse prototype '" + wired.prototype->instance_id + "' carries " +
-                             to_string(wired.prototype->starting_parameters.size()) +
+    if (program.prototype->starting_parameters.size() != synapse_type.parameter_names.size()) {
+        report_error("synapse prototype '" + program.prototype->instance_id + "' carries " +
+                             to_string(program.prototype->starting_parameters.size()) +
                              " starting parameters but its type declares " +
                              to_string(synapse_type.parameter_names.size()),
                      synapse_type.name);
@@ -1509,38 +1845,390 @@ SymbolTable build_synapse_symbol_table(const WiredSynapse &wired, bool bind_weig
     for (usize slot = 0; slot < synapse_type.parameter_names.size(); ++slot) {
         symbols.define(synapse_type.parameter_names[slot],
                        format_float_literal(
-                               wired.prototype->starting_parameters[slot].float64));
+                               program.prototype->starting_parameters[slot].float64));
     }
 
     return symbols;
 }
 
-StateStorage synapse_state_storage(const SynapseTypeSpecification &synapse_type) {
-    return StateStorage{synapse_type.name, synapse_type.state_variable_names, "synapse_state",
-                        "synapse_state_base"};
+// ── What one arriving event delivers: the charge response ────────────────────
+//
+// A spike delivers the whole of the charge the synapse's response to THAT event would inject
+// over all the ticks that follow, in the one tick the spike lands on. Sampling the `i`
+// exposure at the instant of the spike instead is the thing this exists not to do:
+// alphaCurrentSynapse's OnEvent bumps `J` while `i` exposes `I`, and `I` only grows out of
+// `J` over later ticks, so an instantaneous sample returns whatever `I` had decayed to --
+// exactly zero for an isolated first spike, whatever the weight.
+//
+// The response is worked out here, on the host, by integrating the synapse's OWN lowered
+// dynamics; no closed form is written down for any synapse type. For state x, write
+//     Q(x) = sum over the ticks that follow of i(x_n) * dt,     x_0 = x, x_{n+1} = Euler(x_n)
+// the total charge a synapse left at state x and never touched again would still deliver.
+// An event moves the state from x to x' = handler(x, weight), so the charge THAT event adds
+// is Q(x') - Q(x): the tail Q(x) was already delivered by whichever earlier event produced
+// it, and delivering it a second time would inject more total charge than the synapse ever
+// carries.
+//
+// For dynamics linear in the state -- which every current-based synapse this generator
+// lowers is, and which is CHECKED below rather than assumed -- Q is a linear functional:
+//     Q(x) = sum over v of charge_coefficient[v] * x[v]
+// so Q(x') - Q(x) is that same combination of the state CHANGE the handler made. Only the
+// coefficients are precomputed; the state change is read off the edge's live state at the
+// spike, so a handler whose assignment depends on the state it finds (a depressing or
+// facilitating synapse) still delivers a different amount on each successive spike.
+//
+// The engine's `network_inputs` slot holds a CURRENT, which the target cell integrates over
+// one tick as dv = i * dt / C. Delivering charge Q in that one tick therefore means writing
+// Q / dt into the slot, and the division is applied where the value is returned.
+
+// A probe runs until the output has decayed to this fraction of the largest magnitude it
+// reached. The tail beyond that point is the same fraction of the total, which is far below
+// the f32 the coefficient is baked as.
+const f64 charge_probe_decay_fraction = 1e-7;
+
+// And gives up after this many steps. At a 0.1 ms tick that is 20 seconds of model time,
+// thousands of time constants for any synapse; reaching it means the output is not decaying
+// at all, so the charge one event delivers is unbounded.
+const usize maximum_charge_probe_step_count = 200000;
+
+// Two charges are the same charge if they agree this closely, relatively. Two probes stop at
+// different steps, so each carries its own truncated tail; that difference is of the order of
+// charge_probe_decay_fraction, and the tolerance sits well above it and far below any real
+// nonlinearity.
+const f64 charge_linearity_tolerance = 1e-4;
+
+// One synapse program's dynamics in the form the host integration walks them: the value
+// table every expression resolves through, which slot each TimeDerivative advances, and the
+// DerivedVariables that are visible under their own names.
+//
+// The value table is built ONCE and mutated in place per step. Everything constant -- the
+// prototype's parameters, the document's constants, dt -- is bound here, under the same
+// first-definition-wins precedence build_synapse_symbol_table gives the emitted kernel, so
+// the host and the device resolve every identifier to the same quantity.
+struct SynapseHostDynamics {
+    ValueTable values;
+
+    // Which state variables are reachable by their own name, as (slot, name). A state
+    // variable declared twice under one name is bound once, by its first slot.
+    Vector<Pair<usize, String>> bound_state_variables;
+
+    Vector<const DynamicsInstruction *> derivative_by_slot;
+    Vector<const DynamicsInstruction *> visible_derived_variables;
+    f64 step_dt = 0.0;
+};
+
+// Whether `expression` mentions `identifier` as a whole token. Tokenized rather than
+// searched: "t" occurs inside "tau" and inside a number's exponent, and neither is a read of
+// the built-in time.
+bool expression_reads_token(const String &expression, const String &component_type_name,
+                            const String &identifier) {
+    for (const Token &token : tokenize_nml_expression(expression, component_type_name)) {
+        if (token.kind == TokenKind::Identifier && token.text == identifier) return true;
+    }
+    return false;
 }
 
-// Resolves this thread's slice of the aggregated state. Neuron-major within a prototype, so
-// one thread's state variables are contiguous. Computed 64-bit for the same reason
-// network_input_ring_index is: the host sizes synapse_state in s64.
-String emit_synapse_state_base(const WiredSynapse &wired, usize indent_level) {
-    return indent(indent_level) + buffer_index_type_name + " synapse_state_base = " +
-           to_string(wired.state_variable_offset) + " * (" + buffer_index_type_name +
-           ")neuron_count + (" + buffer_index_type_name + ")neuron_index * " +
-           to_string(wired.type->state_variable_names.size()) + ";\n";
+SynapseHostDynamics resolve_synapse_host_dynamics(const SynapseProgram &program,
+                                                  const NML_ParseResult &parse_result) {
+    const SynapseTypeSpecification &synapse_type = *program.type;
+
+    SynapseHostDynamics dynamics;
+    dynamics.step_dt = parse_result.step_dt;
+    dynamics.values.component_type_name = synapse_type.name;
+    dynamics.derivative_by_slot.assign(synapse_type.state_variable_names.size(), nullptr);
+
+    // State variables first, then parameters, exactly as build_synapse_symbol_table orders
+    // them: a Parameter and a StateVariable of one name collide, and the state variable is
+    // the one the emitted kernel reads.
+    Set<String> bound_names;
+    for (usize slot = 0; slot < synapse_type.state_variable_names.size(); ++slot) {
+        if (!bound_names.insert(synapse_type.state_variable_names[slot]).second) continue;
+        dynamics.bound_state_variables.push_back({slot, synapse_type.state_variable_names[slot]});
+        dynamics.values.define(synapse_type.state_variable_names[slot], 0.0);
+    }
+    for (usize slot = 0; slot < synapse_type.parameter_names.size(); ++slot) {
+        if (!bound_names.insert(synapse_type.parameter_names[slot]).second) continue;
+        dynamics.values.define(synapse_type.parameter_names[slot],
+                               program.prototype->starting_parameters[slot].float64);
+    }
+
+    for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Integrate) continue;
+
+        if (instruction.source_tag == NML_DeclarationType::DerivedVariable) {
+            // A shadowed DerivedVariable is unreachable by name in the emitted kernel too,
+            // so it is not evaluated here either.
+            if (!bound_names.insert(instruction.target).second) continue;
+            dynamics.visible_derived_variables.push_back(&instruction);
+            dynamics.values.define(instruction.target, 0.0);
+            continue;
+        }
+
+        if (instruction.source_tag != NML_DeclarationType::TimeDerivative) continue;
+
+        const usize slot = require_state_variable_slot(synapse_state_storage(synapse_type),
+                                                       instruction.target, "TimeDerivative");
+        // Same refusal emit_unconditional_euler_temporaries makes of the emitted step: two
+        // derivatives for one variable is malformed LEMS, and keeping either one silently
+        // drops the other.
+        if (dynamics.derivative_by_slot[slot] != nullptr) {
+            report_error("'" + instruction.target + "' carries more than one TimeDerivative",
+                         synapse_type.name);
+        }
+        dynamics.derivative_by_slot[slot] = &instruction;
+    }
+
+    // Constants sit below the derived locals, and the built-in dt below those -- the order
+    // with_fallback_symbols layers them onto the emitted kernel's table in.
+    const String type_prefix = synapse_type.name + ".";
+    for (const auto &constant_entry : parse_result.global_constants) {
+        if (constant_entry.first.rfind(type_prefix, 0) != 0) continue;
+        const String bare_name = constant_entry.first.substr(type_prefix.length());
+        if (!bound_names.insert(bare_name).second) continue;
+        dynamics.values.define(bare_name, constant_entry.second.float64);
+    }
+    for (const auto &constant_entry : parse_result.global_constants) {
+        if (!bound_names.insert(constant_entry.first).second) continue;
+        dynamics.values.define(constant_entry.first, constant_entry.second.float64);
+    }
+    if (bound_names.insert("dt").second) dynamics.values.define("dt", parse_result.step_dt);
+
+    // `t` is deliberately never bound. The charge one event delivers is worked out once, at
+    // generation time, and a synapse whose dynamics read the absolute clock would deliver a
+    // different amount depending on when the spike arrived -- which one precomputed set of
+    // coefficients cannot express. Named here rather than surfacing as an unknown identifier.
+    if (!dynamics.values.contains("t")) {
+        for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
+            if (instruction.stage != DynamicsStage::Integrate) continue;
+            if (instruction.source_tag != NML_DeclarationType::TimeDerivative &&
+                instruction.source_tag != NML_DeclarationType::DerivedVariable) {
+                continue;
+            }
+            if (!expression_reads_token(instruction.expression, synapse_type.name, "t")) continue;
+            report_error("this synapse's dynamics read the absolute time 't' (in the expression "
+                         "for '" + instruction.target +
+                                 "'), so what one arriving spike delivers depends on when it "
+                                 "arrives; that cannot be resolved once at generation time",
+                         synapse_type.name);
+        }
+    }
+
+    if (!dynamics.values.contains(synapse_output_variable_name)) {
+        report_error("this synapse exposes no '" + synapse_output_variable_name +
+                             "', so there is no current to deliver. A synapse's output current "
+                             "is the StateVariable or DerivedVariable of that name, which is what "
+                             "a postsynaptic cell's \"synapses[*]/i\" path selects",
+                     synapse_type.name);
+    }
+
+    return dynamics;
+}
+
+// Binds `state` into the value table and evaluates the visible DerivedVariables in source
+// order, so each sees the ones declared before it -- the same visibility the emitted locals
+// have. Returns the exposed current the state leaves behind.
+f64 bind_state_and_evaluate_output(SynapseHostDynamics &dynamics, const Vector<f64> &state) {
+    for (const auto &bound_variable : dynamics.bound_state_variables) {
+        dynamics.values.identifier_values[bound_variable.second] = state[bound_variable.first];
+    }
+    for (const DynamicsInstruction *derived_variable : dynamics.visible_derived_variables) {
+        dynamics.values.identifier_values[derived_variable->target] =
+                evaluate_expression(derived_variable->expression, dynamics.values);
+    }
+    return dynamics.values.value_for(synapse_output_variable_name);
+}
+
+// One probe: leave the synapse at `initial_state`, never touch it again, and total the charge
+// it goes on delivering. `step_count_used` reports how far it had to run, which is what makes
+// two probes comparable -- see the linearity check in synapse_event_charge_coefficients.
+f64 probe_synapse_charge_response(SynapseHostDynamics &dynamics, const SynapseProgram &program,
+                                  const Vector<f64> &initial_state, usize &step_count_used) {
+    Vector<f64> state = initial_state;
+
+    f64 charge = 0.0;
+    f64 peak_output = 0.0;
+    step_count_used = 0;
+
+    for (usize step = 0; step < maximum_charge_probe_step_count; ++step) {
+        const f64 output = bind_state_and_evaluate_output(dynamics, state);
+        charge += output * dynamics.step_dt;
+        peak_output = std::max(peak_output, std::fabs(output));
+        step_count_used = step + 1;
+
+        // The output has run its course. Tested before the step rather than after so a probe
+        // whose output has not left zero yet is not mistaken for one that has already decayed:
+        // an alpha current starts at exactly zero and only rises later.
+        if (peak_output > 0.0 && std::fabs(output) <= peak_output * charge_probe_decay_fraction) {
+            return charge;
+        }
+
+        Vector<f64> next_state = state;
+        for (usize slot = 0; slot < state.size(); ++slot) {
+            const DynamicsInstruction *derivative = dynamics.derivative_by_slot[slot];
+            if (derivative == nullptr) continue;
+            next_state[slot] = state[slot] + dynamics.step_dt *
+                                                     evaluate_expression(derivative->expression,
+                                                                         dynamics.values);
+        }
+
+        // A state the step leaves exactly where it found it is a fixed point: the output from
+        // here on repeats forever. A zero one is a finished response -- reached at once by a
+        // state variable the exposed current never reads, which has no peak output to measure a
+        // decay against. A non-zero one is a synapse that delivers without end.
+        if (next_state == state) {
+            if (output == 0.0) return charge;
+            break;
+        }
+        state = next_state;
+    }
+
+    report_error("this synapse's exposed '" + synapse_output_variable_name +
+                         "' does not decay, so one arriving spike would deliver charge without "
+                         "end. Delivering the whole of an event's response at the spike needs "
+                         "that response to be finite",
+                 program.type->name);
+}
+
+// How much charge one unit of each state variable goes on to deliver: the coefficients of
+// Q(x) above, indexed by state variable slot.
+//
+// Probed rather than derived: each state variable is set to one, everything else to zero, and
+// the synapse's own lowered dynamics are integrated until the output has decayed. No closed
+// form is written down for any synapse type, so this works for whatever current-based
+// dynamics a document declares.
+//
+// The linear decomposition Q(x) = sum of coefficient[v] * x[v] is then CHECKED, not assumed:
+// a synapse whose dynamics are nonlinear in its state has no such decomposition, and using
+// one anyway would deliver a wrong number rather than fail.
+Vector<f64> synapse_event_charge_coefficients(const SynapseProgram &program,
+                                              const NML_ParseResult &parse_result) {
+    const usize state_variable_count = program.type->state_variable_names.size();
+    if (state_variable_count == 0) return {};
+
+    if (!(parse_result.step_dt > 0.0)) {
+        report_error("the model declares no positive simulation step, so the charge one "
+                     "arriving spike delivers through this synapse cannot be resolved",
+                     program.type->name);
+    }
+
+    SynapseHostDynamics dynamics = resolve_synapse_host_dynamics(program, parse_result);
+
+    Vector<f64> coefficients(state_variable_count, 0.0);
+    Vector<usize> step_counts(state_variable_count, 0);
+    for (usize slot = 0; slot < state_variable_count; ++slot) {
+        Vector<f64> unit_state(state_variable_count, 0.0);
+        unit_state[slot] = 1.0;
+        coefficients[slot] =
+                probe_synapse_charge_response(dynamics, program, unit_state, step_counts[slot]);
+    }
+
+    // Doubling one variable must double the charge, and starting from every variable at once
+    // must deliver the sum. Between them those are homogeneity and additivity, which is the
+    // whole of linearity.
+    auto refuse_nonlinear = [&](const String &probe_description, f64 measured, f64 predicted) {
+        const f64 scale = std::max(std::fabs(measured), std::fabs(predicted));
+        if (std::fabs(measured - predicted) <= charge_linearity_tolerance * scale) return;
+        report_error("this synapse's dynamics are not linear in its state variables (" +
+                             probe_description + " delivers " + to_string(measured) +
+                             " C where a linear response would deliver " + to_string(predicted) +
+                             "). The charge one arriving spike delivers is precomputed as a "
+                             "fixed combination of the state change its handler makes, which "
+                             "only holds for linear dynamics",
+                     program.type->name);
+    };
+
+    usize probe_step_count = 0;
+    for (usize slot = 0; slot < state_variable_count; ++slot) {
+        Vector<f64> doubled_state(state_variable_count, 0.0);
+        doubled_state[slot] = 2.0;
+        refuse_nonlinear("twice '" + program.type->state_variable_names[slot] + "'",
+                         probe_synapse_charge_response(dynamics, program, doubled_state,
+                                                       probe_step_count),
+                         2.0 * coefficients[slot]);
+    }
+
+    if (state_variable_count > 1) {
+        f64 summed_coefficients = 0.0;
+        for (const f64 coefficient : coefficients) summed_coefficients += coefficient;
+        refuse_nonlinear("every state variable at one",
+                         probe_synapse_charge_response(
+                                 dynamics, program, Vector<f64>(state_variable_count, 1.0),
+                                 probe_step_count),
+                         summed_coefficients);
+    }
+
+    return coefficients;
+}
+
+// Resolves this edge's slice of the per-edge variable block. Plane-major, matching
+// WeightMatrix::per_edge_variable_values exactly: variable v of program p sits in plane
+// (p's offset + v), and a plane is edge_slot_count entries of the same slot convention every
+// other per-edge array uses. Computed 64-bit for the same reason network_input_ring_index is.
+String emit_synapse_state_base(const SynapseProgram &program, usize indent_level) {
+    return indent(indent_level) + buffer_index_type_name + " edge_synapse_state_base = " +
+           to_string(program.state_variable_offset) + " * edge_slot_count + edge_slot;\n";
+}
+
+// One DerivedVariable lowered to a local: the name expressions reach it by, and the line
+// that declares it.
+struct DerivedLocal {
+    String name;
+    String declaration;
+};
+
+// Whether `identifier` occurs in `text` as a whole identifier rather than as part of a
+// longer one -- "derived_i" must not be found inside "derived_iSyn".
+bool text_reads_identifier(const String &text, const String &identifier) {
+    usize search_position = 0;
+    while ((search_position = text.find(identifier, search_position)) != String::npos) {
+        const bool has_identifier_before =
+                search_position > 0 && is_identifier_character(text[search_position - 1]);
+        const usize following_position = search_position + identifier.length();
+        const bool has_identifier_after = following_position < text.length() &&
+                                          is_identifier_character(text[following_position]);
+        if (!has_identifier_before && !has_identifier_after) return true;
+        search_position += identifier.length();
+    }
+    return false;
+}
+
+// The declarations of the locals `consumer_text` actually reads, in source order.
+//
+// Walked backwards because a local may be read by a LATER one: dropping the later one first
+// is what lets the earlier one be dropped with it. A synapse's `i` exposure is a
+// DerivedVariable and the integration step never reads it, so without this every synapse
+// kernel carries an unused-variable warning -- and a warning on every generated kernel is
+// what stops anyone reading the ones that matter.
+String emit_used_derived_locals(const Vector<DerivedLocal> &declared_locals,
+                                const String &consumer_text) {
+    String kept_text = consumer_text;
+    Vector<String> kept_declarations;
+
+    for (usize position = declared_locals.size(); position > 0; --position) {
+        const DerivedLocal &declared_local = declared_locals[position - 1];
+        if (!text_reads_identifier(kept_text, declared_local.name)) continue;
+        kept_text = declared_local.declaration + kept_text;
+        kept_declarations.push_back(declared_local.declaration);
+    }
+
+    String declarations;
+    for (usize position = kept_declarations.size(); position > 0; --position) {
+        declarations += kept_declarations[position - 1];
+    }
+    return declarations;
 }
 
 // DerivedVariables as locals, in source order, each visible to the ones after it -- the same
-// treatment a cell's get. A select= path is refused: a synapse has no attached children with
-// an engine buffer behind them, and the only path shape this generator lowers reduces over a
-// CELL's synapses.
-String emit_synapse_derived_variables(const WiredSynapse &wired,
-                                      const NML_ParseResult &parse_result, SymbolTable &symbols,
-                                      Vector<Pair<String, String>> &derived_variable_locals,
-                                      usize indent_level) {
-    ostringstream derived;
-
-    for (const DynamicsInstruction &instruction : wired.type->dynamics) {
+// treatment a cell's get. Collected rather than emitted, so the caller can drop the ones its
+// own body never reads once that body has been built against the symbol table this fills.
+//
+// A select= path is refused: a synapse has no attached children with an engine buffer behind
+// them, and the only path shape this generator lowers reduces over a CELL's synapses.
+void collect_synapse_derived_variables(const SynapseProgram &program,
+                                       const NML_ParseResult &parse_result, SymbolTable &symbols,
+                                       Vector<DerivedLocal> &declared_locals,
+                                       usize indent_level) {
+    for (const DynamicsInstruction &instruction : program.type->dynamics) {
         if (instruction.stage != DynamicsStage::Integrate) continue;
         if (instruction.source_tag != NML_DeclarationType::DerivedVariable) continue;
 
@@ -1549,124 +2237,195 @@ String emit_synapse_derived_variables(const WiredSynapse &wired,
             report_error("unsupported select path \"" + instruction.expression +
                                  "\" on a synapse: a synapse has no child structure with an "
                                  "engine buffer behind it",
-                         wired.type->name);
+                         program.type->name);
         }
 
         const String read_expression =
                 translate_expression(instruction.expression, visible_symbols);
         const String local_name = "derived_" + sanitize_identifier(instruction.target);
 
-        derived << indent(indent_level) << "float " << local_name << " = " << read_expression
-                << ";\n";
-        derived_variable_locals.push_back({local_name, read_expression});
+        declared_locals.push_back(DerivedLocal{
+                local_name,
+                indent(indent_level) + "float " + local_name + " = " + read_expression + ";\n"});
         symbols.define(instruction.target, local_name);
     }
-
-    return derived.str();
 }
 
-// One wired prototype's per-tick body: deliver this tick's arrivals, integrate one dt, then
-// add the exposed current into the delivered plane every cell reads.
+// One forward-Euler step of one dt over this edge's own state, written into a braced block
+// of its own.
 //
-// All three touch only this neuron's own slots, and the thread that runs them is the thread
-// that later runs the target cell's dynamics, so the hand-off needs no synchronisation. The
-// output add is a PLAIN add for the same reason: within tick T nothing else writes plane 0 of
-// row T -- the host's stimulus lands there before the launch, and every propagated arrival
-// carries a delay of at least one tick, so it lands in a later row.
-String emit_synapse_tick_body(const WiredSynapse &wired, const NML_ParseResult &parse_result) {
-    reject_unsupported_synapse(wired);
+// The block is what makes this reusable: the eager per-tick advance emits it once and the
+// lazy catch-up emits it inside a loop, so the two apply literally the same arithmetic in
+// the same order and agree bit for bit rather than approximately. The DerivedVariable locals
+// are declared INSIDE the block because they are functions of the state and have to be
+// recomputed on every step of a catch-up, not hoisted out of it.
+String emit_synapse_integration_step(const SynapseProgram &program,
+                                     const NML_ParseResult &parse_result, usize indent_level) {
+    const StateStorage storage = synapse_state_storage(*program.type);
 
-    const StateStorage storage = synapse_state_storage(*wired.type);
-
-    ostringstream body;
-    body << emit_synapse_state_base(wired, 1);
-
-    // ── Stage 1, Deliver ─────────────────────────────────────────────────────
-    body << indent(1) << buffer_index_type_name
-         << " synapse_arrival_index = network_input_ring_index(\n"
-         << indent(3) << "tick, " << wired.plane_index
-         << ", ring_depth, neuron_count, neuron_index);\n"
-         << indent(1) << "float " << synapse_arrival_local_name
-         << " = network_inputs[synapse_arrival_index];\n";
-
-    // Deliberately built without the DerivedVariable locals: the handler runs before they are
-    // computed, so one referencing a derived name is reported as an unknown identifier rather
-    // than emitted as a forward reference the shader compiler would reject elsewhere.
-    const SymbolTable arrival_symbols = build_synapse_symbol_table(wired, true);
-    const Vector<const DynamicsInstruction *> arrival_assignments =
-            arrival_assignments_on_port(*wired.type, "in");
-
-    // An arrival handler that ignores the arriving weight cannot be aggregated: N converging
-    // spikes would be applied as one, silently, and the model would run at a fraction of its
-    // declared coupling. Checked on the TRANSLATED expression, where the arrival local appears
-    // if and only if `weight` was read.
-    const SymbolTable visible_arrival_symbols =
-            with_fallback_symbols(arrival_symbols, parse_result);
-    for (const DynamicsInstruction *assignment : arrival_assignments) {
-        const String translated =
-                translate_expression(assignment->expression, visible_arrival_symbols);
-        if (translated.find(synapse_arrival_local_name) == String::npos) {
-            report_error("the OnEvent handler assigns '" + assignment->target +
-                                 "' from an expression that does not read 'weight'. Arrivals "
-                                 "converging on one target are summed into a single weight and "
-                                 "the handler runs once, so an assignment ignoring that weight "
-                                 "would apply many spikes as one",
-                         wired.type->name);
-        }
-    }
-
-    body << indent(1) << "if (" << synapse_arrival_local_name << " != 0.0f) {\n"
-         << emit_state_assignment_group(storage, parse_result, arrival_symbols,
-                                        arrival_assignments, 2)
-         << indent(1) << "}\n";
-
-    // ── Stage 2, Integrate ───────────────────────────────────────────────────
-    SymbolTable symbols = build_synapse_symbol_table(wired, false);
-    Vector<Pair<String, String>> derived_variable_locals;
-    body << emit_synapse_derived_variables(wired, parse_result, symbols, derived_variable_locals,
-                                           1);
+    SymbolTable symbols = build_synapse_symbol_table(program, false);
+    Vector<DerivedLocal> declared_locals;
+    collect_synapse_derived_variables(program, parse_result, symbols, declared_locals,
+                                      indent_level + 1);
 
     // A synapse has no Regimes -- reject_unsupported_synapse refuses one -- so every
     // TimeDerivative it declares integrates unconditionally.
-    Vector<Pair<usize, String>> pending_state_writes;
-    body << emit_unconditional_euler_temporaries(storage, wired.type->dynamics, parse_result,
-                                                 symbols, 1, pending_state_writes);
-    body << emit_euler_write_back(storage, pending_state_writes, 1);
-    const bool has_integrated_state = !pending_state_writes.empty();
+    Vector<PendingStateWrite> pending_state_writes;
+    ostringstream integration;
+    integration << emit_unconditional_euler_temporaries(storage, program.type->dynamics,
+                                                        parse_result, symbols, indent_level + 1,
+                                                        pending_state_writes);
+    integration << emit_euler_write_back(storage, pending_state_writes, indent_level + 1);
 
-    // The delivered current is this tick's, so the derived locals feeding it are re-evaluated
-    // against the state Integrate just wrote -- the same post-integrate reading a cell's own
-    // Detect/Reset stages observe.
-    if (has_integrated_state) {
-        for (const auto &derived_local : derived_variable_locals) {
-            body << indent(1) << derived_local.first << " = " << derived_local.second << ";\n";
+    // A synapse with no TimeDerivative at all has nothing to advance; emitting an empty
+    // block would only be noise the shader compiler has to discard.
+    if (pending_state_writes.empty()) return "";
+
+    const String integration_text = integration.str();
+    return indent(indent_level) + "{\n" +
+           emit_used_derived_locals(declared_locals, integration_text) + integration_text +
+           indent(indent_level) + "}\n";
+}
+
+// The eager per-tick advance for one program: exactly one integration step, no delivery.
+String emit_synapse_advance_body(const SynapseProgram &program,
+                                 const NML_ParseResult &parse_result) {
+    reject_unsupported_synapse(program);
+
+    const String step = emit_synapse_integration_step(program, parse_result, 1);
+    if (step.empty()) return "";
+    return emit_synapse_state_base(program, 1) + step;
+}
+
+// The delivery: what one out-edge contributes to its target's ring slot when the source
+// spikes. Returns the scalar the caller scatters -- one value, one slot.
+//
+// That scalar is the whole of the charge this event's response will deliver, expressed as
+// the current that delivers it inside one tick (charge / dt, since the ring slot holds a
+// current the target integrates over one dt). It is NOT a sample of the `i` exposure: see
+// the charge-response section above for why a sample reads zero on an isolated first spike.
+//
+// Order is load-bearing. The state is advanced to this tick FIRST (either here, by catching
+// up from the tick it was last advanced through, or already by the eager pass); the state is
+// then snapshotted, the arrival handler runs, and the charge is read off the CHANGE the
+// handler made. Snapshotting after the catch-up is what keeps the response the response to
+// this event alone, rather than to everything still in flight from earlier ones.
+String emit_synapse_deliver_body(const SynapseProgram &program,
+                                 const NML_ParseResult &parse_result, bool use_lazy_updates) {
+    reject_unsupported_synapse(program);
+
+    const StateStorage storage = synapse_state_storage(*program.type);
+
+    ostringstream body;
+    body << emit_synapse_state_base(program, 1);
+
+    if (use_lazy_updates) {
+        const String step = emit_synapse_integration_step(program, parse_result, 2);
+        if (!step.empty()) {
+            // The plane holds the tick this edge was last advanced THROUGH, and the engine
+            // seeds it with -1 rather than 0: an edge spiking at tick 0 must still take the
+            // one step the eager pass would have taken at tick 0, or the two disagree from
+            // the very first spike.
+            body << indent(1) << "int synapse_last_update_tick =\n"
+                 << indent(3) << edge_attribute_element(edge_attribute_update_tick_plane_name)
+                 << ";\n"
+                 << indent(1) << "for (" << buffer_index_type_name << " catch_up_tick = ("
+                 << buffer_index_type_name << ")synapse_last_update_tick;\n"
+                 << indent(4) << "catch_up_tick < tick; ++catch_up_tick) {\n"
+                 << step << indent(1) << "}\n"
+                 << indent(1) << edge_attribute_element(edge_attribute_update_tick_plane_name)
+                 << " = (int)tick;\n";
         }
     }
 
-    // ── Delivery ─────────────────────────────────────────────────────────────
-    if (!symbols.contains(synapse_output_variable_name)) {
-        report_error("this synapse exposes no '" + synapse_output_variable_name +
-                             "', so there is no current to deliver. A synapse's output current "
-                             "is the StateVariable or DerivedVariable of that name, which is what "
-                             "a postsynaptic cell's \"synapses[*]/i\" path selects",
-                     wired.type->name);
+    // Refuses a select= path on a synapse before the charge probe below would meet the same
+    // path as an unresolvable identifier. The symbol table it fills is discarded: nothing in
+    // the delivery reads a DerivedVariable any more, because the delivered amount is a
+    // function of the state change rather than of the exposed current.
+    SymbolTable exposure_symbols = build_synapse_symbol_table(program, false);
+    Vector<DerivedLocal> discarded_locals;
+    collect_synapse_derived_variables(program, parse_result, exposure_symbols, discarded_locals, 1);
+
+    const Vector<f64> charge_coefficients =
+            synapse_event_charge_coefficients(program, parse_result);
+
+    const SymbolTable arrival_symbols = build_synapse_symbol_table(program, true);
+    const Vector<const DynamicsInstruction *> arrival_assignments =
+            arrival_assignments_on_port(*program.type, "in");
+
+    // Which state variables the handler moves. Everything else is unchanged by the event and
+    // so contributes nothing to what the event delivers, which is why only these are
+    // snapshotted.
+    Vector<usize> assigned_slots;
+    for (const DynamicsInstruction *assignment : arrival_assignments) {
+        const usize slot =
+                require_state_variable_slot(storage, assignment->target, "StateAssignment");
+        if (find(assigned_slots.begin(), assigned_slots.end(), slot) == assigned_slots.end()) {
+            assigned_slots.push_back(slot);
+        }
     }
 
-    body << indent(1) << buffer_index_type_name
-         << " synapse_output_index = network_input_ring_index(\n"
-         << indent(3) << "tick, 0, ring_depth, neuron_count, neuron_index);\n"
-         << indent(1) << "network_inputs[synapse_output_index] += "
-         << symbols.read_expression_for(synapse_output_variable_name) << ";\n";
+    // A handler that only moves state the exposed current never reads delivers nothing, on
+    // every spike, silently. Refused here for the same reason a synapse with no handler at
+    // all is: a synapse that swallows every spike is a model that runs and is wrong.
+    const bool delivers_anything =
+            any_of(assigned_slots.begin(), assigned_slots.end(),
+                   [&](usize slot) { return charge_coefficients[slot] != 0.0; });
+    if (!delivers_anything) {
+        report_error("this synapse's OnEvent handler moves only state that its exposed '" +
+                             synapse_output_variable_name +
+                             "' never depends on, so every arriving spike would deliver exactly "
+                             "zero charge",
+                     program.type->name);
+    }
 
+    const String snapshot_prefix = "synapse_state_before_";
+    for (const usize slot : assigned_slots) {
+        if (charge_coefficients[slot] == 0.0) continue;
+        body << indent(1) << "float " << snapshot_prefix
+             << sanitize_identifier(program.type->state_variable_names[slot]) << " = "
+             << storage.element(slot) << ";\n";
+    }
+
+    // The local is what `weight` resolves to inside the handler, so it is declared only when
+    // the handler actually reads it. A handler that ignores the arriving weight is legal now
+    // that delivery is per edge -- it applies one spike as one spike -- and declaring the
+    // local anyway is an unused-variable warning on every kernel such a model produces.
+    const String arrival_body = emit_state_assignment_group(storage, parse_result,
+                                                            arrival_symbols, arrival_assignments,
+                                                            1);
+    if (text_reads_identifier(arrival_body, synapse_arrival_local_name)) {
+        body << indent(1) << "float " << synapse_arrival_local_name << " = edge_weight;\n";
+    }
+    body << arrival_body;
+
+    // The charge this event adds: each coefficient against the change the handler made to
+    // that variable. Divided by dt where it is returned, because the ring slot the caller
+    // scatters into holds a current the target integrates over exactly one tick.
+    ostringstream delivered_charge;
+    bool has_first_term = false;
+    for (const usize slot : assigned_slots) {
+        if (charge_coefficients[slot] == 0.0) continue;
+        const String snapshot_name =
+                snapshot_prefix + sanitize_identifier(program.type->state_variable_names[slot]);
+        delivered_charge << (has_first_term ? " +\n" + indent(3) : "")
+                         << format_float_literal(charge_coefficients[slot]) << " * ("
+                         << storage.element(slot) << " - " << snapshot_name << ")";
+        has_first_term = true;
+    }
+
+    body << indent(1) << "float delivered_charge =\n"
+         << indent(3) << delivered_charge.str() << ";\n"
+         << indent(1) << "return delivered_charge / dt;\n";
     return body.str();
 }
 
-String emit_synapse_initialize_body(const WiredSynapse &wired,
+String emit_synapse_initialize_body(const SynapseProgram &program,
                                     const NML_ParseResult &parse_result) {
-    reject_unsupported_synapse(wired);
+    reject_unsupported_synapse(program);
 
     Vector<const DynamicsInstruction *> assignments;
-    for (const DynamicsInstruction &instruction : wired.type->dynamics) {
+    for (const DynamicsInstruction &instruction : program.type->dynamics) {
         if (instruction.stage != DynamicsStage::Initialize) continue;
         if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
         assignments.push_back(&instruction);
@@ -1674,84 +2433,240 @@ String emit_synapse_initialize_body(const WiredSynapse &wired,
     if (assignments.empty()) return "";
 
     ostringstream body;
-    body << emit_synapse_state_base(wired, 1);
-    body << emit_state_assignment_group(synapse_state_storage(*wired.type), parse_result,
-                                        build_synapse_symbol_table(wired, false), assignments, 1);
+    body << emit_synapse_state_base(program, 1);
+    body << emit_state_assignment_group(synapse_state_storage(*program.type), parse_result,
+                                        build_synapse_symbol_table(program, false), assignments,
+                                        1);
     return body.str();
 }
 
-// Resolves every wired prototype against its type, in the order
-// wired_synapse_prototype_indices reports -- which is the order that fixes both the plane
-// numbering and the synapse_state layout the engine allocates to.
-Vector<WiredSynapse> collect_wired_synapses(const NML_ParseResult &parse_result) {
-    Vector<WiredSynapse> wired_synapses;
-    usize state_variable_offset = 0;
+// Resolves every wired prototype against its type, in the order resolve_synapse_programs
+// reports -- which is the order that fixes both the program index stored per edge and the
+// per-edge variable plane layout the engine allocates to.
+Vector<SynapseProgram> collect_synapse_programs(const NML_ParseResult &parse_result) {
+    Vector<SynapseProgram> programs;
 
-    for (const s64 prototype_index : wired_synapse_prototype_indices(parse_result)) {
+    for (const SynapseProgramLayout &layout : resolve_synapse_programs(parse_result)) {
         const ComponentPrototype &prototype =
-                parse_result.synapse_prototypes[(usize)prototype_index];
+                parse_result.synapse_prototypes[(usize)layout.prototype_index];
 
-        if (prototype.type_index < 0 ||
-            prototype.type_index >= (s64)parse_result.synapse_types.size()) {
-            throw runtime_error("kernel_codegen: synapse prototype '" + prototype.instance_id +
-                                "' names synapse type index " + to_string(prototype.type_index) +
-                                ", which no synapse type carries");
-        }
+        SynapseProgram program;
+        program.type = &parse_result.synapse_types[(usize)prototype.type_index];
+        program.prototype = &prototype;
+        program.program_index = programs.size();
+        program.state_variable_offset = (usize)layout.state_variable_offset;
 
-        WiredSynapse wired;
-        wired.type = &parse_result.synapse_types[(usize)prototype.type_index];
-        wired.prototype = &prototype;
-        wired.plane_index = wired_synapses.size() + 1;
-        wired.state_variable_offset = state_variable_offset;
-        state_variable_offset += wired.type->state_variable_names.size();
-
-        wired_synapses.push_back(wired);
+        programs.push_back(program);
     }
 
-    return wired_synapses;
+    return programs;
 }
 
-String synapse_device_function_name(const WiredSynapse &wired, KernelPurpose purpose) {
-    const String prefix =
-            purpose == KernelPurpose::Tick ? "synapse_step_" : "synapse_initialize_";
-    return prefix + sanitize_identifier(wired.prototype->instance_id);
+enum class SynapseEntryPoint { Initialize, Advance, Deliver };
+
+String synapse_device_function_name(const SynapseProgram &program, SynapseEntryPoint entry_point) {
+    const String prefix = entry_point == SynapseEntryPoint::Initialize ? "synapse_initialize_"
+                          : entry_point == SynapseEntryPoint::Advance  ? "synapse_advance_"
+                                                                       : "synapse_deliver_";
+    return prefix + sanitize_identifier(program.prototype->instance_id);
 }
 
 // Emitted with an explicit parameter list rather than through the cell functions' table:
-// a synapse touches only the aggregated state and the ring, and reads none of the
-// per-neuron cell scaffolding.
-String emit_synapse_device_function(const WiredSynapse &wired, const String &body,
-                                    KernelBackend backend, KernelPurpose purpose) {
+// a synapse touches only its own edge's state planes, and reads none of the per-neuron cell
+// scaffolding.
+String emit_synapse_device_function(const SynapseProgram &program, const String &body,
+                                    KernelBackend backend, SynapseEntryPoint entry_point) {
     const bool is_metal = backend == KernelBackend::Metal;
-    const String function_prefix = is_metal ? "inline void " : "__device__ inline void ";
     const String device_qualifier = is_metal ? "device " : "";
     const String tick_type = is_metal ? "long" : "long long";
+    const String return_type = entry_point == SynapseEntryPoint::Deliver ? "float " : "void ";
+    const String function_prefix = (is_metal ? "inline " : "__device__ inline ") + return_type;
 
     ostringstream function;
-    function << function_prefix << synapse_device_function_name(wired, purpose) << "(\n"
-             << indent(2) << device_qualifier << "float *synapse_state,\n";
-    if (purpose == KernelPurpose::Tick) {
-        function << indent(2) << device_qualifier << "float *network_inputs,\n";
+    function << function_prefix << synapse_device_function_name(program, entry_point) << "(\n"
+             << indent(2) << device_qualifier << "float *edge_synapse_state,\n";
+    if (entry_point == SynapseEntryPoint::Deliver) {
+        function << indent(2) << device_qualifier << "int *edge_attributes,\n";
     }
-    function << indent(2) << "int neuron_index,\n" << indent(2) << "int neuron_count";
-    if (purpose == KernelPurpose::Tick) {
+    function << indent(2) << buffer_index_type_name << " edge_slot,\n"
+             << indent(2) << buffer_index_type_name << " edge_slot_count";
+    if (entry_point == SynapseEntryPoint::Deliver) {
         function << ",\n"
-                 << indent(2) << "int ring_depth,\n"
+                 << indent(2) << "float edge_weight,\n"
                  << indent(2) << "float dt,\n"
                  << indent(2) << tick_type << " tick";
+    } else if (entry_point == SynapseEntryPoint::Advance) {
+        function << ",\n" << indent(2) << "float dt";
     }
     function << "\n) {\n" << body << "}\n\n";
     return function.str();
 }
 
-String synapse_device_function_call(const WiredSynapse &wired, KernelPurpose purpose,
-                                    usize indent_level) {
-    const String arguments = purpose == KernelPurpose::Tick
-                                     ? "synapse_state, network_inputs, neuron_index, "
-                                       "neuron_count, ring_depth, dt, tick"
-                                     : "synapse_state, neuron_index, neuron_count";
-    return indent(indent_level) + synapse_device_function_name(wired, purpose) + "(" + arguments +
-           ");\n";
+// The per-edge switch every one of the three passes shares: read this edge's program index
+// and dispatch to the one lowered program it names. -1 (an edge whose projection names no
+// synapse) falls through the default and is left to the caller.
+String emit_synapse_program_dispatch(const Vector<SynapseProgram> &programs,
+                                     const Set<String> &emitted_function_names,
+                                     SynapseEntryPoint entry_point, const String &call_prefix,
+                                     const String &call_suffix, usize indent_level) {
+    ostringstream dispatch;
+    bool emitted_any_case = false;
+    ostringstream cases;
+
+    for (const SynapseProgram &program : programs) {
+        const String function_name = synapse_device_function_name(program, entry_point);
+        if (emitted_function_names.count(function_name) == 0) continue;
+
+        const String arguments = entry_point == SynapseEntryPoint::Deliver
+                                         ? "edge_synapse_state, edge_attributes, edge_slot, "
+                                           "edge_slot_count, edge_weight, dt, tick"
+                                 : entry_point == SynapseEntryPoint::Advance
+                                         ? "edge_synapse_state, edge_slot, edge_slot_count, dt"
+                                         : "edge_synapse_state, edge_slot, edge_slot_count";
+
+        cases << indent(indent_level + 1) << "case " << program.program_index << ":\n"
+              << indent(indent_level + 2) << call_prefix << function_name << "(" << arguments
+              << ")" << call_suffix << ";\n"
+              << indent(indent_level + 2) << "break;\n";
+        emitted_any_case = true;
+    }
+
+    if (!emitted_any_case) return "";
+
+    dispatch << indent(indent_level) << "switch ("
+             << edge_attribute_element(edge_attribute_program_plane_name) << ") {\n"
+             << cases.str() << indent(indent_level + 1) << "default:\n"
+             << indent(indent_level + 2) << "break;\n"
+             << indent(indent_level) << "}\n";
+    return dispatch.str();
+}
+
+// Stage 6, Propagate: one scalar per out-edge into one ring slot, at that edge's delay.
+String emit_propagate_spike_function(const Vector<SynapseProgram> &programs,
+                                     const Set<String> &emitted_function_names,
+                                     KernelBackend backend) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const String function_prefix = is_metal ? "inline " : "__device__ inline ";
+    const String tick_type = is_metal ? "long" : "long long";
+
+    ostringstream per_edge;
+    per_edge << indent(2) << "float edge_weight = constant_weight;\n"
+             // An explicit flag, not `constant_weight != 0.0f`: a model may legitimately
+             // configure a constant weight of exactly zero, and reading the magnitude as the
+             // mode would silently hand it reconstructed weights instead of zeros.
+             << indent(2) << "if (constant_weight_enabled == 0) {\n"
+             << indent(3) << buffer_index_type_name << " target_lane_base = ("
+             << buffer_index_type_name << ")target_neuron_index * row_lane_count;\n"
+             << indent(3) << "float reconstructed_weight = 0.0f;\n"
+             << indent(3) << "for (" << buffer_index_type_name
+             << " lane = 0; lane < row_lane_count; ++lane) {\n"
+             << indent(4) << "reconstructed_weight += U_matrix[source_lane_base + lane] *\n"
+             << indent(6) << "(edge_weight_coefficients[lane] * V_matrix[target_lane_base + lane]);\n"
+             << indent(3) << "}\n"
+             << indent(3) << "edge_weight = reconstructed_weight + edge_weight_deltas[edge_slot];\n"
+             << indent(2) << "}\n\n"
+             // An edge whose projection names no synapse delivers its raw weight, which is
+             // what network_inputs meant before there were any synapse dynamics at all.
+             << indent(2) << "float delivered_current = edge_weight;\n"
+             << emit_synapse_program_dispatch(programs, emitted_function_names,
+                                              SynapseEntryPoint::Deliver,
+                                              "delivered_current = ", "", 2)
+             << indent(2) << buffer_index_type_name << " arrival_index = network_input_ring_index(\n"
+             << indent(4) << "tick + (" << tick_type << ")"
+             << edge_attribute_element(edge_attribute_delay_plane_name) << ",\n"
+             << indent(4) << "ring_depth, neuron_count, target_neuron_index);\n";
+
+    // Many sources converge on one target in the same tick, so the arrival has to be atomic.
+    if (is_metal) {
+        per_edge << indent(2) << "device atomic_float *arrival_slot =\n"
+                 << indent(4) << "(device atomic_float *)(network_inputs + arrival_index);\n"
+                 << indent(2)
+                 << "atomic_fetch_add_explicit(arrival_slot, delivered_current, "
+                    "memory_order_relaxed);\n";
+    } else {
+        per_edge << indent(2) << "atomicAdd(network_inputs + arrival_index, delivered_current);\n";
+    }
+
+    ostringstream function;
+    function << function_prefix << "void propagate_spike(\n"
+             << emit_adjacency_parameters(backend, /*include_network_inputs=*/true,
+                                          /*include_weight_basis=*/true)
+             << indent(2) << tick_type << " rank_float4_stride,\n"
+             << indent(2) << "float constant_weight,\n"
+             << indent(2) << "int constant_weight_enabled,\n"
+             << indent(2) << "int max_neighbor_count,\n"
+             << indent(2) << "int ring_depth,\n"
+             << indent(2) << "int neuron_count,\n"
+             << indent(2) << "int neuron_index,\n"
+             << indent(2) << "float dt,\n"
+             << indent(2) << tick_type << " tick\n"
+             << ") {\n"
+             << indent(1) << buffer_index_type_name
+             << " row_lane_count = rank_float4_stride * 4;\n"
+             << indent(1) << buffer_index_type_name << " source_lane_base = ("
+             << buffer_index_type_name << ")neuron_index * row_lane_count;\n"
+             << emit_out_edge_walk(per_edge.str(), backend, 1) << "}\n\n";
+    return function.str();
+}
+
+// The eager per-tick advance over every out-edge, and the one-shot per-edge initialisation.
+// Both are the same walk with a different per-edge body, and both are emitted only when the
+// model actually has a lowered synapse program to run.
+String emit_per_edge_synapse_pass_function(const Vector<SynapseProgram> &programs,
+                                           const Set<String> &emitted_function_names,
+                                           SynapseEntryPoint entry_point,
+                                           KernelBackend backend) {
+    const bool is_metal = backend == KernelBackend::Metal;
+    const String function_prefix = is_metal ? "inline " : "__device__ inline ";
+    const String function_name = entry_point == SynapseEntryPoint::Advance
+                                         ? "advance_out_edge_synapses"
+                                         : "initialize_out_edge_synapses";
+
+    const String per_edge =
+            emit_synapse_program_dispatch(programs, emitted_function_names, entry_point, "", "", 2);
+    if (per_edge.empty()) return "";
+
+    ostringstream function;
+    function << function_prefix << "void " << function_name << "(\n"
+             << emit_adjacency_parameters(backend, /*include_network_inputs=*/false,
+                                          /*include_weight_basis=*/false)
+             << indent(2) << "int max_neighbor_count,\n"
+             << indent(2) << "int neuron_count,\n"
+             << indent(2) << "int neuron_index";
+    if (entry_point == SynapseEntryPoint::Advance) {
+        function << ",\n" << indent(2) << "float dt";
+    }
+    function << "\n) {\n" << emit_out_edge_walk(per_edge, backend, 1) << "}\n\n";
+    return function.str();
+}
+
+String emit_per_edge_synapse_pass_call(SynapseEntryPoint entry_point, usize indent_level) {
+    const String function_name = entry_point == SynapseEntryPoint::Advance
+                                         ? "advance_out_edge_synapses"
+                                         : "initialize_out_edge_synapses";
+    const String arguments =
+            adjacency_argument_list(/*include_network_inputs=*/false,
+                                    /*include_weight_basis=*/false) +
+            ", max_neighbor_count, neuron_count, neuron_index" +
+            (entry_point == SynapseEntryPoint::Advance ? ", dt" : "");
+    return indent(indent_level) + function_name + "(" + arguments + ");\n";
+}
+
+// The fixed epilogue every cell device function ends with.
+String emit_propagation_epilogue(usize indent_level) {
+    ostringstream epilogue;
+    epilogue << indent(indent_level) << "if (spike_flags[neuron_index] != 0) {\n"
+             << indent(indent_level + 1) << "propagate_spike(\n"
+             << indent(indent_level + 3)
+             << adjacency_argument_list(/*include_network_inputs=*/true,
+                                        /*include_weight_basis=*/true)
+             << ",\n"
+             << indent(indent_level + 3)
+             << "rank_float4_stride, constant_weight, constant_weight_enabled,\n"
+             << indent(indent_level + 3)
+             << "max_neighbor_count, ring_depth, neuron_count, neuron_index, dt, tick);\n"
+             << indent(indent_level) << "}\n";
+    return epilogue.str();
 }
 
 // ── Per-cell-type bodies ─────────────────────────────────────────────────────
@@ -1807,7 +2722,7 @@ String emit_tick_body(const CellTypeSpecification &cell_type,
     // ones, and only then the single write-back covering both -- so a regime-scoped
     // derivative reading a regime-free variable still sees the state as it stood at entry.
     const StateStorage storage = cell_state_storage(cell_type);
-    Vector<Pair<usize, String>> pending_state_writes;
+    Vector<PendingStateWrite> pending_state_writes;
     body << emit_unconditional_euler_temporaries(storage, cell_type.dynamics, parse_result,
                                                  symbols, 1, pending_state_writes);
     body << emit_regime_dispatched_integration(cell_type, regimes, storage, parse_result, symbols,
@@ -2009,6 +2924,8 @@ const Vector<KernelArgumentDeclaration> &kernel_argument_declarations() {
     // the engine binds) and counts float4 elements, so a row is four times that many lanes.
     static const Vector<KernelArgumentDeclaration> declarations = {
         {"cell_state", "device float       *cell_state", "float *cell_state"},
+        {"cell_state_residual", "device float       *cell_state_residual",
+         "float *cell_state_residual"},
         {"cell_parameters", "device const float *cell_parameters", "const float *cell_parameters"},
         {"network_inputs", "device float       *network_inputs", "float *network_inputs"},
         {"last_spiked", "device long        *last_spiked", "long long *last_spiked"},
@@ -2034,22 +2951,17 @@ const Vector<KernelArgumentDeclaration> &kernel_argument_declarations() {
          "const float *edge_weight_coefficients"},
         {"edge_weight_deltas", "device const float *edge_weight_deltas",
          "const float *edge_weight_deltas"},
-        {"edge_delay_ticks", "device const int   *edge_delay_ticks",
-         "const int *edge_delay_ticks"},
-        {"branching_factor", "constant int       &branching_factor", "int branching_factor"},
-        {"superblock_size_words", "constant int       &superblock_size_words",
-         "int superblock_size_words"},
-        {"padded_node_count", "constant int       &padded_node_count", "int padded_node_count"},
-        {"tree_height", "constant int       &tree_height", "int tree_height"},
-        {"internal_bit_count", "constant int       &internal_bit_count", "int internal_bit_count"},
+        {"edge_attributes", "device int         *edge_attributes", "int *edge_attributes"},
+        {"edge_synapse_state", "device float       *edge_synapse_state",
+         "float *edge_synapse_state"},
+        {"k2tree_shape", "device const int   *k2tree_shape", "const int *k2tree_shape"},
         {"rank_float4_stride", "constant long      &rank_float4_stride",
          "long long rank_float4_stride"},
         {"constant_weight", "constant float     &constant_weight", "float constant_weight"},
+        {"constant_weight_enabled", "constant int       &constant_weight_enabled",
+         "int constant_weight_enabled"},
         {"max_neighbor_count", "constant int       &max_neighbor_count", "int max_neighbor_count"},
         {"ring_depth", "constant int       &ring_depth", "int ring_depth"},
-        {"synapse_state", "device float       *synapse_state", "float *synapse_state"},
-        {"edge_synapse_plane", "device const int   *edge_synapse_plane",
-         "const int *edge_synapse_plane"},
     };
     return declarations;
 }
@@ -2070,21 +2982,22 @@ const Vector<String> &kernel_argument_names() {
 // the storage those touch.
 const Vector<String> &device_function_parameter_names(KernelPurpose purpose) {
     static const Vector<String> tick_parameters = {
-        "cell_state",       "cell_parameters",          "network_inputs",
-        "last_spiked",      "spike_flags",              "internal_node_words",
-        "leaf_node_words",  "rank_superblock_table",    "rank_subblock_table",
-        "U_matrix",         "V_matrix",                 "edge_weight_coefficients",
-        "edge_weight_deltas", "edge_delay_ticks",       "edge_synapse_plane",
-        "state_base",       "parameter_base",           "neuron_index",
-        "neuron_count",
-        "branching_factor", "superblock_size_words",    "padded_node_count",
-        "tree_height",      "internal_bit_count",       "rank_float4_stride",
-        "constant_weight",  "max_neighbor_count",       "ring_depth",
-        "dt",               "tick",
+        "cell_state",         "cell_state_residual",   "cell_parameters",
+        "network_inputs",     "last_spiked",           "spike_flags",
+        "internal_node_words",
+        "leaf_node_words",    "rank_superblock_table", "rank_subblock_table",
+        "U_matrix",           "V_matrix",              "edge_weight_coefficients",
+        "edge_weight_deltas", "edge_attributes",       "edge_synapse_state",
+        "k2tree_shape",
+        "state_base",         "parameter_base",        "neuron_index",
+        "neuron_count",       "rank_float4_stride",    "constant_weight",
+        "constant_weight_enabled",                     "max_neighbor_count",
+        "ring_depth",         "dt",                    "tick",
     };
     static const Vector<String> initialize_parameters = {
-        "cell_state",     "cell_parameters", "network_inputs", "last_spiked", "spike_flags",
-        "state_base",     "parameter_base",  "neuron_index",   "dt",          "tick",
+        "cell_state",  "cell_state_residual", "cell_parameters", "network_inputs",
+        "last_spiked", "spike_flags",         "state_base",      "parameter_base",
+        "neuron_index", "dt",                 "tick",
     };
     return purpose == KernelPurpose::Tick ? tick_parameters : initialize_parameters;
 }
@@ -2110,15 +3023,6 @@ String source_preamble(KernelBackend backend, const String &generator_name) {
              << buffer_index_type_name << ";\n";
     preamble << "\n";
     return preamble.str();
-}
-
-// How many planes wide one network_inputs ring row is: the delivered-current plane every
-// cell reads, plus one arrival plane per wired synapse prototype. Baked into the source
-// rather than passed, because the argument table is full and it is a property of the model
-// the source was generated from.
-String network_input_plane_count_definition(const NML_ParseResult &parse_result) {
-    return "#define SPIKECOREC_NETWORK_INPUT_PLANE_COUNT " +
-           to_string(wired_synapse_prototype_indices(parse_result).size() + 1) + "\n\n";
 }
 
 // The one declaration in the argument table that carries `name`.
@@ -2181,8 +3085,7 @@ String emit_device_function(const String &function_name, const String &body,
 }
 
 String emit_master_kernel(const Vector<String> &device_function_names,
-                          const Vector<WiredSynapse> &wired_synapses,
-                          const Set<String> &emitted_synapse_function_names,
+                          bool runs_eager_synapse_advance, bool runs_synapse_initialization,
                           KernelBackend backend, KernelPurpose purpose) {
     const bool is_metal = backend == KernelBackend::Metal;
     const Vector<KernelArgumentDeclaration> &declarations = kernel_argument_declarations();
@@ -2190,7 +3093,7 @@ String emit_master_kernel(const Vector<String> &device_function_names,
     ostringstream kernel;
 
     // Both entry points take the identical signature so the engine binds one argument set
-    // for both; the initialize kernel simply never reads the propagation half of it.
+    // for both.
     kernel << (is_metal ? "kernel void " : "extern \"C\" __global__ void ")
            << kernel_function_name(purpose) << "(\n";
     for (usize position = 0; position < declarations.size(); ++position) {
@@ -2222,21 +3125,18 @@ String emit_master_kernel(const Vector<String> &device_function_names,
         kernel << indent(1) << "spike_flags[neuron_index] = 0;\n\n";
     }
 
-    // Stages 1 and 2 for the synapses converging on THIS neuron, ahead of the cell dynamics
-    // and in this same thread. Every one of them writes only this neuron's slots, so the
-    // current they deliver reaches the cell below through ordinary program order rather than
-    // through any cross-thread synchronisation. Run for every neuron, not only the wired
-    // targets: an unwired neuron's arrival slot and state are both zero, so its synapse
-    // contributes zero, and knowing which neurons are targets would cost a per-neuron buffer.
-    if (!wired_synapses.empty()) {
-        for (const WiredSynapse &wired : wired_synapses) {
-            if (emitted_synapse_function_names.count(
-                        synapse_device_function_name(wired, purpose)) == 0) {
-                continue;
-            }
-            kernel << synapse_device_function_call(wired, purpose, 1);
-        }
-        kernel << "\n";
+    // The per-edge synapse passes walk this neuron's OUT-edges, so the thread that runs them
+    // is the thread that later propagates down those same edges -- one owner per edge, no
+    // cross-thread synchronisation, and the advance is guaranteed to precede the delivery
+    // that reads what it wrote.
+    //
+    // Emitted ahead of the cell switch rather than inside a cell device function because a
+    // synapse is a property of the edge, not of the cell type at either end of it.
+    if (purpose == KernelPurpose::Tick && runs_eager_synapse_advance) {
+        kernel << emit_per_edge_synapse_pass_call(SynapseEntryPoint::Advance, 1) << "\n";
+    }
+    if (purpose == KernelPurpose::Initialize && runs_synapse_initialization) {
+        kernel << emit_per_edge_synapse_pass_call(SynapseEntryPoint::Initialize, 1) << "\n";
     }
 
     kernel << indent(1) << "int state_base = cell_state_base[neuron_index];\n";
@@ -2273,14 +3173,12 @@ const Vector<String> &ring_row_clear_argument_names() {
     return names;
 }
 
-GeneratedKernel generate_ring_row_clear(const NML_ParseResult &parse_result,
-                                        KernelBackend backend) {
+GeneratedKernel generate_ring_row_clear(KernelBackend backend) {
     const bool is_metal = backend == KernelBackend::Metal;
     const Vector<String> &argument_names = ring_row_clear_argument_names();
 
     ostringstream source;
     source << source_preamble(backend, "generate_ring_row_clear_kernel");
-    source << network_input_plane_count_definition(parse_result);
     source << (is_metal ? "kernel void " : "extern \"C\" __global__ void ")
            << ring_row_clear_function_name << "(\n";
 
@@ -2304,16 +3202,10 @@ GeneratedKernel generate_ring_row_clear(const NML_ParseResult &parse_result,
            << indent(1) << "if (neuron_index >= neuron_count) return;\n\n"
            << indent(1) << "int ring_row = (int)(tick % (" << (is_metal ? "long" : "long long")
            << ")ring_depth);\n"
-           // Every plane of the row, not just the delivered-current one: an arrival plane
-           // this tick's synapse stage has already drained holds a value nothing will consume
-           // again, and leaving it would have the ring re-deliver it a full lap later.
            << indent(1)
-           << "int plane_base = ring_row * SPIKECOREC_NETWORK_INPUT_PLANE_COUNT;\n"
-           << indent(1) << "for (int plane_index = 0;\n"
-           << indent(3) << "plane_index < SPIKECOREC_NETWORK_INPUT_PLANE_COUNT; ++plane_index) {\n"
-           << indent(2)
-           << "network_inputs[(plane_base + plane_index) * neuron_count + neuron_index] = 0.0f;\n"
-           << indent(1) << "}\n"
+           << "network_inputs[(" << buffer_index_type_name << ")ring_row * ("
+           << buffer_index_type_name << ")neuron_count + (" << buffer_index_type_name
+           << ")neuron_index] = 0.0f;\n"
            << "}\n";
 
     GeneratedKernel generated;
@@ -2324,46 +3216,82 @@ GeneratedKernel generate_ring_row_clear(const NML_ParseResult &parse_result,
 }
 
 GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBackend backend,
-                                KernelPurpose purpose) {
+                                KernelPurpose purpose, bool use_lazy_synapse_updates) {
     ostringstream source;
     source << source_preamble(backend, purpose == KernelPurpose::Tick
                                                ? "generate_tick_kernel"
                                                : "generate_initialize_kernel");
 
-    // Only the tick entry point propagates, so only it carries the walk and the ring
-    // helpers; emitting them into the initialize kernel would leave dead code behind.
-    if (purpose == KernelPurpose::Tick) {
-        source << network_input_plane_count_definition(parse_result);
-        source << emit_propagation_helpers(backend);
-    }
+    // Both entry points walk the adjacency now: the tick entry point to propagate and (in
+    // eager mode) to advance every out-edge's synapse, the initialize entry point to run
+    // each edge's OnStart into its own per-edge state planes.
+    source << emit_k2tree_helpers(backend);
+    source << emit_edge_attribute_plane_definitions();
 
     // The synapses ahead of the cells, so a cell device function is free to read anything
     // they declare and so the source reads in the order the tick runs.
-    const Vector<WiredSynapse> wired_synapses = collect_wired_synapses(parse_result);
+    const Vector<SynapseProgram> programs = collect_synapse_programs(parse_result);
     Set<String> emitted_synapse_function_names;
 
-    for (const WiredSynapse &wired : wired_synapses) {
-        const String function_name = synapse_device_function_name(wired, purpose);
+    // Which entry points each program contributes. Deliver is the tick entry point's, and
+    // it is the one every lowered synapse must have; Advance only exists in eager mode, and
+    // Initialize only for a type that declares an OnStart.
+    Vector<SynapseEntryPoint> entry_points;
+    if (purpose == KernelPurpose::Tick) {
+        entry_points.push_back(SynapseEntryPoint::Deliver);
+        if (!use_lazy_synapse_updates) entry_points.push_back(SynapseEntryPoint::Advance);
+    } else {
+        entry_points.push_back(SynapseEntryPoint::Initialize);
+    }
 
+    for (const SynapseProgram &program : programs) {
         // Two prototype ids can sanitise onto one C identifier ("a-b" and "a_b"), which would
         // silently give one prototype the other's dynamics and parameters.
-        if (emitted_synapse_function_names.count(function_name) > 0) {
-            report_error("synapse prototype '" + wired.prototype->instance_id +
+        const String delivery_name =
+                synapse_device_function_name(program, SynapseEntryPoint::Deliver);
+        for (const SynapseProgram &other : programs) {
+            if (other.program_index >= program.program_index) break;
+            if (synapse_device_function_name(other, SynapseEntryPoint::Deliver) != delivery_name) {
+                continue;
+            }
+            report_error("synapse prototype '" + program.prototype->instance_id +
                                  "' collides with another prototype's after sanitising to '" +
-                                 function_name + "'",
-                         wired.type->name);
+                                 delivery_name + "'",
+                         program.type->name);
         }
 
-        const String body = purpose == KernelPurpose::Tick
-                                    ? emit_synapse_tick_body(wired, parse_result)
-                                    : emit_synapse_initialize_body(wired, parse_result);
+        for (const SynapseEntryPoint entry_point : entry_points) {
+            const String body =
+                    entry_point == SynapseEntryPoint::Deliver
+                            ? emit_synapse_deliver_body(program, parse_result,
+                                                        use_lazy_synapse_updates)
+                    : entry_point == SynapseEntryPoint::Advance
+                            ? emit_synapse_advance_body(program, parse_result)
+                            : emit_synapse_initialize_body(program, parse_result);
 
-        // A synapse with no OnStart initialises nothing; the engine zeroes the buffer, so an
-        // empty device function would only be dead code the master kernel still called.
-        if (body.empty()) continue;
+            // A synapse with no OnStart initialises nothing and one with no TimeDerivative
+            // has nothing to advance; the engine zeroes the state block, so an empty device
+            // function would only be dead code the dispatch still had a case for.
+            if (body.empty()) continue;
 
-        source << emit_synapse_device_function(wired, body, backend, purpose);
-        emitted_synapse_function_names.insert(function_name);
+            source << emit_synapse_device_function(program, body, backend, entry_point);
+            emitted_synapse_function_names.insert(
+                    synapse_device_function_name(program, entry_point));
+        }
+    }
+
+    const bool runs_eager_synapse_advance =
+            purpose == KernelPurpose::Tick && !use_lazy_synapse_updates;
+    if (purpose == KernelPurpose::Tick) {
+        source << emit_propagate_spike_function(programs, emitted_synapse_function_names, backend);
+    }
+    if (runs_eager_synapse_advance) {
+        source << emit_per_edge_synapse_pass_function(programs, emitted_synapse_function_names,
+                                                      SynapseEntryPoint::Advance, backend);
+    }
+    if (purpose == KernelPurpose::Initialize) {
+        source << emit_per_edge_synapse_pass_function(programs, emitted_synapse_function_names,
+                                                      SynapseEntryPoint::Initialize, backend);
     }
 
     Vector<String> device_function_names;
@@ -2388,8 +3316,17 @@ GeneratedKernel generate_kernel(const NML_ParseResult &parse_result, KernelBacke
         device_function_names.push_back(function_name);
     }
 
-    source << emit_master_kernel(device_function_names, wired_synapses,
-                                 emitted_synapse_function_names, backend, purpose);
+    // Whether the initialize entry point has any per-edge OnStart body to walk for at all.
+    bool runs_synapse_initialization = false;
+    for (const SynapseProgram &program : programs) {
+        if (emitted_synapse_function_names.count(
+                    synapse_device_function_name(program, SynapseEntryPoint::Initialize)) > 0) {
+            runs_synapse_initialization = true;
+        }
+    }
+
+    source << emit_master_kernel(device_function_names, runs_eager_synapse_advance,
+                                 runs_synapse_initialization, backend, purpose);
 
     GeneratedKernel generated;
     generated.source = source.str();
@@ -2474,23 +3411,29 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
         report_error("empty expression", symbols.component_type_name);
     }
 
-    ExpressionParser parser(std::move(tokens), symbols);
+    const SourceEmission semantics(symbols);
+    ExpressionParser<SourceEmission> parser(std::move(tokens), semantics);
     return parser.parse_complete_expression();
 }
 
-GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result) {
-    return generate_kernel(parse_result, active_backend(), KernelPurpose::Tick);
+GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result,
+                                     bool use_lazy_synapse_updates) {
+    return generate_kernel(parse_result, active_backend(), KernelPurpose::Tick,
+                           use_lazy_synapse_updates);
 }
 
 GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result) {
-    return generate_kernel(parse_result, active_backend(), KernelPurpose::Initialize);
+    // The update policy only shapes the tick entry point; initialisation is the same either
+    // way, so the initialize kernel is generated once and the flag it is handed is inert.
+    return generate_kernel(parse_result, active_backend(), KernelPurpose::Initialize,
+                           /*use_lazy_synapse_updates=*/true);
 }
 
-GeneratedKernel generate_ring_row_clear_kernel(const NML_ParseResult &parse_result) {
-    return generate_ring_row_clear(parse_result, active_backend());
+GeneratedKernel generate_ring_row_clear_kernel() {
+    return generate_ring_row_clear(active_backend());
 }
 
-Vector<s64> wired_synapse_prototype_indices(const NML_ParseResult &parse_result) {
+Vector<SynapseProgramLayout> resolve_synapse_programs(const NML_ParseResult &parse_result) {
     Set<s64> referenced_prototype_indices;
     for (const Neuron &neuron : parse_result.neurons) {
         for (const NetworkEdge &edge : neuron.outgoing_edges) {
@@ -2501,14 +3444,40 @@ Vector<s64> wired_synapse_prototype_indices(const NML_ParseResult &parse_result)
 
     // Walked in prototype order rather than in the set's, so the numbering is a property of
     // the model rather than of the order the edges happened to be visited in.
-    Vector<s64> ordered_prototype_indices;
+    Vector<SynapseProgramLayout> programs;
+    s64 state_variable_offset = 0;
     for (usize prototype_index = 0; prototype_index < parse_result.synapse_prototypes.size();
          ++prototype_index) {
         if (referenced_prototype_indices.count((s64)prototype_index) == 0) continue;
-        ordered_prototype_indices.push_back((s64)prototype_index);
+
+        const ComponentPrototype &prototype = parse_result.synapse_prototypes[prototype_index];
+        if (prototype.type_index < 0 ||
+            prototype.type_index >= (s64)parse_result.synapse_types.size()) {
+            throw runtime_error("kernel_codegen: synapse prototype '" + prototype.instance_id +
+                                "' names synapse type index " + to_string(prototype.type_index) +
+                                ", which no synapse type carries");
+        }
+
+        SynapseProgramLayout layout;
+        layout.prototype_index = (s64)prototype_index;
+        layout.state_variable_offset = state_variable_offset;
+        layout.state_variable_count =
+                (s64)parse_result.synapse_types[(usize)prototype.type_index]
+                        .state_variable_names.size();
+        state_variable_offset += layout.state_variable_count;
+
+        programs.push_back(layout);
     }
 
-    return ordered_prototype_indices;
+    return programs;
+}
+
+s64 per_edge_synapse_variable_count(const NML_ParseResult &parse_result) {
+    s64 total_state_variable_count = 0;
+    for (const SynapseProgramLayout &layout : resolve_synapse_programs(parse_result)) {
+        total_state_variable_count += layout.state_variable_count;
+    }
+    return total_state_variable_count;
 }
 
 } // namespace spikecorec::nml

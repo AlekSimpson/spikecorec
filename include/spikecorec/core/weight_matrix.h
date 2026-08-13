@@ -183,13 +183,44 @@ namespace spikecorec {
         bool using_constant_delay_ticks;
 
         // Number of per-edge synapse-state variables (arch §4.3's `Ck`/`Sk` family)
-        // this WeightMatrix's shared U/V basis is configured to support, on top of
-        // the weight itself — set by configure_per_edge_variable_count() (ticket #5
-        // [C2], from a model's `.alloc` `peredge` directive count, IR spec §2). This
-        // is only the COUNT the engine has committed to; it does not yet allocate or
-        // seed any real per-matrix `Ck` coefficient vectors or sparse `Sk` delta
-        // buffers (that's tickets #52-54/#57).
+        // this WeightMatrix's shared U/V basis carries, on top of the weight itself —
+        // set by configure_per_edge_variable_count() (ticket #5 [C2], from a model's
+        // `.alloc` `peredge` directive count, IR spec §2).
         s64 per_edge_variable_count = 0;
+
+        // Family index of per-edge variable 0. The remaining per_edge_variable_count - 1
+        // variables follow it consecutively, so variable v is matrix
+        // per_edge_variable_matrix_base + v. -1 until configure_per_edge_variable_count()
+        // has registered them (and whenever the count is zero).
+        s64 per_edge_variable_matrix_base = -1;
+
+        // Storage behind those matrices: one contiguous
+        // [per_edge_variable_count][node_count * max_neighbor_count] f32 allocation,
+        // VARIABLE-MAJOR — variable v's plane starts at v * node_count *
+        // max_neighbor_count, and inside a plane the slot convention is the one every
+        // other Sk uses (row-major by source node; within a row, the neighbour's
+        // position in k^2-tree traversal order). Each per-edge variable matrix's entry
+        // in sparse_delta_buffers is therefore a NULL handle owning nothing: its Sk
+        // plane lives here instead, and sparse_delta_data_for() is what resolves either
+        // spelling to a base pointer.
+        //
+        // Contiguous rather than one allocation per matrix because the generated kernel
+        // reads and writes these planes ON DEVICE, once per spike per out-edge. A
+        // Metal/CUDA kernel takes one pointer per argument and the master kernel's
+        // argument table is nearly full, so one buffer per state variable is not
+        // available; one buffer with baked plane offsets is exactly the consolidation
+        // the argument-table comment in nml/kernel_codegen.h calls for.
+        //
+        // Like per-edge delay and exact per-edge weights, every one of these matrices
+        // has its Ck pinned to all-zero in EVERY lane, padding lanes included, so its
+        // low-rank term is identically 0.0f and the stored plane IS the value. That is
+        // what keeps a synapse state variable exact at realistic SI magnitudes (1e-12
+        // and smaller) and invariant under refit()'s re-fit of the shared basis.
+        //
+        // This is still memory compression bookkeeping, not learning (see CLAUDE.md's
+        // U/V factorization note): the k^2-tree keeps compressing the adjacency, and
+        // nothing here is fit to data.
+        GpuPointer<f32> per_edge_variable_values;
 
         // Total real edges in the k^2-tree adjacency, computed once at
         // construction by walking get_neighbors() for every node (so it stays
@@ -253,9 +284,42 @@ namespace spikecorec {
         bool check_index_inbounds(s32, s32) const;
         bool check_index_inbounds(s32) const;
 
-        // Sets per_edge_variable_count (arch §4.3, ticket #5 [C2]). Throws if
-        // count is negative.
+        // Registers `count` per-edge variable matrices in the shared-basis family and
+        // allocates the contiguous zero-filled plane block behind them (arch §4.3,
+        // ticket #5 [C2]). Each new matrix's Ck is pinned to all-zero in every lane, so
+        // its stored plane is the whole value — the same representation per-edge delay
+        // and exact per-edge weights already use, and for the same reason (see
+        // per_edge_variable_values and using_exact_edge_weights).
+        //
+        // Idempotent for a repeated identical count. Throws std::invalid_argument if
+        // count is negative, or if a DIFFERENT non-zero count is configured after the
+        // first call: the already-registered matrices would be orphaned in the family
+        // and their planes would be read at the wrong offsets, which is silent.
         void configure_per_edge_variable_count(s64 count);
+
+        // The family index of per-edge variable `variable_index`. Throws
+        // std::invalid_argument when the index is outside [0, per_edge_variable_count).
+        [[nodiscard]] s64 per_edge_variable_matrix_index(s64 variable_index) const;
+
+        // Whether `matrix_index` is one of the per-edge variable matrices. Those are
+        // exempt from refit()'s Ck re-fit and from its Sk clear, and from the Sk
+        // occupancy count, on exactly the grounds per-edge delay already is: their plane
+        // is permanent storage the model reads back, not drift awaiting a refit.
+        [[nodiscard]] bool is_per_edge_variable_matrix(s64 matrix_index) const;
+
+        // Absolute per-edge point setter/getter for synapse state variable
+        // `variable_index` on the real k^2-tree edge (source_node, target_node) — the
+        // mirror of set_edge_weight()/set_edge_delay_ticks(), with the same edge-scoped
+        // contract and the same absolute-write (never delta-against-a-reconstruction)
+        // discipline that keeps 1e-12 values from being rounded away.
+        //
+        // Throws std::invalid_argument on a bad variable index, an out-of-bounds pair, a
+        // pair that is not a real edge, or a real edge with no slot within
+        // max_neighbor_count.
+        void set_edge_variable(s64 variable_index, s32 source_node, s32 target_node, f32 value);
+
+        [[nodiscard]] f32 get_edge_variable(s64 variable_index, s32 source_node,
+                                            s32 target_node) const;
 
     private:
         // Fatally exits if `network` is empty. Called from the constructor's
@@ -296,10 +360,27 @@ namespace spikecorec {
         // neighbor slots can never have anything accumulated into it.
         [[nodiscard]] GpuPointer<f32> allocate_sparse_delta_buffer() const;
 
+        // Forces every lane of `matrix_index`'s Ck to exactly 0.0f, padding lanes
+        // included (add_coefficient_vector fills those with the neutral 1.0f — see
+        // allocate_coefficient_vector — which would leave a nonzero low-rank term
+        // whenever rank is not a multiple of 4). That pinning is what makes a matrix's
+        // stored Sk entry its WHOLE value, invariant under any later refit of U/V.
+        // Shared by the three representations that depend on it: per-edge delay, exact
+        // per-edge weights, and the per-edge variable family.
+        void pin_coefficient_vector_to_zero(s64 matrix_index);
+
+        // The base of `matrix_index`'s Sk storage: its own allocation for an ordinary
+        // matrix, or its plane inside the contiguous per_edge_variable_values block for
+        // a per-edge variable matrix. Null when there are no representable neighbour
+        // slots at all (an edge-free network), which is the one case no Sk is allocated
+        // for. Every Sk read and write goes through this rather than indexing
+        // sparse_delta_buffers directly, so the two storage spellings cannot diverge.
+        [[nodiscard]] f32 *sparse_delta_data_for(s64 matrix_index);
+        [[nodiscard]] const f32 *sparse_delta_data_for(s64 matrix_index) const;
+
         // Registers delay_matrix_index if it has not been registered yet, via the
-        // ordinary add_coefficient_vector() family path, then forces every lane of
-        // that matrix's Ck (padding lanes included, which add_coefficient_vector
-        // fills with the neutral 1.0f) to exactly 0.0f. Idempotent.
+        // ordinary add_coefficient_vector() family path, then pins that matrix's Ck to
+        // all-zero. Idempotent.
         void ensure_delay_matrix_registered();
 
         // Switches the default matrix into exact mode (see using_exact_edge_weights), in
@@ -435,11 +516,12 @@ namespace spikecorec {
         // is the reserved all-ones slot get()/neighbor_weights() rely on for
         // bit-compatibility — overwriting it breaks that guarantee for this instance.
         //
-        // THROWS std::invalid_argument for the two matrices whose Ck is pinned to
+        // THROWS std::invalid_argument for every matrix whose Ck is pinned to
         // all-zero, because that pinning is what makes their Sk entry the whole stored
         // value: DEFAULT_MATRIX_INDEX once set_edge_weight() has put this instance in
-        // exact mode (using_exact_edge_weights), and delay_matrix_index once
-        // set_edge_delay_ticks() has registered it. Any Ck written onto either restores
+        // exact mode (using_exact_edge_weights), delay_matrix_index once
+        // set_edge_delay_ticks() has registered it, and every per-edge variable matrix
+        // configure_per_edge_variable_count() registered. Any Ck written onto one restores
         // an order-1 low-rank term on top of values that are routinely 1e-9 or smaller,
         // corrupting every weight (or every delay) at once with no diagnostic. Use
         // set_edge_weight()/set_edge_delay_ticks() to change those values.

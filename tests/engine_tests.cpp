@@ -547,42 +547,6 @@ String write_alpha_synapse_model(const FixtureDirectory &fixture) {
                          alpha_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
 
-// Two sources onto ONE target through two alphaCurrentSynapse prototypes whose only
-// difference is `tau`. Their responses decay at different rates, so a single pooled
-// accumulator could not represent both: whatever rate it decayed at would be wrong for one
-// of them.
-String two_tau_network_nml() {
-    return R"(<neuroml id="twotaunet">
-    <oneShotCell id="source0" fireTime="0.25ms"/>
-    <traceCell id="target0"/>
-    <alphaCurrentSynapse id="alphaFast" tau="0.5ms" ibase="1nA"/>
-    <alphaCurrentSynapse id="alphaSlow" tau="2ms" ibase="1nA"/>
-
-    <network id="net1">
-        <population id="popSource" component="source0" size="2"/>
-        <population id="popTarget" component="target0" size="1"/>
-
-        <projection id="projFast" presynapticPopulation="popSource"
-                    postsynapticPopulation="popTarget" synapse="alphaFast">
-            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
-                          weight="1" delay="0.1ms"/>
-        </projection>
-        <projection id="projSlow" presynapticPopulation="popSource"
-                    postsynapticPopulation="popTarget" synapse="alphaSlow">
-            <connectionWD id="0" preCellId="../popSource[1]" postCellId="../popTarget[0]"
-                          weight="1" delay="0.1ms"/>
-        </projection>
-    </network>
-</neuroml>
-)";
-}
-
-String write_two_tau_model(const FixtureDirectory &fixture) {
-    fixture.write("net.nml", two_tau_network_nml());
-    return fixture.write("model.xml",
-                         alpha_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
-}
-
 // The same one-source-one-target wiring through expOneSynapse, which is conductance-based.
 String conductance_synapse_network_nml() {
     return R"(<neuroml id="conductancesynapsenet">
@@ -609,36 +573,6 @@ String write_conductance_synapse_model(const FixtureDirectory &fixture) {
     return fixture.write("model.xml",
                          alpha_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
-
-// alphaCurrentSynapse's own dynamics, integrated on the host exactly as the generated
-// kernel does: the arrival applied first (stage 1 is Deliver), then one forward-Euler step
-// of both state variables from the state as it stood at entry, then `i`, which is `I`, read
-// off the state that step just wrote.
-//
-// Written out rather than compared against the closed-form alpha function because the
-// kernel integrates with forward Euler at the model's own dt, and at dt = tau / 5 the two
-// differ by percent. The point of the comparison is that the SHAPE and the RATE are the
-// synapse's, so the expectation has to be the same discretisation.
-struct AlphaSynapseReference {
-    f32 tau = 0.0f;
-    f32 ibase = 0.0f;
-    f32 current_I = 0.0f;
-    f32 current_J = 0.0f;
-
-    AlphaSynapseReference(f32 tau, f32 ibase) : tau(tau), ibase(ibase) {}
-
-    // Advances one tick and returns the current delivered on it.
-    f32 step(f32 dt, f32 arrival_weight) {
-        if (arrival_weight != 0.0f) current_J = current_J + arrival_weight * ibase;
-
-        const f32 next_I = current_I + dt * ((2.7182818284590451f * current_J - current_I) / tau);
-        const f32 next_J = current_J + dt * (-current_J / tau);
-        current_I = next_I;
-        current_J = next_J;
-
-        return current_I;
-    }
-};
 
 // Where a traceCell's one state variable sits in the flat cell_state array.
 f32 trace_cell_last_input(const SpikeEngine &engine, s64 neuron_index) {
@@ -745,8 +679,97 @@ String glif3_refractory_network_nml() {
 )";
 }
 
+// A cell type declaring a Regime and NO StateVariable. Legal LEMS, and the shape that
+// defeats a "cell_state is empty" test for "there is nothing to record": the appended regime
+// index gives such a type one cell_state slot, so the buffer is not empty and slot 0 is the
+// regime number rather than a membrane potential.
+String regime_only_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="regimeOnlyCell" extends="baseSpikingCell"
+                   description="Declares a Regime and no StateVariable at all.">
+        <Parameter name="fireTime" dimension="time"/>
+
+        <Dynamics>
+            <Regime name="waiting" initial="true">
+                <OnCondition test="t .geq. fireTime">
+                    <EventOut port="spike"/>
+                    <Transition regime="done"/>
+                </OnCondition>
+            </Regime>
+
+            <Regime name="done"/>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="1ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String regime_only_network_nml() {
+    return R"(<neuroml id="regimeonlynet">
+    <regimeOnlyCell id="cell0" fireTime="0.25ms"/>
+
+    <network id="net1">
+        <population id="popOnly" component="cell0" size="1"/>
+    </network>
+</neuroml>
+)";
+}
+
+String write_regime_only_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", regime_only_network_nml());
+    return fixture.write("model.xml",
+                         regime_only_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// The same StateVariable-free cell type, recorded through an explicit <OutputColumn> naming a
+// variable it does not declare. That selection resolves through a different path from an empty
+// one -- by name rather than by default -- and lands on the same first cell_state slot, which
+// for this type is the appended regime index.
+String regime_only_named_selection_lems_xml(const String &network_file,
+                                            const String &recording_file) {
+    const String document = regime_only_lems_xml(network_file, recording_file);
+    const String empty_output_file = R"(">
+        </OutputFile>)";
+    const String named_output_file = R"(">
+            <OutputColumn id="c0" quantity="popOnly[0]/v"/>
+        </OutputFile>)";
+
+    const usize position = document.find(empty_output_file);
+    if (position == String::npos) return document;
+    return document.substr(0, position) + named_output_file +
+           document.substr(position + empty_output_file.length());
+}
+
+String write_regime_only_named_selection_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", regime_only_network_nml());
+    return fixture.write("model.xml", regime_only_named_selection_lems_xml(
+                                              "net.nml", fixture.path_of("out.spire")));
+}
+
 String write_glif3_refractory_model(const FixtureDirectory &fixture) {
     fixture.write("net.nml", glif3_refractory_network_nml());
+    return fixture.write("model.xml",
+                         glif3_refractory_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// The same cell at the refractory period the reference traces were captured with. 5ms at a
+// 0.1ms step is the pair the exit-model fixtures declare, and it is the one the compensated
+// accumulation has to land on the reference's tick for.
+String write_glif3_refractory_model_at_five_milliseconds(const FixtureDirectory &fixture) {
+    String network = glif3_refractory_network_nml();
+    const usize position = network.find("t_ref=\"1ms\"");
+    if (position != String::npos) network.replace(position, 11, "t_ref=\"5ms\"");
+
+    fixture.write("net.nml", network);
     return fixture.write("model.xml",
                          glif3_refractory_lems_xml("net.nml", fixture.path_of("out.spire")));
 }
@@ -779,24 +802,61 @@ struct Glif3Sample {
     s32 regime_index = 0;
 };
 
-// How many ticks the model's own refractory countdown actually takes to reach `t_ref`.
+// How many increments of dt the reference implementation's refractory countdown takes to
+// reach `t_ref`: the same forward-Euler integration of `d(refractoryTimeElapsed)/dt = 1`
+// jLEMS performs, in the f64 it performs it in.
 //
-// NOT t_ref / dt. The countdown is a forward-Euler integration of `d(refractoryTimeElapsed)
-// /dt = 1`, so it is dt added to itself in f32, and repeated addition of 0.1ms accumulates
-// slightly SHORT (9.9999993e-4 after ten steps) while 1ms rounds slightly LONG
-// (1.0000000e-3). A refractory period written as an exact multiple of dt therefore runs one
-// tick longer than the multiple. jLEMS's f64 accumulation falls short in the same direction,
-// so this is the reference implementation's behaviour too rather than a divergence from it --
-// but it is not what "t_ref / dt ticks" would predict, which is why it is computed here
-// instead of assumed.
-s64 refractory_window_tick_count(f32 step_dt, f32 refractory_period) {
-    f32 accumulated = 0.0f;
-    s64 tick_count = 0;
-    while (accumulated < refractory_period && tick_count < 1000) {
-        accumulated = accumulated + step_dt * 1.0f;
-        tick_count += 1;
+// NOT t_ref / dt, and not an f32 accumulation either. In f32 the increments lose their low
+// bits against a total that outgrows them -- fifty additions of 0.1ms reach 4.9999989569e-03
+// where f32(5ms) is 4.9999998882e-03 -- so an uncompensated engine takes one tick longer than
+// this and the refractory period is a tick long everywhere. The engine compensates that
+// accumulation (see "Compensated accumulation" in src/nml/kernel_codegen.cpp), and this is
+// what it is held to.
+s64 reference_refractory_increment_count(f64 step_dt, f64 refractory_period) {
+    f64 accumulated = 0.0;
+    s64 increment_count = 0;
+    while (accumulated < refractory_period && increment_count < 100000) {
+        accumulated = accumulated + step_dt * 1.0;
+        increment_count += 1;
     }
-    return tick_count;
+    return increment_count;
+}
+
+// The same count as an UNCOMPENSATED f32 engine would produce. Not used as an expectation --
+// it is the wrong answer -- but as the falsification hook: a test that cannot tell this apart
+// from the reference count is a test that would pass with the compensation deleted.
+s64 uncompensated_refractory_increment_count(f32 step_dt, f32 refractory_period) {
+    f32 accumulated = 0.0f;
+    s64 increment_count = 0;
+    while (accumulated < refractory_period && increment_count < 100000) {
+        accumulated = accumulated + step_dt * 1.0f;
+        increment_count += 1;
+    }
+    return increment_count;
+}
+
+// The count the engine's own compensated accumulation produces, modelled here in f32.
+//
+// Compensating the sum removes the error that GROWS with the number of steps, which is the
+// defect. What it cannot remove is that f32(dt) and f32(t_ref) are separately rounded: the
+// accumulated value converges on the correctly rounded n * f32(dt), and whether that reaches
+// f32(t_ref) at n = t_ref/dt depends on how the two roundings fell. At t_ref = 5ms and
+// dt = 0.1ms they agree and the engine matches the f64 reference exactly; at t_ref = 1ms the
+// exact product 10 * f32(0.1ms) sits 0.63 ulp BELOW f32(1ms), so the crossing is still one
+// tick late and no amount of compensation moves it. Modelled rather than asserted as a
+// constant so which of the two a given (dt, t_ref) falls into is visible.
+s64 compensated_refractory_increment_count(f32 step_dt, f32 refractory_period) {
+    f32 accumulated = 0.0f;
+    f32 residual = 0.0f;
+    s64 increment_count = 0;
+    while (accumulated < refractory_period && increment_count < 100000) {
+        const f32 increment = step_dt * 1.0f - residual;
+        const f32 next_value = accumulated + increment;
+        residual = (next_value - accumulated) - increment;
+        accumulated = next_value;
+        increment_count += 1;
+    }
+    return increment_count;
 }
 
 spikecorec::Vector<Glif3Sample> run_glif3_refractory(SpikeEngine &engine, s64 tick_count) {
@@ -1169,8 +1229,7 @@ TEST(SpikeEngine, step_simulation_advances_state_and_delivers_input) {
     // empty: the ring row is cleared as a whole row at the end of the tick that read it, so
     // input a type never reads is consumed rather than piling up for the rest of the run.
     const s64 ring_element_count =
-            (s64)engine.network_input_ring_depth * engine.network_input_plane_count *
-            engine.total_neuron_count;
+            (s64)engine.network_input_ring_depth * engine.total_neuron_count;
     for (s64 element = 0; element < ring_element_count; ++element) {
         EXPECT_FLOAT_EQ(network_inputs[element], 0.0f)
                 << "network_inputs[" << element << "] accumulated input nothing consumed";
@@ -1414,8 +1473,7 @@ TEST(SpikeEngine, a_delivered_spike_is_not_redelivered_when_the_ring_wraps) {
     // Nothing is left pending anywhere in the ring either.
     const f32 *network_inputs = engine.network_inputs.get_contents();
     const s64 ring_element_count =
-            (s64)engine.network_input_ring_depth * engine.network_input_plane_count *
-            engine.total_neuron_count;
+            (s64)engine.network_input_ring_depth * engine.total_neuron_count;
     for (s64 element = 0; element < ring_element_count; ++element) {
         EXPECT_FLOAT_EQ(network_inputs[element], 0.0f)
                 << "network_inputs[" << element << "] still holds an undelivered arrival";
@@ -1546,132 +1604,1044 @@ nml::NML_ParseResult make_parallel_edge_model(s64 first_delay_tick_count,
     parse_result.neurons[0].outgoing_edges.push_back(second_edge);
     return parse_result;
 }
+// ── per-edge synapse fixtures ──────────────────────────────────────────────────
+//
+// expCurrentSynapse is an exponential CURRENT-based synapse, declared inline rather than
+// taken from the standard library because the library carries no current-based exponential
+// (expOneSynapse and friends are conductance-based, and those are refused). Its shape is the
+// one that makes per-edge delivery observable: the OnEvent handler bumps the very variable
+// the `i` exposure reads, so the scalar a spike delivers is (this edge's decayed state) plus
+// (this spike's own contribution) -- both non-zero, and different on a second spike.
+//
+// twoShotCell fires twice, which is what separates "the delivered value is computed from
+// live state" from "the delivered value was baked at construction".
+String per_edge_synapse_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="twoShotCell" extends="baseSpikingCell"
+                   description="Emits exactly two spikes, at fireTimeOne and fireTimeTwo.">
+        <Parameter name="fireTimeOne" dimension="time"/>
+        <Parameter name="fireTimeTwo" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="firedCount" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="firedCount" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. fireTimeOne .and. firedCount .lt. 0.5">
+                <StateAssignment variable="firedCount" value="1"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+
+            <OnCondition test="t .geq. fireTimeTwo .and. firedCount .lt. 1.5">
+                <StateAssignment variable="firedCount" value="2"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="traceCell" extends="baseCell"
+                   description="Records what its synapses delivered, on every tick.">
+        <Dynamics>
+            <StateVariable name="lastInput" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="lastInput" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. 0">
+                <StateAssignment variable="lastInput" value="iSyn"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="expCurrentSynapse" extends="baseCurrentBasedSynapse"
+                   description="Exponentially decaying current-based synapse.">
+        <Property name="weight" dimension="none" defaultValue="1"/>
+        <Parameter name="tau" dimension="time"/>
+        <Parameter name="ibase" dimension="current"/>
+
+        <Dynamics>
+            <StateVariable name="I" dimension="current"/>
+
+            <DerivedVariable name="i" exposure="i" dimension="current" value="I"/>
+
+            <TimeDerivative variable="I" value="-I / tau"/>
+
+            <OnStart>
+                <StateAssignment variable="I" value="0"/>
+            </OnStart>
+
+            <OnEvent port="in">
+                <StateAssignment variable="I" value="I + weight * ibase"/>
+            </OnEvent>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="4ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popTarget[0]/lastInput"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+// One source firing twice, through one expCurrentSynapse, onto one target.
+String per_edge_synapse_network_nml() {
+    return R"(<neuroml id="peredgesynapsenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <traceCell id="target0"/>
+    <expCurrentSynapse id="expSyn" tau="0.5ms" ibase="1nA"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="expSyn">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+String write_per_edge_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", per_edge_synapse_network_nml());
+    return fixture.write("model.xml",
+                         per_edge_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// ── a synapse whose handler reads the state it lands on ──────────────────────────
+//
+// Every synapse above adds `weight * ibase` whatever state it finds, so its events are all the
+// same size. This one depletes a resource on each arrival and recovers it slowly, so what an
+// arriving spike sets in motion depends on the edge's LIVE state -- which is what separates
+// "the amount is worked out against the edge as it stands" from "the amount was resolved once,
+// at construction, and is being replayed".
+String depressing_synapse_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="twoShotCell" extends="baseSpikingCell"
+                   description="Emits exactly two spikes, at fireTimeOne and fireTimeTwo.">
+        <Parameter name="fireTimeOne" dimension="time"/>
+        <Parameter name="fireTimeTwo" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="firedCount" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="firedCount" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. fireTimeOne .and. firedCount .lt. 0.5">
+                <StateAssignment variable="firedCount" value="1"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+
+            <OnCondition test="t .geq. fireTimeTwo .and. firedCount .lt. 1.5">
+                <StateAssignment variable="firedCount" value="2"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="traceCell" extends="baseCell"
+                   description="Records what its synapses delivered, on every tick.">
+        <Dynamics>
+            <StateVariable name="lastInput" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="lastInput" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. 0">
+                <StateAssignment variable="lastInput" value="iSyn"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="depressingCurrentSynapse" extends="baseCurrentBasedSynapse"
+                   description="Exponential current whose arrivals deplete a slowly recovering
+                                resource, so successive spikes deliver less.">
+        <Property name="weight" dimension="none" defaultValue="1"/>
+        <Parameter name="tau" dimension="time"/>
+        <Parameter name="ibase" dimension="current"/>
+        <Parameter name="tauRecovery" dimension="time"/>
+        <Parameter name="remaining" dimension="none"/>
+
+        <Dynamics>
+            <StateVariable name="I" dimension="current"/>
+            <StateVariable name="available" dimension="none"/>
+
+            <DerivedVariable name="i" exposure="i" dimension="current" value="I"/>
+
+            <TimeDerivative variable="I" value="-I / tau"/>
+            <TimeDerivative variable="available" value="(1 - available) / tauRecovery"/>
+
+            <OnStart>
+                <StateAssignment variable="I" value="0"/>
+                <StateAssignment variable="available" value="1"/>
+            </OnStart>
+
+            <OnEvent port="in">
+                <StateAssignment variable="I" value="I + weight * ibase * available"/>
+                <StateAssignment variable="available" value="available * remaining"/>
+            </OnEvent>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="4ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popTarget[0]/lastInput"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String depressing_synapse_network_nml() {
+    return R"(<neuroml id="depressingsynapsenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <traceCell id="target0"/>
+    <depressingCurrentSynapse id="depSyn" tau="0.5ms" ibase="1nA" tauRecovery="20ms"
+                              remaining="0.4"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="depSyn">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+String write_depressing_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", depressing_synapse_network_nml());
+    return fixture.write("model.xml",
+                         depressing_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// Two sources firing twice each, onto ONE target, through two expCurrentSynapse prototypes
+// whose only difference is `tau`. Every edge carries its own state, so a lazy catch-up that
+// used the wrong elapsed count or the wrong edge's slot shows up as a wrong amplitude here
+// and nowhere else.
+String two_tau_per_edge_network_nml() {
+    return R"(<neuroml id="twotauperedgenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <twoShotCell id="source1" fireTimeOne="0.45ms" fireTimeTwo="1.65ms"/>
+    <traceCell id="target0"/>
+    <expCurrentSynapse id="expFast" tau="0.5ms" ibase="1nA"/>
+    <expCurrentSynapse id="expSlow" tau="2ms" ibase="3nA"/>
+
+    <network id="net1">
+        <population id="popSourceFast" component="source0" size="1"/>
+        <population id="popSourceSlow" component="source1" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="projFast" presynapticPopulation="popSourceFast"
+                    postsynapticPopulation="popTarget" synapse="expFast">
+            <connectionWD id="0" preCellId="../popSourceFast[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+        <projection id="projSlow" presynapticPopulation="popSourceSlow"
+                    postsynapticPopulation="popTarget" synapse="expSlow">
+            <connectionWD id="0" preCellId="../popSourceSlow[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.2ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+// A synapse whose OnStart leaves its state NON-ZERO, so the state is already moving before
+// the first spike ever arrives.
+//
+// That is the only shape in which the seed of the last-advanced-tick plane is observable at
+// all: with an all-zero OnStart and a homogeneous derivative, a state of zero decays to zero
+// however many steps are applied, so seeding "never advanced" as tick 0 rather than -1 costs
+// exactly one step of nothing and both policies agree anyway. Here the missing step is one
+// step of a real decay, and the two disagree by that factor.
+String priming_synapse_lems_xml(const String &network_file, const String &recording_file) {
+    return R"(<Lems>
+    <Target component="sim1"/>
+
+    <ComponentType name="twoShotCell" extends="baseSpikingCell"
+                   description="Emits exactly two spikes, at fireTimeOne and fireTimeTwo.">
+        <Parameter name="fireTimeOne" dimension="time"/>
+        <Parameter name="fireTimeTwo" dimension="time"/>
+
+        <Dynamics>
+            <StateVariable name="firedCount" dimension="none"/>
+
+            <OnStart>
+                <StateAssignment variable="firedCount" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. fireTimeOne .and. firedCount .lt. 0.5">
+                <StateAssignment variable="firedCount" value="1"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+
+            <OnCondition test="t .geq. fireTimeTwo .and. firedCount .lt. 1.5">
+                <StateAssignment variable="firedCount" value="2"/>
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="traceCell" extends="baseCell"
+                   description="Records what its synapses delivered, on every tick.">
+        <Dynamics>
+            <StateVariable name="lastInput" dimension="none"/>
+
+            <DerivedVariable name="iSyn" dimension="none" select="synapses[*]/i" reduce="add"/>
+
+            <OnStart>
+                <StateAssignment variable="lastInput" value="0"/>
+            </OnStart>
+
+            <OnCondition test="t .geq. 0">
+                <StateAssignment variable="lastInput" value="iSyn"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+
+    <ComponentType name="primedCurrentSynapse" extends="baseCurrentBasedSynapse"
+                   description="Exponentially decaying current-based synapse, primed at OnStart.">
+        <Property name="weight" dimension="none" defaultValue="1"/>
+        <Parameter name="tau" dimension="time"/>
+        <Parameter name="ibase" dimension="current"/>
+
+        <Dynamics>
+            <StateVariable name="I" dimension="current"/>
+
+            <DerivedVariable name="i" exposure="i" dimension="current" value="I"/>
+
+            <TimeDerivative variable="I" value="-I / tau"/>
+
+            <OnStart>
+                <StateAssignment variable="I" value="ibase"/>
+            </OnStart>
+
+            <OnEvent port="in">
+                <StateAssignment variable="I" value="I + weight * ibase"/>
+            </OnEvent>
+        </Dynamics>
+    </ComponentType>
+
+    <Include file=")" + network_file + R"("/>
+
+    <Simulation id="sim1" length="4ms" step="0.1ms" target="net1">
+        <OutputFile id="of1" fileName=")" + recording_file + R"(">
+            <OutputColumn id="c0" quantity="popTarget[0]/lastInput"/>
+        </OutputFile>
+    </Simulation>
+</Lems>
+)";
+}
+
+String priming_synapse_network_nml() {
+    return R"(<neuroml id="primingsynapsenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <traceCell id="target0"/>
+    <primedCurrentSynapse id="primedSyn" tau="0.5ms" ibase="1nA"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="1"/>
+
+        <projection id="proj0" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="primedSyn">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+// One source, two targets: one edge through a synapse and one through none at all. The
+// per-edge program plane is the only thing that tells them apart, so a slot flattened for
+// the wrong edge -- or a "no synapse" edge that picks up a program anyway -- shows up as
+// synapse dynamics running on a connection that declared none.
+String mixed_synapse_network_nml() {
+    return R"(<neuroml id="mixedsynapsenet">
+    <twoShotCell id="source0" fireTimeOne="0.25ms" fireTimeTwo="0.85ms"/>
+    <traceCell id="target0"/>
+    <expCurrentSynapse id="expSyn" tau="0.5ms" ibase="1nA"/>
+
+    <network id="net1">
+        <population id="popSource" component="source0" size="1"/>
+        <population id="popTarget" component="target0" size="2"/>
+
+        <projection id="projSynapse" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget" synapse="expSyn">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[0]"
+                          weight="1" delay="0.1ms"/>
+        </projection>
+        <projection id="projPlain" presynapticPopulation="popSource"
+                    postsynapticPopulation="popTarget">
+            <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popTarget[1]"
+                          weight="2.5" delay="0.1ms"/>
+        </projection>
+    </network>
+</neuroml>
+)";
+}
+
+String write_mixed_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", mixed_synapse_network_nml());
+    return fixture.write("model.xml",
+                         per_edge_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+String write_priming_synapse_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", priming_synapse_network_nml());
+    return fixture.write("model.xml",
+                         priming_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+String write_two_tau_per_edge_model(const FixtureDirectory &fixture) {
+    fixture.write("net.nml", two_tau_per_edge_network_nml());
+    return fixture.write("model.xml",
+                         per_edge_synapse_lems_xml("net.nml", fixture.path_of("out.spire")));
+}
+
+// The charge one unit of an exponentially decaying current goes on to deliver: sum of I_n *
+// dt over the ticks that follow, in the same forward Euler the engine integrates with.
+// Written out rather than reduced to its closed form (which is exactly tau) so the expectation
+// is arrived at the way the generator arrives at it, not by agreeing with it.
+f64 exponential_synapse_unit_charge(f64 step_dt, f64 tau) {
+    f64 state = 1.0;
+    f64 charge = 0.0;
+    f64 peak = 0.0;
+    for (usize step = 0; step < 200000; ++step) {
+        charge += state * step_dt;
+        peak = std::max(peak, std::fabs(state));
+        if (std::fabs(state) <= peak * 1e-9) break;
+        state = state + step_dt * (-state / tau);
+    }
+    return charge;
+}
+
+// The same, for alphaCurrentSynapse's two coupled variables, starting from one unit of the
+// variable its OnEvent handler bumps. The continuous answer is e * tau; this is that quantity
+// as forward Euler at the engine's own tick actually produces it.
+f64 alpha_synapse_unit_charge(f64 step_dt, f64 tau) {
+    f64 current_i = 0.0;
+    f64 current_j = 1.0;
+    f64 charge = 0.0;
+    f64 peak = 0.0;
+    for (usize step = 0; step < 200000; ++step) {
+        charge += current_i * step_dt;
+        peak = std::max(peak, std::fabs(current_i));
+        if (peak > 0.0 && std::fabs(current_i) <= peak * 1e-9) break;
+        const f64 next_i =
+                current_i + step_dt * ((2.7182818284590451 * current_j - current_i) / tau);
+        const f64 next_j = current_j + step_dt * (-current_j / tau);
+        current_i = next_i;
+        current_j = next_j;
+    }
+    return charge;
+}
+
+// expCurrentSynapse's own dynamics, integrated on the host exactly as the generated kernel
+// does under either update policy: one forward-Euler step per elapsed tick, then the arrival
+// handler, then the charge that handler's change goes on to deliver, as the current that
+// delivers it inside one tick. Written out rather than compared against exp(-t/tau) because
+// the kernel integrates with forward Euler at the model's own dt, and at dt = tau / 5 the two
+// differ by percent -- the point of the comparison is the amplitude and the rate, so the
+// expectation has to be the same discretisation.
+struct ExponentialCurrentSynapseReference {
+    f32 tau = 0.0f;
+    f32 ibase = 0.0f;
+    f32 current_I = 0.0f;
+    s64 last_advanced_tick = -1;
+
+    ExponentialCurrentSynapseReference(f32 tau, f32 ibase) : tau(tau), ibase(ibase) {}
+
+    // Advances this edge to `tick`, applies one arrival of `weight`, and returns the scalar
+    // the edge delivers.
+    f32 deliver(f32 dt, s64 tick, f32 weight) {
+        for (s64 elapsed = last_advanced_tick; elapsed < tick; ++elapsed) {
+            current_I = current_I + dt * (-current_I / tau);
+        }
+        last_advanced_tick = tick;
+
+        const f32 state_before_arrival = current_I;
+        current_I = current_I + weight * ibase;
+
+        const f64 unit_charge = exponential_synapse_unit_charge((f64)dt, (f64)tau);
+        return (f32)(unit_charge * (f64)(current_I - state_before_arrival) / (f64)dt);
+    }
+};
+
+// depressingCurrentSynapse's own dynamics on the host, in the same forward Euler the engine
+// integrates with: one step per elapsed tick, then the arrival handler, then the charge the
+// change that handler made goes on to deliver.
+//
+// `available` never touches `i`, so it contributes no charge of its own -- what it changes is
+// how much of the current the handler injects, which is the whole point.
+struct DepressingSynapseReference {
+    f32 tau = 0.0f;
+    f32 ibase = 0.0f;
+    f32 tau_recovery = 0.0f;
+    f32 remaining = 0.0f;
+    f32 current_I = 0.0f;
+    f32 available = 1.0f;
+    s64 last_advanced_tick = -1;
+
+    f32 deliver(f32 dt, s64 tick, f32 weight) {
+        for (s64 elapsed = last_advanced_tick; elapsed < tick; ++elapsed) {
+            const f32 next_I = current_I + dt * (-current_I / tau);
+            const f32 next_available = available + dt * ((1.0f - available) / tau_recovery);
+            current_I = next_I;
+            available = next_available;
+        }
+        last_advanced_tick = tick;
+
+        const f32 state_before_arrival = current_I;
+        // Simultaneous, as LEMS specifies: both right-hand sides read the pre-handler state.
+        const f32 assigned_I = current_I + weight * ibase * available;
+        const f32 assigned_available = available * remaining;
+        current_I = assigned_I;
+        available = assigned_available;
+
+        const f64 unit_charge = exponential_synapse_unit_charge((f64)dt, (f64)tau);
+        return (f32)(unit_charge * (f64)(current_I - state_before_arrival) / (f64)dt);
+    }
+};
+
+// Every non-zero slot of the delay ring, as (flat index, value). One arrival should occupy
+// exactly one of them.
+struct RingArrival {
+    s64 element_index = 0;
+    f32 value = 0.0f;
+};
+
+spikecorec::Vector<RingArrival> non_zero_ring_arrivals(const SpikeEngine &engine) {
+    const f32 *network_inputs = engine.network_inputs.get_contents();
+    const s64 element_count =
+            (s64)engine.network_input_ring_depth * engine.total_neuron_count;
+
+    spikecorec::Vector<RingArrival> arrivals;
+    for (s64 element_index = 0; element_index < element_count; ++element_index) {
+        if (network_inputs[element_index] == 0.0f) continue;
+        arrivals.push_back(RingArrival{element_index, network_inputs[element_index]});
+    }
+    return arrivals;
+}
+
+// Where an arrival due on `arrival_tick` for `neuron_index` lands in the flat ring.
+s64 ring_element_index(const SpikeEngine &engine, s64 arrival_tick, s64 neuron_index) {
+    return (arrival_tick % (s64)engine.network_input_ring_depth) * engine.total_neuron_count +
+           neuron_index;
+}
 
 } // namespace
 
 // ── current-based synapse dynamics ─────────────────────────────────────────────
 
-TEST(SpikeEngine, a_current_based_synapse_delivers_its_time_course_not_an_impulse) {
+TEST(SpikeEngine, a_spike_delivers_the_whole_charge_of_its_event_into_one_ring_slot) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
 
-    // The one test that separates a real synapse model from adding the raw edge weight at
-    // the arrival tick. An alphaCurrentSynapse has two coupled state variables integrated on
-    // every tick whether or not anything arrived, so one spike produces a current that RISES
-    // over several ticks, peaks around tau, and decays -- not a single non-zero tick.
-    FixtureDirectory fixture("neuroml_alpha_synapse_time_course");
-    String model_path = write_alpha_synapse_model(fixture);
+    // When the source spikes, its outgoing edge advances its OWN state to this tick, runs the
+    // arrival handler, and writes ONE scalar into ONE ring slot at tick + that edge's delay.
+    // That scalar is the whole of the charge this event's response goes on to deliver,
+    // expressed as the current that delivers it inside one tick.
+    //
+    // expCurrentSynapse's handler adds weight * ibase whatever state it finds, so its events
+    // are all the same size and both spikes deliver the same amount. That is the correct
+    // answer, not an insensitive test: the tail still in flight from the first spike was
+    // delivered in full at the first spike, and delivering any of it again would inject more
+    // total charge than the synapse ever carries. A handler that DOES read the state it finds
+    // is covered by a_second_spike_forwards_a_different_amount_when_the_handler_reads_the_edges_state.
+    FixtureDirectory fixture("neuroml_per_edge_synapse");
+    String model_path = write_per_edge_synapse_model(fixture);
 
     SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
     ASSERT_EQ(engine.total_neuron_count, 2);
 
-    // One wired prototype, so the ring is two planes wide: the delivered current every cell
-    // reads, and that prototype's own arrivals.
-    EXPECT_EQ(engine.network_input_plane_count, 2);
-    // Two state variables (I and J) per neuron, for the one prototype.
-    EXPECT_EQ(engine.synapse_state_element_count, 2 * engine.total_neuron_count);
+    // One state variable (I) for the one lowered program, one plane over the edge slots.
+    EXPECT_EQ(engine.per_edge_synapse_variable_count, 1);
+    EXPECT_EQ(engine.weights.per_edge_variable_count, 1);
+    ASSERT_NE(engine.weights.per_edge_variable_values.pointer, nullptr);
 
     const f32 step_dt = (f32)engine.network_details.step_dt;
-    const s64 tick_count = 40;
+    const s64 first_spike_tick = 3;   // first tick with t >= 0.25ms at dt = 0.1ms
+    const s64 second_spike_tick = 9;  // first tick with t >= 0.85ms
+    const s64 delay_tick_count = 1;   // 0.1ms at dt = 0.1ms
 
-    // The source fires on the first tick with t >= 0.25ms, and the edge's 0.1ms delay is one
-    // tick, so the arrival is due one tick after that.
-    const s64 source_spike_tick = 3;
-    const s64 arrival_tick = source_spike_tick + 1;
+    ExponentialCurrentSynapseReference reference(/*tau=*/5.0e-4f, /*ibase=*/1.0e-9f);
+    f32 first_delivered = 0.0f;
+    f32 second_delivered = 0.0f;
 
-    AlphaSynapseReference reference(/*tau=*/5.0e-4f, /*ibase=*/1.0e-9f);
-    spikecorec::Vector<f32> delivered(tick_count, 0.0f);
-    spikecorec::Vector<f32> expected(tick_count, 0.0f);
-
-    for (s64 tick = 0; tick < tick_count; ++tick) {
+    for (s64 tick = 0; tick <= second_spike_tick; ++tick) {
         engine.step_simulation(tick);
-        delivered[(usize)tick] = trace_cell_last_input(engine, /*neuron_index=*/1);
-        expected[(usize)tick] = reference.step(step_dt, tick == arrival_tick ? 1.0f : 0.0f);
+
+        if (tick != first_spike_tick && tick != second_spike_tick) continue;
+
+        ASSERT_EQ(engine.spike_flags.get_contents()[0], 1)
+                << "the source did not spike on tick " << tick;
+
+        // ONE slot, not a plane and not a per-target accumulation spread over several ticks.
+        const spikecorec::Vector<RingArrival> arrivals = non_zero_ring_arrivals(engine);
+        ASSERT_EQ(arrivals.size(), 1u)
+                << "tick " << tick << ": a spike wrote " << arrivals.size()
+                << " ring slots, not one";
+        EXPECT_EQ(arrivals[0].element_index,
+                  ring_element_index(engine, tick + delay_tick_count, /*neuron_index=*/1))
+                << "tick " << tick << ": the arrival did not land at tick + delay for the "
+                << "edge's target";
+
+        const f32 expected = reference.deliver(step_dt, tick, /*weight=*/1.0f);
+        EXPECT_NEAR(arrivals[0].value, expected, std::fabs(expected) * 1e-4f + 1e-15f)
+                << "tick " << tick << ": delivered " << arrivals[0].value << " where the edge's "
+                << "own state gives " << expected;
+
+        (tick == first_spike_tick ? first_delivered : second_delivered) = arrivals[0].value;
     }
 
-    ASSERT_EQ(engine.spike_flags.get_contents()[0], 0)
-            << "the source fired more than once, so the trace is not one spike's response";
+    // The amount really is a charge and not a sample of `i`. This synapse's exposure IS the
+    // state its handler moves, so a sample would have reported weight * ibase; a charge
+    // reports weight * ibase * tau / dt, which is tau / dt = 5 times that.
+    const f32 expected_first =
+            (f32)(exponential_synapse_unit_charge((f64)step_dt, 5.0e-4) * 1.0e-9 / (f64)step_dt);
+    EXPECT_NEAR(first_delivered, expected_first, expected_first * 1e-4f);
+    EXPECT_NEAR(first_delivered / 1.0e-9f, 5.0e-4f / step_dt, 1e-2f)
+            << "the delivered amount is the size a sample of `i` would have reported";
 
-    // Nothing before the arrival, and the arrival tick itself is only the start of the rise.
-    for (s64 tick = 0; tick < arrival_tick; ++tick) {
-        EXPECT_FLOAT_EQ(delivered[(usize)tick], 0.0f)
-                << "current was delivered on tick " << tick << ", before the spike arrived";
-    }
+    // Both events are the same size, because this handler's increment does not read the state
+    // it lands on. See the header comment.
+    EXPECT_NEAR(second_delivered, first_delivered, first_delivered * 1e-4f);
 
-    // A time course, not an impulse: rising for several ticks after the arrival, falling well
-    // afterwards, and non-zero on every tick in between. tau is 0.5ms against a 0.1ms dt, so
-    // the peak is around five ticks past the arrival and the tail runs far past that.
-    for (s64 tick = arrival_tick; tick < arrival_tick + 3; ++tick) {
-        EXPECT_GT(delivered[(usize)tick + 1], delivered[(usize)tick])
-                << "the delivered current did not rise from tick " << tick << " to the next";
-    }
-    for (s64 tick = arrival_tick + 15; tick < tick_count - 1; ++tick) {
-        EXPECT_LT(delivered[(usize)tick + 1], delivered[(usize)tick])
-                << "the delivered current did not decay from tick " << tick << " to the next";
-    }
-    for (s64 tick = arrival_tick; tick < tick_count; ++tick) {
-        EXPECT_GT(delivered[(usize)tick], 0.0f)
-                << "the delivered current was zero on tick " << tick
-                << ": a single-tick impulse, not a synapse integrated every tick";
-    }
-
-    // And it is the synapse's own trajectory, tick for tick.
-    for (s64 tick = 0; tick < tick_count; ++tick) {
-        EXPECT_NEAR(delivered[(usize)tick], expected[(usize)tick],
-                    std::fabs(expected[(usize)tick]) * 1e-4f + 1e-15f)
-                << "tick " << tick << " delivered " << delivered[(usize)tick] << " where the "
-                << "synapse's own dynamics give " << expected[(usize)tick];
-    }
+    // And the target reads that same scalar out of the ring on the following tick.
+    engine.step_simulation(second_spike_tick + 1);
+    EXPECT_NEAR(trace_cell_last_input(engine, /*neuron_index=*/1), second_delivered,
+                std::fabs(second_delivered) * 1e-5f + 1e-15f);
 
     engine.shutdown();
 }
 
-TEST(SpikeEngine, two_current_based_synapses_on_one_target_decay_at_their_own_rates) {
+TEST(SpikeEngine, a_second_spike_forwards_a_different_amount_when_the_handler_reads_the_edges_state) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
 
-    // Two alphaCurrentSynapse prototypes differing only in tau, converging on one neuron.
-    // They get a plane and a state slice each and are integrated separately, so the target
-    // sees the SUM OF TWO independent responses. Pooling them into one accumulator would
-    // have to decay the total at a single rate, which is neither of theirs.
-    FixtureDirectory fixture("neuroml_two_tau_synapses");
-    String model_path = write_two_tau_model(fixture);
+    // What separates per-edge state that is LIVE from an amount resolved once at construction.
+    // This synapse's handler injects `weight * ibase * available`, and depletes `available` as
+    // it goes, so the second spike down the same edge sets less charge in motion than the
+    // first -- by a factor the edge's own state decides, not the model's declaration.
+    //
+    // The check is on the amount DELIVERED, not just on the stored state: an engine that kept
+    // the state faithfully and still forwarded a construction-time constant would pass a
+    // state-only assertion and fail this one.
+    FixtureDirectory fixture("neuroml_depressing_synapse");
+    String model_path = write_depressing_synapse_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    ASSERT_EQ(engine.total_neuron_count, 2);
+    EXPECT_EQ(engine.per_edge_synapse_variable_count, 2);
+
+    const f32 step_dt = (f32)engine.network_details.step_dt;
+    const s64 first_spike_tick = 3;
+    const s64 second_spike_tick = 9;
+    const s64 delay_tick_count = 1;
+
+    DepressingSynapseReference reference;
+    reference.tau = 5.0e-4f;
+    reference.ibase = 1.0e-9f;
+    reference.tau_recovery = 2.0e-2f;
+    reference.remaining = 0.4f;
+
+    f32 first_delivered = 0.0f;
+    f32 second_delivered = 0.0f;
+
+    for (s64 tick = 0; tick <= second_spike_tick; ++tick) {
+        engine.step_simulation(tick);
+        if (tick != first_spike_tick && tick != second_spike_tick) continue;
+
+        ASSERT_EQ(engine.spike_flags.get_contents()[0], 1) << "no spike on tick " << tick;
+
+        const spikecorec::Vector<RingArrival> arrivals = non_zero_ring_arrivals(engine);
+        ASSERT_EQ(arrivals.size(), 1u) << "tick " << tick;
+        EXPECT_EQ(arrivals[0].element_index,
+                  ring_element_index(engine, tick + delay_tick_count, /*neuron_index=*/1));
+
+        const f32 expected = reference.deliver(step_dt, tick, /*weight=*/1.0f);
+        EXPECT_NEAR(arrivals[0].value, expected, std::fabs(expected) * 1e-3f + 1e-18f)
+                << "tick " << tick << ": delivered " << arrivals[0].value
+                << " where the edge's own state gives " << expected;
+
+        (tick == first_spike_tick ? first_delivered : second_delivered) = arrivals[0].value;
+    }
+
+    // The load-bearing comparison: different, and different in the direction and by roughly
+    // the factor the depletion declares. Six ticks of a 20ms recovery restores almost nothing,
+    // so the second spike lands on close to `remaining` of the resource.
+    EXPECT_GT(first_delivered, 0.0f);
+    EXPECT_LT(second_delivered, first_delivered * 0.5f)
+            << "the second spike forwarded " << second_delivered << " against the first's "
+            << first_delivered << ", so the edge's state was not read by the handler";
+    EXPECT_NEAR(second_delivered / first_delivered, 0.4f, 0.02f);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, per_edge_synapse_state_lives_in_the_weight_matrix_and_evolves_there) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // Where the state lives is not an implementation detail: the generated kernel reads and
+    // writes the WeightMatrix's own per-edge variable planes, so the host accessor and the
+    // device both see one copy. A mirrored buffer would drift silently.
+    FixtureDirectory fixture("neuroml_per_edge_state_storage");
+    String model_path = write_per_edge_synapse_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    // Its Ck is pinned to all-zero, which is what makes the stored plane the whole value at
+    // any magnitude rather than a delta on top of an order-1 reconstruction.
+    const s64 matrix_index = engine.weights.per_edge_variable_matrix_index(0);
+    EXPECT_TRUE(engine.weights.is_per_edge_variable_matrix(matrix_index));
+    EXPECT_EQ(engine.weights.get_edge_variable(0, /*source_node=*/0, /*target_node=*/1), 0.0f);
+
+    // Run past the first spike; the edge's state is now non-zero, and it is readable through
+    // the compressed storage rather than out of a separate engine buffer.
+    for (s64 tick = 0; tick <= 4; ++tick) engine.step_simulation(tick);
+
+    const f32 after_first_spike =
+            engine.weights.get_edge_variable(0, /*source_node=*/0, /*target_node=*/1);
+    EXPECT_GT(after_first_spike, 0.0f)
+            << "the edge's synapse state is still zero after a spike travelled down it";
+    EXPECT_NEAR(after_first_spike, 1.0e-9f, 1.0e-13f)
+            << "the state is not the arrival handler's `weight * ibase` at SI magnitude";
+
+    // The same value read through the generic family accessor, which is what proves this is
+    // the shared-basis storage and not a private array wearing its name.
+    EXPECT_FLOAT_EQ(engine.weights.get_for_matrix(0, 1, matrix_index), after_first_spike);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, lazy_and_eager_synapse_updates_produce_identical_results) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The equivalence that proves the catch-up is right. Lazy advances an edge only when its
+    // source spikes, across the whole elapsed interval at once; eager advances every edge
+    // every tick. A wrong elapsed count -- an off-by-one at the seed, a catch-up that stops
+    // one tick early -- changes nothing structural and shows up ONLY as a subtly wrong
+    // amplitude, which is exactly what comparing the two policies catches.
+    //
+    // Two edges with different tau, different ibase, different delays and sources that fire
+    // at different ticks, so the elapsed intervals differ per edge and a per-edge slot mix-up
+    // is visible too.
+    FixtureDirectory lazy_fixture("neuroml_lazy_eager_lazy");
+    FixtureDirectory eager_fixture("neuroml_lazy_eager_eager");
+    String lazy_model_path = write_two_tau_per_edge_model(lazy_fixture);
+    String eager_model_path = write_two_tau_per_edge_model(eager_fixture);
+
+    SpikeEngine lazy_engine(lazy_model_path, /*enable_hebbian_learning=*/false,
+                            /*use_lazy_synapse_updates=*/true);
+    SpikeEngine eager_engine(eager_model_path, /*enable_hebbian_learning=*/false,
+                             /*use_lazy_synapse_updates=*/false);
+
+    ASSERT_TRUE(lazy_engine.use_lazy_synapse_updates);
+    ASSERT_FALSE(eager_engine.use_lazy_synapse_updates);
+    ASSERT_EQ(lazy_engine.total_neuron_count, eager_engine.total_neuron_count);
+    ASSERT_EQ(lazy_engine.per_edge_synapse_variable_count, 2);
+
+    const s64 tick_count = 40;
+    f32 largest_delivered = 0.0f;
+    s64 non_zero_delivery_count = 0;
+
+    // Each edge's own last spike tick, which is the only tick at which the two policies' per
+    // edge STATE is comparable: lazy leaves an edge's state as of that edge's last spike,
+    // where eager keeps decaying it every tick afterwards. Both are right -- nothing observes
+    // the state in between -- so comparing them at the end of the run would compare two
+    // different instants and fail for the wrong reason.
+    const s64 fast_edge_last_spike_tick = 9;
+    const s64 slow_edge_last_spike_tick = 17;
+    f32 lazy_state_by_edge[2] = {0.0f, 0.0f};
+    f32 eager_state_by_edge[2] = {0.0f, 0.0f};
+
+    for (s64 tick = 0; tick < tick_count; ++tick) {
+        lazy_engine.step_simulation(tick);
+        eager_engine.step_simulation(tick);
+
+        const f32 lazy_delivered = trace_cell_last_input(lazy_engine, /*neuron_index=*/2);
+        const f32 eager_delivered = trace_cell_last_input(eager_engine, /*neuron_index=*/2);
+
+        EXPECT_NEAR(lazy_delivered, eager_delivered,
+                    std::fabs(eager_delivered) * 1e-5f + 1e-18f)
+                << "tick " << tick << ": lazy delivered " << lazy_delivered << " and eager "
+                << eager_delivered;
+
+        largest_delivered = std::max(largest_delivered, std::fabs(eager_delivered));
+        if (eager_delivered != 0.0f) non_zero_delivery_count += 1;
+
+        if (tick == fast_edge_last_spike_tick) {
+            lazy_state_by_edge[0] = lazy_engine.weights.get_edge_variable(0, 0, 2);
+            eager_state_by_edge[0] = eager_engine.weights.get_edge_variable(0, 0, 2);
+        }
+        if (tick == slow_edge_last_spike_tick) {
+            lazy_state_by_edge[1] = lazy_engine.weights.get_edge_variable(1, 1, 2);
+            eager_state_by_edge[1] = eager_engine.weights.get_edge_variable(1, 1, 2);
+        }
+    }
+
+    // A comparison of two all-zero traces would pass for the wrong reason.
+    EXPECT_GE(non_zero_delivery_count, 4)
+            << "the two policies agreed on a trace that never delivered anything";
+    EXPECT_GT(largest_delivered, 1e-10f);
+
+    // The per-edge state each policy left behind agrees too, at each edge's last spike -- so
+    // the agreement above is not two different states that happen to deliver the same
+    // scalars.
+    for (usize edge_position = 0; edge_position < 2; ++edge_position) {
+        EXPECT_GT(std::fabs(eager_state_by_edge[edge_position]), 1e-12f)
+                << "edge " << edge_position << " carried no state to compare";
+        EXPECT_NEAR(lazy_state_by_edge[edge_position], eager_state_by_edge[edge_position],
+                    std::fabs(eager_state_by_edge[edge_position]) * 1e-5f + 1e-18f)
+                << "edge " << edge_position << " at its own last spike";
+    }
+
+    lazy_engine.shutdown();
+    eager_engine.shutdown();
+}
+
+TEST(SpikeEngine, the_edge_attribute_plane_layout_matches_the_generated_source) {
+    // The engine fills these planes and the generated kernel indexes them, each from its own
+    // copy of the layout. A disagreement reads as a wrong delay or a wrong synapse program on
+    // every edge at once, and never as a crash -- so the two copies are compared directly.
+    nml::NML_ParseResult parse_result;
+    nml::CellTypeSpecification cell_type;
+    cell_type.name = "plainCell";
+    cell_type.state_variable_names = {"v"};
+    parse_result.cell_types.push_back(cell_type);
+    parse_result.neurons.push_back(nml::Neuron{});
+
+    const String tick_source = nml::generate_tick_kernel(parse_result).source;
+    EXPECT_NE(tick_source.find("#define SPIKECOREC_EDGE_ATTRIBUTE_DELAY_PLANE " +
+                               to_string(SpikeEngine::EDGE_ATTRIBUTE_DELAY_PLANE)),
+              String::npos)
+            << tick_source;
+    EXPECT_NE(tick_source.find("#define SPIKECOREC_EDGE_ATTRIBUTE_PROGRAM_PLANE " +
+                               to_string(SpikeEngine::EDGE_ATTRIBUTE_PROGRAM_PLANE)),
+              String::npos)
+            << tick_source;
+    EXPECT_NE(tick_source.find("#define SPIKECOREC_EDGE_ATTRIBUTE_UPDATE_TICK_PLANE " +
+                               to_string(SpikeEngine::EDGE_ATTRIBUTE_UPDATE_TICK_PLANE)),
+              String::npos)
+            << tick_source;
+
+    // And the count covers every plane the generated source names.
+    EXPECT_EQ(SpikeEngine::EDGE_ATTRIBUTE_PLANE_COUNT, 3);
+}
+
+TEST(SpikeEngine, an_edge_through_no_synapse_delivers_its_raw_weight_beside_one_that_does_not) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // A model mixing the two kinds of edge, which is what makes the per-edge program plane
+    // load-bearing rather than decorative: an edge whose projection names no synapse must
+    // deliver its raw weight, and an edge that names one must deliver its synapse's scalar,
+    // in the same walk of the same source's row. Getting the plane wrong runs synapse
+    // dynamics on a plain connection -- a plausible number on a connection that declared no
+    // dynamics at all.
+    FixtureDirectory fixture("neuroml_mixed_synapse");
+    String model_path = write_mixed_synapse_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+    ASSERT_EQ(engine.total_neuron_count, 3);
+    EXPECT_EQ(engine.per_edge_synapse_variable_count, 1);
+
+    const s64 first_spike_tick = 3;
+    for (s64 tick = 0; tick <= first_spike_tick; ++tick) engine.step_simulation(tick);
+    ASSERT_EQ(engine.spike_flags.get_contents()[0], 1);
+
+    // Two arrivals, both in the row for tick + 1, one per target.
+    const spikecorec::Vector<RingArrival> arrivals = non_zero_ring_arrivals(engine);
+    ASSERT_EQ(arrivals.size(), 2u);
+
+    f32 synapse_target_arrival = 0.0f;
+    f32 plain_target_arrival = 0.0f;
+    for (const RingArrival &arrival : arrivals) {
+        if (arrival.element_index == ring_element_index(engine, first_spike_tick + 1, 1)) {
+            synapse_target_arrival = arrival.value;
+        }
+        if (arrival.element_index == ring_element_index(engine, first_spike_tick + 1, 2)) {
+            plain_target_arrival = arrival.value;
+        }
+    }
+
+    // The plain edge delivers exactly its declared weight, untouched by any synapse.
+    EXPECT_FLOAT_EQ(plain_target_arrival, 2.5f);
+    // The synapse edge delivers the charge its handler's `weight * ibase` goes on to carry, at
+    // SI magnitude -- which the plain weight would swamp by orders of magnitude if the two
+    // were confused.
+    const f32 step_dt = (f32)engine.network_details.step_dt;
+    const f32 expected_synapse_arrival =
+            (f32)(exponential_synapse_unit_charge((f64)step_dt, 5.0e-4) * 1.0e-9 / (f64)step_dt);
+    EXPECT_NEAR(synapse_target_arrival, expected_synapse_arrival,
+                expected_synapse_arrival * 1e-4f);
+
+    // And the synapse-free edge left no per-edge state behind: nothing ran on it.
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, /*source_node=*/0, /*target_node=*/2),
+                    0.0f);
+    EXPECT_NEAR(engine.weights.get_edge_variable(0, /*source_node=*/0, /*target_node=*/1),
+                1.0e-9f, 1.0e-13f);
+
+    engine.shutdown();
+}
+
+TEST(SpikeEngine, lazy_and_eager_agree_for_a_synapse_whose_state_starts_non_zero) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // What pins down the seed of the last-advanced-tick plane. An edge that has never been
+    // advanced is seeded to -1, not 0, because at tick 0 the eager pass takes one step and
+    // the catch-up has to take the same one. With an all-zero OnStart that step is a step of
+    // nothing and both seeds agree, which is why this needs a synapse whose OnStart leaves
+    // real state behind -- its first spike then lands on a value the two policies have
+    // decayed a DIFFERENT number of times if the seed is wrong.
+    FixtureDirectory lazy_fixture("neuroml_priming_lazy");
+    FixtureDirectory eager_fixture("neuroml_priming_eager");
+    String lazy_model_path = write_priming_synapse_model(lazy_fixture);
+    String eager_model_path = write_priming_synapse_model(eager_fixture);
+
+    SpikeEngine lazy_engine(lazy_model_path, /*enable_hebbian_learning=*/false,
+                            /*use_lazy_synapse_updates=*/true);
+    SpikeEngine eager_engine(eager_model_path, /*enable_hebbian_learning=*/false,
+                             /*use_lazy_synapse_updates=*/false);
+
+    const s64 first_spike_tick = 3;
+    const s64 second_spike_tick = 9;
+
+    // The reference the seed decides: I starts at ibase and takes one step per tick from tick
+    // 0, so by the first spike it has taken first_spike_tick + 1 of them.
+    //
+    // What the seed changes is the STATE, not the delivered amount -- this handler's increment
+    // is the same whatever it lands on -- so the state is what the two policies are compared
+    // through, read straight out of the per-edge planes.
+    const f32 step_dt = (f32)lazy_engine.network_details.step_dt;
+    const f32 tau = 5.0e-4f;
+    f32 expected_state = 1.0e-9f;
+    for (s64 tick = 0; tick <= first_spike_tick; ++tick) {
+        expected_state = expected_state + step_dt * (-expected_state / tau);
+    }
+    const f32 expected_state_after_first_spike = expected_state + 1.0e-9f;
+
+    f32 lazy_state_after_first_spike = 0.0f;
+    f32 eager_state_after_first_spike = 0.0f;
+
+    for (s64 tick = 0; tick <= second_spike_tick; ++tick) {
+        lazy_engine.step_simulation(tick);
+        eager_engine.step_simulation(tick);
+
+        if (tick != first_spike_tick && tick != second_spike_tick) continue;
+
+        const spikecorec::Vector<RingArrival> lazy_arrivals =
+                non_zero_ring_arrivals(lazy_engine);
+        const spikecorec::Vector<RingArrival> eager_arrivals =
+                non_zero_ring_arrivals(eager_engine);
+        ASSERT_EQ(lazy_arrivals.size(), 1u) << "tick " << tick;
+        ASSERT_EQ(eager_arrivals.size(), 1u) << "tick " << tick;
+
+        EXPECT_NEAR(lazy_arrivals[0].value, eager_arrivals[0].value,
+                    std::fabs(eager_arrivals[0].value) * 1e-5f + 1e-18f)
+                << "tick " << tick << ": the two policies delivered different amounts";
+
+        const f32 lazy_state = lazy_engine.weights.get_edge_variable(0, 0, 1);
+        const f32 eager_state = eager_engine.weights.get_edge_variable(0, 0, 1);
+        EXPECT_NEAR(lazy_state, eager_state, std::fabs(eager_state) * 1e-5f + 1e-18f)
+                << "tick " << tick << ": the catch-up applied a different number of steps than "
+                << "the eager pass";
+
+        if (tick == first_spike_tick) {
+            lazy_state_after_first_spike = lazy_state;
+            eager_state_after_first_spike = eager_state;
+        }
+    }
+
+    // And both agree with the step count derived above, so this is not two policies agreeing
+    // on the same wrong number.
+    EXPECT_NEAR(eager_state_after_first_spike, expected_state_after_first_spike,
+                std::fabs(expected_state_after_first_spike) * 1e-4f);
+    EXPECT_NEAR(lazy_state_after_first_spike, expected_state_after_first_spike,
+                std::fabs(expected_state_after_first_spike) * 1e-4f);
+
+    lazy_engine.shutdown();
+    eager_engine.shutdown();
+}
+
+TEST(SpikeEngine, two_synapses_on_one_target_keep_their_own_per_edge_state) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // Two edges converging on one neuron through prototypes differing in tau and ibase. Each
+    // carries its own state planes, so the target sees the sum of two independent responses.
+    // Pooling them would have to decay the total at one rate, which is neither of theirs.
+    FixtureDirectory fixture("neuroml_two_tau_per_edge");
+    String model_path = write_two_tau_per_edge_model(fixture);
 
     SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
     ASSERT_EQ(engine.total_neuron_count, 3);
 
-    // Two wired prototypes: three planes, and two state variables each per neuron.
-    EXPECT_EQ(engine.network_input_plane_count, 3);
-    EXPECT_EQ(engine.synapse_state_element_count, 4 * engine.total_neuron_count);
+    // One state variable per program, two programs.
+    EXPECT_EQ(engine.per_edge_synapse_variable_count, 2);
 
     const f32 step_dt = (f32)engine.network_details.step_dt;
-    const s64 tick_count = 60;
-    const s64 arrival_tick = 4;
+    ExponentialCurrentSynapseReference fast_reference(/*tau=*/5.0e-4f, /*ibase=*/1.0e-9f);
+    ExponentialCurrentSynapseReference slow_reference(/*tau=*/2.0e-3f, /*ibase=*/3.0e-9f);
 
-    AlphaSynapseReference fast_reference(/*tau=*/5.0e-4f, /*ibase=*/1.0e-9f);
-    AlphaSynapseReference slow_reference(/*tau=*/2.0e-3f, /*ibase=*/1.0e-9f);
-    // What a single pooled state would give: the two arrivals summed into one synapse, which
-    // is what the design must NOT do.
-    AlphaSynapseReference pooled_reference(/*tau=*/5.0e-4f, /*ibase=*/1.0e-9f);
+    // Source 0 fires at ticks 3 and 9 through the fast edge (delay 1 tick); source 1 fires at
+    // ticks 5 and 17 through the slow edge (delay 2 ticks).
+    const f32 first_fast = fast_reference.deliver(step_dt, 3, 1.0f);
+    const f32 first_slow = slow_reference.deliver(step_dt, 5, 1.0f);
+    const f32 second_fast = fast_reference.deliver(step_dt, 9, 1.0f);
+    const f32 second_slow = slow_reference.deliver(step_dt, 17, 1.0f);
 
-    for (s64 tick = 0; tick < tick_count; ++tick) {
+    spikecorec::Vector<f32> delivered_by_tick((usize)40, 0.0f);
+    for (s64 tick = 0; tick < 40; ++tick) {
         engine.step_simulation(tick);
-
-        const f32 arrival_weight = tick == arrival_tick ? 1.0f : 0.0f;
-        const f32 expected = fast_reference.step(step_dt, arrival_weight) +
-                             slow_reference.step(step_dt, arrival_weight);
-        const f32 pooled = pooled_reference.step(step_dt, 2.0f * arrival_weight);
-        const f32 delivered = trace_cell_last_input(engine, /*neuron_index=*/2);
-
-        EXPECT_NEAR(delivered, expected, std::fabs(expected) * 1e-4f + 1e-15f)
-                << "tick " << tick << ": the two synapses did not each decay at their own tau";
-
-        // Late enough that the fast response has all but gone and the slow one has not: if
-        // the two had been pooled at one rate the difference would be plain.
-        if (tick >= arrival_tick + 30) {
-            EXPECT_GT(delivered, 4.0f * pooled)
-                    << "tick " << tick << ": the delivered current decayed like a single "
-                    << "pooled synapse rather than like two with different tau";
-        }
+        delivered_by_tick[(usize)tick] = trace_cell_last_input(engine, /*neuron_index=*/2);
     }
+
+    auto expect_delivery = [&](s64 tick, f32 expected) {
+        EXPECT_NEAR(delivered_by_tick[(usize)tick], expected,
+                    std::fabs(expected) * 1e-4f + 1e-15f)
+                << "tick " << tick;
+    };
+    expect_delivery(4, first_fast);
+    expect_delivery(7, first_slow);
+    expect_delivery(10, second_fast);
+    expect_delivery(19, second_slow);
+
+    // The two really are on different clocks. What one event delivers is ibase * tau, so the
+    // ratio between the two edges pins BOTH prototype parameters at once: pooling them onto
+    // one program would give the two edges one amplitude, and mixing up which tau belongs to
+    // which would give the reciprocal ratio.
+    const f32 expected_amplitude_ratio = (3.0e-9f * 2.0e-3f) / (1.0e-9f * 5.0e-4f);
+    EXPECT_NEAR(first_slow / first_fast, expected_amplitude_ratio,
+                expected_amplitude_ratio * 1e-3f)
+            << "the two edges did not each keep their own tau and ibase";
+    EXPECT_NEAR(second_slow / second_fast, expected_amplitude_ratio,
+                expected_amplitude_ratio * 1e-3f);
 
     engine.shutdown();
 }
@@ -1713,10 +2683,9 @@ TEST(SpikeEngine, a_declared_but_unwired_synapse_prototype_is_neither_lowered_no
     // Both prototypes reached the parse result, so this is not passing by their absence.
     EXPECT_GE(engine.network_details.synapse_prototypes.size(), 2u);
 
-    // Neither is wired, so the ring keeps its single delivered-current plane and no synapse
-    // state is allocated at all.
-    EXPECT_EQ(engine.network_input_plane_count, 1);
-    EXPECT_EQ(engine.synapse_state_element_count, 0);
+    // Neither is wired, so no per-edge synapse state is allocated at all.
+    EXPECT_EQ(engine.per_edge_synapse_variable_count, 0);
+    EXPECT_EQ(engine.weights.per_edge_variable_count, 0);
 
     // And the synapse-free projection still delivers its raw weight, one tick late.
     const LatchCellReader target(engine, /*neuron_index=*/1);
@@ -1727,7 +2696,180 @@ TEST(SpikeEngine, a_declared_but_unwired_synapse_prototype_is_neither_lowered_no
     engine.shutdown();
 }
 
+TEST(SpikeEngine, an_alpha_current_synapse_delivers_the_charge_its_handler_sets_in_motion) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // alphaCurrentSynapse is the shape that makes sampling the exposure useless: its handler
+    // bumps J, its `i` exposes I, and I only grows out of J over the ticks that follow. So at
+    // the instant of the spike I is whatever it had decayed to -- exactly zero for an isolated
+    // first spike, at any weight. A network built out of these propagated nothing, silently,
+    // while every unit test passed.
+    //
+    // What is delivered instead is the whole charge the event sets in motion: e * tau per unit
+    // of J, as the discrete scheme actually produces it, delivered as the current that carries
+    // it in one tick.
+    FixtureDirectory fixture("neuroml_alpha_impulsive_delivery");
+    String model_path = write_alpha_synapse_model(fixture);
+
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    const f32 step_dt = (f32)engine.network_details.step_dt;
+    const s64 spike_tick = 3;
+    for (s64 tick = 0; tick <= spike_tick; ++tick) engine.step_simulation(tick);
+
+    ASSERT_EQ(engine.spike_flags.get_contents()[0], 1);
+    const spikecorec::Vector<RingArrival> arrivals = non_zero_ring_arrivals(engine);
+    ASSERT_EQ(arrivals.size(), 1u)
+            << "the first spike through an alphaCurrentSynapse delivered nothing, which is what "
+               "sampling the `i` exposure at the spike does";
+
+    // e * tau * (weight * ibase) / dt, with the alpha's own tau of 0.5ms and ibase of 1nA.
+    const f64 unit_charge = alpha_synapse_unit_charge((f64)step_dt, 5.0e-4);
+    const f32 expected = (f32)(unit_charge * 1.0e-9 / (f64)step_dt);
+    EXPECT_NEAR(arrivals[0].value, expected, expected * 1e-3f);
+
+    // Its state moved as declared: J carries the arrival, I has not risen yet. The state is
+    // live and stays live; it is only the DELIVERY that is impulsive.
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, 0, 1), 0.0f);  // I
+    EXPECT_NEAR(engine.weights.get_edge_variable(1, 0, 1), 1.0e-9f, 1.0e-13f);  // J
+
+    engine.shutdown();
+}
+
 // ── regimes ────────────────────────────────────────────────────────────────────
+
+TEST(SpikeEngine, recording_a_type_with_a_regime_and_no_state_variable_is_refused) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The regime index is appended to the cell's own cell_state chunk, so a type declaring a
+    // Regime and no StateVariable has cell_state_element_count > 0 while having nothing to
+    // record. A refusal keyed on that count therefore stopped firing for exactly this shape,
+    // and the recorder would have written out regime numbers as if they were a membrane
+    // potential -- plausible values, wrong quantity, no diagnostic.
+    FixtureDirectory fixture("neuroml_regime_only_recording");
+    String model_path = write_regime_only_model(fixture);
+
+    try {
+        SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+        engine.shutdown();
+        FAIL() << "expected recording a StateVariable-free cell type to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("regimeOnlyCell"), String::npos) << message;
+        EXPECT_NE(message.find("StateVariable"), String::npos) << message;
+    }
+}
+
+TEST(SpikeEngine, recording_a_regime_only_type_by_an_undeclared_name_is_refused) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The other half of the same hole. A selection naming a variable the cell type does not
+    // declare falls back to the neuron's FIRST cell_state slot -- and for a type carrying a
+    // Regime and no StateVariable that slot is the appended regime index. The recording would
+    // then be a column of 0s and 1s under a heading that says `v`: plausible values, wrong
+    // quantity, no diagnostic. The refusal has to key on the type's DECLARATIONS, which is the
+    // only thing that distinguishes this shape.
+    FixtureDirectory fixture("neuroml_regime_only_named_recording");
+    String model_path = write_regime_only_named_selection_model(fixture);
+
+    try {
+        SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+        engine.shutdown();
+        FAIL() << "expected a named selection on a StateVariable-free cell type to be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("regimeOnlyCell"), String::npos) << message;
+        EXPECT_NE(message.find("StateVariable"), String::npos) << message;
+    }
+}
+
+TEST(SpikeEngine, a_regime_refractory_period_lasts_the_ticks_the_reference_freezes_for) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
+
+    // The GLIF shape, at the parameters the reference traces were captured with: a refractory
+    // regime whose `refractoryTimeElapsed' = 1` counts up to t_ref = 5ms at dt = 0.1ms.
+    //
+    // The expectation is derived from the MECHANISM -- how many increments of dt reach t_ref
+    // in the f64 the reference implementation integrates in -- rather than from any recorded
+    // trace. Calibrating on a trace would be worthless here: a 2% perturbation of t_ref and
+    // this f32 defect are the same size and cancel, so a model with the wrong t_ref reproduces
+    // the reference on a broken engine.
+    FixtureDirectory fixture("neuroml_glif3_refractory_five_milliseconds");
+    String model_path = write_glif3_refractory_model_at_five_milliseconds(fixture);
+    SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
+
+    const f64 step_dt = engine.network_details.step_dt;
+    const f64 refractory_period = 5.0e-3;
+    ASSERT_NEAR(step_dt, 1.0e-4, 1e-12);
+
+    const s64 reference_increment_count =
+            reference_refractory_increment_count(step_dt, refractory_period);
+    ASSERT_EQ(reference_increment_count, 50);
+
+    // What the same run gives WITHOUT the compensation, so this test cannot pass with the
+    // compensation removed: it is a different number, and the engine is held to the other one.
+    const s64 uncompensated_increment_count =
+            uncompensated_refractory_increment_count((f32)step_dt, (f32)refractory_period);
+    ASSERT_EQ(uncompensated_increment_count, 51);
+
+    const nml::CellRegimeLayout regimes =
+            nml::resolve_cell_regimes(engine.network_details.cell_types[0]);
+    ASSERT_TRUE(regimes.has_regimes());
+    const s64 state_base = engine.cell_state_base.get_contents()[0];
+    const s64 regime_slot = state_base + (s64)regimes.regime_state_slot;
+    const s64 refractory_regime_index = regimes.index_of("refractory");
+    ASSERT_GE(refractory_regime_index, 0);
+
+    spikecorec::Vector<s64> refractory_run_lengths;
+    spikecorec::Vector<s64> frozen_membrane_run_lengths;
+    s64 refractory_run_length = 0;
+    s64 frozen_run_length = 1;
+    f32 previous_membrane_potential = 0.0f;
+
+    for (s64 tick = 0; tick < engine.lifetime; ++tick) {
+        engine.step_simulation(tick);
+        const f32 *cell_state = engine.cell_state.get_contents();
+
+        if ((s64)cell_state[regime_slot] == refractory_regime_index) {
+            refractory_run_length += 1;
+        } else if (refractory_run_length > 0) {
+            refractory_run_lengths.push_back(refractory_run_length);
+            refractory_run_length = 0;
+        }
+
+        const f32 membrane_potential = cell_state[state_base];
+        if (tick > 0 && membrane_potential == previous_membrane_potential) {
+            frozen_run_length += 1;
+        } else {
+            if (frozen_run_length > 1) frozen_membrane_run_lengths.push_back(frozen_run_length);
+            frozen_run_length = 1;
+        }
+        previous_membrane_potential = membrane_potential;
+    }
+
+    ASSERT_GE(refractory_run_lengths.size(), 3u)
+            << "the cell did not enter the refractory regime often enough to measure";
+    // The drive is on from tick 0, so v moves on every tick it is not held: every frozen run
+    // is a refractory hold and there is exactly one of each per spike.
+    ASSERT_EQ(frozen_membrane_run_lengths.size(), refractory_run_lengths.size());
+
+    // One increment per tick spent in the regime, so the run length IS the increment count.
+    for (usize index = 0; index < refractory_run_lengths.size(); ++index) {
+        EXPECT_EQ(refractory_run_lengths[index], reference_increment_count)
+            << "refractory hold " << index << " lasted " << refractory_run_lengths[index]
+            << " ticks where the reference takes " << reference_increment_count
+            << " increments of dt to reach t_ref";
+    }
+
+    // And what a recorded trace sees: the reset sample plus every held one, which is one more
+    // sample than the number of increments.
+    for (usize index = 0; index < frozen_membrane_run_lengths.size(); ++index) {
+        EXPECT_EQ(frozen_membrane_run_lengths[index], reference_increment_count + 1)
+                << "frozen membrane run " << index;
+    }
+
+    engine.shutdown();
+}
 
 TEST(SpikeEngine, a_regime_bearing_cell_type_widens_its_state_chunk_by_one_slot) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not vendored";
@@ -1771,10 +2913,14 @@ TEST(SpikeEngine, a_glif3_cell_refracts_pinning_v_while_its_after_spike_currents
     SpikeEngine engine(model_path, /*enable_hebbian_learning=*/false);
 
     const f32 reset_potential = -0.075f;
-    // t_ref = 1ms at step = 0.1ms -- eleven ticks, not ten; see
-    // refractory_window_tick_count.
+    // t_ref = 1ms at step = 0.1ms. Eleven ticks, not ten: this is the (dt, t_ref) pair where
+    // 10 * f32(0.1ms) still lands below f32(1ms) even summed exactly, so it is one tick longer
+    // than the reference and the compensation cannot shorten it. See
+    // compensated_refractory_increment_count, and
+    // a_regime_refractory_period_lasts_the_ticks_the_reference_freezes_for for the pair where
+    // the two do agree.
     const s64 refractory_tick_count =
-            refractory_window_tick_count((f32)engine.network_details.step_dt, 1e-3f);
+            compensated_refractory_increment_count((f32)engine.network_details.step_dt, 1e-3f);
     ASSERT_EQ(refractory_tick_count, 11);
 
     const spikecorec::Vector<Glif3Sample> samples =

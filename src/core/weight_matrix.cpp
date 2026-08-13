@@ -164,9 +164,12 @@ WeightMatrix::~WeightMatrix() {
     for (auto &coefficient_vector : coefficient_vectors) {
         deallocate(std::move(coefficient_vector));
     }
+    // The per-edge variable matrices' entries here are null handles -- their storage is
+    // the one contiguous block released just below -- and deallocate tolerates a null.
     for (auto &delta_buffer : sparse_delta_buffers) {
         deallocate(std::move(delta_buffer));
     }
+    deallocate(std::move(per_edge_variable_values));
 }
 
 WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
@@ -189,6 +192,7 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
         deallocate(std::move(delta_buffer));
     }
     sparse_delta_buffers.clear();
+    deallocate(std::move(per_edge_variable_values));
 
     // k2tree is a K2Tree sub-object (not a pointer), and K2Tree's own defaulted
     // move-assignment operator has the identical GpuPointer-assert problem as
@@ -206,6 +210,9 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     // sparse_delta_touched is plain host memory (vector<bool>) — an ordinary
     // vector move-assignment, no GPU-asserting-move hazard to work around here.
     sparse_delta_touched = std::move(other.sparse_delta_touched);
+    per_edge_variable_values = std::move(other.per_edge_variable_values);
+    per_edge_variable_count = other.per_edge_variable_count;
+    per_edge_variable_matrix_base = other.per_edge_variable_matrix_base;
     delay_matrix_index = other.delay_matrix_index;
     node_count = other.node_count;
     max_neighbor_count = other.max_neighbor_count;
@@ -292,7 +299,136 @@ void WeightMatrix::configure_per_edge_variable_count(s64 count) {
         log::throw_invalid_argument(log::logger(),
             fmt::format("WeightMatrix::configure_per_edge_variable_count: count must be >= 0 (got {})", count));
     }
+    if (count == per_edge_variable_count) {
+        return;
+    }
+    // Reconfiguring would leave the already-registered matrices in the family with
+    // nothing addressing them and would move every later variable's plane offset out
+    // from under whatever already read it -- both silent.
+    if (per_edge_variable_count != 0) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::configure_per_edge_variable_count: already configured for "
+                        "{} per-edge variables; reconfiguring to {} would orphan the registered "
+                        "matrices and move every plane offset", per_edge_variable_count, count));
+    }
+
     per_edge_variable_count = count;
+    if (count == 0) {
+        return;
+    }
+
+    // One contiguous, zero-filled plane block behind all of them (see the header comment
+    // on per_edge_variable_values for why contiguous). allocate<f32> does not
+    // zero-initialize, and "never written" has to read back as exactly 0.0f.
+    const s64 slot_count = node_count * max_neighbor_count;
+    if (slot_count > 0) {
+        const usize byte_count = (usize)(count * slot_count) * sizeof(f32);
+        per_edge_variable_values = allocate<f32>(byte_count);
+        memset(per_edge_variable_values.get_contents(), 0, byte_count);
+    }
+
+    per_edge_variable_matrix_base = matrix_count();
+    for (s64 variable_index = 0; variable_index < count; ++variable_index) {
+        // Registered through the ordinary family path, so a per-edge synapse state
+        // variable is stored by exactly the machinery per-edge delay already uses.
+        // add_coefficient_vector pushes a null Sk handle for it (see
+        // allocate_sparse_delta_buffer); sparse_delta_data_for routes its reads and
+        // writes into this instance's plane block instead.
+        const s64 matrix_index = add_coefficient_vector(vector<f32>((usize)rank, 0.0f));
+        pin_coefficient_vector_to_zero(matrix_index);
+
+        // add_coefficient_vector gives every new matrix an Sk allocation of its own;
+        // this family's storage is the shared plane block instead, so release it and
+        // leave a null handle behind (deallocate's move leaves the handle null, which is
+        // what sparse_delta_data_for keys off).
+        deallocate(std::move(sparse_delta_buffers[(usize)matrix_index]));
+
+        // The plane IS the value from the moment it exists, so the untouched fast path
+        // in lookup_sparse_delta/apply_sparse_delta_overlay must not skip it.
+        sparse_delta_touched[(usize)matrix_index] = true;
+    }
+
+    log::logger().debug("configure_per_edge_variable_count: count={} matrix_base={} slot_count={}",
+                        count, per_edge_variable_matrix_base, slot_count);
+}
+
+bool WeightMatrix::is_per_edge_variable_matrix(s64 matrix_index) const {
+    return per_edge_variable_matrix_base >= 0 &&
+           matrix_index >= per_edge_variable_matrix_base &&
+           matrix_index < per_edge_variable_matrix_base + per_edge_variable_count;
+}
+
+s64 WeightMatrix::per_edge_variable_matrix_index(s64 variable_index) const {
+    if (variable_index < 0 || variable_index >= per_edge_variable_count) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::per_edge_variable_matrix_index: variable_index {} out of "
+                        "range [0, {})", variable_index, per_edge_variable_count));
+    }
+    return per_edge_variable_matrix_base + variable_index;
+}
+
+void WeightMatrix::set_edge_variable(s64 variable_index, s32 source_node, s32 target_node,
+                                     f32 value) {
+    log::logger().trace("set_edge_variable: variable_index={} source_node={} target_node={} value={}",
+                        variable_index, source_node, target_node, value);
+    const s64 matrix_index = per_edge_variable_matrix_index(variable_index);
+
+    // The same edge-scoped contract set_edge_weight/set_edge_delay_ticks document, and
+    // deliberately independent of the check_indexing knob for the same reason.
+    bool in_bounds = source_node >= 0 && source_node < node_count &&
+                     target_node >= 0 && target_node < node_count;
+    if (!in_bounds) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_variable: (source_node={}, target_node={}) out of "
+                        "bounds for node_count={}", source_node, target_node, node_count));
+    }
+    if (!k2tree.adjacent(source_node, target_node)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_variable: (source_node={}, target_node={}) is not "
+                        "a real edge", source_node, target_node));
+    }
+    optional<s64> slot = find_neighbor_slot(source_node, target_node);
+    if (!slot.has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_edge_variable: (source_node={}, target_node={}) is a "
+                        "real edge but not representable within max_neighbor_count={}",
+                        source_node, target_node, max_neighbor_count));
+    }
+
+    // An absolute write, not an accumulate. This matrix's Ck is all-zero, so the plane
+    // slot IS the value and nothing is subtracted off an order-1 reconstruction -- which
+    // is precisely the subtraction that annihilates a 1e-12 synapse state in f32 (see
+    // using_exact_edge_weights for the arithmetic).
+    f32 *plane_data = sparse_delta_data_for(matrix_index);
+    plane_data[source_node * max_neighbor_count + *slot] = value;
+}
+
+f32 WeightMatrix::get_edge_variable(s64 variable_index, s32 source_node, s32 target_node) const {
+    const s64 matrix_index = per_edge_variable_matrix_index(variable_index);
+
+    bool in_bounds = source_node >= 0 && source_node < node_count &&
+                     target_node >= 0 && target_node < node_count;
+    if (!in_bounds) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::get_edge_variable: (source_node={}, target_node={}) out of "
+                        "bounds for node_count={}", source_node, target_node, node_count));
+    }
+    if (!k2tree.adjacent(source_node, target_node)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::get_edge_variable: (source_node={}, target_node={}) is not "
+                        "a real edge", source_node, target_node));
+    }
+    if (!find_neighbor_slot(source_node, target_node).has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::get_edge_variable: (source_node={}, target_node={}) is a "
+                        "real edge but not representable within max_neighbor_count={}",
+                        source_node, target_node, max_neighbor_count));
+    }
+
+    // Read straight out of the plane rather than through get_for_matrix()'s
+    // reconstruct-then-add: the all-zero Ck makes the low-rank term identically 0.0f, so
+    // the two agree exactly and this one cannot be perturbed by U/V.
+    return lookup_sparse_delta(matrix_index, source_node, target_node);
 }
 
 bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
@@ -359,6 +495,34 @@ GpuPointer<f32> WeightMatrix::allocate_sparse_delta_buffer() const {
     return delta_buffer;
 }
 
+void WeightMatrix::pin_coefficient_vector_to_zero(s64 matrix_index) {
+    s64 effective_lane_count = rank_float4_stride * 4;
+    f32 *coefficient_data = coefficient_vectors[(usize)matrix_index].get_contents();
+    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
+        coefficient_data[lane_index] = 0.0f;
+    }
+}
+
+f32 *WeightMatrix::sparse_delta_data_for(s64 matrix_index) {
+    if (is_per_edge_variable_matrix(matrix_index)) {
+        if (per_edge_variable_values.pointer == nullptr) return nullptr;
+        const s64 plane_index = matrix_index - per_edge_variable_matrix_base;
+        return per_edge_variable_values.get_contents() + plane_index * node_count * max_neighbor_count;
+    }
+    if (sparse_delta_buffers[(usize)matrix_index].pointer == nullptr) return nullptr;
+    return sparse_delta_buffers[(usize)matrix_index].get_contents();
+}
+
+const f32 *WeightMatrix::sparse_delta_data_for(s64 matrix_index) const {
+    if (is_per_edge_variable_matrix(matrix_index)) {
+        if (per_edge_variable_values.pointer == nullptr) return nullptr;
+        const s64 plane_index = matrix_index - per_edge_variable_matrix_base;
+        return per_edge_variable_values.get_contents() + plane_index * node_count * max_neighbor_count;
+    }
+    if (sparse_delta_buffers[(usize)matrix_index].pointer == nullptr) return nullptr;
+    return sparse_delta_buffers[(usize)matrix_index].get_contents();
+}
+
 void WeightMatrix::ensure_delay_matrix_registered() {
     if (delay_matrix_index >= 0) {
         return;
@@ -368,16 +532,9 @@ void WeightMatrix::ensure_delay_matrix_registered() {
     // exactly the same machinery as every other per-edge variable.
     delay_matrix_index = add_coefficient_vector(vector<f32>((usize)rank, 0.0f));
 
-    // add_coefficient_vector fills the padding lanes beyond the logical `rank` with
-    // the neutral 1.0f (see allocate_coefficient_vector), which would leave a
-    // nonzero low-rank term whenever rank is not a multiple of 4. Delay must
-    // reconstruct as EXACTLY its Sk entry and stay invariant under refit()'s U/V
-    // re-fit, so force every lane — padding included — to 0.0f.
-    s64 effective_lane_count = rank_float4_stride * 4;
-    f32 *delay_coefficients = coefficient_vectors[(usize)delay_matrix_index].get_contents();
-    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
-        delay_coefficients[lane_index] = 0.0f;
-    }
+    // Delay must reconstruct as EXACTLY its Sk entry and stay invariant under refit()'s
+    // U/V re-fit -- see pin_coefficient_vector_to_zero for why the padding lanes matter.
+    pin_coefficient_vector_to_zero(delay_matrix_index);
     log::logger().debug("ensure_delay_matrix_registered: delay_matrix_index={}", delay_matrix_index);
 }
 
@@ -397,7 +554,7 @@ void WeightMatrix::enable_exact_edge_weights() {
     if (delta_buffer_element_count > 0) {
         const f32 *default_coefficients =
             coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents();
-        f32 *delta_data = sparse_delta_buffers[(usize)DEFAULT_MATRIX_INDEX].get_contents();
+        f32 *delta_data = sparse_delta_data_for(DEFAULT_MATRIX_INDEX);
         vector<s32> neighbor_buffer((usize)max_neighbor_count);
         for (s64 node_index = 0; node_index < node_count; ++node_index) {
             s64 degree = get_neighbors(node_index, neighbor_buffer.data());
@@ -414,19 +571,12 @@ void WeightMatrix::enable_exact_edge_weights() {
         sparse_delta_touched[(usize)DEFAULT_MATRIX_INDEX] = true;
     }
 
-    // ---- Step 2: pin the default matrix's Ck to all-zero, padding lanes included (the
-    // constructor fills those with the neutral 1.0f -- see allocate_coefficient_vector --
-    // which would leave a nonzero low-rank term whenever rank is not a multiple of 4).
-    // With every lane zero, reconstruct_entry sums u * (0.0f * v) terms and returns
-    // exactly 0.0f, so an edge reads back as exactly its Sk entry no matter what U and V
-    // hold now or after any later refit. Identical in shape and purpose to
-    // ensure_delay_matrix_registered's own zeroing.
-    s64 effective_lane_count = rank_float4_stride * 4;
-    f32 *default_coefficient_data =
-        coefficient_vectors[(usize)DEFAULT_MATRIX_INDEX].get_contents();
-    for (s64 lane_index = 0; lane_index < effective_lane_count; ++lane_index) {
-        default_coefficient_data[lane_index] = 0.0f;
-    }
+    // ---- Step 2: pin the default matrix's Ck to all-zero. With every lane zero,
+    // reconstruct_entry sums u * (0.0f * v) terms and returns exactly 0.0f, so an edge
+    // reads back as exactly its Sk entry no matter what U and V hold now or after any
+    // later refit. Identical in shape and purpose to ensure_delay_matrix_registered's own
+    // zeroing -- see pin_coefficient_vector_to_zero.
+    pin_coefficient_vector_to_zero(DEFAULT_MATRIX_INDEX);
 
     using_exact_edge_weights = true;
     log::logger().debug("enable_exact_edge_weights: default matrix pinned to its sparse "
@@ -473,7 +623,7 @@ void WeightMatrix::set_edge_weight(s32 source_node, s32 target_node, f32 weight)
     // this slot IS the weight and get() returns `0.0f + weight`, which is `weight` itself
     // for every finite f32. Nothing is subtracted off a reconstruction, so nothing can be
     // rounded away.
-    f32 *delta_data = sparse_delta_buffers[(usize)DEFAULT_MATRIX_INDEX].get_contents();
+    f32 *delta_data = sparse_delta_data_for(DEFAULT_MATRIX_INDEX);
     delta_data[source_node * max_neighbor_count + *slot] = weight;
     sparse_delta_touched[(usize)DEFAULT_MATRIX_INDEX] = true;
 }
@@ -502,7 +652,10 @@ f32 WeightMatrix::lookup_sparse_delta(s64 matrix_index, s32 source_node, s32 tar
     if (!slot.has_value()) {
         return 0.0f;
     }
-    const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+    const f32 *delta_data = sparse_delta_data_for(matrix_index);
+    if (delta_data == nullptr) {
+        return 0.0f;
+    }
     return delta_data[source_node * max_neighbor_count + *slot];
 }
 
@@ -516,7 +669,10 @@ void WeightMatrix::apply_sparse_delta_overlay(f32 *output_weights, s64 matrix_in
     // shape (see the header comment on sparse_delta_buffers), so overlaying Sk is
     // a plain element-wise add — no neighbor walk needed. Slots beyond a node's
     // real degree, and any real edge never accumulated into, are exactly 0.0f.
-    const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+    const f32 *delta_data = sparse_delta_data_for(matrix_index);
+    if (delta_data == nullptr) {
+        return;
+    }
     s64 total_pair_count = node_count * max_neighbor_count;
     for (s64 pair_index = 0; pair_index < total_pair_count; ++pair_index) {
         output_weights[(usize)pair_index] += delta_data[pair_index];
@@ -589,6 +745,14 @@ void WeightMatrix::set_coefficient_vector(s64 matrix_index, const vector<f32> &c
                         "delay matrix, whose Ck is pinned to all-zero so a delay reads back as "
                         "exactly its Sk entry -- overwriting it would corrupt every stored "
                         "delay; use set_edge_delay_ticks() instead", matrix_index));
+    }
+    if (is_per_edge_variable_matrix(matrix_index)) {
+        log::throw_invalid_argument(log::logger(),
+            fmt::format("WeightMatrix::set_coefficient_vector: matrix_index={} is per-edge "
+                        "variable {}, whose Ck is pinned to all-zero so its stored plane is the "
+                        "whole value -- overwriting it would add an order-1 low-rank term to "
+                        "every per-edge synapse state variable at once; use set_edge_variable() "
+                        "instead", matrix_index, matrix_index - per_edge_variable_matrix_base));
     }
 
     if ((s64)coefficients.size() != rank) {
@@ -695,7 +859,7 @@ void WeightMatrix::accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 
                         source_node, target_node, max_neighbor_count));
     }
 
-    f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+    f32 *delta_data = sparse_delta_data_for(matrix_index);
     delta_data[source_node * max_neighbor_count + *slot] += delta;
     sparse_delta_touched[(usize)matrix_index] = true;
 }
@@ -1029,7 +1193,15 @@ f32 WeightMatrix::max_sparse_delta_occupancy_fraction() const {
         if (matrix_index == DEFAULT_MATRIX_INDEX && using_exact_edge_weights) {
             continue;
         }
-        const f32 *delta_data = sparse_delta_buffers[(usize)matrix_index].get_contents();
+        // A per-edge variable's plane holds the model's live synapse state, permanently
+        // and by design -- not drift awaiting a refit. It is exempt from refit's clear
+        // for that reason, so counting it here would pin this fraction near 100% forever
+        // and make the occupancy trigger fire on every tick, exactly as it would for the
+        // delay and exact-weight planes above.
+        if (is_per_edge_variable_matrix(matrix_index)) {
+            continue;
+        }
+        const f32 *delta_data = sparse_delta_data_for(matrix_index);
         s64 occupied_slot_count = 0;
         for (s64 slot_index = 0; slot_index < total_slot_count; ++slot_index) {
             if (delta_data[slot_index] != 0.0f) {
@@ -1090,8 +1262,11 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
             if (matrix_index == DEFAULT_MATRIX_INDEX && using_exact_edge_weights) {
                 continue; // see the exact-weight exemption comment on the main clear below
             }
+            if (is_per_edge_variable_matrix(matrix_index)) {
+                continue; // see the per-edge variable exemption comment on the main clear below
+            }
             if (delta_buffer_element_count > 0) {
-                memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
+                memset(sparse_delta_data_for(matrix_index), 0,
                        (usize)delta_buffer_element_count * sizeof(f32));
             }
             sparse_delta_touched[(usize)matrix_index] = false;
@@ -1201,6 +1376,16 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
             // all-zero Ck zeroes every term), which is why no separate exclusion is
             // needed there: delay magnitudes never drag the shared basis around.
             if (matrix_index == delay_matrix_index) {
+                continue;
+            }
+            // Every per-edge variable matrix's Ck is pinned all-zero on exactly the same
+            // grounds, and for exactly the same reason: it is what makes a synapse state
+            // variable read back as precisely its stored plane entry rather than that
+            // entry plus an order-1 low-rank term, both here and in the generated kernel,
+            // which reads the same plane on device. Fitting it would also let synapse
+            // state magnitudes drag the shared basis around, since the U/V updates below
+            // are Ck-weighted and an all-zero Ck zeroes every one of their terms.
+            if (is_per_edge_variable_matrix(matrix_index)) {
                 continue;
             }
 
@@ -1334,8 +1519,17 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
         if (matrix_index == DEFAULT_MATRIX_INDEX && using_exact_edge_weights) {
             continue;
         }
+        // Every per-edge variable matrix is exempt on the same grounds again: its plane is
+        // not pending drift, it is where the model's live per-edge synapse state lives, and
+        // folding a 1e-12 state value into the lossy low-rank plane would round it away
+        // entirely. Its Ck is already skipped by the sweeps above, and being all-zero it
+        // contributes nothing to the U/V updates -- so this clear is the only other place
+        // that has to know.
+        if (is_per_edge_variable_matrix(matrix_index)) {
+            continue;
+        }
         if (delta_buffer_element_count > 0) {
-            memset(sparse_delta_buffers[(usize)matrix_index].get_contents(), 0,
+            memset(sparse_delta_data_for(matrix_index), 0,
                    (usize)delta_buffer_element_count * sizeof(f32));
         }
         sparse_delta_touched[(usize)matrix_index] = false;
@@ -1421,6 +1615,15 @@ void WeightMatrix::load_from_disk(const char *filepath) {
         sparse_delta_touched.clear();
         sparse_delta_buffers.push_back(allocate_sparse_delta_buffer());
         sparse_delta_touched.push_back(false);
+
+        // The per-edge variable matrices went with the rest of the family, so their
+        // plane block has nothing addressing it anymore and the registration has to be
+        // undone in lockstep -- leaving per_edge_variable_matrix_base pointing at a
+        // family that no longer holds those matrices would have is_per_edge_variable_matrix
+        // claim the fresh default slot, and refit would then stop clearing it.
+        deallocate(std::move(per_edge_variable_values));
+        per_edge_variable_count = 0;
+        per_edge_variable_matrix_base = -1;
 
         // The default matrix above is a fresh all-ones Ck over an empty Sk -- i.e. exactly
         // the reservoir matrix a constructor hands back -- so exact mode is no longer in

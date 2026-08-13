@@ -141,44 +141,52 @@ usize cell_state_slot_count(const CellTypeSpecification &cell_type);
 // Both generators currently emit this order, and both emit the same list:
 //
 //   0  cell_state               device float *
-//   1  cell_parameters          device const float *
-//   2  network_inputs           device float *        -- the delay ring, see below
-//   3  last_spiked              device long *
-//   4  spike_flags              device int *
-//   5  cell_state_base          device const int *
-//   6  cell_parameter_base      device const int *
-//   7  cell_type_index          device const int *
-//   8  neuron_count             constant int &
-//   9  dt                       constant float &
-//   10 tick                     constant long &
-//   11 internal_node_words      device const uint *
-//   12 leaf_node_words          device const uint *
-//   13 rank_superblock_table    device const uint *
-//   14 rank_subblock_table      device const ushort *
-//   15 U_matrix                 device const float *
-//   16 V_matrix                 device const float *
-//   17 edge_weight_coefficients device const float *  -- the weight matrix's Ck
-//   18 edge_weight_deltas       device const float *  -- the weight matrix's Sk
-//   19 edge_delay_ticks         device const int *    -- per-edge delay, whole ticks
-//   20 branching_factor         constant int &
-//   21 superblock_size_words    constant int &
-//   22 padded_node_count        constant int &
-//   23 tree_height              constant int &
-//   24 internal_bit_count       constant int &
-//   25 rank_float4_stride       constant long &
-//   26 constant_weight          constant float &
-//   27 max_neighbor_count       constant int &
-//   28 ring_depth               constant int &
-//   29 synapse_state            device float *        -- aggregated synapse state, see below
-//   30 edge_synapse_plane       device const int *    -- per-edge, which ring plane it feeds
+//   1  cell_state_residual      device float *        -- compensated accumulation, see below
+//   2  cell_parameters          device const float *
+//   3  network_inputs           device float *        -- the delay ring, see below
+//   4  last_spiked              device long *
+//   5  spike_flags              device int *
+//   6  cell_state_base          device const int *
+//   7  cell_parameter_base      device const int *
+//   8  cell_type_index          device const int *
+//   9  neuron_count             constant int &
+//   10 dt                       constant float &
+//   11 tick                     constant long &
+//   12 internal_node_words      device const uint *
+//   13 leaf_node_words          device const uint *
+//   14 rank_superblock_table    device const uint *
+//   15 rank_subblock_table      device const ushort *
+//   16 U_matrix                 device const float *
+//   17 V_matrix                 device const float *
+//   18 edge_weight_coefficients device const float *  -- the weight matrix's Ck
+//   19 edge_weight_deltas       device const float *  -- the weight matrix's Sk
+//   20 edge_attributes          device int *          -- three per-edge int planes, see below
+//   21 edge_synapse_state       device float *        -- per-edge synapse state, see below
+//   22 k2tree_shape             device const int *    -- five k^2-tree shape scalars, see below
+//   23 rank_float4_stride       constant long &
+//   24 constant_weight          constant float &
+//   25 constant_weight_enabled  constant int &
+//   26 max_neighbor_count       constant int &
+//   27 ring_depth               constant int &
 //
-// Arguments 11-19 are the adjacency and per-edge state stage 6 (Propagate) walks; 20-28
+// Arguments 12-22 are the adjacency and per-edge state stage 6 (Propagate) walks; 23-27
 // describe their shape. The initialize kernel takes the identical list so the engine binds
-// one argument set for both entry points, and simply never reads the propagation half.
+// one argument set for both entry points.
 //
-// That is 31 arguments, which is exactly Metal's per-stage buffer argument table limit.
-// Anything added from here on has to consolidate two logical arrays into one buffer with
-// baked offsets, the way the network_inputs ring already packs its planes.
+// That is 28 of Metal's 31 per-stage buffer argument slots. Two consolidations keep it
+// there, both of the shape the ring already uses -- one buffer, baked plane offsets:
+//
+//   edge_attributes packs three [neuron_count * max_neighbor_count] int planes, in order:
+//     plane 0  each edge's delay in whole ticks
+//     plane 1  which lowered synapse program the edge runs, or -1 for none
+//     plane 2  the tick each edge's synapse state was last advanced through, or -1 before
+//              it has ever been advanced (lazy synapse updates only -- see below)
+//
+//   k2tree_shape packs the five k^2-tree shape scalars, in order: branching_factor,
+//   superblock_size_words, padded_node_count, tree_height, internal_bit_count.
+//
+// constant_weight_enabled is a flag rather than `constant_weight != 0`: a model may set a
+// constant weight of exactly zero, and a magnitude cannot double as a mode.
 //
 // U_matrix / V_matrix are the host's float4 buffers declared as plain floats -- identical
 // bytes, and scalar lanes make the on-device reconstruction the same arithmetic
@@ -199,6 +207,38 @@ struct GeneratedKernel {
 // Every TimeDerivative is evaluated against the state as it stood at entry and written
 // back only once all of them have been computed, so two variables that reference each
 // other integrate consistently instead of one seeing the other's updated value.
+//
+// ── Compensated accumulation ─────────────────────────────────────────────────
+// Forward Euler is a running sum, and an f32 running sum loses the low bits of every
+// increment that is small beside the total. Fifty additions of a 0.1 ms dt reach
+// 4.9999989569e-03 where f32(5 ms) is 4.9999998882e-03, so a `refractoryTimeElapsed .geq.
+// t_ref` fires one tick late and the refractory period is a tick too long -- for essentially
+// every t_ref at that dt, and a 20% error at a 0.5 ms one.
+//
+// Metal has no double precision, so each CELL state variable carries an f32 residual instead:
+// the part of the last increment that did not fit, folded into the next one. That is Kahan
+// compensated summation, and it applies to every state variable of every ComponentType rather
+// than to any particular comparison. The residuals live in `cell_state_residual`, laid out
+// exactly parallel to `cell_state`, and are discarded wherever a variable is ASSIGNED
+// (OnStart, an OnCondition's reset, a regime's OnEntry) because they describe a sum that no
+// longer exists.
+//
+// Two things worth knowing about it:
+//  - The emitted step routes the sum through two `volatile` locals. The residual is an
+//    exact-arithmetic identity, and Metal compiles with fast math on by default, so without
+//    them the optimiser folds it to a literal zero -- and with only one of them it reassociates
+//    into a form that evaluates to zero at run time. Both were checked in the emitted AIR.
+//  - It removes the error that GROWS with the number of steps. What it cannot remove is that
+//    f32(dt) and f32(t_ref) are separately rounded: at t_ref = 5 ms and dt = 0.1 ms they agree
+//    and the crossing lands on the reference's tick, but at t_ref = 1 ms the exact product
+//    10 * f32(0.1 ms) is still 0.63 ulp below f32(1 ms) and the crossing is a tick late.
+//    Closing that would need the accumulator to be a true two-float pair and dt to be carried
+//    as two floats.
+//
+// Per-edge synapse state carries no residual: it is one compressed plane per state variable
+// across every edge, so residuals would double the largest allocation the engine makes, and
+// what they buy is a threshold crossed on the right tick -- a property of a cell's
+// OnConditions, which a synapse declares none of.
 //
 // ── What Detect, Emit and Reset observe: the POST-INTEGRATE state ─────────────
 // Stages 3 to 5 run after Integrate, so everything they read is this tick's integrated
@@ -238,70 +278,118 @@ struct GeneratedKernel {
 // supporting engine infrastructure is identical for every cell type, and the engine must
 // therefore NOT dispatch a propagation kernel of its own.
 //
-// `network_inputs` is a delay ring: one flat allocation of
-// ring_depth * plane_count * neuron_count floats indexed as [row][plane][neuron]. An arrival
-// lands in row (tick + edge delay) % ring_depth and a cell reads row tick % ring_depth.
-// Arrivals are atomic -- many sources converge on one target -- but the READ is a plain
-// load, and it does not clear anything: the row is zeroed as a whole row after the dispatch,
-// by generate_ring_row_clear_kernel below.
+// `network_inputs` is a delay ring: one flat allocation of ring_depth * neuron_count floats
+// indexed as [row][neuron]. An arrival lands in row (tick + edge delay) % ring_depth and a
+// cell reads row tick % ring_depth. Arrivals are atomic -- many sources converge on one
+// target -- but the READ is a plain load, and it does not clear anything: the row is zeroed
+// as a whole row after the dispatch, by generate_ring_row_clear_kernel below.
 //
 // `ring_depth` exceeds the model's largest per-edge delay -- the engine computes it -- so an
 // arrival can never land in the row being read this tick.
 //
-// ── The ring's planes, and stage 2 for synapses ──────────────────────────────
-// A ring row is `plane_count` = 1 + wired_synapse_prototype_indices().size() planes wide:
+// ── Synapses: per-edge state, impulsive delivery ─────────────────────────────
+// A synapse's StateVariables are PER EDGE, and they live in the WeightMatrix's compressed
+// per-edge variable family (one registered matrix per state variable, its Ck pinned to
+// all-zero so the stored plane is the whole value -- see
+// WeightMatrix::per_edge_variable_values). `edge_synapse_state` is that block, bound
+// straight through: variable v's plane starts at v * neuron_count * max_neighbor_count, and
+// inside a plane an edge sits at source_neuron * max_neighbor_count + its neighbour slot,
+// the same slot convention every other per-edge array uses.
 //
-//   plane 0        the DELIVERED CURRENT every cell reads through its `synapses[*]/i` path.
-//                  External stimulus is added here by the host, synapse outputs by the
-//                  synapse stage, and an edge that names no synapse scatters its raw weight
-//                  straight into it -- which is the pre-synapse behaviour, kept because an
-//                  edge with no synapse component has no dynamics to run.
-//   plane 1 + p    arrivals awaiting wired synapse prototype p. An edge whose projection
-//                  names that prototype scatters its weight here instead, and the synapse
-//                  stage drains it.
+// Lowered synapse program p owns the state_variable_count planes starting at its
+// state_variable_offset; both offsets are BAKED into the generated source, as are the
+// prototype's own parameter values, which are constants of the prototype rather than of any
+// edge. Nothing tracks a prototype at run time: `edge_attributes` plane 1 names a lowered
+// program, and that is the whole of it.
 //
-// Synapse state is aggregated PER (target neuron, synapse prototype), not per edge. A sum
-// of same-prototype synapses is a single synapse of the summed arrival weight -- their state
-// equations are linear and share one parameter set -- so many converging edges of one
-// prototype share one state. Keyed by PROTOTYPE rather than by type because the parameters
-// are a property of the prototype: two alphaCurrentSynapse instances with different `tau`
-// decay at different rates and must not share a state or a plane. That is also what stops
-// two current-based synapses on one target from being silently pooled: they land in
-// different planes and integrate separately.
+// What is instantaneous is the DELIVERY, not the dynamics. On a presynaptic spike, and
+// inside the source neuron's own propagation walk, each outgoing edge:
 //
-// `synapse_state` is that storage: wired prototype p's slice starts at
-// (sum of the preceding prototypes' state variable counts) * neuron_count, and within it a
-// neuron occupies its type's state_variable_names.size() consecutive floats. The offsets are
-// baked into the generated source, so no per-prototype descriptor buffer is needed; so are
-// the prototypes' parameter values, which are constants of the prototype.
+//   1. advances its own state to this tick (see the two update policies below),
+//   2. snapshots the state variables the arrival handler is about to move,
+//   3. runs the OnEvent handler with `weight` bound to that EDGE's weight, and
+//   4. writes the whole of the charge that event's response will deliver into the ONE ring
+//      slot at (tick + that edge's delay), as the current that delivers it in one tick.
 //
-// Per tick, per neuron, ahead of the cell dynamics and in the same thread (so the write and
-// the cell's read need no synchronisation -- one thread owns one target's slots):
+// An edge whose projection names no synapse delivers its raw weight instead, which is what
+// network_inputs meant before there were synapse dynamics at all.
 //
-//   1. Deliver: read plane 1+p of this tick's row. Non-zero means arrivals are due, and the
-//      OnEvent handler runs once with `weight` bound to the SUMMED arrival weight. For a
-//      handler affine in `weight` -- every current-based synapse in the standard library --
-//      that is exactly the sum of the individual arrivals' effects.
-//   2. Integrate one dt, forward Euler, same simultaneous write-back as a cell.
-//   3. Add the synapse's `i` exposure into plane 0 of this tick's row.
+// ── What "the whole of the charge" means, and why not a sample of `i` ────────
+// Write Q(x) for the total charge a synapse left at state x and never touched again would
+// still deliver: the sum of i(x_n) * dt over the ticks that follow. An event moves the state
+// from x to x' = handler(x, weight), so the charge THAT event adds is Q(x') - Q(x). The tail
+// Q(x) was already delivered in full by whichever earlier event produced it, and delivering
+// any of it again would inject more total charge than the synapse ever carries.
+//
+// Sampling `i` at the instant of the spike is the thing this exists not to do.
+// alphaCurrentSynapse's OnEvent bumps `J` while its `i` exposes `I`, and `I` only grows out of
+// `J` over LATER ticks -- so an instantaneous sample returns whatever `I` had decayed to,
+// which for an isolated first spike is exactly zero at any weight. A network built out of
+// those propagates nothing, silently, while every unit test on the state itself passes.
+//
+// For dynamics linear in the state -- which every current-based synapse lowered here is, and
+// which is CHECKED rather than assumed -- Q is a linear functional, so Q(x') - Q(x) is a fixed
+// combination of the state CHANGE the handler made:
+//     delivered charge = sum over v of charge_coefficient[v] * (x'[v] - x[v])
+// Only the coefficients are precomputed, by integrating the synapse's own lowered dynamics on
+// the host from each unit basis state until the output decays -- no closed form is written
+// down for any synapse type, so this works for whatever current-based dynamics a document
+// declares. The state change is read off the edge's LIVE state at the spike, so a handler
+// whose assignment depends on the state it finds (a depressing or facilitating synapse) still
+// delivers a different amount on each successive spike.
+//
+// The ring slot holds a CURRENT that the target integrates over exactly one tick, so charge Q
+// is written into it as Q / dt.
+//
+// ── Lazy vs eager synapse updates ────────────────────────────────────────────
+// `use_lazy_synapse_updates` selects which of two equivalent schemes advances that per-edge
+// state. It is baked into the source rather than passed, so the unused half is not compiled.
+//
+//   lazy (default)  Nothing touches an edge until its source spikes. The delivery above
+//                   first catches the edge up from `edge_attributes` plane 2 -- the tick it
+//                   was last advanced through -- to this tick, then records this tick there.
+//                   Costs nothing at all for an edge whose source is silent.
+//   eager           Every edge advances one dt every tick, in the source neuron's thread,
+//                   ahead of the cell dynamics; the delivery then does no catch-up.
+//
+// The catch-up applies the SAME per-tick step the eager pass does, once per elapsed tick,
+// so the two agree exactly rather than approximately -- which is what makes eager usable as
+// the reference the lazy path is checked against. It is valid on the same grounds the
+// engine's own active-set lazy decay is (CLAUDE.md): the state observed at a spike is the
+// state that would have been there, because nothing else observes it in between.
 //
 // Throws, naming the construct and the ComponentType, on anything below.
-GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result);
+GeneratedKernel generate_tick_kernel(const NML_ParseResult &parse_result,
+                                     bool use_lazy_synapse_updates = true);
+
+// One lowered synapse program: the wired prototype it came from and which per-edge variable
+// planes hold its state.
+//
+// The engine and this generator must agree on this list exactly -- a program's POSITION in
+// it is what `edge_attributes` plane 1 stores per edge, and its state_variable_offset is
+// where the generated source reads and writes. Derived here, once, rather than computed
+// independently on each side.
+struct SynapseProgramLayout {
+    s64 prototype_index = -1;
+    s64 state_variable_offset = 0;
+    s64 state_variable_count = 0;
+};
 
 // The synapse prototypes at least one edge actually delivers through, in prototype order.
 // A declared-but-unwired synapse contributes nothing to a simulation, so it is neither
 // lowered nor allocated for.
-//
-// The engine and this generator must agree on this list exactly: a prototype's POSITION in
-// it selects its slice of `synapse_state`, and that position + 1 is its plane in the
-// network_inputs ring. Derived here, once, rather than computed independently on each side.
-Vector<s64> wired_synapse_prototype_indices(const NML_ParseResult &parse_result);
+Vector<SynapseProgramLayout> resolve_synapse_programs(const NML_ParseResult &parse_result);
+
+// How many per-edge variable planes the model needs: the total state width of every lowered
+// synapse program. This is the count the engine hands to
+// WeightMatrix::configure_per_edge_variable_count.
+s64 per_edge_synapse_variable_count(const NML_ParseResult &parse_result);
 
 // OnStart bodies only -- every cell type's, and every wired synapse prototype's -- run once
 // at initialisation. Skips every other stage.
 GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result);
 
-// Zeroes every plane of row `tick % ring_depth` of `network_inputs`, one thread per neuron.
+// Zeroes row `tick % ring_depth` of `network_inputs`, one thread per neuron.
 // The engine dispatches it immediately behind the tick kernel, in the same command batch, so within
 // tick T the order is: host adds T's stimulus into row T % ring_depth -> the tick kernel
 // reads that row and propagates into rows (T + delay) % ring_depth -> this kernel zeroes row
@@ -325,10 +413,8 @@ GeneratedKernel generate_initialize_kernel(const NML_ParseResult &parse_result);
 // it flattens the per-edge delays.
 //
 // `argument_names` is a subset of the master kernel's, bound by the same machinery:
-// network_inputs, neuron_count, tick, ring_depth. It takes the model because the row's
-// plane count comes out of it and is baked into the source rather than passed -- the
-// argument table has no slot left to spend on a scalar.
-GeneratedKernel generate_ring_row_clear_kernel(const NML_ParseResult &parse_result);
+// network_inputs, neuron_count, tick, ring_depth.
+GeneratedKernel generate_ring_row_clear_kernel();
 
 // NML/LEMS expression syntax -> C-family syntax, via a tokenizer and a recursive-descent
 // parser. Textual substitution cannot do this correctly: `^` is exponentiation and
@@ -352,12 +438,15 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
 //    and reverses sign as v crosses erev, where a current-based synapse injects a fixed
 //    current profile. Those are different models, not approximations of each other, so the
 //    generator names the synapse type and stops rather than running it as current-based.
-//  - A synapse whose SynapseTypeSpecification::requires_per_edge_state is set: its state
-//    does not superpose across converging edges, so the per-target aggregation above is
-//    invalid for it. Per-edge synapse state is a separate ticket.
+//  - A synapse whose SynapseTypeSpecification::requires_per_edge_state is set. Its state is
+//    now stored per edge like every other synapse's, so THAT is no longer the obstacle; what
+//    the flag actually records (see nml.cpp's requires_per_edge_state) is a <Children
+//    type="basePlasticityMechanism"/> or "baseBlockMechanism" declaration, and this generator
+//    lowers no child-component structure. Running the parent's dynamics alone would silently
+//    drop the mechanism that makes the synapse depress, facilitate or block.
 //  - Regime / Transition / OnEntry on a SYNAPSE. Cells support them (see CellRegimeLayout);
-//    a synapse's would need the same appended state slot in `synapse_state`, and no synapse
-//    in the standard library declares one.
+//    a synapse's would need the same appended slot in its per-edge state, and no synapse in
+//    the standard library declares one.
 //  - ConditionalDerivedVariable / Case. Not a choice: DynamicsInstruction carries a Case's
 //    `value` but not its `condition` attribute (nml.cpp's collect_dynamics_instructions
 //    reads only value/test/select), so the per-case tests never reach codegen. Emitting
@@ -365,4 +454,20 @@ String translate_expression(const String &nml_expression, const SymbolTable &sym
 //  - A `select=` path over anything but the attached synapses -- see generate_tick_kernel.
 //  - random(x). A deterministic per-neuron stream needs a seed argument, and adding one
 //    would change the argument order above for a function Phase 1 never calls.
+//
+// Four more come from resolving what one arriving spike delivers (see generate_tick_kernel).
+// Each of them would otherwise be a plausible wrong number on every spike, for the whole run:
+//  - A synapse NONLINEAR in its state variables. The delivered charge is precomputed as a
+//    fixed combination of the state change the handler makes, and that decomposition only
+//    exists for linear dynamics. Measured by probing, not assumed: the response to twice a
+//    state variable has to be twice the response, and the response to all of them at once has
+//    to be the sum.
+//  - A synapse whose exposed `i` never decays. Its response to one event carries unbounded
+//    charge, and no scalar expresses that.
+//  - A synapse whose dynamics read the absolute time `t`. What a spike delivers would then
+//    depend on when it arrived, which one set of coefficients resolved at generation time
+//    cannot express.
+//  - A synapse whose OnEvent handler moves only state the exposed `i` never depends on. Every
+//    spike through it would deliver exactly zero, which is the same silent swallowing a
+//    synapse with no handler at all would do.
 } // namespace spikecorec::nml
