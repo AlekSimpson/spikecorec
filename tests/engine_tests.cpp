@@ -18,6 +18,7 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/nml/dynamics_codegen.h"
 #include "../examples/balanced_network_model.h"
+#include "../examples/glif_network_model.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -899,6 +900,304 @@ TEST(SpikeEngine, both_cell_types_integrate_their_own_equations) {
     // Its OnCondition assigns both v and u (v = c, u = u + d), so a spiking izhikevich
     // cell must sit at or below its reset value rather than above vpeak.
     EXPECT_LE(engine.read_state_variable(4, "v"), 0.035f);
+}
+
+// ── the GLIF family ───────────────────────────────────────────────────────────────
+
+namespace {
+
+// Spike times of one neuron, in order.
+Vector<f64> spike_times_of(const SpikeEngine &engine, s64 neuron_index) {
+    Vector<f64> times;
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        if (spike.neuron_index == neuron_index) times.push_back(spike.time_seconds);
+    }
+    return times;
+}
+
+} // namespace
+
+// All five GLIF types under the same current step. Each one's defining behaviour is
+// asserted rather than its trace being eyeballed: GLIF1 and GLIF2 fire at a fixed rate,
+// and the three that carry adaptation state fire progressively slower.
+TEST(SpikeEngine, the_glif_family_each_produce_their_defining_behaviour) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    SpikeEngine engine("tests/fixtures/nml/LEMS_glif_family.xml");
+    ASSERT_EQ(engine.total_neuron_count, 5);
+    ASSERT_EQ(engine.network_details.cell_types.size(), 5u);
+
+    engine.run();
+
+    // GLIF1 is a leaky integrator with a hard refractory period, so its interval has a
+    // closed form: the time to charge from vreset to vth under the step, plus t_ref.
+    //   tau       = C / gL = 100 pF / 10 nS = 10 ms
+    //   v_infinity = EL + I/gL = -70 mV + 500 pA / 10 nS = -20 mV
+    //   charge    = tau * ln((v_inf - vreset) / (v_inf - vth)) = 10 ms * ln(50/30)
+    const f64 membrane_time_constant = 100e-12 / 10e-9;
+    const f64 steady_state = -0.070 + 500e-12 / 10e-9;
+    const f64 charging_time = membrane_time_constant *
+            std::log((steady_state - -0.070) / (steady_state - -0.050));
+    const f64 expected_interval = charging_time + 5e-3;
+
+    const Vector<f64> glif1 = spike_times_of(engine, 0);
+    ASSERT_GE(glif1.size(), 5u) << "GLIF1 did not fire under 2.5x rheobase";
+    EXPECT_NEAR(glif1[3] - glif1[2], expected_interval, 2e-4);
+
+    // Its intervals are all the same: nothing in GLIF1 accumulates across spikes.
+    EXPECT_NEAR(glif1[glif1.size() - 1] - glif1[glif1.size() - 2],
+                glif1[2] - glif1[1], 2e-4);
+
+    // Every type fires, and the refractory period is respected by all of them: no
+    // interval anywhere is shorter than t_ref.
+    for (s64 cell = 0; cell < 5; cell += 1) {
+        const Vector<f64> times = spike_times_of(engine, cell);
+        ASSERT_GE(times.size(), 5u) << "cell " << cell << " fired " << times.size()
+                                    << " times";
+
+        for (usize index = 1; index < times.size(); index += 1) {
+            EXPECT_GE(times[index] - times[index - 1], 5e-3 - 1e-4)
+                    << "cell " << cell << " interval " << index << " is shorter than t_ref";
+        }
+    }
+
+    // GLIF3 (after-spike currents), GLIF4 (adapting threshold) and GLIF5 (both) slow down
+    // over the step; GLIF1 and GLIF2 do not. This is the whole reason those types carry
+    // extra state, so it is the thing worth asserting.
+    auto adaptation_ratio = [&](s64 cell) {
+        const Vector<f64> times = spike_times_of(engine, cell);
+        const f64 first = times[1] - times[0];
+        const f64 last = times[times.size() - 1] - times[times.size() - 2];
+        return last / first;
+    };
+
+    EXPECT_NEAR(adaptation_ratio(0), 1.0, 0.05) << "GLIF1 should not adapt";
+    EXPECT_NEAR(adaptation_ratio(1), 1.0, 0.05) << "GLIF2 should not adapt";
+    EXPECT_GT(adaptation_ratio(2), 1.5) << "GLIF3's after-spike currents should adapt";
+    EXPECT_GT(adaptation_ratio(3), 1.2) << "GLIF4's adapting threshold should adapt";
+    EXPECT_GT(adaptation_ratio(4), 1.5) << "GLIF5 carries both and should adapt";
+
+    // The adaptation state actually moved, and in the direction that suppresses firing:
+    // the after-spike currents are hyperpolarising and the threshold rises.
+    EXPECT_LT(engine.read_state_variable(2, "asc1"), 0.0f);
+    EXPECT_LT(engine.read_state_variable(2, "asc2"), 0.0f);
+    EXPECT_GT(engine.read_state_variable(3, "theta"), -0.050f);
+    EXPECT_GT(engine.read_state_variable(4, "theta"), -0.050f);
+}
+
+TEST(DynamicsCodegen, a_regime_pair_lowers_to_a_refractory_gate) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    NML_Parser parser;
+    const NML_ParseResult parsed =
+            parser.parse_lems("tests/fixtures/nml/LEMS_glif_family.xml");
+    const ModelLayout layout = compute_model_layout(parsed);
+    const String source = generate_master_kernel(parsed, layout);
+
+    // The gate itself, and no trace of a state machine.
+    EXPECT_NE(source.find("const float time_since_spike"), String::npos);
+    EXPECT_EQ(source.find("set_regime"), String::npos);
+    EXPECT_EQ(source.find("neuron_regime"), String::npos);
+
+    // The refractory regime's own timer is never integrated: last_spiked replaces it.
+    EXPECT_EQ(source.find("refractoryTimeElapsed +="), String::npos);
+
+    // GLIF3's after-spike currents are declared outside the regimes, so they decay every
+    // tick including while the cell is held. If they had been swept into the gate they
+    // would freeze during the refractory period and adaptation would be wrong.
+    const usize gate = source.find("const float time_since_spike");
+    const usize asc_decay = source.find("derived_ascSum");
+    ASSERT_NE(asc_decay, String::npos);
+    EXPECT_LT(asc_decay, gate) << "ascSum must be computed before the refractory gate";
+}
+
+TEST(DynamicsCodegen, a_regime_shape_that_is_not_the_refractory_pair_is_refused) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("three_regimes");
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ThreeRegimes">
+  <ComponentType name="ThreeRegimeCell" extends="baseCell">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="gL" dimension="conductance"/>
+    <Parameter name="EL" dimension="voltage"/>
+    <Parameter name="vth" dimension="voltage"/>
+    <EventPort name="spike" direction="out"/>
+    <Exposure name="v" dimension="voltage"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <OnStart><StateAssignment variable="v" value="EL"/></OnStart>
+      <Regime name="one" initial="true">
+        <TimeDerivative variable="v" value="(gL * (EL - v)) / C"/>
+        <OnCondition test="v .gt. vth"><Transition regime="two"/></OnCondition>
+      </Regime>
+      <Regime name="two">
+        <OnCondition test="v .gt. vth"><Transition regime="three"/></OnCondition>
+      </Regime>
+      <Regime name="three">
+        <OnCondition test="v .gt. vth"><Transition regime="one"/></OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+
+  <ThreeRegimeCell id="cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"/>
+  <network id="threeRegimeNetwork">
+    <population id="pop" component="cell" size="1"/>
+  </network>
+</neuroml>
+)");
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "threeRegimeNetwork", "10ms", "0.1ms"));
+
+    NML_Parser parser;
+    const NML_ParseResult parsed = parser.parse_lems(lems_path);
+    const ModelLayout layout = compute_model_layout(parsed);
+
+    try {
+        generate_master_kernel(parsed, layout);
+        FAIL() << "a three-regime state machine should not lower to a refractory gate";
+    } catch (const std::runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("ThreeRegimeCell"), String::npos) << message;
+        EXPECT_NE(message.find("3 regimes"), String::npos) << message;
+    }
+}
+
+// ── the GLIF networks are alive ───────────────────────────────────────────────────
+
+namespace {
+
+struct NetworkActivity {
+    f64 mean_rate = 0.0;
+    f64 participation = 0.0;
+    f64 peak_synchrony = 0.0;
+    f64 middle_rate = 0.0;
+    f64 final_rate = 0.0;
+};
+
+NetworkActivity measure_activity(const SpikeEngine &engine, f64 step_seconds,
+                                 f64 total_seconds) {
+    NetworkActivity activity;
+    activity.mean_rate = engine.mean_firing_rate_hertz();
+    activity.participation = engine.fraction_of_neurons_that_spiked();
+
+    Vector<s64> spikes_per_tick((usize)engine.lifetime, 0);
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        const s64 tick = (s64)(spike.time_seconds / step_seconds + 0.5);
+        if (tick >= 0 && tick < engine.lifetime) spikes_per_tick[(usize)tick] += 1;
+    }
+    activity.peak_synchrony =
+            (f64)*std::max_element(spikes_per_tick.begin(), spikes_per_tick.end()) /
+            (f64)engine.total_neuron_count;
+
+    auto rate_over = [&](f64 from_seconds, f64 to_seconds) {
+        s64 count = 0;
+        for (const RecordedSpike &spike : engine.recorded_spikes) {
+            if (spike.time_seconds >= from_seconds && spike.time_seconds < to_seconds) {
+                count += 1;
+            }
+        }
+        return (f64)count / ((f64)engine.total_neuron_count * (to_seconds - from_seconds));
+    };
+    activity.middle_rate = rate_over(0.4 * total_seconds, 0.6 * total_seconds);
+    activity.final_rate = rate_over(0.8 * total_seconds, total_seconds);
+
+    return activity;
+}
+
+} // namespace
+
+// One recurrent network per GLIF type, each asserted to be alive on the same terms: a
+// population rate in a sensible band, nearly every neuron participating, activity that is
+// asynchronous rather than one repeating volley, and a network still firing at the end of
+// the run. A network that loads, runs, records and produces almost nothing passes every
+// other test in this file and fails this one.
+class GlifNetworkAliveness : public ::testing::TestWithParam<s32> {};
+
+TEST_P(GlifNetworkAliveness, sustains_asynchronous_recurrent_activity) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    const s32 glif_index = GetParam();
+    ModelDirectory directory("glif" + to_string(glif_index) + "_network");
+
+    examples::GlifNetworkParameters parameters;
+    parameters.glif_index = glif_index;
+    parameters.cell_types_path = "tests/fixtures/nml/glif_cell_types.nml";
+
+    const String lems_path = examples::write_glif_network_model(directory.path(), parameters);
+
+    SpikeEngine engine(lems_path);
+    EXPECT_EQ(engine.total_neuron_count, 500);
+    EXPECT_EQ(engine.layout.total_edge_count, 10000);
+
+    engine.run();
+
+    const NetworkActivity activity = measure_activity(
+            engine, parameters.step_seconds, parameters.simulation_seconds);
+
+    // Alive, and not saturated. The 5 ms refractory period caps any cell at 200 Hz, so a
+    // rate approaching that would mean every cell firing flat out.
+    EXPECT_GT(activity.mean_rate, 2.0) << "GLIF" << glif_index << " is barely firing";
+    EXPECT_LT(activity.mean_rate, 60.0) << "GLIF" << glif_index << " is saturated";
+
+    // Broadly alive rather than a few cells carrying the whole rate.
+    EXPECT_GT(activity.participation, 0.85);
+
+    // Not a lockstep volley: no tick where a large part of the population fires together.
+    // This is a ceiling, not a demand for a flat raster -- the adapting types develop a
+    // real population rhythm, because after-spike currents recover on a shared time
+    // constant and pull the network into bands. That shows up in the raster around 10 Hz
+    // for GLIF3 and GLIF5 and is a property of the model, not a defect. What this rules
+    // out is every cell firing on the same tick.
+    EXPECT_LT(activity.peak_synchrony, 0.5);
+
+    // Still going at the end. A wide floor rather than a tight band, because the types
+    // that adapt are genuinely still settling at the end of the run -- GLIF5 carries both
+    // after-spike currents and an adapting threshold and drifts down the longest. What
+    // this rules out is the network dying, not slow adaptation.
+    ASSERT_GT(activity.middle_rate, 0.0);
+    EXPECT_GT(activity.final_rate, 0.6 * activity.middle_rate)
+            << "GLIF" << glif_index << " decayed from " << activity.middle_rate << " Hz to "
+            << activity.final_rate << " Hz";
+    EXPECT_GT(activity.final_rate, 2.0);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllFiveTypes, GlifNetworkAliveness,
+                         ::testing::Values(1, 2, 3, 4, 5),
+                         [](const ::testing::TestParamInfo<s32> &info) {
+                             return "GLIF" + to_string(info.param);
+                         });
+
+// The three types that carry adaptation state fire more slowly in a network than the two
+// that do not, under identical drive and identical connectivity. This is the network-level
+// counterpart of the single-cell adaptation test: it confirms the extra state is doing
+// something once cells are wired together, not just under a clean current step.
+TEST(SpikeEngine, adapting_glif_networks_settle_below_non_adapting_ones) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    Vector<f64> rate_by_type(6, 0.0);
+
+    for (s32 glif_index : {1, 3, 5}) {
+        ModelDirectory directory("glif_rate_" + to_string(glif_index));
+
+        examples::GlifNetworkParameters parameters;
+        parameters.glif_index = glif_index;
+        parameters.cell_types_path = "tests/fixtures/nml/glif_cell_types.nml";
+        // Half the run of the aliveness tests: the rate separation is fully developed
+        // within a second (23 Hz against 5 Hz), and three networks at full length is two
+        // minutes of suite time for a comparison that is already clear.
+        parameters.simulation_seconds = 1.0;
+
+        SpikeEngine engine(examples::write_glif_network_model(directory.path(), parameters));
+        engine.run();
+        rate_by_type[(usize)glif_index] = engine.mean_firing_rate_hertz();
+    }
+
+    // GLIF3's after-spike currents suppress firing; GLIF5 adds an adapting threshold on
+    // top, so it settles at or below GLIF3.
+    EXPECT_LT(rate_by_type[3], rate_by_type[1] * 0.75)
+            << "GLIF3 " << rate_by_type[3] << " Hz vs GLIF1 " << rate_by_type[1] << " Hz";
+    EXPECT_LT(rate_by_type[5], rate_by_type[1] * 0.75)
+            << "GLIF5 " << rate_by_type[5] << " Hz vs GLIF1 " << rate_by_type[1] << " Hz";
 }
 
 // ── the demo is alive ─────────────────────────────────────────────────────────────

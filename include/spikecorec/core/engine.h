@@ -3,6 +3,7 @@
 //
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -101,6 +102,18 @@ namespace spikecorec {
         Vector<RecordingSelection> traced_selections;
         Vector<f64> recorded_trace_times;
 
+        // Set up by record_membrane_video(): a .spire recording of every neuron's
+        // membrane potential, which is what the video renderer consumes. Separate from the
+        // model's own OutputFiles because LEMS has no way to ask for "every neuron, every
+        // Nth tick", and pretending one of its elements meant that would be inventing
+        // semantics the format does not have.
+        std::unique_ptr<SimulationRecorder> membrane_video_recorder;
+        s64 membrane_video_frame_stride = 1;
+        // Where each neuron's `v` sits in cell_state, precomputed so a frame is a gather
+        // rather than a per-neuron name lookup.
+        Vector<s64> membrane_offset_per_neuron;
+        Vector<f32> membrane_frame_scratch;
+
         KernelHandle master_kernel{};
         String master_kernel_source;
 
@@ -145,7 +158,12 @@ namespace spikecorec {
         [[nodiscard]] f64 fraction_of_neurons_that_spiked() const;
 
         // Writes every recording profile the model declared to the files it named.
-        void write_recordings() const;
+        void write_recordings();
+
+        // Records every neuron's membrane potential into `path` as a .spire recording,
+        // one frame every `frame_stride` ticks, for examples/render_membrane_video.py to
+        // turn into a video. Call before run(); finished by write_recordings()/shutdown().
+        void record_membrane_video(const String &path, s64 frame_stride = 1);
 
         void shutdown();
 
