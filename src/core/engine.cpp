@@ -2,8 +2,10 @@
 // Created by Alek Simpson on 5/30/26.
 //
 
+#include <algorithm>
 #include <cstring>
-#include <cmath>
+#include <fstream>
+#include <iomanip>
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda_runtime.h>
@@ -11,678 +13,531 @@
 #include <Metal/Metal.hpp>
 #endif
 
-#include "spikecorec/nml/nml.h"
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
-#include "spikecorec/core/recording.h"
-#include "spikecorec/core/topologies.h"
+#include "spikecorec/nml/dynamics_codegen.h"
 
 using namespace std;
 using namespace spikecorec;
-using namespace spikecorec::log;
+using namespace spikecorec::nml;
 
-// ── constructor / destructor ──────────────────────────────────────────────────
+namespace {
 
-SpikeEngine::SpikeEngine()
-    : logger(make_logger())
-    , weights(random_fixed_outdegree(15), 1, true)
-    , neuron_count(15 * 15)
-    , input_neuron_count(0)
-    , thread_count_per_block(256)
-    , block_count(0)
-    , resting_membrane_potential(0.1f)
-    , decay_rate(0.01f)
-    , learning_rate(0.0f) // plasticity off by default
-    , spike_period(1)
-    , spike_threshold(1.0f)
-    , alive(true)
-    , active_set_optimization_enabled(true)
-{
+// Every arena carve is rounded up to EngineAllocator::ALLOCATION_ALIGNMENT, so the slab
+// has to be sized with that rounding included or the last few buffers do not fit.
+u64 aligned_byte_count(u64 element_bytes, s64 length) {
+    if (length <= 0) return 0;
 
-    block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
-
-    usize neuron_f32_byte_size = (usize) neuron_count * sizeof(f32);
-    usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
-    usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
-
-    network_inputs = allocate<f32>(neuron_f32_byte_size);
-    memset(network_inputs.get_contents(), 0, neuron_f32_byte_size);
-
-    membrane_potentials = allocate<f32>(neuron_f32_byte_size);
-    std::fill(membrane_potentials.get_contents(),
-            membrane_potentials.get_contents() + neuron_count,
-            resting_membrane_potential);
-
-    last_spiked = allocate<s64>(neuron_s64_byte_size);
-    memset(last_spiked.get_contents(), 0, neuron_s64_byte_size);
-
-    last_tick_updated = allocate<s64>(neuron_s64_byte_size);
-    memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
-
-    active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
-    next_active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
-
-    active_neuron_count = allocate<s32>(sizeof(s32));
-    next_active_neuron_count = allocate<s32>(sizeof(s32));
-    active_neuron_count.get_contents()[0] = 0;
-    next_active_neuron_count.get_contents()[0] = 0;
-
-    active_generation = allocate<s32>(neuron_s32_byte_size);
-    s32 *active_generation_data = active_generation.get_contents();
-    for (s64 neuron_index = 0; neuron_index < neuron_count; ++neuron_index)
-        active_generation_data[neuron_index] = -1;
-
-    input_staging = allocate<f32>(neuron_f32_byte_size);
-    override_staging = allocate<s64>(neuron_s64_byte_size);
-
-    prefetch_to_gpu(network_inputs, neuron_f32_byte_size);
-    prefetch_to_gpu(membrane_potentials, neuron_f32_byte_size);
-    prefetch_to_gpu(last_spiked, neuron_s64_byte_size);
-    prefetch_to_gpu(last_tick_updated, neuron_s64_byte_size);
-    prefetch_to_gpu(active_neuron_indices, neuron_s32_byte_size);
-    prefetch_to_gpu(next_active_neuron_indices, neuron_s32_byte_size);
-    prefetch_to_gpu(active_neuron_count, sizeof(s32));
-    prefetch_to_gpu(next_active_neuron_count, sizeof(s32));
-    prefetch_to_gpu(active_generation, neuron_s32_byte_size);
-    prefetch_to_gpu(input_staging, neuron_f32_byte_size);
-    prefetch_to_gpu(override_staging, neuron_s64_byte_size);
-
-    logger->debug("SpikeEngine buffers allocated: neuron_f32_byte_size={} neuron_s32_byte_size={} "
-                  "neuron_s64_byte_size={} thread_count_per_block={} block_count={}",
-                  neuron_f32_byte_size, neuron_s32_byte_size, neuron_s64_byte_size,
-                  thread_count_per_block, block_count);
-    logger->info("SpikeEngine constructed: neuron_count={} resting_mp={} decay_rate={} learning_rate={}",
-                  neuron_count, resting_membrane_potential, decay_rate, learning_rate);
+    const u64 alignment = EngineAllocator::ALLOCATION_ALIGNMENT;
+    const u64 requested = element_bytes * (u64)length;
+    return (requested + alignment - 1) / alignment * alignment;
 }
 
-SpikeEngine::SpikeEngine(String &lems_input_file, boolean enable_hebbian_learning) {
-    NML_Parser parser = NML_Parser();
-    allocator = EngineAllocator(MAX_CPU_POOL_COUNT, MAX_GPU_POOL_COUNT);
+// The starting value of `variable_name` for a type, folded from its OnStart.
+f64 starting_value_for(const Vector<DynamicsInstruction> &dynamics,
+                       const String &variable_name,
+                       const Vector<String> &parameter_names,
+                       const Vector<Real> &parameter_values,
+                       const String &owner_name) {
+    for (const DynamicsInstruction &instruction : dynamics) {
+        if (instruction.stage != DynamicsStage::Initialize) continue;
+        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+        if (instruction.target != variable_name) continue;
 
-    // TODO: in the future we can create custom spikecorec component types which enable custom engine features
-    // like our builtin hebbian learning mechanism
-
-    try {
-
-    boolean is_valid_neuroml = parser.validate_against_schema(neuroml_input_file);
-    if (!is_valid_neuroml) {
-        throw new runtime_error("Given NeuroML file is not valid.");
-    }
-    
-    network_details = parser.parse_lems(lems_input_file); 
-
-    // We need to initialize 4 things:
-    // 1. simulation cells
-    s64 cell_memory_length = 0;
-    s64 input_buffer_single_row_length = 0;
-    for (const auto &population : network_details.populations) {
-        CellTypeSpecification &cell_type = network_details.cell_types[population.cell_type_index];
-        cell_memory_length += neuron_count * cell_type.state_variable_names.size();
-        input_buffer_single_row_length += neuron_count;
+        return evaluate_initial_value(instruction.expression, parameter_names,
+                                      parameter_values, owner_name);
     }
 
-    GpuPointer<f32> cell_data = static_cast<GpuPointer<f32>>(
-        allocator.allocate_gpu(sizeof(f32), memory_length)
-    );
+    // LEMS leaves a StateVariable with no OnStart at zero.
+    return 0.0;
+}
 
-    // todo: initialize cells with starting parameters
+} // namespace
 
-    // todo: 2. simulation synapses / network topology
+// ── construction ──────────────────────────────────────────────────────────────────
 
-    // 3. network input buffers
-    // input buffer uses multiple rows to create a roling network 
-    // input window to simulate spike delay times
-    s64 MAX_DELAY_TIME = 0; 
-    Vector<Set<s64>> input_neuron_populations;
-    UnorderedMap<s64, Vector<f64>> input_neuron_event_streams;
-    for (const auto &input_profile : network_details.input_profiles) {
-        input_neuron_count += input_profile.targets.size();
+SpikeEngine::SpikeEngine(const String &lems_input_file)
+    : logger(log::make_logger()) {
 
-        if (input_profile.continuous_current_injection) {
-            // will implement this later: 
-            // todo: here we need to do some different stuff to setup cont current injection
-            // this involves writing directly to cell memory for every input
-            // this will have to take the form of a modulus conditional on max_delay_time
-            continue;
-        }
+    if (!gpu_context_is_initialized()) initialize_gpu_context();
 
-
-        if (input_profile.max_delay_time > MAX_DELAY_TIME) {
-            MAX_DELAY_TIME = input_profile.max_delay_time;
-        }
-
-        for (const auto &input_target : input_profile.targets) {
-            input_neuron_event_streams[input_target.neuron_index];
-            input_neuron_event_streams[input_target.neuron_index].insert(
-                create_event_stream(input_target.event_ticks);
-            );
-        }
+    NML_Parser parser;
+    if (!parser.validate_against_schema(lems_input_file)) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: " + lems_input_file + " failed NeuroML schema validation:\n" +
+                parser.last_schema_validation_errors);
     }
 
-    GpuPointer<f32> network_input_buffer = static_cast<GpuPointer<f32>>(
-        allocator.allocate_gpu(sizeof(f32), input_buffer_single_row_length * MAX_DELAY_TIME);
-    );
+    network_details = parser.parse_lems(lems_input_file);
+    layout = compute_model_layout(network_details);
 
-    // 4. engine utility values
-    total_neuron_count = neurons.size();
+    total_neuron_count = layout.total_neuron_count;
     lifetime = network_details.total_tick_count;
-    active_set_optimization_enabled = false;
-    
-    if (network_details.random_seed.has_value()) {
-        simulation_seed = network_details.random_seed.value();
+    step_dt = (f32)network_details.step_dt;
+    if (network_details.random_seed.has_value()) simulation_seed = *network_details.random_seed;
+
+    if (total_neuron_count == 0) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: " + lems_input_file + " defines no neurons — check that the "
+                "Simulation's target names a network with at least one population");
+    }
+    if (step_dt <= 0.0f) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: " + lems_input_file + " gives the Simulation no usable step "
+                "(parsed " + to_string(network_details.step_dt) + " s)");
     }
 
-    GpuPointer<s64> last_spiked;
-    GpuPointer<s64> last_tick_updated;
-    if (hebbian_learning_enabled) {
-        last_spiked = static_cast<GpuPointer<s64>>(
-            allocator.allocate_gpu(sizeof(s64), total_neuron_count);
-        );
-        last_tick_updated = static_cast<GpuPointer<s64>>(
-            allocator.allocate_gpu(sizeof(s64), total_neuron_count);
-        );
+    block_count = (s32)((total_neuron_count + thread_count_per_block - 1) /
+                        thread_count_per_block);
+
+    allocate_model_buffers();
+    initialize_cell_state();
+    build_weight_matrix();
+    collect_stimulus();
+
+    master_kernel_source = generate_master_kernel(network_details, layout);
+    logger->debug("SpikeEngine: generated master kernel, {} bytes:\n{}",
+                  master_kernel_source.size(), master_kernel_source);
+    master_kernel = compile_kernel(master_kernel_source.c_str(), "master_step");
+
+    spike_counts_per_neuron.assign((usize)total_neuron_count, 0);
+
+    for (const RecordingConfig &profile : network_details.recording_profiles) {
+        for (const RecordingSelection &selection : profile.selections) {
+            if (!selection.event_port.empty()) continue;
+            if (selection.neuron_index < 0) continue;
+            traced_selections.push_back(selection);
+        }
     }
-    
-    // todo: active set optimization allocation/initialization
 
+    alive = true;
+    logger->info("SpikeEngine constructed from {}: {} neurons, {} edges, {} cell types, "
+                 "{} synapse prototypes, dt={} s, {} ticks, spike history {} rows",
+                 lems_input_file, total_neuron_count, layout.total_edge_count,
+                 network_details.cell_types.size(),
+                 network_details.synapse_prototypes.size(),
+                 network_details.step_dt, lifetime, layout.spike_history_length);
+}
 
+void SpikeEngine::allocate_model_buffers() {
+    const u64 gpu_bytes =
+            aligned_byte_count(sizeof(f32), layout.cell_state_length) +
+            aligned_byte_count(sizeof(f32), layout.cell_parameter_length) +
+            aligned_byte_count(sizeof(f32), layout.synapse_parameter_length) +
+            aligned_byte_count(sizeof(f32), 2 * total_neuron_count) +
+            aligned_byte_count(sizeof(u8), layout.spike_history_length * total_neuron_count) +
+            aligned_byte_count(sizeof(s64), total_neuron_count);
+
+    allocator = EngineAllocator(0, gpu_bytes);
+
+    cell_state         = allocator.allocate_gpu(sizeof(f32), layout.cell_state_length);
+    cell_parameters    = allocator.allocate_gpu(sizeof(f32), layout.cell_parameter_length);
+    synapse_parameters = allocator.allocate_gpu(sizeof(f32), layout.synapse_parameter_length);
+    network_inputs     = allocator.allocate_gpu(sizeof(f32), 2 * total_neuron_count);
+    spike_history      = allocator.allocate_gpu(
+            sizeof(u8), layout.spike_history_length * total_neuron_count);
+    last_spiked        = allocator.allocate_gpu(sizeof(s64), total_neuron_count);
+
+    // The arena does not clear its slab, and every one of these is read before it is
+    // written on the first tick.
+    memset(network_inputs.get_contents(), 0, (usize)(2 * total_neuron_count) * sizeof(f32));
+    memset(spike_history.get_contents(), 0,
+           (usize)(layout.spike_history_length * total_neuron_count) * sizeof(u8));
+    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+
+    // Parameter rows, one per prototype, in the column order the type declared.
+    f32 *cell_parameter_data = static_cast<f32 *>(cell_parameters.get_contents());
+    for (usize index = 0; index < network_details.cell_prototypes.size(); index += 1) {
+        const ComponentPrototype &prototype = network_details.cell_prototypes[index];
+        const s64 base = layout.cell_prototype_parameter_base[index];
+        for (usize column = 0; column < prototype.starting_parameters.size(); column += 1) {
+            cell_parameter_data[base + (s64)column] =
+                    (f32)prototype.starting_parameters[column].float64;
+        }
     }
-    catch (Exception exception) {
 
-    // do something with the error
-    
-       
+    f32 *synapse_parameter_data = static_cast<f32 *>(synapse_parameters.get_contents());
+    for (usize index = 0; index < network_details.synapse_prototypes.size(); index += 1) {
+        const ComponentPrototype &prototype = network_details.synapse_prototypes[index];
+        const s64 base = layout.synapse_prototype_parameter_base[index];
+        for (usize column = 0; column < prototype.starting_parameters.size(); column += 1) {
+            synapse_parameter_data[base + (s64)column] =
+                    (f32)prototype.starting_parameters[column].float64;
+        }
+    }
 
+    logger->debug("SpikeEngine: arena {} bytes — cell_state {}, cell_parameters {}, "
+                  "synapse_parameters {}, network_inputs {}, spike_history {}",
+                  gpu_bytes, layout.cell_state_length, layout.cell_parameter_length,
+                  layout.synapse_parameter_length, 2 * total_neuron_count,
+                  layout.spike_history_length * total_neuron_count);
+}
 
+// Runs each cell type's OnStart once per neuron. This is not a formality: iafCell's
+// OnStart is `v = leakReversal`, and a cell left at 0 V when its threshold is -50 mV is
+// already over threshold on tick 0 — the whole network fires once and then sits at reset
+// forever, which looks exactly like a working simulation of a dead network.
+void SpikeEngine::initialize_cell_state() {
+    f32 *cell_state_data = static_cast<f32 *>(cell_state.get_contents());
 
+    for (usize index = 0; index < network_details.populations.size(); index += 1) {
+        const PopulationLayout &population = network_details.populations[index];
+        const CellTypeSpecification &cell_type =
+                network_details.cell_types[(usize)population.cell_type_index];
+        const ComponentPrototype &prototype =
+                network_details.cell_prototypes[(usize)population.prototype_index];
+
+        const s64 base = layout.population_state_base[index];
+
+        for (usize slot = 0; slot < cell_type.state_variable_names.size(); slot += 1) {
+            const f64 initial = starting_value_for(
+                    cell_type.dynamics, cell_type.state_variable_names[slot],
+                    cell_type.parameter_names, prototype.starting_parameters, cell_type.name);
+
+            f32 *run = cell_state_data + base + (s64)slot * population.neuron_count;
+            std::fill(run, run + population.neuron_count, (f32)initial);
+
+            logger->debug("SpikeEngine: population '{}' starts {} = {}",
+                          population.population_name,
+                          cell_type.state_variable_names[slot], initial);
+        }
     }
 }
 
-SpikeEngine::SpikeEngine(
-    vector<vector<s32>> *network,
-    const vector<s64> &shape,
-    s64 rank,
-    f32 resting_mp,
-    f32 decay_rate,
-    f32 learning_rate,
-    bool plasticity_enabled, 
-    bool active_set_optimization_enabled
-)   : logger(make_logger())
-    , weights(*network, rank, true)
-    , neuron_count(shape[0] * shape[1])
-    , input_neuron_count(0)
-    , thread_count_per_block(256)
-    , block_count(0)
-    , resting_membrane_potential(resting_mp)
-    , decay_rate(decay_rate)
-    , learning_rate(learning_rate)
-    , spike_period(1)
-    , spike_threshold(1.0f)
-    , alive(true)
-    , active_set_optimization_enabled(active_set_optimization_enabled)
-{
-    if (!plasticity_enabled && learning_rate > 0.0f) {
-        throw std::runtime_error(
-                "Spike engine cannot be initialized with learning rate > 0.0f" 
-                + " while plasticity is disabled.");
+// Everything per-edge goes into the WeightMatrix: the connection weight, the delay, the
+// edge's synapse prototype, and that synapse's state variables. The k^2-tree is what says
+// which (source, target) pairs exist, so only real edges are ever addressed, and each
+// matrix's Ck is pinned to zero so the stored value is the value — a weight of 5e-10 reads
+// back as 5e-10 rather than as whatever the shared basis reconstructs near it.
+void SpikeEngine::build_weight_matrix() {
+    const Vector<Vector<s64>> adjacency = build_adjacency_list(network_details);
+
+    Vector<vector<s32>> network((usize)total_neuron_count);
+    for (usize source = 0; source < adjacency.size(); source += 1) {
+        network[source].reserve(adjacency[source].size());
+        for (s64 target : adjacency[source]) network[source].push_back((s32)target);
     }
 
-    if (!plasticity_enabled) learning_rate = 0.0f;
+    weights.emplace(network, /*rank=*/1, /*check_indexing=*/true, /*max_neighbor_count=*/-1,
+                    /*weight_seed=*/(s64)simulation_seed);
+    weights->configure_per_edge_variable_count(layout.per_edge_variable_count);
 
+    for (usize source = 0; source < network_details.neurons.size(); source += 1) {
+        for (const NetworkEdge &edge : network_details.neurons[source].outgoing_edges) {
+            const s32 source_node = (s32)source;
+            const s32 target_node = (s32)edge.target_neuron_index;
 
-    block_count = (s32) ((neuron_count + thread_count_per_block - 1) / thread_count_per_block);
+            weights->set_edge_weight(source_node, target_node, (f32)edge.weight);
 
-    usize neuron_f32_byte_size = (usize) neuron_count * sizeof(f32);
-    usize neuron_s32_byte_size = (usize) neuron_count * sizeof(s32);
-    usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
+            // The engine's synaptic latency is one tick, so a connection that names no
+            // delay still arrives a tick later rather than instantaneously.
+            weights->set_edge_delay_ticks(source_node, target_node,
+                                          (s32)std::max<s64>(1, edge.delay_tick_count));
 
-    network_inputs = allocate<f32>(neuron_f32_byte_size);
-    memset(network_inputs.get_contents(), 0, neuron_f32_byte_size);
+            if (edge.synapse_prototype_index < 0) {
+                log::throw_runtime_error(*logger,
+                        "SpikeEngine: the connection " + to_string(source) + " -> " +
+                        to_string(edge.target_neuron_index) +
+                        " names no synapse, so there is nothing to carry its current");
+            }
+            weights->set_edge_variable(0, source_node, target_node,
+                                       (f32)edge.synapse_prototype_index);
 
-    membrane_potentials = allocate<f32>(neuron_f32_byte_size);
-    std::fill(membrane_potentials.get_contents(),
-            membrane_potentials.get_contents() + neuron_count,
-            resting_membrane_potential);
+            const ComponentPrototype &prototype =
+                    network_details.synapse_prototypes[(usize)edge.synapse_prototype_index];
+            const SynapseTypeSpecification &synapse_type =
+                    network_details.synapse_types[(usize)prototype.type_index];
 
-    last_spiked = allocate<s64>(neuron_s64_byte_size);
-    memset(last_spiked.get_contents(), 0, neuron_s64_byte_size);
+            for (usize slot = 0; slot < synapse_type.state_variable_names.size(); slot += 1) {
+                const f64 initial = starting_value_for(
+                        synapse_type.dynamics, synapse_type.state_variable_names[slot],
+                        synapse_type.parameter_names, prototype.starting_parameters,
+                        synapse_type.name);
 
-    last_tick_updated = allocate<s64>(neuron_s64_byte_size);
-    memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
+                weights->set_edge_variable((s64)slot + 1, source_node, target_node,
+                                           (f32)initial);
+            }
+        }
+    }
 
-    active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
-    next_active_neuron_indices = allocate<s32>(neuron_s32_byte_size);
+    logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, "
+                  "max_neighbor_count {}, {} per-edge variables",
+                  weights->node_count, weights->total_edge_count,
+                  weights->max_neighbor_count, layout.per_edge_variable_count);
+}
 
-    active_neuron_count = allocate<s32>(sizeof(s32));
-    next_active_neuron_count = allocate<s32>(sizeof(s32));
-    active_neuron_count.get_contents()[0] = 0;
-    next_active_neuron_count.get_contents()[0] = 0;
+void SpikeEngine::collect_stimulus() {
+    for (const SimulationInputConfig &profile : network_details.input_profiles) {
+        for (const InputTarget &target : profile.targets) {
+            if (target.neuron_index < 0) continue;
 
-    active_generation = allocate<s32>(neuron_s32_byte_size);
-    s32 *active_generation_data = active_generation.get_contents();
-    for (s64 neuron_index = 0; neuron_index < neuron_count; ++neuron_index)
-        active_generation_data[neuron_index] = -1;
+            if (profile.continuous_current_injection) {
+                continuous_injection_targets.push_back(target.neuron_index);
+                continuous_injection_amplitudes.push_back(
+                        (f32)(profile.amplitude * target.weight));
+                continuous_injection_start_ticks.push_back(profile.start_tick);
+                continuous_injection_end_ticks.push_back(
+                        profile.end_tick > profile.start_tick ? profile.end_tick : lifetime);
+                continue;
+            }
 
-    input_staging = allocate<f32>(neuron_f32_byte_size);
-    override_staging = allocate<s64>(neuron_s64_byte_size);
+            if (target.event_ticks.empty()) continue;
 
-    prefetch_to_gpu(network_inputs, neuron_f32_byte_size);
-    prefetch_to_gpu(membrane_potentials, neuron_f32_byte_size);
-    prefetch_to_gpu(last_spiked, neuron_s64_byte_size);
-    prefetch_to_gpu(last_tick_updated, neuron_s64_byte_size);
-    prefetch_to_gpu(active_neuron_indices, neuron_s32_byte_size);
-    prefetch_to_gpu(next_active_neuron_indices, neuron_s32_byte_size);
-prefetch_to_gpu(active_neuron_count, sizeof(s32));
-    prefetch_to_gpu(next_active_neuron_count, sizeof(s32));
-    prefetch_to_gpu(active_generation, neuron_s32_byte_size);
-    prefetch_to_gpu(input_staging, neuron_f32_byte_size);
-    prefetch_to_gpu(override_staging, neuron_s64_byte_size);
+            ScheduledSpikeTrain train;
+            train.neuron_index = target.neuron_index;
+            train.magnitude = (f32)(profile.amplitude * target.weight);
+            train.event_ticks = target.event_ticks;
+            scheduled_spike_trains.push_back(std::move(train));
 
-    logger->debug("SpikeEngine buffers allocated: neuron_f32_byte_size={} neuron_s32_byte_size={} "
-                  "neuron_s64_byte_size={} thread_count_per_block={} block_count={}",
-                  neuron_f32_byte_size, neuron_s32_byte_size, neuron_s64_byte_size,
-                  thread_count_per_block, block_count);
-    logger->info("SpikeEngine constructed: neuron_count={} resting_mp={} decay_rate={} learning_rate={}",
-                  neuron_count, resting_mp, decay_rate, learning_rate);
+            if (profile.amplitude == 0.0) {
+                logger->warn("SpikeEngine: input '{}' delivers a spike train but declares no "
+                             "amplitude, so each of its events injects 0 A and the train has "
+                             "no effect", profile.input_component_id);
+            }
+        }
+    }
+
+    logger->info("SpikeEngine: stimulus — {} continuous injections, {} spike trains",
+                 continuous_injection_targets.size(), scheduled_spike_trains.size());
 }
 
 SpikeEngine::~SpikeEngine() {
-    logger->info("Spike Engine shutting down.");
     if (alive) shutdown();
 }
 
-bool SpikeEngine::plasticity_enabled() {
-    return learning_rate > 0.0f;
-}
+// ── running ───────────────────────────────────────────────────────────────────────
 
-void SpikeEngine::enable_plasticity(f32 _learning_rate) {
-    if (plasticity_enabled()) return;
+// Host-side stimulus lands in the row this tick's kernel is about to drain, so injected
+// current reaches the cell on the tick the model asked for rather than the one after.
+void SpikeEngine::apply_stimulus(s64 tick) {
+    f32 *input_data = static_cast<f32 *>(network_inputs.get_contents());
+    const s64 row_base = (tick % 2) * total_neuron_count;
 
-    learning_rate = _learning_rate;
-}
+    for (usize index = 0; index < continuous_injection_targets.size(); index += 1) {
+        if (tick < continuous_injection_start_ticks[index]) continue;
+        if (tick >= continuous_injection_end_ticks[index]) continue;
 
-void SpikeEngine::disable_plasticity() {
-    if (!plasticity_enabled()) return;
-
-    learning_rate = 0.0f;
-}
-
-void SpikeEngine::setup_lifetime(int lifetime_, bool allocate_logs, s64 max_log_bytes) {
-    logger->debug("setup_lifetime: lifetime={} allocate_logs={} max_log_bytes={}",
-                  lifetime_, allocate_logs, max_log_bytes);
-    lifetime = lifetime_;
-    if (lifetime < 0 || !allocate_logs) {
-        logger->info("Not allocating logs for run data.");
-        return;
+        input_data[row_base + continuous_injection_targets[index]] +=
+                continuous_injection_amplitudes[index];
     }
 
-    s32 size_of_f32 = 4;
-    s64 required_bytes = neuron_count * lifetime * size_of_f32;
-    if (max_log_bytes < required_bytes) {
-        throw_runtime_error(*logger,
-            fmt::format("setup_lifetime: refusing to allocate membrane potential log "
-                        "({} neurons x {} ticks = {} bytes exceeds {}-byte budget; "
-                        "pass a larger max_log_bytes to enable recording)",
-                        neuron_count, lifetime, required_bytes, max_log_bytes));
-    }
-
-    cell_state_logs = new f32*[neuron_count];
-    for (s64 i = 0; i < neuron_count; ++i)
-        cell_state_logs[i] = new f32[lifetime];
-
-    logger->debug("setup_lifetime: allocated cell_state_logs for {} neurons x {} ticks", 
-                  neuron_count, lifetime);
-}
-
-void SpikeEngine::set_input_neurons(const vector<s32> &input_neuron_list) {
-    logger->debug("set_input_neurons: input_neuron_count={}", input_neuron_list.size());
-    if (input_neuron_list.empty()) return;
-
-    s32 s32_byte_size = 4;
-    if (input_neuron_indices.pointer != nullptr) deallocate(std::move(input_neuron_indices));
-    input_neuron_indices = allocate<s32>(neuron_count * s32_byte_size);
-    memcpy(
-        input_neuron_indices.get_contents(),
-        input_neuron_list.data(),
-        input_neuron_list.size() * s32_byte_size
-    );
-    input_neuron_count = (s64) input_neuron_list.size();
-
-    prefetch_to_gpu(input_neuron_indices, (usize)neuron_count * s32_byte_size);
-}
-
-void SpikeEngine::reset_state(s64 last_spiked_value, s32 active_gen_value) {
-    logger->debug("reset_state: last_spiked_value={} active_gen_value={}", 
-                  last_spiked_value, active_gen_value);
-    s32 f32_byte_size = 4;
-    usize neuron_s64_byte_size = (usize) neuron_count * sizeof(s64);
-
-    memset(network_inputs.get_contents(), 0, (usize) neuron_count * f32_byte_size);
-    std::fill(membrane_potentials.get_contents(),
-              membrane_potentials.get_contents() + neuron_count,
-              resting_membrane_potential);
-    std::fill(last_spiked.get_contents(), 
-              last_spiked.get_contents() + neuron_count, 
-              last_spiked_value);
-    memset(last_tick_updated.get_contents(), 0, neuron_s64_byte_size);
-    active_neuron_count.get_contents()[0] = 0;
-    next_active_neuron_count.get_contents()[0] = 0;
-    std::fill(active_generation.get_contents(), 
-              active_generation.get_contents() + neuron_count, 
-              active_gen_value);
-}
-
-void SpikeEngine::step_simulation(
-    const vector<f32> &input_values,
-    s64 tick,
-    const vector<s64> &override_input_neurons,
-    bool decay_all_neurons
-) {
-    if (input_values.empty()) {
-        log::throw_runtime_error(*logger, 
-                fmt::format("step_simulation: input_values is empty (tick={})", tick));
-    }
-
-    logger->trace("step_simulation: tick={} input_values.size={} override_input_neurons.size={}" 
-                  + " decay_all_neurons={}",
-                  tick, input_values.size(), override_input_neurons.size(), decay_all_neurons);
-
-    MetalCommandBatch *batch = begin_command_batch();
-
-    if (decay_all_neurons) {
-        gpu_decay_all_neurons(
-            membrane_potentials.get_contents(),
-            last_tick_updated.get_contents(),
-            neuron_count,
-            tick,
-            resting_membrane_potential,
-            decay_rate,
-            batch);
-    }
-
-    memcpy(input_staging.get_contents(), 
-           input_values.data(), input_values.size() * sizeof(f32));
-
-    // QUESTION: anyway to combine these two steps? 
-    // what exactly is the merge_input_neurons for?
-    gpu_add_network_input(
-        membrane_potentials.get_contents(),
-        input_neuron_indices.get_contents(),
-        input_staging.get_contents(),
-        (s64)input_values.size(),
-        batch);
-
-    next_active_neuron_count.get_contents()[0] = 0;
-
-    if (!override_input_neurons.empty()) {
-        memcpy(override_staging.get_contents(), 
-               override_input_neurons.data(), override_input_neurons.size() * sizeof(s64));
-
-        gpu_merge_input_neurons(
-            active_neuron_indices.get_contents(),
-            active_neuron_count.get_contents(),
-            override_staging.get_contents(),
-            (s64)override_input_neurons.size(),
-            batch);
-    }
-
-    gpu_step(
-        tick,
-        tick + 1,
-        spike_period,
-        spike_threshold,
-        learning_rate,
-        decay_rate,
-        resting_membrane_potential,
-        weights.U_matrix.get_contents(),
-        weights.V_matrix.get_contents(),
-        weights.rank_float4_stride,
-        use_constant_weight ? weights.constant_weight : 0.0,
-        weights.k2tree.internal_node_words.get_contents(),
-        weights.k2tree.leaf_node_words.get_contents(),
-        weights.k2tree.rank_superblock_table.get_contents(),
-        weights.k2tree.rank_subblock_table.get_contents(),
-        weights.k2tree.branching_factor,
-        weights.k2tree.superblock_size_words,
-        weights.k2tree.padded_node_count,
-        weights.k2tree.tree_height,
-        weights.k2tree.internal_bit_count,
-        neuron_count,
-        network_inputs.get_contents(),
-        membrane_potentials.get_contents(),
-        last_spiked.get_contents(),
-        last_tick_updated.get_contents(),
-        active_neuron_indices.get_contents(),
-        active_neuron_count.get_contents(),
-        next_active_neuron_indices.get_contents(),
-        next_active_neuron_count.get_contents(),
-        active_generation.get_contents(),
-        active_set_optimization_enabled,
-        thread_count_per_block,
-        block_count,
-        batch);
-
-    commit_command_batch(batch);
-
-    std::swap(active_neuron_indices, next_active_neuron_indices);
-    std::swap(active_neuron_count, next_active_neuron_count);
-
-    logger->trace("step_simulation: tick={} completed, active_neuron_count={}",
-                  tick, active_neuron_count.get_contents()[0]);
-}
-
-void SpikeEngine::start_static_record(
-    const vector<vector<f32>> &input_spikes,
-    s64 lifetime,
-    const string &filename,
-    bool record_membrane,
-    s64 record_stride,
-    optional<string> compression,
-    optional<int> compression_level,
-    bool full_decay,
-    bool compression_async,
-    usize compression_queue_max,
-    usize compression_chunk_bytes
-) {
-    if (lifetime < 0) {
-        log::throw_runtime_error(*logger, 
-                fmt::format("start_static_record: lifetime must be >= 0 (got {})", lifetime));
-    }
-    if (record_stride < 1) {
-        log::throw_runtime_error(*logger,
-            fmt::format("start_static_record: record_stride must be >= 1 (got {})", 
-                        record_stride));
-    }
-    if (input_neuron_count <= 0) {
-        log::throw_runtime_error(*logger,
-            "start_static_record: no input neurons configured (call set_input_neurons first)");
-    }
-    if ((s64)input_spikes.size() < lifetime) {
-        log::throw_runtime_error(*logger,
-            fmt::format("start_static_record: input_spikes has {} " + 
-                        "ticks but lifetime requires {}",
-                        input_spikes.size(), lifetime));
-    }
-
-    // Each tick's input row is positionally matched to input_neuron_indices, so
-    // it must contain exactly input_neuron_count values.
-    for (s64 tick = 0; tick < lifetime; ++tick) {
-        if ((s64)input_spikes[(usize)tick].size() != input_neuron_count) {
-            log::throw_runtime_error(*logger,
-                fmt::format("start_static_record: input_spikes[{}] has {} values but there are {} input neurons",
-                            tick, input_spikes[(usize)tick].size(), input_neuron_count));
+    for (ScheduledSpikeTrain &train : scheduled_spike_trains) {
+        while (train.cursor < train.event_ticks.size() &&
+               (s64)train.event_ticks[train.cursor] < tick) {
+            train.cursor += 1;
+        }
+        while (train.cursor < train.event_ticks.size() &&
+               (s64)train.event_ticks[train.cursor] == tick) {
+            input_data[row_base + train.neuron_index] += train.magnitude;
+            train.cursor += 1;
         }
     }
+}
 
-    logger->info("start_static_record: lifetime={} filename={}", lifetime, filename);
+void SpikeEngine::step_simulation(s64 tick) {
+    apply_stimulus(tick);
 
-    SimulationRecorder recorder(
-        filename, neuron_count, compression, compression_level,
-        compression_async, compression_queue_max, compression_chunk_bytes);
+    const s32 neuron_count_argument = (s32)total_neuron_count;
+    const s32 spike_history_length_argument = (s32)layout.spike_history_length;
+    const s32 max_neighbor_count_argument = (s32)weights->max_neighbor_count;
 
-    // Forces input neurons into the active set every tick regardless of
-    // whether they're already active
-    vector<s64> override_input_neurons((usize)input_neuron_count);
-    const s32 *input_indices = input_neuron_indices.get_contents();
-    for (s64 i = 0; i < input_neuron_count; ++i)
-        override_input_neurons[(usize)i] = (s64)input_indices[i];
+    void *cell_state_pointer         = cell_state.get_contents();
+    void *cell_parameters_pointer    = cell_parameters.get_contents();
+    void *synapse_parameters_pointer = synapse_parameters.get_contents();
+    void *network_inputs_pointer     = network_inputs.get_contents();
+    void *spike_history_pointer      = spike_history.get_contents();
+    void *last_spiked_pointer        = last_spiked.get_contents();
 
-    for (s64 tick = 0; tick < lifetime; ++tick) {
-        step_simulation(input_spikes[(usize)tick], tick, override_input_neurons, /*decay_all_neurons=*/false);
+    const K2Tree &tree = weights->k2tree;
+    void *internal_words_pointer   = (void *)tree.internal_node_words.get_contents();
+    void *leaf_words_pointer       = (void *)tree.leaf_node_words.get_contents();
+    void *superblock_table_pointer = (void *)tree.rank_superblock_table.get_contents();
+    void *subblock_table_pointer   = (void *)tree.rank_subblock_table.get_contents();
 
-        if (record_membrane && tick % record_stride == 0) {
-            // _decay_all(tick) runs after step() and only on recorded ticks,
-            // immediately before the membrane-potential snapshot
-            if (full_decay) {
-                gpu_decay_all_neurons(
-                    membrane_potentials.get_contents(),
-                    last_tick_updated.get_contents(),
-                    neuron_count,
-                    tick,
-                    resting_membrane_potential,
-                    decay_rate);
+    void *edge_weights_pointer =
+            (void *)weights->sparse_delta_buffers[WeightMatrix::DEFAULT_MATRIX_INDEX]
+                    .get_contents();
+    void *edge_delays_pointer =
+            (void *)weights->sparse_delta_buffers[(usize)weights->delay_matrix_index]
+                    .get_contents();
+    void *edge_variables_pointer = (void *)weights->per_edge_variable_values.get_contents();
+
+    const void *arguments[] = {
+        &tick, &step_dt, &neuron_count_argument, &spike_history_length_argument,
+        &max_neighbor_count_argument,
+        &cell_state_pointer, &cell_parameters_pointer, &synapse_parameters_pointer,
+        &network_inputs_pointer, &spike_history_pointer, &last_spiked_pointer,
+        &internal_words_pointer, &leaf_words_pointer,
+        &superblock_table_pointer, &subblock_table_pointer,
+        &tree.branching_factor, &tree.superblock_size_words, &tree.padded_node_count,
+        &tree.tree_height, &tree.internal_bit_count,
+        &edge_weights_pointer, &edge_delays_pointer, &edge_variables_pointer,
+    };
+    const usize argument_sizes[] = {
+        sizeof(s64), sizeof(f32), sizeof(s32), sizeof(s32), sizeof(s32),
+        sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
+        sizeof(void *), sizeof(void *), sizeof(void *),
+    };
+
+    metal_dispatch(master_kernel, LaunchConfig{(u32)block_count, (u32)thread_count_per_block},
+                   arguments, argument_sizes,
+                   (u32)(sizeof(arguments) / sizeof(arguments[0])));
+    synchronize_gpu_work();
+
+    record_tick(tick);
+}
+
+void SpikeEngine::run() {
+    logger->info("SpikeEngine: running {} ticks at dt={} s", lifetime, step_dt);
+
+    for (s64 tick = 0; tick < lifetime; tick += 1) step_simulation(tick);
+
+    logger->info("SpikeEngine: run finished — {} spikes, mean rate {:.2f} Hz, {:.1f}% of "
+                 "neurons spiked at least once",
+                 recorded_spikes.size(), mean_firing_rate_hertz(),
+                 100.0 * fraction_of_neurons_that_spiked());
+}
+
+void SpikeEngine::record_tick(s64 tick) {
+    const u8 *spike_row = static_cast<const u8 *>(spike_history.get_contents()) +
+                          (tick % layout.spike_history_length) * total_neuron_count;
+
+    for (s64 neuron_index = 0; neuron_index < total_neuron_count; neuron_index += 1) {
+        if (spike_row[neuron_index] == 0) continue;
+
+        spike_counts_per_neuron[(usize)neuron_index] += 1;
+        recorded_spikes.push_back(RecordedSpike{(f64)tick * network_details.step_dt,
+                                                neuron_index});
+    }
+
+    if (traced_selections.empty()) return;
+
+    recorded_trace_times.push_back((f64)tick * network_details.step_dt);
+    for (const RecordingSelection &selection : traced_selections) {
+        recorded_traces.push_back(
+                read_state_variable(selection.neuron_index, selection.variable_name));
+    }
+}
+
+// ── readback ──────────────────────────────────────────────────────────────────────
+
+f32 SpikeEngine::read_state_variable(s64 neuron_index, const String &variable_name) const {
+    for (usize index = 0; index < network_details.populations.size(); index += 1) {
+        const PopulationLayout &population = network_details.populations[index];
+        if (neuron_index < population.first_neuron_index) continue;
+        if (neuron_index >= population.first_neuron_index + population.neuron_count) continue;
+
+        const CellTypeSpecification &cell_type =
+                network_details.cell_types[(usize)population.cell_type_index];
+
+        for (usize slot = 0; slot < cell_type.state_variable_names.size(); slot += 1) {
+            if (cell_type.state_variable_names[slot] != variable_name) continue;
+
+            const s64 local_index = neuron_index - population.first_neuron_index;
+            const s64 offset = layout.population_state_base[index] +
+                               (s64)slot * population.neuron_count + local_index;
+            return static_cast<const f32 *>(cell_state.get_contents())[offset];
+        }
+
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: neuron " + to_string(neuron_index) + " is a '" +
+                cell_type.name + "', which declares no state variable '" +
+                variable_name + "'");
+    }
+
+    log::throw_runtime_error(*logger,
+            "SpikeEngine: neuron index " + to_string(neuron_index) +
+            " is outside every population");
+}
+
+f64 SpikeEngine::mean_firing_rate_hertz() const {
+    if (total_neuron_count == 0 || lifetime == 0 || network_details.step_dt <= 0.0) return 0.0;
+
+    s64 total_spikes = 0;
+    for (s64 count : spike_counts_per_neuron) total_spikes += count;
+
+    const f64 elapsed_seconds = (f64)lifetime * network_details.step_dt;
+    return (f64)total_spikes / ((f64)total_neuron_count * elapsed_seconds);
+}
+
+f64 SpikeEngine::fraction_of_neurons_that_spiked() const {
+    if (total_neuron_count == 0) return 0.0;
+
+    s64 spiking_neurons = 0;
+    for (s64 count : spike_counts_per_neuron) spiking_neurons += count > 0 ? 1 : 0;
+
+    return (f64)spiking_neurons / (f64)total_neuron_count;
+}
+
+// ── recording output ──────────────────────────────────────────────────────────────
+
+void SpikeEngine::write_recordings() const {
+    for (const RecordingConfig &profile : network_details.recording_profiles) {
+        if (profile.output_filenames.empty()) continue;
+
+        const String &filename = profile.output_filenames.front();
+        const OutputFileFormat format = profile.file_output_format.front();
+
+        ofstream file(filename);
+        if (!file) {
+            logger->error("SpikeEngine: cannot open '{}' for writing", filename);
+            continue;
+        }
+
+        if (format == OutputFileFormat::SPIKE_EVENTS) {
+            // The NeuroML event-file convention: one "time id" line per spike, ordered by
+            // time, restricted to the neurons the EventSelections named.
+            Set<s64> selected;
+            for (const RecordingSelection &selection : profile.selections) {
+                if (selection.neuron_index >= 0) selected.insert(selection.neuron_index);
             }
 
-            synchronize_gpu_work();
-            prefetch_to_cpu(membrane_potentials, (usize)neuron_count * sizeof(f32));
-            recorder.record_frame(membrane_potentials.get_contents(), neuron_count);
+            s64 written = 0;
+            for (const RecordedSpike &spike : recorded_spikes) {
+                if (!selected.empty() && selected.count(spike.neuron_index) == 0) continue;
+
+                file << setprecision(9) << spike.time_seconds << "\t"
+                     << spike.neuron_index << "\n";
+                written += 1;
+            }
+            logger->info("SpikeEngine: wrote {} spikes to {}", written, filename);
+            continue;
         }
+
+        // The NML column-matrix convention: first column time, one further column per
+        // OutputColumn, in the order the file declared them.
+        Vector<usize> columns;
+        for (const RecordingSelection &selection : profile.selections) {
+            for (usize index = 0; index < traced_selections.size(); index += 1) {
+                if (traced_selections[index].quantity_path != selection.quantity_path) continue;
+                columns.push_back(index);
+                break;
+            }
+        }
+
+        for (usize row = 0; row < recorded_trace_times.size(); row += 1) {
+            file << setprecision(9) << recorded_trace_times[row];
+            for (usize column : columns) {
+                file << "\t" << recorded_traces[row * traced_selections.size() + column];
+            }
+            file << "\n";
+        }
+        logger->info("SpikeEngine: wrote {} rows x {} columns to {}",
+                     recorded_trace_times.size(), columns.size(), filename);
     }
-
-    recorder.finish();
-    logger->info("start_static_record: finished");
-}
-
-pair<f32, f32> SpikeEngine::estimate_bifurcation_weight(s32 input_period) const {
-    f32 decay_factor = std::pow(1.0f - decay_rate, (f32)input_period);
-    f32 w_accum = (spike_threshold - resting_membrane_potential) * (1.0f - decay_factor);
-    f32 w_instant = spike_threshold - resting_membrane_potential;
-    return make_pair(w_accum, w_instant);
-}
-
-void SpikeEngine::scale_uniform_weights_near_bifurcation(
-    f32 *target, f32 *w_accum, f32 *w_instant,
-    s32 input_period, f32 scale, bool freeze_learning, const bool *use_constant_weight_
-) {
-    auto [w_accum_, w_instant_] = estimate_bifurcation_weight(input_period);
-    *w_accum = w_accum_;
-    *w_instant = w_instant_;
-    *target = *w_accum * scale;
-    weights.set_constant_weight(*target);
-
-    if (freeze_learning) {
-        learning_rate = 0.0f;
-    }
-
-    use_constant_weight = use_constant_weight_ != nullptr
-        ? *use_constant_weight_
-        : freeze_learning;
-
-    logger->debug("scale_uniform_weights_near_bifurcation: input_period={} scale={} target={} "
-                  "w_accum={} w_instant={} use_constant_weight={}",
-                  input_period, scale, *target, *w_accum, *w_instant, use_constant_weight);
-}
-
-ScaledReservoirResult SpikeEngine::scale_randomized_weights_near_bifurcation(
-    s32 input_period, 
-    f32 scale, 
-    bool freeze_learning
-) {
-    auto [w_accum, w_instant] = estimate_bifurcation_weight(input_period);
-    f32 target = abs(w_accum * scale);
-    ScaleResult result = weights.scale_neighbor_weights_to_root_mean_square(target);
-
-    use_constant_weight = false;
-
-    if (freeze_learning) {
-        learning_rate = 0.0f;
-    }
-
-    logger->debug("scale_randomized_weights_near_bifurcation: " +
-                  "input_period={} scale={} target={} " +
-                  "w_accum={} w_instant={}",
-                  input_period, scale, target, w_accum, w_instant);
-
-    return ScaledReservoirResult{result,w_accum,w_instant};
-}
-
-void SpikeEngine::get_reservoir_features_vector(
-    s64 tick, 
-    f32 spike_tau, 
-    f32 voltage_scale, 
-    GpuPointer<f32> output_buffer
-) {
-    logger->trace("get_reservoir_features_vector: tick={} spike_tau={} voltage_scale={}", 
-                  tick, spike_tau, voltage_scale);
-    if (spike_tau <= 0.0f) {
-        logger->warn("get_reservoir_features_vector: spike_tau was <= 0.0. Aborting.");
-        return;
-    }
-    if (voltage_scale <= 0.0f) {
-        logger->warn("get_reservoir_features_vector: voltage_scale was <= 0.0. Aborting.");
-        return;
-    }
-    gpu_reservoir_features(
-        neuron_count,
-        tick,
-        spike_tau,
-        voltage_scale,
-        membrane_potentials.get_contents(),
-        last_spiked.get_contents(),
-        last_tick_updated.get_contents(),
-        resting_membrane_potential,
-        decay_rate,
-        output_buffer.get_contents());
 }
 
 void SpikeEngine::shutdown() {
     if (!alive) return;
 
-    logger->info("shutdown: releasing GPU buffers");
+    logger->info("SpikeEngine: shutting down");
 
-    if (cell_state_logs != nullptr) {
-        for (s64 i = 0; i < neuron_count; ++i)
-            delete[] cell_state_logs[i];
-        delete[] cell_state_logs;
-        cell_state_logs = nullptr;
-    }
-
-    deallocate(std::move(network_inputs));
-    deallocate(std::move(membrane_potentials));
-    deallocate(std::move(last_spiked));
-    deallocate(std::move(last_tick_updated));
-    deallocate(std::move(active_neuron_indices));
-    deallocate(std::move(next_active_neuron_indices));
-    deallocate(std::move(active_neuron_count));
-    deallocate(std::move(next_active_neuron_count));
-    deallocate(std::move(active_generation));
-    deallocate(std::move(input_neuron_indices));
-    deallocate(std::move(input_staging));
-    deallocate(std::move(override_staging));
+    release_kernel(master_kernel);
+    weights.reset();
+    allocator = EngineAllocator();
 
     alive = false;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

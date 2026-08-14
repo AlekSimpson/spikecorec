@@ -84,6 +84,13 @@ CXXFLAGS        += -DSPIKECOREC_NML_STD_LIB_DIR=\"$(NML_STD_LIB_DIR)\"
 NML_SCHEMA_PATH := $(abspath third_party/neuroml2/schema/NeuroML_v2.3.xsd)
 CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 
+# ── Device-code includes shared with runtime-compiled kernels ────────────────
+# A kernel compiled at runtime by compile_kernel() has no include path, so
+# dynamics_codegen reads k2tree_device.metalinc from here and prepends its text to
+# the source it generates. Absolute, for the same reason the two paths above are.
+METAL_DEVICE_DIR := $(abspath src/metal)
+CXXFLAGS         += -DSPIKECOREC_METAL_DEVICE_DIR=\"$(METAL_DEVICE_DIR)\"
+
 # ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────
 # Header-only mode is spdlog's default (it self-defines SPDLOG_HEADER_ONLY
 # whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.
@@ -197,9 +204,9 @@ $(BUILD_DIR)/metal/%.o: $(SRC_DIR)/metal/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ── Metal shaders (.metal → .air → .metallib) ────────────────
-$(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal
+$(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal $(SRC_DIR)/metal/k2tree_device.metalinc
 	@mkdir -p $(@D)
-	$(METALC) $(METALFLAGS) -c $< -o $@
+	$(METALC) $(METALFLAGS) -I$(SRC_DIR)/metal -c $< -o $@
 
 $(BUILD_DIR)/default.metallib: $(AIR_FILES)
 	@mkdir -p $(@D)
