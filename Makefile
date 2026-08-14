@@ -268,7 +268,14 @@ examples-metal: check-metal $(METAL_LIB)
 
 # One example at a time: `make build/examples/iaf_single_cell_example` builds
 # examples/iaf_single_cell_example.cpp and nothing else.
-$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(METAL_LIB) $(BUILD_DIR)/default.metallib
+#
+# Every header in examples/ is a dependency of every example. Coarse on purpose: an
+# example whose model parameters live in a header it includes must not keep running the
+# old numbers after that header changes, and a stale demo binary reporting a result that
+# no longer follows from the source is worse than a slow rebuild.
+EX_HEADERS := $(wildcard $(EX_DIR)/*.h)
+
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HEADERS) $(METAL_LIB) $(BUILD_DIR)/default.metallib
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
