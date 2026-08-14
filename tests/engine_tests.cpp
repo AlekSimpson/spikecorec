@@ -1027,6 +1027,76 @@ TEST(DynamicsCodegen, a_regime_pair_lowers_to_a_refractory_gate) {
     EXPECT_LT(asc_step, gate) << "asc1 must decay whether or not the cell is refractory";
 }
 
+// GLIF2's only difference from GLIF1 is its reset rule: v = vreset + resetScale*(v - vth),
+// which carries part of the threshold overshoot into the next cycle instead of discarding
+// it. Under the family fixture's drive the overshoot is a fraction of a millivolt, so
+// GLIF2 and GLIF1 fire identically -- which means every other assertion about GLIF2 passes
+// just as well if codegen dropped the reset expression entirely.
+//
+// So: two GLIF2 cells differing only in resetScale, under a drive strong enough that the
+// per-tick overshoot is large. A higher resetScale resets closer to threshold and must
+// fire more often. If the expression were dropped, both would reset to vreset and the
+// counts would match.
+TEST(SpikeEngine, glif2_reset_scale_changes_how_often_the_cell_fires) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("reset_scale");
+    // 10 nA against a 200 pA leak at threshold is about 98 V/s, so at dt = 0.1 ms the cell
+    // overshoots vth by roughly 9.8 mV before it is caught -- a fifth of the 20 mV swing,
+    // and enough for resetScale to matter.
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ResetScale">
+  <include href="glif_cell_types.nml"/>
+
+  <GLIF2Cell id="discardOvershoot" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"
+             vreset="-70mV" resetScale="0" t_ref="1ms"/>
+  <GLIF2Cell id="carryOvershoot" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"
+             vreset="-70mV" resetScale="0.9" t_ref="1ms"/>
+
+  <pulseGenerator id="hardDrive" delay="0ms" duration="200ms" amplitude="10nA"/>
+
+  <network id="resetScaleNetwork">
+    <population id="popDiscard" component="discardOvershoot" size="1"/>
+    <population id="popCarry" component="carryOvershoot" size="1"/>
+    <explicitInput target="popDiscard[0]" input="hardDrive"/>
+    <explicitInput target="popCarry[0]" input="hardDrive"/>
+  </network>
+</neuroml>
+)");
+    // The types file is included by relative href, so it has to sit beside the model.
+    {
+        ifstream source("tests/fixtures/nml/glif_cell_types.nml");
+        ASSERT_TRUE(source.good()) << "GLIF cell type fixture missing";
+        ostringstream contents;
+        contents << source.rdbuf();
+        directory.write("glif_cell_types.nml", contents.str());
+    }
+
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "resetScaleNetwork", "200ms", "0.1ms"));
+
+    SpikeEngine engine(lems_path);
+    engine.run();
+
+    const Vector<f64> discarding = spike_times_of(engine, 0);
+    const Vector<f64> carrying = spike_times_of(engine, 1);
+
+    ASSERT_GE(discarding.size(), 10u);
+    ASSERT_GE(carrying.size(), 10u);
+
+    // Resetting nearer to threshold means a shorter climb back, so more spikes in the same
+    // window. Equality here is the failure the test exists to catch.
+    EXPECT_GT(carrying.size(), discarding.size())
+            << "resetScale=0.9 fired " << carrying.size() << " times and resetScale=0 fired "
+            << discarding.size() << "; the reset rule is not being applied";
+
+    // And the interval difference is in the direction and rough size the arithmetic says:
+    // the carried overshoot removes roughly 9 mV of a 20 mV climb.
+    const f64 discarding_interval = discarding[5] - discarding[4];
+    const f64 carrying_interval = carrying[5] - carrying[4];
+    EXPECT_LT(carrying_interval, discarding_interval);
+    EXPECT_GT(discarding_interval - carrying_interval, 5e-5);
+}
+
 TEST(DynamicsCodegen, a_regime_shape_that_is_not_the_refractory_pair_is_refused) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
