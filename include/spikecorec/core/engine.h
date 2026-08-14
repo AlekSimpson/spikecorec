@@ -25,6 +25,11 @@ using namespace spikecorec::nml;
 
 namespace spikecorec {
 
+    // What last_spiked holds for a neuron that has not fired yet. A refractory gate
+    // compares tick - last_spiked against the cell's refractory time, so this has to read
+    // as "long ago" rather than as tick 0.
+    constexpr s64 NEVER_SPIKED_TICK = -((s64)1 << 32);
+
     // One spike, as the model asked for it to be recorded.
     struct RecordedSpike {
         f64 time_seconds = 0.0;

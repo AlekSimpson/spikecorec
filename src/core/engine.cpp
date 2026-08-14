@@ -145,7 +145,12 @@ void SpikeEngine::allocate_model_buffers() {
     memset(network_inputs.get_contents(), 0, (usize)(2 * total_neuron_count) * sizeof(f32));
     memset(spike_history.get_contents(), 0,
            (usize)(layout.spike_history_length * total_neuron_count) * sizeof(u8));
-    memset(last_spiked.get_contents(), 0, (usize)total_neuron_count * sizeof(s64));
+    // Far enough in the past that (tick - last_spiked) * dt is large for any run length.
+    // Zero would not do: a refractory gate reads it as "fired on tick 0", so every cell in
+    // the model would start the run held and the ones that are never driven would stay
+    // held forever.
+    s64 *last_spiked_data = static_cast<s64 *>(last_spiked.get_contents());
+    std::fill(last_spiked_data, last_spiked_data + total_neuron_count, NEVER_SPIKED_TICK);
 
     // Parameter rows, one per prototype, in the column order the type declared.
     f32 *cell_parameter_data = static_cast<f32 *>(cell_parameters.get_contents());

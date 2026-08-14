@@ -391,6 +391,10 @@ static void collect_dynamics_instructions(
     instruction.regime_name = regime_name;
     instruction.condition = condition;
 
+    if (declaration.tag_type == NML_DeclarationType::Regime) {
+        instruction.is_initial_regime = declaration.value_or("initial") == "true";
+    }
+
     return_value.push_back(instruction);
 
     // A Regime scopes everything under it; a condition or event handler gates everything
