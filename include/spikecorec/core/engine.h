@@ -25,6 +25,10 @@ namespace spikecorec {
         f32 w_instant;
     };
 
+    // transform list of event ticks to list of 0s and 1s where the 1 indices correspond 
+    // to the event ticks and the 1 is transformed into actual input value using rate, amplitude and weight
+    Vector<f64> create_event_stream(f64 rate, f64 amplitude, f64 weight, const Vector<s64> &event_ticks);
+
     class SpikeEngine {
     public:
         SharedPointer<EngineLogger> logger;
@@ -60,6 +64,7 @@ namespace spikecorec {
         // static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
         // f32 **cell_state_logs = nullptr;
         RecordingConfig recordings;
+        NML_ParseResult network_details;
 
         s64 lifetime = 0;
         s64 total_neuron_count;
@@ -77,6 +82,7 @@ namespace spikecorec {
         bool use_constant_weight = false;
         bool alive = false;
         bool active_set_optimization_enabled = true;
+        u64 simulation_seed = 0;
 
         SpikeEngine(const SpikeEngine &) = delete;
 

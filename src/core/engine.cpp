@@ -95,8 +95,12 @@ SpikeEngine::SpikeEngine()
                   neuron_count, resting_membrane_potential, decay_rate, learning_rate);
 }
 
-SpikeEngine::SpikeEngine(String &neuroml_input_file) {
+SpikeEngine::SpikeEngine(String &lems_input_file, boolean enable_hebbian_learning) {
     NML_Parser parser = NML_Parser();
+    allocator = EngineAllocator(MAX_CPU_POOL_COUNT, MAX_GPU_POOL_COUNT);
+
+    // TODO: in the future we can create custom spikecorec component types which enable custom engine features
+    // like our builtin hebbian learning mechanism
 
     try {
 
@@ -105,7 +109,81 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file) {
         throw new runtime_error("Given NeuroML file is not valid.");
     }
     
+    network_details = parser.parse_lems(lems_input_file); 
 
+    // We need to initialize 4 things:
+    // 1. simulation cells
+    s64 cell_memory_length = 0;
+    s64 input_buffer_single_row_length = 0;
+    for (const auto &population : network_details.populations) {
+        CellTypeSpecification &cell_type = network_details.cell_types[population.cell_type_index];
+        cell_memory_length += neuron_count * cell_type.state_variable_names.size();
+        input_buffer_single_row_length += neuron_count;
+    }
+
+    GpuPointer<f32> cell_data = static_cast<GpuPointer<f32>>(
+        allocator.allocate_gpu(sizeof(f32), memory_length)
+    );
+
+    // todo: initialize cells with starting parameters
+
+    // todo: 2. simulation synapses / network topology
+
+    // 3. network input buffers
+    // input buffer uses multiple rows to create a roling network 
+    // input window to simulate spike delay times
+    s64 MAX_DELAY_TIME = 0; 
+    Vector<Set<s64>> input_neuron_populations;
+    UnorderedMap<s64, Vector<f64>> input_neuron_event_streams;
+    for (const auto &input_profile : network_details.input_profiles) {
+        input_neuron_count += input_profile.targets.size();
+
+        if (input_profile.continuous_current_injection) {
+            // will implement this later: 
+            // todo: here we need to do some different stuff to setup cont current injection
+            // this involves writing directly to cell memory for every input
+            // this will have to take the form of a modulus conditional on max_delay_time
+            continue;
+        }
+
+
+        if (input_profile.max_delay_time > MAX_DELAY_TIME) {
+            MAX_DELAY_TIME = input_profile.max_delay_time;
+        }
+
+        for (const auto &input_target : input_profile.targets) {
+            input_neuron_event_streams[input_target.neuron_index];
+            input_neuron_event_streams[input_target.neuron_index].insert(
+                create_event_stream(input_target.event_ticks);
+            );
+        }
+    }
+
+    GpuPointer<f32> network_input_buffer = static_cast<GpuPointer<f32>>(
+        allocator.allocate_gpu(sizeof(f32), input_buffer_single_row_length * MAX_DELAY_TIME);
+    );
+
+    // 4. engine utility values
+    total_neuron_count = neurons.size();
+    lifetime = network_details.total_tick_count;
+    active_set_optimization_enabled = false;
+    
+    if (network_details.random_seed.has_value()) {
+        simulation_seed = network_details.random_seed.value();
+    }
+
+    GpuPointer<s64> last_spiked;
+    GpuPointer<s64> last_tick_updated;
+    if (hebbian_learning_enabled) {
+        last_spiked = static_cast<GpuPointer<s64>>(
+            allocator.allocate_gpu(sizeof(s64), total_neuron_count);
+        );
+        last_tick_updated = static_cast<GpuPointer<s64>>(
+            allocator.allocate_gpu(sizeof(s64), total_neuron_count);
+        );
+    }
+    
+    // todo: active set optimization allocation/initialization
 
 
     }

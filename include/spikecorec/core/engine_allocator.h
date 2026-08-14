@@ -5,22 +5,20 @@
 
 namespace spikecorec {
 
-using PoolIndex = s64;
-
 struct EngineAllocator {
-    s64 max_pool_count;
+    u64 cpu_total_bytes;
+    u64 gpu_total_bytes;
+    s32 cpu_cursor = 0;
+    s32 gpu_cursor = 0;
 
-    s64 *pool_sizes;
-    s64 *pool_cursors;
-    u64 **pool_cpu_memory;
-    GpuPointer<u64> *pool_gpu_memory;
+    void *pool_cpu_memory;
+    GpuPointer<void> pool_gpu_memory;
 
-    EngineAllocator();
-    EngineAllocator(s64 max_pools);
+    EngineAllocator(u64 cpu_total_bytes, u64 gpu_total_bytes);
     ~EngineAllocator();
 
-    u64 *allocate_cpu(u64 element_bytes, int length);
-    GpuPointer<u64> allocate_gpu(u64 element_bytes, int length);
+    void *allocate_cpu(u64 element_bytes, s64 length);
+    GpuPointer<void> allocate_gpu(u64 element_bytes, s64 length);
 };
 
 }

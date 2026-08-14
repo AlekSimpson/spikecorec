@@ -303,12 +303,6 @@ struct ComponentInstance {
     String value_or(const String &key, const String &fallback = "") const;
 };
 
-struct ComponentInstanceVisitorContext {
-    Stack<String> id_scope;
-
-    String get_base_scope_id();
-};
-
 #ifndef SPIKECOREC_NML_STD_LIB_DIR
 #define SPIKECOREC_NML_STD_LIB_DIR ""
 #endif
@@ -422,8 +416,8 @@ struct SimulationInputConfig {
 
     f64 amplitude = 0.0;
     f64 rate = 0.0;
-    s64 start_tick = 0;
-    s64 end_tick = 0;
+    // s64 start_tick = 0;
+    // s64 end_tick = 0;
     s64 max_delay_time = 0;
     bool continuous_current_injection = false;
 };
@@ -438,7 +432,6 @@ struct NML_ParseResult {
     // maps to consult. Where a name lookup is genuinely needed, scan -- these vectors hold
     // a handful of entries each.
 
-    // ── the run, from the LEMS <Target>/Simulation ────────────────────────────────
     String simulation_component_id;
     String target_network_id;
     f64 step_dt = 0.0;             // (SI value) must be floating point: 0.01ms is 1e-5 s
@@ -449,20 +442,17 @@ struct NML_ParseResult {
     // Document-scope <Constant>s, plus each ComponentType's own namespaced by its type.
     UnorderedMap<String, Real> global_constants;
 
-    // ── types and their parameterisations ─────────────────────────────────────────
     // An entry's position is its type index; a prototype names the type it parameterises.
     Vector<CellTypeSpecification> cell_types;
     Vector<SynapseTypeSpecification> synapse_types;
     Vector<ComponentPrototype> cell_prototypes;
     Vector<ComponentPrototype> synapse_prototypes;
 
-    // ── the network ───────────────────────────────────────────────────────────────
     // Populations occupy contiguous neuron ranges in document order; neurons[k] carries
     // its own type, prototype, population and outgoing edges.
     Vector<PopulationLayout> populations;
     Vector<Neuron> neurons;
 
-    // ── simulation I/O ────────────────────────────────────────────────────────────
     Vector<SimulationInputConfig> input_profiles;
     Vector<RecordingConfig> recording_profiles;
 };
@@ -552,9 +542,6 @@ struct NML_Parser {
                             const ComponentType &component_type,
                             ComponentInstance &instance);
 
-    // Takes the LEMS document root so the export can read the things that only exist at
-    // document scope: <Constant>s, and the Simulation instance carrying dt/length/seed
-    // and the recording selections.
     NML_ParseResult export_model_details_to_engine(NML_Node *lems_root);
 };
 
