@@ -1005,10 +1005,26 @@ TEST(DynamicsCodegen, a_regime_pair_lowers_to_a_refractory_gate) {
     // GLIF3's after-spike currents are declared outside the regimes, so they decay every
     // tick including while the cell is held. If they had been swept into the gate they
     // would freeze during the refractory period and adaptation would be wrong.
-    const usize gate = source.find("const float time_since_spike");
-    const usize asc_decay = source.find("derived_ascSum");
+    //
+    // Scoped to GLIF3's own case arm. Searching the whole kernel compares offsets across
+    // five different cell bodies -- GLIF1's gate comes before GLIF3's ascSum simply
+    // because GLIF1 is emitted first, which says nothing about either.
+    const usize body_start = source.find("case 2: { // GLIF3Cell");
+    ASSERT_NE(body_start, String::npos);
+    const usize body_end = source.find("} break;", body_start);
+    ASSERT_NE(body_end, String::npos);
+    const String glif3_body = source.substr(body_start, body_end - body_start);
+
+    const usize gate = glif3_body.find("const float time_since_spike");
+    const usize asc_decay = glif3_body.find("derived_ascSum");
+    ASSERT_NE(gate, String::npos);
     ASSERT_NE(asc_decay, String::npos);
     EXPECT_LT(asc_decay, gate) << "ascSum must be computed before the refractory gate";
+
+    // And the decay itself is outside the gate, not inside it.
+    const usize asc_step = glif3_body.find("state_1 += step_dt");
+    ASSERT_NE(asc_step, String::npos);
+    EXPECT_LT(asc_step, gate) << "asc1 must decay whether or not the cell is refractory";
 }
 
 TEST(DynamicsCodegen, a_regime_shape_that_is_not_the_refractory_pair_is_refused) {
