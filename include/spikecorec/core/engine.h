@@ -51,9 +51,11 @@ namespace spikecorec {
 
         // Holds every per-edge quantity: the exact connection weight, the per-edge delay,
         // and one plane per synapse state variable — all indexed by the k^2-tree's own
-        // adjacency, so only real edges are ever addressed. Optional because there is no
-        // network to build one from until a model has been parsed.
-        Optional<WeightMatrix> weights;
+        // adjacency, so only real edges are ever addressed. Default-constructed until the
+        // model has been parsed, and left that way for a model whose populations are never
+        // wired together: an empty weight matrix is a network with no connections, which
+        // is an ordinary state rather than an absent one.
+        WeightMatrix weights;
 
         NML_ParseResult network_details;
         ModelLayout layout;
@@ -87,9 +89,21 @@ namespace spikecorec {
         Vector<s64> continuous_injection_start_ticks;
         Vector<s64> continuous_injection_end_ticks;
 
-        // Continuous injection is the only stimulus Phase 1 delivers. A spike train is
-        // refused at construction rather than silently injecting nothing — see
-        // collect_stimulus.
+        // A scheduled spike train: one entry per (input profile, target) that carries
+        // event times, plus a cursor into them. Kept sparse rather than expanded into a
+        // dense [target][tick] array, which for a long run is almost all zeros.
+        //
+        // Each event injects `magnitude` for exactly one tick, so it delivers a charge of
+        // magnitude * dt. That is what makes the amplitude a nanoamp-scale number rather
+        // than the picoamps a sustained injector uses: to move a 100 pF membrane by 15 mV
+        // in one 0.1 ms tick takes 15 nA.
+        struct ScheduledSpikeTrain {
+            s64 neuron_index = -1;
+            f32 magnitude = 0.0f;
+            Vector<s32> event_ticks;
+            usize cursor = 0;
+        };
+        Vector<ScheduledSpikeTrain> scheduled_spike_trains;
 
         // ── recording ─────────────────────────────────────────────────────────────
         // Every neuron's spike count over the run, accumulated tick by tick. Kept

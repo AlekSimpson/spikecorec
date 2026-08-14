@@ -17,13 +17,15 @@ namespace spikecorec {
 
     class K2Tree {
     public:
-        // metadata
-        s32 branching_factor; // k value, default 2
-        s32 superblock_size_words; // words per rank superblock, default 1024
-        s32 node_count; // number of nodes N
-        s32 padded_node_count; // node_count padded up to branching_factor^tree_height
-        s32 tree_height; // height H of the k^2-tree
-        s32 internal_bit_count; // number of bits in internal_node_words
+        // metadata. Initialized so a default-constructed K2Tree is the empty adjacency
+        // rather than uninitialized memory: tree_height 0 is what every row walk, on host
+        // and on device, already checks before descending.
+        s32 branching_factor = DEFAULT_BRANCHING_FACTOR;
+        s32 superblock_size_words = 1024; // words per rank superblock
+        s32 node_count = 0; // number of nodes N
+        s32 padded_node_count = 0; // node_count padded up to branching_factor^tree_height
+        s32 tree_height = 0; // height H of the k^2-tree
+        s32 internal_bit_count = 0; // number of bits in internal_node_words
 
         // bit arrays packed as uint32 words — allocated in unified memory, readable from CPU and GPU
         GpuPointer<u32> internal_node_words; // internal node bits, levels 0..tree_height-2
@@ -32,12 +34,15 @@ namespace spikecorec {
         GpuPointer<u16> rank_subblock_table; // rank subblock table over internal_node_words
 
         // lengths of the arrays above (in elements, not bytes)
-        usize internal_node_words_length;
-        usize leaf_node_words_length;
-        usize rank_superblock_length;
-        usize rank_subblock_length;
+        usize internal_node_words_length = 0;
+        usize leaf_node_words_length = 0;
+        usize rank_superblock_length = 0;
+        usize rank_subblock_length = 0;
 
-        K2Tree() = delete;
+        // The empty adjacency: no nodes, no bits, null arrays. Destructing one is safe
+        // because deallocate() no-ops on a null handle, and every walk bails on
+        // tree_height == 0 before touching an array.
+        K2Tree() = default;
         K2Tree(const K2Tree&)            = delete;
         K2Tree& operator=(const K2Tree&) = delete;
         K2Tree(K2Tree&&)                 = default;
