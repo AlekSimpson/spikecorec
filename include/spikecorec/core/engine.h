@@ -153,6 +153,21 @@ namespace spikecorec {
         // simulate, rather than loading something it would run incorrectly.
         explicit SpikeEngine(const String &lems_input_file);
 
+        // The same, with the network's connectivity supplied in code instead of in the
+        // document. The model still declares the cells, the synapse, the stimulus and the
+        // run; `adjacency` says which neuron reaches which, and every edge it describes
+        // uses `synapse_component_id` with the given weight and delay.
+        //
+        // This is how a large network is built: the topology helpers in topologies.h
+        // (square_torus and friends) generate millions of edges in a loop, where writing
+        // them as <connection> elements would mean millions of lines of XML. `adjacency`
+        // must have one row per neuron the model's populations declare.
+        SpikeEngine(const String &lems_input_file,
+                    const vector<vector<s32>> &adjacency,
+                    const String &synapse_component_id,
+                    f64 connection_weight = 1.0,
+                    f64 connection_delay_seconds = 0.0);
+
         ~SpikeEngine();
 
         // Runs the model for the number of ticks its Simulation asked for, recording as its
@@ -186,8 +201,22 @@ namespace spikecorec {
         void initialize_cell_state();
         void build_weight_matrix();
         void collect_stimulus();
+
+        // Replaces whatever connections the document declared with `adjacency`, all
+        // carrying one synapse prototype. Runs before the layout is computed, so
+        // everything downstream sees an ordinary parse result.
+        void apply_topology(const vector<vector<s32>> &adjacency,
+                            const String &synapse_component_id,
+                            f64 connection_weight,
+                            f64 connection_delay_seconds);
         void apply_stimulus(s64 tick);
         void *resolve_edge_plane(s64 matrix_index);
+
+        // The current one event of a spike train injects when the model names no
+        // amplitude: enough charge, in a single tick, to carry this neuron from where it
+        // starts to where it fires. Derived from the target's own declared quantities, so
+        // it follows whatever cell the train is wired to.
+        [[nodiscard]] f64 default_spike_amplitude_for(s64 neuron_index) const;
         void record_tick(s64 tick);
     };
 } // namespace spikecorec

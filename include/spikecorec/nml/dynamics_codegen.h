@@ -75,6 +75,18 @@ struct ModelLayout {
 
 ModelLayout compute_model_layout(const NML_ParseResult &parse_result);
 
+// The comparison a cell spikes on, taken from the OnCondition that carries its EventOut:
+// `v .gt. thresh` yields ("v", "thresh"). Both come back as names — the caller decides
+// whether each is a parameter, a state variable or a literal, because that differs by
+// model: GLIF1 tests against the parameter `vth` while GLIF4 tests against the state
+// variable `theta`.
+//
+// Returns false when the type emits no spike, or when its condition is not a comparison
+// this can read.
+bool find_spike_threshold_condition(const CellTypeSpecification &cell_type,
+                                    String &return_state_variable,
+                                    String &return_threshold_symbol);
+
 // The complete master kernel source for this model: the fixed 9-stage scaffold with one
 // generated body spliced in per cell type and per synapse type. Compile with
 // compile_kernel(source.c_str(), "master_step").

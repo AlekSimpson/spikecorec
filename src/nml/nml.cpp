@@ -217,6 +217,24 @@ Vector<String> ComponentType::ordered_parameter_names() const {
     return names;
 }
 
+Vector<String> ComponentType::ordered_parameter_dimensions() const {
+    Vector<String> dimensions;
+
+    // Walked with exactly the same filter as ordered_parameter_names so the two stay
+    // index-for-index aligned; a parameter that declares no dimension contributes an
+    // empty entry rather than being skipped.
+    for (const NML_Declaration &declaration : declarations.for_all()) {
+        if (declaration.tag_type != NML_DeclarationType::Parameter &&
+            declaration.tag_type != NML_DeclarationType::Property) {
+            continue;
+        }
+        if (!declaration.has_value("name")) continue;
+        dimensions.push_back(declaration.value_or("dimension"));
+    }
+
+    return dimensions;
+}
+
 Vector<String> ComponentType::ordered_state_variable_names() const {
     Vector<String> names;
     for (const NML_Declaration &declaration : declarations.for_all()) {
@@ -1192,6 +1210,8 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 specification.state_variable_names =
                         component_type.ordered_state_variable_names();
                 specification.parameter_names = component_type.ordered_parameter_names();
+                specification.parameter_dimensions =
+                        component_type.ordered_parameter_dimensions();
                 specification.dynamics = extract_dynamics_program(component_type);
 
                 // Where this type's state begins in the engine's cell-state buffer: the

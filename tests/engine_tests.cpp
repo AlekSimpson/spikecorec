@@ -16,6 +16,7 @@
 
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/topologies.h"
 #include "spikecorec/nml/dynamics_codegen.h"
 #include "../examples/balanced_network_model.h"
 #include "../examples/glif_network_model.h"
@@ -845,20 +846,15 @@ TEST(SpikeEngine, a_spike_train_drives_the_cell_on_the_ticks_it_names) {
   <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
            reset="-70 mV" C="100 pF"/>
   <!--
-    A standard spikeArray is a spike source and declares no amplitude, so LEMS drops an
-    amplitude attribute written on one: only attributes matching a declared Parameter are
-    bound to an instance. A train that is to inject current has to say how much, so the
-    model declares a subtype that carries it.
+    A plain spikeArray, declaring no amplitude. A spike is a binary event, so what it is
+    worth in current is a property of the cell it lands on: the engine works out the charge
+    that carries this iafCell from its leak reversal to its threshold in one tick.
   -->
-  <ComponentType name="spikeArrayCurrent" extends="spikeArray">
-    <Parameter name="amplitude" dimension="current"/>
-  </ComponentType>
-
-  <spikeArrayCurrent id="train" amplitude="25 nA">
+  <spikeArray id="train">
     <spike id="0" time="10 ms"/>
     <spike id="1" time="25 ms"/>
     <spike id="2" time="40 ms"/>
-  </spikeArrayCurrent>
+  </spikeArray>
   <network id="trainNetwork">
     <population id="pop" component="c" size="1"/>
     <explicitInput target="pop[0]" input="train"/>
@@ -873,6 +869,12 @@ TEST(SpikeEngine, a_spike_train_drives_the_cell_on_the_ticks_it_names) {
     EXPECT_EQ(engine.scheduled_spike_trains[0].event_ticks,
               (Vector<s32>{100, 250, 400}));
 
+    // 1.05 * C * (thresh - reset) / dt = 1.05 * 100 pF * 20 mV / 0.1 ms = 21 nA. Measured
+    // from the reset value rather than the leak reversal, because after its first spike the
+    // cell sits at reset and that is the widest gap any later event has to close. The 5% is
+    // because the comparison that fires a cell is strict.
+    EXPECT_NEAR(engine.scheduled_spike_trains[0].magnitude, 2.1e-8f, 1e-11f);
+
     engine.run();
 
     // One spike per event, and no others: nothing else drives this cell.
@@ -885,16 +887,17 @@ TEST(SpikeEngine, a_spike_train_drives_the_cell_on_the_ticks_it_names) {
     EXPECT_NEAR(times[2], 0.040, 1.5e-4);
 }
 
-// The one case still worth refusing: a train that would inject nothing. A component with
-// event times and no amplitude loads, runs every tick and writes an empty recording, which
-// is the failure hardest to notice.
-TEST(SpikeEngine, a_spike_train_with_no_amplitude_is_refused_rather_than_run_silent) {
+// The default needs the target's capacitance to turn a charge into a voltage. A cell that
+// declares none -- iafTauCell integrates a time constant directly and has no C -- cannot
+// supply one, and that is refused by name rather than guessed at.
+TEST(SpikeEngine, a_spike_train_onto_a_cell_with_no_capacitance_is_refused) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
-    ModelDirectory directory("spike_train_refused");
+    ModelDirectory directory("spike_train_no_capacitance");
+    // iafTauCell relaxes toward leakReversal with a time constant and declares no
+    // capacitance at all, so there is no way to turn a charge into a voltage.
     directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
-  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
+  <iafTauCell id="c" leakReversal="-65 mV" tau="10 ms" thresh="-50 mV" reset="-70 mV"/>
   <spikeArray id="train">
     <spike id="0" time="10 ms"/>
     <spike id="1" time="20 ms"/>
@@ -910,11 +913,11 @@ TEST(SpikeEngine, a_spike_train_with_no_amplitude_is_refused_rather_than_run_sil
 
     try {
         SpikeEngine engine(lems_path);
-        FAIL() << "a spike-train stimulus should not load as a silent no-op";
+        FAIL() << "a cell with no capacitance cannot supply a default spike amplitude";
     } catch (const std::runtime_error &error) {
         const String message = error.what();
-        EXPECT_NE(message.find("train"), String::npos) << message;
-        EXPECT_NE(message.find("no amplitude"), String::npos) << message;
+        EXPECT_NE(message.find("iafTauCell"), String::npos) << message;
+        EXPECT_NE(message.find("capacitance"), String::npos) << message;
     }
 }
 
@@ -1306,6 +1309,116 @@ TEST(DynamicsCodegen, a_regime_shape_that_is_not_the_refractory_pair_is_refused)
         const String message = error.what();
         EXPECT_NE(message.find("ThreeRegimeCell"), String::npos) << message;
         EXPECT_NE(message.find("3 regimes"), String::npos) << message;
+    }
+}
+
+// ── connectivity supplied in code ─────────────────────────────────────────────────
+
+namespace {
+
+// A GLIF1 sheet with no connections in the document at all: the population, the synapse and
+// the drive are declared, and the edges come from a topology helper.
+String torus_model(s64 neuron_count) {
+    ostringstream document;
+    document << R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Torus">
+  <include href=")" << filesystem::absolute("tests/fixtures/nml/glif_cell_types.nml").string()
+             << R"("/>
+  <GLIF1Cell id="torusCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
+             vth="-50mV"/>
+  <alphaCurrentSynapse id="torusSynapse" tau="5 ms" ibase="30 pA"/>
+  <pulseGenerator id="torusDrive" delay="0 ms" duration="1000 ms" amplitude="260 pA"/>
+  <network id="torusNetwork">
+    <population id="torusPopulation" component="torusCell" size=")" << neuron_count << R"("/>
+    <inputList id="torusInput" component="torusDrive" population="torusPopulation">
+)";
+    for (s64 index = 0; index < neuron_count; index += 1) {
+        document << "      <input id=\"" << index
+                 << "\" target=\"../torusPopulation[" << index
+                 << "]\" destination=\"synapses\"/>\n";
+    }
+    document << R"(    </inputList>
+  </network>
+</neuroml>
+)";
+    return document.str();
+}
+
+} // namespace
+
+// The topology constructor is what makes size a parameter: a 16x16 torus is 1,024 edges
+// and a 1,000x1,000 one is four million, and neither is written down. This checks the
+// edges the engine ends up with are exactly the ones square_torus() describes.
+TEST(SpikeEngine, connectivity_can_come_from_a_topology_instead_of_the_document) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    const s64 side = 16;
+    const s64 neuron_count = side * side;
+
+    ModelDirectory directory("torus_topology");
+    directory.write("model.nml", torus_model(neuron_count));
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "torusNetwork", "200ms", "0.1ms"));
+
+    const vector<vector<s32>> adjacency = square_torus(side);
+    ASSERT_EQ((s64)adjacency.size(), neuron_count);
+
+    SpikeEngine engine(lems_path, adjacency, "torusSynapse", /*weight=*/1.0,
+                       /*delay_seconds=*/1e-3);
+
+    // Every node of a square torus has exactly four neighbours, so the edge count is
+    // whatever the helper produced rather than anything the document said.
+    EXPECT_EQ(engine.total_neuron_count, neuron_count);
+    EXPECT_EQ(engine.layout.total_edge_count, neuron_count * 4);
+
+    // And they are the same edges, with the weight and delay the constructor was given.
+    for (s64 source = 0; source < neuron_count; source += 1) {
+        for (s32 target : adjacency[(usize)source]) {
+            EXPECT_FLOAT_EQ(engine.weights.get((s32)source, target), 1.0f)
+                    << source << " -> " << target;
+            EXPECT_EQ(engine.weights.get_edge_delay_ticks((s32)source, target), 10)
+                    << source << " -> " << target;
+        }
+    }
+
+    // A torus wraps, so the first node reaches the last column and the last row.
+    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, (s32)(side - 1)), 10);
+    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, (s32)(neuron_count - side)), 10);
+
+    engine.run();
+
+    // And it is a working network, not just a correctly wired one.
+    EXPECT_GT(engine.mean_firing_rate_hertz(), 2.0);
+    EXPECT_GT(engine.fraction_of_neurons_that_spiked(), 0.9);
+}
+
+TEST(SpikeEngine, a_topology_that_does_not_match_the_model_is_refused) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("torus_mismatch");
+    directory.write("model.nml", torus_model(256));
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "torusNetwork", "10ms", "0.1ms"));
+
+    // A topology sized for a different network would otherwise wire some neurons and
+    // silently leave the rest unconnected.
+    try {
+        SpikeEngine engine(lems_path, square_torus(8), "torusSynapse");
+        FAIL() << "a topology of the wrong size should be refused";
+    } catch (const std::runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("64"), String::npos) << message;
+        EXPECT_NE(message.find("256"), String::npos) << message;
+    }
+
+    // Naming a synapse the model does not declare is the other way to get a silently
+    // wrong network.
+    try {
+        SpikeEngine engine(lems_path, square_torus(16), "noSuchSynapse");
+        FAIL() << "an unknown synapse should be refused";
+    } catch (const std::runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("noSuchSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("torusSynapse"), String::npos) << message;
     }
 }
 
