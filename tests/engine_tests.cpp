@@ -714,6 +714,40 @@ TEST(SpikeEngine, declared_output_files_are_written_with_the_shape_the_model_ask
     EXPECT_GT(spike_rows, 0);
 }
 
+// A spikeArray declares no amplitude, because it is a spike source rather than a current
+// injector — its train becomes current only by going through a synapse. Treating it as a
+// current injection would load the model, run every tick, and write a recording with
+// nothing in it, which is the failure that is hardest to notice.
+TEST(SpikeEngine, a_spike_train_stimulus_is_refused_rather_than_run_silent) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("spike_train_refused");
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
+           reset="-70 mV" C="100 pF"/>
+  <spikeArray id="train">
+    <spike id="0" time="10 ms"/>
+    <spike id="1" time="20 ms"/>
+  </spikeArray>
+  <network id="trainNetwork">
+    <population id="pop" component="c" size="1"/>
+    <explicitInput target="pop[0]" input="train"/>
+  </network>
+</neuroml>
+)");
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "trainNetwork", "50ms", "0.1ms"));
+
+    try {
+        SpikeEngine engine(lems_path);
+        FAIL() << "a spike-train stimulus should not load as a silent no-op";
+    } catch (const std::runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("train"), String::npos) << message;
+        EXPECT_NE(message.find("spike train"), String::npos) << message;
+    }
+}
+
 // ── more than one cell type in a model ────────────────────────────────────────────
 
 // Every other test in this file has exactly one cell type, which leaves the parts of the

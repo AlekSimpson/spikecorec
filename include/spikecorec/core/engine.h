@@ -81,16 +81,9 @@ namespace spikecorec {
         Vector<s64> continuous_injection_start_ticks;
         Vector<s64> continuous_injection_end_ticks;
 
-        // One entry per (input profile, target) that carries a spike train, plus a cursor
-        // into that train. Kept sparse rather than expanded into a dense
-        // [target][tick] array, which for a long run is mostly zeros.
-        struct ScheduledSpikeTrain {
-            s64 neuron_index = -1;
-            f32 magnitude = 0.0f;
-            Vector<s32> event_ticks;
-            usize cursor = 0;
-        };
-        Vector<ScheduledSpikeTrain> scheduled_spike_trains;
+        // Continuous injection is the only stimulus Phase 1 delivers. A spike train is
+        // refused at construction rather than silently injecting nothing — see
+        // collect_stimulus.
 
         // ── recording ─────────────────────────────────────────────────────────────
         // Every neuron's spike count over the run, accumulated tick by tick. Kept
