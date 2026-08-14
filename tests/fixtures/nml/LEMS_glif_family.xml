@@ -1,0 +1,31 @@
+<Lems>
+    <Include file="Cells.xml"/>
+    <Include file="Synapses.xml"/>
+    <Include file="Inputs.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="glif_family.nml"/>
+
+    <Simulation id="sim1" length="500ms" step="0.05ms" target="glifFamilyNetwork">
+        <OutputFile id="traces" fileName="glif_family_traces.dat">
+            <OutputColumn id="glif1_v" quantity="popGlif1[0]/v"/>
+            <OutputColumn id="glif2_v" quantity="popGlif2[0]/v"/>
+            <OutputColumn id="glif3_v" quantity="popGlif3[0]/v"/>
+            <OutputColumn id="glif4_v" quantity="popGlif4[0]/v"/>
+            <OutputColumn id="glif5_v" quantity="popGlif5[0]/v"/>
+            <OutputColumn id="glif3_asc1" quantity="popGlif3[0]/asc1"/>
+            <OutputColumn id="glif3_asc2" quantity="popGlif3[0]/asc2"/>
+            <OutputColumn id="glif4_theta" quantity="popGlif4[0]/theta"/>
+            <OutputColumn id="glif5_theta" quantity="popGlif5[0]/theta"/>
+        </OutputFile>
+        <EventOutputFile id="spikes" fileName="glif_family_spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="popGlif1[0]" eventPort="spike"/>
+            <EventSelection id="1" select="popGlif2[0]" eventPort="spike"/>
+            <EventSelection id="2" select="popGlif3[0]" eventPort="spike"/>
+            <EventSelection id="3" select="popGlif4[0]" eventPort="spike"/>
+            <EventSelection id="4" select="popGlif5[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+
+    <Target component="sim1"/>
+</Lems>

@@ -201,6 +201,12 @@ struct DynamicsInstruction {
     String target;       // variable written, or exposure / port name
     String expression;   // value= / test= source expression, verbatim
     String regime_name;  // owning Regime, empty when the instruction is regime-free
+
+    // Only meaningful on the Regime declaration itself: whether it carried
+    // initial="true". A state machine has to start somewhere, and which regime that is
+    // cannot be recovered from the instruction stream otherwise -- declaration order is
+    // not it, since LEMS lets any regime be the initial one.
+    bool is_initial_regime = false;
     // What gates this instruction: the OnCondition test for a Reset/Emit, or the port
     // name for anything an OnEvent handles. Empty when nothing gates it -- which is the
     // case for OnStart and OnEntry bodies, located by `stage` instead.

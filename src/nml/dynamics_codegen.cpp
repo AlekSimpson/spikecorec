@@ -319,14 +319,19 @@ bool is_path_select(const String &expression) {
            expression.find(']') != String::npos;
 }
 
+// `regime_filter` selects which scope's instructions to take: "" is the regime-free body
+// that runs every tick, and a regime's name is the body that runs only when that regime is
+// the live one.
 Vector<const DynamicsInstruction *> instructions_in_stage(
         const Vector<DynamicsInstruction> &program,
         DynamicsStage stage,
-        NML_DeclarationType source_tag) {
+        NML_DeclarationType source_tag,
+        const String &regime_filter) {
     Vector<const DynamicsInstruction *> selected;
     for (const DynamicsInstruction &instruction : program) {
         if (instruction.stage != stage) continue;
         if (instruction.source_tag != source_tag) continue;
+        if (instruction.regime_name != regime_filter) continue;
         selected.push_back(&instruction);
     }
     return selected;
@@ -335,7 +340,8 @@ Vector<const DynamicsInstruction *> instructions_in_stage(
 // The distinct OnCondition tests in the program, in first-appearance order. Reset and Emit
 // instructions carry the test that fired them in `condition`, so grouping by that string
 // reassembles each OnCondition's body.
-Vector<String> ordered_conditions(const Vector<DynamicsInstruction> &program) {
+Vector<String> ordered_conditions(const Vector<DynamicsInstruction> &program,
+                                  const String &regime_filter) {
     Vector<String> conditions;
     for (const DynamicsInstruction &instruction : program) {
         if (instruction.stage != DynamicsStage::Reset &&
@@ -343,6 +349,7 @@ Vector<String> ordered_conditions(const Vector<DynamicsInstruction> &program) {
             continue;
         }
         if (instruction.condition.empty()) continue;
+        if (instruction.regime_name != regime_filter) continue;
 
         bool already_seen = false;
         for (const String &known : conditions) already_seen |= known == instruction.condition;
@@ -351,13 +358,131 @@ Vector<String> ordered_conditions(const Vector<DynamicsInstruction> &program) {
     return conditions;
 }
 
-void reject_unsupported_constructs(const String &type_name,
-                                   const Vector<DynamicsInstruction> &program) {
+// The one regime shape the engine simulates: an active regime and a refractory one, which
+// is what every GLIF cell declares and the only thing regimes are used for in Phase 1.
+//
+// It is not lowered as a state machine. A cell is refractory for a fixed time after it
+// fires, and the engine already records when each neuron last fired, so the whole pair
+// collapses to a gate on `tick - last_spiked`: the active regime's body runs when enough
+// time has passed and is skipped when it has not. The refractory regime's own contents --
+// a timer variable, the TimeDerivative that advances it, the OnEntry that zeroes it, and
+// the two Transitions -- exist only to express that delay in LEMS, and all of it is
+// replaced by the comparison. No regime index, no transition table, no OnEntry.
+struct RefractoryPattern {
+    bool present = false;
+    String active_regime;
+    String refractory_regime;
+    String duration_expression; // the right-hand side of `timer .geq. t_ref`
+    String timer_variable;      // dropped: last_spiked replaces it
+};
+
+Vector<const DynamicsInstruction *> regime_declarations(
+        const Vector<DynamicsInstruction> &program) {
+    Vector<const DynamicsInstruction *> regimes;
     for (const DynamicsInstruction &instruction : program) {
-        if (!instruction.regime_name.empty()) {
+        if (instruction.source_tag != NML_DeclarationType::Regime) continue;
+        regimes.push_back(&instruction);
+    }
+    return regimes;
+}
+
+// Splits `timer .geq. t_ref` into its two sides. Returns false for any other shape, which
+// is what makes an unrecognised refractory regime an error rather than a silent
+// mistranslation.
+bool split_refractory_test(const String &test, String &timer_name, String &duration) {
+    for (const String &comparison : {String(".geq."), String(".gt."), String(">="), String(">")}) {
+        const usize position = test.find(comparison);
+        if (position == String::npos) continue;
+
+        timer_name = test.substr(0, position);
+        duration = test.substr(position + comparison.size());
+
+        auto trim = [](String &text) {
+            while (!text.empty() && isspace(static_cast<unsigned char>(text.front()))) {
+                text.erase(0, 1);
+            }
+            while (!text.empty() && isspace(static_cast<unsigned char>(text.back()))) {
+                text.pop_back();
+            }
+        };
+        trim(timer_name);
+        trim(duration);
+
+        return !timer_name.empty() && !duration.empty();
+    }
+    return false;
+}
+
+RefractoryPattern detect_refractory_pattern(const String &type_name,
+                                            const Vector<DynamicsInstruction> &program) {
+    const Vector<const DynamicsInstruction *> regimes = regime_declarations(program);
+
+    RefractoryPattern pattern;
+    if (regimes.empty()) return pattern;
+
+    if (regimes.size() != 2) {
+        throw runtime_error(
+                "dynamics_codegen: '" + type_name + "' declares " +
+                to_string(regimes.size()) + " regimes. The engine simulates exactly one "
+                "regime shape -- an active regime plus a refractory one, which is what "
+                "every GLIF cell uses -- and lowers it to a refractory-time gate rather "
+                "than to a general state machine");
+    }
+
+    for (const DynamicsInstruction *regime : regimes) {
+        if (!regime->is_initial_regime) continue;
+
+        if (!pattern.active_regime.empty()) {
+            throw runtime_error("dynamics_codegen: '" + type_name +
+                                "' marks more than one regime initial");
+        }
+        pattern.active_regime = regime->target;
+    }
+    if (pattern.active_regime.empty()) {
+        throw runtime_error("dynamics_codegen: '" + type_name +
+                            "' marks no regime initial, so there is no active regime");
+    }
+
+    for (const DynamicsInstruction *regime : regimes) {
+        if (regime->target != pattern.active_regime) pattern.refractory_regime = regime->target;
+    }
+
+    // The refractory regime's exit condition carries the duration the cell is held for.
+    for (const DynamicsInstruction &instruction : program) {
+        if (instruction.stage != DynamicsStage::Detect) continue;
+        if (instruction.regime_name != pattern.refractory_regime) continue;
+
+        if (!split_refractory_test(instruction.expression, pattern.timer_variable,
+                                   pattern.duration_expression)) {
+            throw runtime_error(
+                    "dynamics_codegen: '" + type_name + "' leaves its refractory regime on '" +
+                    instruction.expression + "'. The engine recognises an elapsed-time test "
+                    "of the form `timer .geq. duration`, because it holds the cell by "
+                    "comparing against when it last fired rather than by running a timer");
+        }
+        break;
+    }
+
+    if (pattern.duration_expression.empty()) {
+        throw runtime_error(
+                "dynamics_codegen: '" + type_name + "' declares a refractory regime '" +
+                pattern.refractory_regime + "' with no exit condition, so a cell entering "
+                "it would never fire again");
+    }
+
+    pattern.present = true;
+    return pattern;
+}
+
+void reject_unsupported_constructs(const String &type_name,
+                                   const Vector<DynamicsInstruction> &program,
+                                   const RefractoryPattern &pattern) {
+    for (const DynamicsInstruction &instruction : program) {
+        if (!instruction.regime_name.empty() && !pattern.present) {
             throw runtime_error(
                     "dynamics_codegen: '" + type_name + "' declares Regime '" +
-                    instruction.regime_name + "'; regimes are Phase 2 (ticket #62/#63)");
+                    instruction.regime_name + "', which is not the active/refractory pair "
+                    "the engine simulates");
         }
         if (instruction.source_tag == NML_DeclarationType::ConditionalDerivedVariable ||
             instruction.source_tag == NML_DeclarationType::Case) {
@@ -381,12 +506,14 @@ String emit_integrate_stage(const Vector<DynamicsInstruction> &program,
                             const Vector<String> &state_variable_names,
                             const String &state_reference_prefix,
                             const String &type_name,
-                            const String &indent) {
+                            const String &indent,
+                            const String &regime_filter,
+                            const String &temporary_suffix) {
     ostringstream source;
 
     for (const DynamicsInstruction *derived :
          instructions_in_stage(program, DynamicsStage::Integrate,
-                               NML_DeclarationType::DerivedVariable)) {
+                               NML_DeclarationType::DerivedVariable, regime_filter)) {
         if (is_path_select(derived->expression)) continue; // bound to the input accumulator
 
         source << indent << "const float derived_" << derived->target << " = "
@@ -394,10 +521,11 @@ String emit_integrate_stage(const Vector<DynamicsInstruction> &program,
     }
 
     const Vector<const DynamicsInstruction *> derivatives = instructions_in_stage(
-            program, DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative);
+            program, DynamicsStage::Integrate, NML_DeclarationType::TimeDerivative,
+            regime_filter);
 
     for (usize index = 0; index < derivatives.size(); index += 1) {
-        source << indent << "const float derivative_" << index << " = "
+        source << indent << "const float derivative_" << temporary_suffix << index << " = "
                << translate_expression(derivatives[index]->expression, symbols, type_name)
                << ";\n";
     }
@@ -416,7 +544,7 @@ String emit_integrate_stage(const Vector<DynamicsInstruction> &program,
         }
 
         source << indent << state_reference_prefix << slot << " += step_dt * derivative_"
-               << index << ";\n";
+               << temporary_suffix << index << ";\n";
     }
 
     return source.str();
@@ -430,15 +558,17 @@ String emit_conditional_stages(const Vector<DynamicsInstruction> &program,
                                const String &state_reference_prefix,
                                const String &type_name,
                                const String &spike_flag_name,
-                               const String &indent) {
+                               const String &indent,
+                               const String &regime_filter) {
     ostringstream source;
 
-    for (const String &condition : ordered_conditions(program)) {
+    for (const String &condition : ordered_conditions(program, regime_filter)) {
         source << indent << "if (" << translate_expression(condition, symbols, type_name)
                << ") {\n";
 
         for (const DynamicsInstruction &instruction : program) {
             if (instruction.condition != condition) continue;
+            if (instruction.regime_name != regime_filter) continue;
 
             if (instruction.stage == DynamicsStage::Reset &&
                 instruction.source_tag == NML_DeclarationType::StateAssignment) {
@@ -549,7 +679,9 @@ SymbolTable build_synapse_symbols(const SynapseTypeSpecification &synapse_type,
 String generate_cell_body(const CellTypeSpecification &cell_type,
                           const NML_ParseResult &parse_result,
                           s64 case_index) {
-    reject_unsupported_constructs(cell_type.name, cell_type.dynamics);
+    const RefractoryPattern refractory =
+            detect_refractory_pattern(cell_type.name, cell_type.dynamics);
+    reject_unsupported_constructs(cell_type.name, cell_type.dynamics, refractory);
 
     const SymbolTable symbols = build_cell_symbols(cell_type, parse_result);
     const String indent = "            ";
@@ -563,12 +695,40 @@ String generate_cell_body(const CellTypeSpecification &cell_type,
     }
     source << "\n";
 
+    // Regime-free dynamics run every tick, refractory or not: a GLIF cell's after-spike
+    // currents and its adapting threshold keep decaying while the cell is held, which is
+    // exactly why they are declared outside the regimes.
     source << emit_integrate_stage(cell_type.dynamics, symbols,
                                    cell_type.state_variable_names, "state_",
-                                   cell_type.name, indent);
+                                   cell_type.name, indent, "", "");
     source << emit_conditional_stages(cell_type.dynamics, symbols,
                                       cell_type.state_variable_names, "state_",
-                                      cell_type.name, "spiked", indent);
+                                      cell_type.name, "spiked", indent, "");
+
+    if (refractory.present) {
+        // The whole active/refractory pair, as one comparison. `last_spiked` is seeded far
+        // in the past so a cell that has never fired is never held.
+        source << "\n"
+               << indent << "// regime '" << refractory.active_regime << "', held for "
+               << refractory.duration_expression << " after a spike (regime '"
+               << refractory.refractory_regime << "')\n"
+               << indent << "const float time_since_spike = (float)(tick - last_spiked["
+               << "neuron_index]) * step_dt;\n"
+               << indent << "if (time_since_spike >= "
+               << translate_expression(refractory.duration_expression, symbols, cell_type.name)
+               << ") {\n";
+
+        source << emit_integrate_stage(cell_type.dynamics, symbols,
+                                       cell_type.state_variable_names, "state_",
+                                       cell_type.name, indent + "    ",
+                                       refractory.active_regime, "active_");
+        source << emit_conditional_stages(cell_type.dynamics, symbols,
+                                          cell_type.state_variable_names, "state_",
+                                          cell_type.name, "spiked", indent + "    ",
+                                          refractory.active_regime);
+
+        source << indent << "}\n";
+    }
 
     source << "\n";
     for (usize slot = 0; slot < cell_type.state_variable_names.size(); slot += 1) {
@@ -595,7 +755,8 @@ String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
                 "dynamics_codegen: '" + synapse_type.name +
                 "' composes a plasticity or block mechanism; that is Phase 2 (ticket #66)");
     }
-    reject_unsupported_constructs(synapse_type.name, synapse_type.dynamics);
+    reject_unsupported_constructs(synapse_type.name, synapse_type.dynamics,
+                                  RefractoryPattern{});
 
     const SymbolTable symbols = build_synapse_symbols(synapse_type, parse_result);
     const String indent = "                    ";
@@ -641,7 +802,7 @@ String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
 
     source << emit_integrate_stage(synapse_type.dynamics, symbols,
                                    synapse_type.state_variable_names, "state_",
-                                   synapse_type.name, indent);
+                                   synapse_type.name, indent, "", "");
 
     // The current this synapse delivers is its `i` exposure, which every
     // baseCurrentBasedSynapse declares as a DerivedVariable.
