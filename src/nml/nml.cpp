@@ -673,6 +673,17 @@ void NML_Parser::ingest_document(const String &file_path) {
             path included = path(reference);
             if (included.is_relative()) included = containing_directory / included;
 
+            // A model that says <Include file="Cells.xml"/> means the standard library's
+            // Cells.xml, not one sitting beside itself. Falling back keeps such a document
+            // portable instead of only loadable from the directory it was written in --
+            // and parse_lems has already ingested the standard library, so the fallback
+            // path is normally deduped away rather than re-read.
+            if (!exists(included) && !STANDARD_LIBRARY_PATH.empty()) {
+                const path from_standard_library =
+                        path(STANDARD_LIBRARY_PATH) / path(reference).filename();
+                if (exists(from_standard_library)) included = from_standard_library;
+            }
+
             ingest_document(included.string());
             continue;
         }
@@ -1752,6 +1763,30 @@ void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
 }
 
 bool NML_Parser::validate_against_schema(const String &nml_file_path) {
+    // The schema describes NeuroML documents. A LEMS wrapper -- <Lems><Include .../>
+    // <Target .../></Lems>, which is what drives a simulation and therefore what gets
+    // handed to the engine -- is a different language with no XSD here, and validating one
+    // against the NeuroML schema reports every element in it as an error. There is nothing
+    // to check, so say so rather than failing a perfectly good file.
+    xmlDocPtr document = xmlReadFile(nml_file_path.c_str(), nullptr, 0);
+    if (!document) {
+        last_schema_validation_errors = "could not read " + nml_file_path;
+        return false;
+    }
+
+    xmlNodePtr root = xmlDocGetRootElement(document);
+    const bool is_neuroml_document =
+            root && root->name &&
+            String(reinterpret_cast<const char *>(root->name)) == "neuroml";
+    xmlFreeDoc(document);
+
+    if (!is_neuroml_document) {
+        log::logger().debug("{} is not a NeuroML document root; skipping XSD validation",
+                            nml_file_path);
+        last_schema_validation_errors.clear();
+        return true;
+    }
+
     xmlSchemaParserCtxtPtr parser_context = xmlSchemaNewParserCtxt(NML_SCHEMA_PATH.c_str());
     if (!parser_context) {
         log::logger().error("Could not create XSD parser context for schema {}", NML_SCHEMA_PATH);

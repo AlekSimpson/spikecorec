@@ -266,6 +266,14 @@ examples-metal: check-metal $(METAL_LIB)
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(LIBXML2_LIBS) \
 	    -o $(BUILD_DIR)/metal_example
 
+# One example at a time: `make build/examples/iaf_single_cell_example` builds
+# examples/iaf_single_cell_example.cpp and nothing else.
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(METAL_LIB) $(BUILD_DIR)/default.metallib
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
+	    -o $@
+
 # ── Utilities ────────────────────────────────────────────────
 info:
 	@echo "Platform   : $(UNAME_S) $(UNAME_M)"

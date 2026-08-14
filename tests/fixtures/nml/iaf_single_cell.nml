@@ -1,0 +1,35 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/development/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="IafSingleCell">
+
+    <!--
+      One iafCell driven by a constant current, chosen so the whole trajectory is
+      checkable by hand:
+
+        tau  = C / leakConductance = 100 pF / 5 nS      = 20 ms
+        rheobase current           = leakConductance * (thresh - leakReversal)
+                                   = 5 nS * 15 mV       = 75 pA
+
+      The 90 pA drive is 1.2x rheobase, so the cell charges toward
+      leakReversal + I/leakConductance = -65 mV + 18 mV = -47 mV, crosses the
+      -50 mV threshold, and fires periodically. Its interspike interval is
+      tau * ln((I/gL - (reset - EL)) / (I/gL - (thresh - EL)))
+        = 20 ms * ln((18 - (-5)) / (18 - 15)) = 20 ms * ln(23/3) = 40.7 ms.
+    -->
+
+    <iafCell id="testCell"
+             leakConductance="5 nS"
+             leakReversal="-65 mV"
+             thresh="-50 mV"
+             reset="-70 mV"
+             C="100 pF"/>
+
+    <pulseGenerator id="steadyDrive" delay="0 ms" duration="500 ms" amplitude="90 pA"/>
+
+    <network id="singleCellNetwork">
+        <population id="cellPopulation" component="testCell" size="1"/>
+        <explicitInput target="cellPopulation[0]" input="steadyDrive"/>
+    </network>
+
+</neuroml>
