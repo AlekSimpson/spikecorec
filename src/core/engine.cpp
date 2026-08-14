@@ -428,6 +428,16 @@ void SpikeEngine::record_tick(s64 tick) {
                                                 neuron_index});
     }
 
+    if (membrane_video_recorder && tick % membrane_video_frame_stride == 0) {
+        const f32 *cell_state_data = static_cast<const f32 *>(cell_state.get_contents());
+        for (s64 neuron_index = 0; neuron_index < total_neuron_count; neuron_index += 1) {
+            membrane_frame_scratch[(usize)neuron_index] =
+                    cell_state_data[membrane_offset_per_neuron[(usize)neuron_index]];
+        }
+        membrane_video_recorder->record_frame(membrane_frame_scratch.data(),
+                                              total_neuron_count);
+    }
+
     if (traced_selections.empty()) return;
 
     recorded_trace_times.push_back((f64)tick * network_details.step_dt);
@@ -487,9 +497,58 @@ f64 SpikeEngine::fraction_of_neurons_that_spiked() const {
     return (f64)spiking_neurons / (f64)total_neuron_count;
 }
 
+// ── membrane video ────────────────────────────────────────────────────────────────
+
+void SpikeEngine::record_membrane_video(const String &path, s64 frame_stride) {
+    if (frame_stride < 1) {
+        log::throw_runtime_error(*logger,
+                "record_membrane_video: frame_stride must be at least 1 (got " +
+                to_string(frame_stride) + ")");
+    }
+
+    // Where each neuron's `v` lives, resolved once. Every GLIF and iaf cell exposes it;
+    // a cell type that does not is an error rather than a silently flat row in the video.
+    membrane_offset_per_neuron.assign((usize)total_neuron_count, -1);
+
+    for (usize index = 0; index < network_details.populations.size(); index += 1) {
+        const PopulationLayout &population = network_details.populations[index];
+        const CellTypeSpecification &cell_type =
+                network_details.cell_types[(usize)population.cell_type_index];
+
+        s64 slot = -1;
+        for (usize candidate = 0; candidate < cell_type.state_variable_names.size();
+             candidate += 1) {
+            if (cell_type.state_variable_names[candidate] == "v") slot = (s64)candidate;
+        }
+        if (slot < 0) {
+            log::throw_runtime_error(*logger,
+                    "record_membrane_video: cell type '" + cell_type.name +
+                    "' declares no membrane potential `v`, so there is nothing to render");
+        }
+
+        for (s64 member = 0; member < population.neuron_count; member += 1) {
+            membrane_offset_per_neuron[(usize)(population.first_neuron_index + member)] =
+                    layout.population_state_base[index] + slot * population.neuron_count +
+                    member;
+        }
+    }
+
+    membrane_video_frame_stride = frame_stride;
+    membrane_frame_scratch.assign((usize)total_neuron_count, 0.0f);
+    membrane_video_recorder = std::make_unique<SimulationRecorder>(path, total_neuron_count);
+
+    logger->info("record_membrane_video: {} neurons every {} ticks -> {}",
+                 total_neuron_count, frame_stride, path);
+}
+
 // ── recording output ──────────────────────────────────────────────────────────────
 
-void SpikeEngine::write_recordings() const {
+void SpikeEngine::write_recordings() {
+    if (membrane_video_recorder) {
+        membrane_video_recorder->finish();
+        logger->info("SpikeEngine: membrane video recording closed");
+    }
+
     for (const RecordingConfig &profile : network_details.recording_profiles) {
         if (profile.output_filenames.empty()) continue;
 
