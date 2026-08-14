@@ -449,6 +449,166 @@ TEST(SpikeEngine, a_delayed_connection_arrives_on_the_tick_it_says) {
     EXPECT_EQ(first_listener_movement_tick - first_source_spike_tick, 32);
 }
 
+// Per-edge storage is addressed by (source, slot), where `slot` is the edge's position in
+// the k^2-tree row walk. The host fills those slots by walking with get_neighbors(); the
+// kernel reads them by walking with k2t_next_neighbor(). Nothing enforces that the two
+// walks agree — and if they ever disagree, every edge silently receives another edge's
+// weight, delay and synapse state. The network still runs, still spikes, and still looks
+// entirely reasonable in a raster.
+//
+// So: one source, three targets with weights 1x/2x/3x and delays 1/3/5 ms, and a single
+// presynaptic spike. Each target's own weight must show up in the size of its response and
+// its own delay in the timing of it. A permutation of the slots fails both halves.
+TEST(SpikeEngine, each_edge_gets_its_own_weight_and_delay_not_another_edges) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("slot_identity");
+    // The pulse stops at 40 ms. The cell first reaches threshold at
+    // tau*ln((I/gL)/(I/gL - 15 mV)) = 20 ms * ln(6) = 35.8 ms and the next crossing would
+    // be 40.7 ms after that, so the run contains exactly one presynaptic spike and each
+    // target sees exactly one postsynaptic response.
+    //
+    // Targets 1, 4 and 7 rather than 1, 2, 3: non-adjacent columns make the tree walk
+    // descend and unwind between neighbours instead of reading one contiguous leaf.
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Slots">
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
+           reset="-70 mV" C="100 pF"/>
+  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="40 ms" amplitude="90 pA"/>
+  <network id="slotNetwork">
+    <population id="pop" component="c" size="8"/>
+    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop"
+                synapse="syn">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]"
+                    weight="1" delay="1 ms"/>
+      <connectionWD id="1" preCellId="../pop[0]" postCellId="../pop[4]"
+                    weight="2" delay="3 ms"/>
+      <connectionWD id="2" preCellId="../pop[0]" postCellId="../pop[7]"
+                    weight="3" delay="5 ms"/>
+    </projection>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)");
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "slotNetwork", "120ms", "0.1ms"));
+
+    SpikeEngine engine(lems_path);
+
+    const s64 targets[3] = {1, 4, 7};
+    const s64 expected_delay_ticks[3] = {10, 30, 50};
+
+    const f32 resting = -0.065f;
+    s64 spike_tick = -1;
+    s64 first_movement_tick[3] = {-1, -1, -1};
+    f32 peak_deflection[3] = {0.0f, 0.0f, 0.0f};
+
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+
+        if (spike_tick < 0 && !engine.recorded_spikes.empty()) spike_tick = tick;
+
+        for (s64 index = 0; index < 3; index += 1) {
+            const f32 membrane_potential =
+                    engine.read_state_variable(targets[index], "v");
+            const f32 deflection = membrane_potential - resting;
+
+            if (first_movement_tick[index] < 0 && std::fabs(deflection) > 1e-9f) {
+                first_movement_tick[index] = tick;
+            }
+            peak_deflection[index] = std::max(peak_deflection[index], deflection);
+        }
+    }
+
+    ASSERT_GE(spike_tick, 0);
+    ASSERT_EQ(engine.recorded_spikes.size(), 1u) << "the drive should produce one spike";
+
+    // Timing: each target moves delay + 2 ticks after the presynaptic spike, for its own
+    // delay. Slot-permuted delays would give 30/10/50 or some other rearrangement.
+    for (s64 index = 0; index < 3; index += 1) {
+        ASSERT_GE(first_movement_tick[index], 0) << "target " << targets[index] << " never moved";
+        EXPECT_EQ(first_movement_tick[index] - spike_tick, expected_delay_ticks[index] + 2)
+                << "target " << targets[index];
+    }
+
+    // Size: an alphaCurrentSynapse's response scales linearly in the connection weight, so
+    // the three peaks are in 1:2:3. Slot-permuted weights would give 3:2:1 or 2:1:3.
+    for (s64 index = 0; index < 3; index += 1) {
+        EXPECT_GT(peak_deflection[index], 0.0f) << "target " << targets[index];
+    }
+    EXPECT_NEAR(peak_deflection[1] / peak_deflection[0], 2.0, 0.02);
+    EXPECT_NEAR(peak_deflection[2] / peak_deflection[0], 3.0, 0.02);
+
+    // Nothing reached any other cell: only three of the eight have an incoming edge.
+    for (s64 neuron_index = 1; neuron_index < 8; neuron_index += 1) {
+        if (neuron_index == 1 || neuron_index == 4 || neuron_index == 7) continue;
+        EXPECT_FLOAT_EQ(engine.read_state_variable(neuron_index, "v"), resting)
+                << "neuron " << neuron_index << " has no incoming edge and no input";
+    }
+}
+
+// Each edge names its own synapse prototype, stored in plane 0 of the per-edge family and
+// used by the kernel to pick both the generated body and the parameter row. With two
+// prototypes of the same type differing only in the sign of ibase, reading the wrong row
+// flips excitation into inhibition — which in a balanced network shows up as the whole
+// thing dying or running away, but never as an error.
+TEST(SpikeEngine, an_edge_uses_the_parameters_of_its_own_synapse_prototype) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("prototype_identity");
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Prototypes">
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
+           reset="-70 mV" C="100 pF"/>
+  <alphaCurrentSynapse id="excitatory" tau="5 ms" ibase="12 pA"/>
+  <alphaCurrentSynapse id="inhibitory" tau="5 ms" ibase="-12 pA"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="40 ms" amplitude="90 pA"/>
+  <network id="prototypeNetwork">
+    <population id="pop" component="c" size="4"/>
+    <projection id="excitatoryProjection" presynapticPopulation="pop"
+                postsynapticPopulation="pop" synapse="excitatory">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]"
+                    weight="1" delay="1 ms"/>
+    </projection>
+    <projection id="inhibitoryProjection" presynapticPopulation="pop"
+                postsynapticPopulation="pop" synapse="inhibitory">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[2]"
+                    weight="1" delay="1 ms"/>
+    </projection>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)");
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "prototypeNetwork", "120ms", "0.1ms"));
+
+    SpikeEngine engine(lems_path);
+    ASSERT_EQ(engine.network_details.synapse_prototypes.size(), 2u);
+
+    const f32 resting = -0.065f;
+    f32 excitatory_peak = 0.0f;
+    f32 inhibitory_trough = 0.0f;
+
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+
+        excitatory_peak = std::max(excitatory_peak,
+                                   engine.read_state_variable(1, "v") - resting);
+        inhibitory_trough = std::min(inhibitory_trough,
+                                     engine.read_state_variable(2, "v") - resting);
+    }
+
+    ASSERT_EQ(engine.recorded_spikes.size(), 1u);
+
+    // Opposite signs, equal magnitudes: the two prototypes differ only in the sign of
+    // ibase, so a swap would show up as both deflections having the same sign.
+    EXPECT_GT(excitatory_peak, 0.0f);
+    EXPECT_LT(inhibitory_trough, 0.0f);
+    EXPECT_NEAR(excitatory_peak, -inhibitory_trough, 1e-6f);
+
+    // Neuron 3 has no incoming edge, so nothing reached it.
+    EXPECT_FLOAT_EQ(engine.read_state_variable(3, "v"), resting);
+}
+
 TEST(SpikeEngine, connection_weights_and_delays_survive_the_weight_matrix_exactly) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
