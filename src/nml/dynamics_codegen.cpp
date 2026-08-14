@@ -1065,6 +1065,25 @@ f64 evaluate_initial_value(const String &expression,
             "on the host and does not evaluate general expressions there");
 }
 
+bool find_spike_threshold_condition(const CellTypeSpecification &cell_type,
+                                    String &return_state_variable,
+                                    String &return_threshold_symbol) {
+    // The test that fires the spike, not just any OnCondition: a GLIF cell has a second
+    // one for leaving its refractory regime, and that compares a timer against a duration.
+    String spike_test;
+    for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Emit) continue;
+        if (instruction.source_tag != NML_DeclarationType::EventOut) continue;
+        if (instruction.condition.empty()) continue;
+
+        spike_test = instruction.condition;
+        break;
+    }
+    if (spike_test.empty()) return false;
+
+    return split_refractory_test(spike_test, return_state_variable, return_threshold_symbol);
+}
+
 ModelLayout compute_model_layout(const NML_ParseResult &parse_result) {
     ModelLayout layout;
     layout.total_neuron_count = (s64)parse_result.neurons.size();

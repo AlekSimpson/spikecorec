@@ -57,6 +57,13 @@ f64 starting_value_for(const Vector<DynamicsInstruction> &dynamics,
 // ── construction ──────────────────────────────────────────────────────────────────
 
 SpikeEngine::SpikeEngine(const String &lems_input_file)
+    : SpikeEngine(lems_input_file, {}, "", 1.0, 0.0) {}
+
+SpikeEngine::SpikeEngine(const String &lems_input_file,
+                         const vector<vector<s32>> &adjacency,
+                         const String &synapse_component_id,
+                         f64 connection_weight,
+                         f64 connection_delay_seconds)
     : logger(log::make_logger()) {
 
     if (!gpu_context_is_initialized()) initialize_gpu_context();
@@ -69,6 +76,14 @@ SpikeEngine::SpikeEngine(const String &lems_input_file)
     }
 
     network_details = parser.parse_lems(lems_input_file);
+
+    // Before the layout, so the edge count, the delay ring and the weight matrix are all
+    // sized from the connectivity that will actually be simulated.
+    if (!adjacency.empty()) {
+        apply_topology(adjacency, synapse_component_id, connection_weight,
+                       connection_delay_seconds);
+    }
+
     layout = compute_model_layout(network_details);
 
     total_neuron_count = layout.total_neuron_count;
@@ -273,6 +288,190 @@ void SpikeEngine::build_weight_matrix() {
                   weights.max_neighbor_count, layout.per_edge_variable_count);
 }
 
+// A spike is a binary event; what it is worth in current depends entirely on the cell it
+// lands on. When the model declines to say, the sensible reading of "a spike arrived" is
+// "enough to make this cell fire", which is C * (threshold - resting) / dt: the charge that
+// moves the membrane the whole way in one tick.
+//
+// Every term comes from the target's own declarations rather than from guessed names. The
+// capacitance is the parameter whose DIMENSION is capacitance, whatever the model calls it.
+// The threshold and the resting value come from the cell's own spike condition and its
+// OnStart -- so GLIF1, which tests the parameter `vth`, and GLIF4, which tests the state
+// variable `theta`, both resolve without either being special-cased.
+f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
+    // Strictly above threshold, because the comparison that fires a cell is a strict one:
+    // landing exactly on it does not spike.
+    constexpr f64 THRESHOLD_OVERSHOOT = 1.05;
+
+    for (usize index = 0; index < network_details.populations.size(); index += 1) {
+        const PopulationLayout &population = network_details.populations[index];
+        if (neuron_index < population.first_neuron_index) continue;
+        if (neuron_index >= population.first_neuron_index + population.neuron_count) continue;
+
+        const CellTypeSpecification &cell_type =
+                network_details.cell_types[(usize)population.cell_type_index];
+        const ComponentPrototype &prototype =
+                network_details.cell_prototypes[(usize)population.prototype_index];
+
+        f64 capacitance = 0.0;
+        for (usize slot = 0; slot < cell_type.parameter_dimensions.size(); slot += 1) {
+            if (cell_type.parameter_dimensions[slot] != "capacitance") continue;
+            if (slot >= prototype.starting_parameters.size()) continue;
+            capacitance = prototype.starting_parameters[slot].float64;
+        }
+        if (capacitance <= 0.0) {
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: a spike train targets a '" + cell_type.name +
+                    "', which declares no parameter of dimension capacitance, so there is "
+                    "no way to work out what one event should inject. Give the input an "
+                    "amplitude");
+        }
+
+        String membrane_name;
+        String threshold_symbol;
+        if (!find_spike_threshold_condition(cell_type, membrane_name, threshold_symbol)) {
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: a spike train targets a '" + cell_type.name +
+                    "', whose spike condition is not a comparison this can read, so there "
+                    "is no threshold to aim at. Give the input an amplitude");
+        }
+
+        // The swing to cover is measured from the lowest the membrane goes, not from where
+        // it starts. A cell that has just fired sits at its reset value, which for every
+        // iaf and GLIF cell is below the leak reversal -- sizing the event from the
+        // starting potential makes the first spike fire and the ones after it fall short.
+        f64 membrane_floor = starting_value_for(cell_type.dynamics, membrane_name,
+                                                cell_type.parameter_names,
+                                                prototype.starting_parameters,
+                                                cell_type.name);
+
+        for (const DynamicsInstruction &instruction : cell_type.dynamics) {
+            if (instruction.stage != DynamicsStage::Reset) continue;
+            if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+            if (instruction.target != membrane_name) continue;
+
+            // Only a reset that folds to a value counts. GLIF2 resets to
+            // `vreset + resetScale*(v - vth)`, which depends on the overshoot and cannot be
+            // known here; its plain vreset floor is covered by the OnStart value instead.
+            try {
+                membrane_floor = std::min(
+                        membrane_floor,
+                        evaluate_initial_value(instruction.expression,
+                                               cell_type.parameter_names,
+                                               prototype.starting_parameters,
+                                               cell_type.name));
+            } catch (const std::runtime_error &) {
+                // not foldable; the OnStart value stands
+            }
+        }
+
+        const f64 resting = membrane_floor;
+
+        // The threshold is a parameter in GLIF1/2/3 and a state variable in GLIF4/5.
+        bool threshold_found = false;
+        f64 threshold = 0.0;
+        for (usize slot = 0; slot < cell_type.parameter_names.size(); slot += 1) {
+            if (cell_type.parameter_names[slot] != threshold_symbol) continue;
+            if (slot >= prototype.starting_parameters.size()) continue;
+            threshold = prototype.starting_parameters[slot].float64;
+            threshold_found = true;
+        }
+        for (const String &state_name : cell_type.state_variable_names) {
+            if (threshold_found || state_name != threshold_symbol) continue;
+            threshold = starting_value_for(cell_type.dynamics, state_name,
+                                           cell_type.parameter_names,
+                                           prototype.starting_parameters, cell_type.name);
+            threshold_found = true;
+        }
+
+        if (!threshold_found || threshold <= resting) {
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: a spike train targets a '" + cell_type.name +
+                    "', whose threshold '" + threshold_symbol + "' resolves to no value "
+                    "above its starting membrane potential, so no finite current would make "
+                    "it fire. Give the input an amplitude");
+        }
+
+        return THRESHOLD_OVERSHOOT * capacitance * (threshold - resting) /
+               network_details.step_dt;
+    }
+
+    log::throw_runtime_error(*logger,
+            "SpikeEngine: spike train targets neuron " + to_string(neuron_index) +
+            ", which is outside every population");
+}
+
+void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
+                                 const String &synapse_component_id,
+                                 f64 connection_weight,
+                                 f64 connection_delay_seconds) {
+    const s64 neuron_count = (s64)network_details.neurons.size();
+    if ((s64)adjacency.size() != neuron_count) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: the topology has " + to_string(adjacency.size()) +
+                " rows but the model's populations declare " + to_string(neuron_count) +
+                " neurons; one row per neuron is required");
+    }
+
+    // An instance id may be document-scoped ("net.syn"), so match the trailing name too.
+    s64 prototype_index = -1;
+    String available;
+    for (usize index = 0; index < network_details.synapse_prototypes.size(); index += 1) {
+        const String &instance_id = network_details.synapse_prototypes[index].instance_id;
+        available += (available.empty() ? "" : ", ") + instance_id;
+
+        const usize separator = instance_id.rfind('.');
+        const String leaf = separator == String::npos ? instance_id
+                                                      : instance_id.substr(separator + 1);
+        if (instance_id == synapse_component_id || leaf == synapse_component_id) {
+            prototype_index = (s64)index;
+        }
+    }
+    if (prototype_index < 0) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: the topology names synapse '" + synapse_component_id +
+                "', which the model does not declare. It declares: " +
+                (available.empty() ? "no synapses at all" : available));
+    }
+
+    const s64 type_index =
+            network_details.synapse_prototypes[(usize)prototype_index].type_index;
+
+    // At least one tick: the engine's synaptic latency has no zero-delay path.
+    const s64 delay_ticks = std::max<s64>(
+            1, (s64)std::llround(connection_delay_seconds / network_details.step_dt));
+
+    s64 edge_count = 0;
+    for (s64 source = 0; source < neuron_count; source += 1) {
+        Vector<NetworkEdge> &edges = network_details.neurons[(usize)source].outgoing_edges;
+        edges.clear();
+        edges.reserve(adjacency[(usize)source].size());
+
+        for (s32 target : adjacency[(usize)source]) {
+            if (target < 0 || (s64)target >= neuron_count) {
+                log::throw_runtime_error(*logger,
+                        "SpikeEngine: the topology sends neuron " + to_string(source) +
+                        " to " + to_string(target) + ", which is outside the " +
+                        to_string(neuron_count) + " neurons the model declares");
+            }
+
+            NetworkEdge edge;
+            edge.target_neuron_index = target;
+            edge.synapse_type_index = type_index;
+            edge.synapse_prototype_index = prototype_index;
+            edge.weight = connection_weight;
+            edge.delay_tick_count = delay_ticks;
+            edges.push_back(edge);
+            edge_count += 1;
+        }
+    }
+
+    logger->info("SpikeEngine: topology applied — {} neurons, {} edges, synapse '{}', "
+                 "weight {}, delay {} ticks",
+                 neuron_count, edge_count, synapse_component_id, connection_weight,
+                 delay_ticks);
+}
+
 void SpikeEngine::collect_stimulus() {
     for (const SimulationInputConfig &profile : network_details.input_profiles) {
         for (const InputTarget &target : profile.targets) {
@@ -290,27 +489,18 @@ void SpikeEngine::collect_stimulus() {
 
             if (target.event_ticks.empty()) continue;
 
-            // A spike train injects its amplitude for one tick at each event time. What it
-            // cannot do is inject nothing: a component that declares no amplitude would
-            // load, run every tick, and write a silent recording. That is the one case
-            // worth refusing, and it names what to add rather than refusing trains at all.
-            if (profile.amplitude == 0.0) {
-                log::throw_runtime_error(*logger,
-                        "SpikeEngine: input '" + profile.input_component_id + "' of type '" +
-                        profile.input_component_type_name + "' carries " +
-                        to_string(target.event_ticks.size()) +
-                        " spike times but declares no amplitude, so every one of them would "
-                        "inject 0 A. LEMS binds only attributes that match a declared "
-                        "Parameter, so writing amplitude= on a standard spikeArray is "
-                        "dropped — the model needs a ComponentType that declares one. An "
-                        "event injects it for a single tick, so the charge is amplitude * dt "
-                        "and the figure is nanoamps rather than the picoamps a sustained "
-                        "injector uses");
-            }
+            // A spike train injects a current for one tick at each event time. A model
+            // that names an amplitude gets that; one that does not -- which is every
+            // standard spike source, since LEMS binds only attributes matching a declared
+            // Parameter -- gets whatever makes its target fire. A spike is a binary event
+            // and its worth in current is a property of the cell receiving it.
+            const f64 amplitude = profile.amplitude != 0.0
+                    ? profile.amplitude
+                    : default_spike_amplitude_for(target.neuron_index);
 
             ScheduledSpikeTrain train;
             train.neuron_index = target.neuron_index;
-            train.magnitude = (f32)(profile.amplitude * target.weight);
+            train.magnitude = (f32)(amplitude * target.weight);
             train.event_ticks = target.event_ticks;
             scheduled_spike_trains.push_back(std::move(train));
         }

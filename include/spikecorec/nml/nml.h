@@ -280,6 +280,12 @@ struct ComponentType {
     // computed from other parameters rather than supplied by an instance).
     Vector<String> ordered_parameter_names() const;
 
+    // The `dimension` of each of those parameters, in the same order and of the same
+    // length. Retained because a dimension is how a quantity identifies itself without
+    // anyone guessing at names: the capacitance of a cell is the parameter whose dimension
+    // is "capacitance", whatever that model chose to call it.
+    Vector<String> ordered_parameter_dimensions() const;
+
     // StateVariable names in declaration order; the index is the variable's slot within
     // this type's state chunk.
     Vector<String> ordered_state_variable_names() const;
@@ -347,6 +353,9 @@ struct CellTypeSpecification {
 
     // Column order of a prototype's starting_parameters.
     Vector<String> parameter_names;
+
+    // Parallel to parameter_names: each parameter's declared dimension.
+    Vector<String> parameter_dimensions;
 
     // Stage-tagged instruction program, ready for lowering into kernel code.
     Vector<DynamicsInstruction> dynamics;
