@@ -240,6 +240,15 @@ struct DeclarationList {
     // redeclaring an ancestor's Parameter an override rather than a duplicate.
     void overlay(const NML_Declaration &declaration);
 
+    // Drops the declaration sharing `declaration`'s namespace_key(), keeping
+    // ordered_declaration_type_counts in step. Returns whether one was dropped.
+    //
+    // The counterpart of overlay() for an override that cannot be expressed as a
+    // replacement: a subtype re-expressing an inherited declaration in a NARROWER scope
+    // (a TimeDerivative moved inside a Regime) does not sit at this list's top level at
+    // all, so the ancestor's has to go rather than be replaced in place.
+    bool remove_matching(const NML_Declaration &declaration);
+
     // First declaration of `type` named `name`, or nullptr.
     const NML_Declaration *find(NML_DeclarationType type, const String &name) const;
 

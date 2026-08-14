@@ -438,6 +438,142 @@ TEST(Resolution, a_state_variable_overrides_an_inherited_parameter_of_the_same_n
               (Vector<String>{"tau"}));
 }
 
+// Names of the variables a type's TOP-LEVEL (regime-free) TimeDerivatives write, in order.
+// Regime-scoped derivatives live under their Regime and so are absent from this list by
+// construction, which is exactly the distinction the three tests below turn on.
+Vector<String> regime_free_derivative_variables(const ComponentType &component_type) {
+    Vector<String> variables;
+    for (const NML_Declaration *declaration :
+         component_type.declarations.find_all(NML_DeclarationType::TimeDerivative)) {
+        variables.push_back(declaration->value_or("variable"));
+    }
+    return variables;
+}
+
+// Variables a named Regime of `component_type` declares a TimeDerivative for, in order.
+Vector<String> regime_scoped_derivative_variables(const ComponentType &component_type,
+                                                  const String &regime_name) {
+    Vector<String> variables;
+    const NML_Declaration *regime =
+            component_type.declarations.find(NML_DeclarationType::Regime, regime_name);
+    if (regime == nullptr) return variables;
+
+    for (const NML_Declaration &child : regime->children) {
+        if (child.tag_type != NML_DeclarationType::TimeDerivative) continue;
+        variables.push_back(child.value_or("variable"));
+    }
+    return variables;
+}
+
+// This is the shape of iafRefCell extends iafCell (and iafTauRefCell extends iafTauCell): the
+// subtype moves the parent's derivative for `v` into its own Regime and redeclares nothing at
+// the top level. Merging the two leaves the flattened type carrying a regime-free derivative
+// for `v` AND a regime-scoped one, which the kernel generator refuses as ambiguous -- and it
+// is not ambiguous, because `extends` means the subtype overrides.
+TEST(Resolution, a_regime_scoped_time_derivative_overrides_an_inherited_regime_free_one) {
+    FixtureDirectory fixture("regime_scoped_derivative_override");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="parent_type">
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <TimeDerivative variable="v" value="parent_expression"/>
+        </Dynamics>
+    </ComponentType>
+    <ComponentType name="child_type" extends="parent_type">
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <Regime name="integrating" initial="true">
+                <TimeDerivative variable="v" value="child_expression"/>
+            </Regime>
+        </Dynamics>
+    </ComponentType>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &child = parser.declared_component_types.at("child_type");
+
+    EXPECT_TRUE(regime_free_derivative_variables(child).empty())
+            << "the parent's regime-free derivative for 'v' survived alongside the subtype's "
+               "regime-scoped one, which is the pair the generator refuses as ambiguous";
+    EXPECT_EQ(regime_scoped_derivative_variables(child, "integrating"),
+              (Vector<String>{"v"}));
+
+    // The parent is untouched: the override is a property of the resolved subtype, not an edit
+    // to the type it extends.
+    EXPECT_EQ(regime_free_derivative_variables(
+                      parser.declared_component_types.at("parent_type")),
+              (Vector<String>{"v"}));
+}
+
+// The override is per VARIABLE. A subtype regime-scoping `w` says nothing about an inherited
+// derivative for `v`, and dropping that one would silently freeze the variable.
+TEST(Resolution, a_regime_scoped_derivative_leaves_an_inherited_one_for_another_variable) {
+    FixtureDirectory fixture("regime_scoped_derivative_other_variable");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="parent_type">
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <TimeDerivative variable="v" value="parent_expression"/>
+        </Dynamics>
+    </ComponentType>
+    <ComponentType name="child_type" extends="parent_type">
+        <Dynamics>
+            <StateVariable name="w" dimension="none"/>
+            <Regime name="integrating" initial="true">
+                <TimeDerivative variable="w" value="child_expression"/>
+            </Regime>
+        </Dynamics>
+    </ComponentType>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &child = parser.declared_component_types.at("child_type");
+
+    EXPECT_EQ(regime_free_derivative_variables(child), (Vector<String>{"v"}));
+    EXPECT_EQ(regime_scoped_derivative_variables(child, "integrating"),
+              (Vector<String>{"w"}));
+}
+
+// The genuinely ambiguous case, and it stays ambiguous. One ComponentType declaring both a
+// regime-free and a regime-scoped derivative for one variable says nothing about which applies,
+// so BOTH survive resolution and the generator refuses the pair. Only an INHERITED regime-free
+// derivative is overridden -- there the subtype is what says which applies.
+TEST(Resolution, one_type_declaring_both_kinds_of_derivative_for_a_variable_keeps_both) {
+    FixtureDirectory fixture("same_type_derivative_ambiguity");
+    fixture.write("types.xml", R"(<Lems>
+    <ComponentType name="ambiguous_type">
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage"/>
+            <TimeDerivative variable="v" value="regime_free_expression"/>
+            <Regime name="integrating" initial="true">
+                <TimeDerivative variable="v" value="regime_scoped_expression"/>
+            </Regime>
+        </Dynamics>
+    </ComponentType>
+</Lems>
+)");
+
+    NML_Parser parser;
+    parser.ingest_document(fixture.path_of("types.xml"));
+    parser.resolve_all_component_types();
+
+    const ComponentType &ambiguous = parser.declared_component_types.at("ambiguous_type");
+
+    EXPECT_EQ(regime_free_derivative_variables(ambiguous), (Vector<String>{"v"}))
+            << "the type's OWN regime-free derivative was dropped. Nothing in this document says "
+               "which of the two applies, so resolving it here picks one silently.";
+    EXPECT_EQ(regime_scoped_derivative_variables(ambiguous, "integrating"),
+              (Vector<String>{"v"}));
+}
+
 TEST(Resolution, fixed_pins_an_inherited_parameter) {
     FixtureDirectory fixture("fixed");
     fixture.write("types.xml", R"(<Lems>

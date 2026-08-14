@@ -89,20 +89,46 @@ using namespace spikecorec;
 //   refused  -- construction throws. The expected message substring is asserted, so a refusal
 //               silently changing into a different refusal fails here.
 //
-// There is deliberately no "broken" row: the sweep found no candidate that constructs and then
-// produces a wrong-looking number, and encoding one as an expectation would freeze a defect into
-// the suite. A candidate that starts producing non-finite or frozen state fails its own case.
+// There is deliberately no "broken" row, and there is one candidate pair that would need one --
+// see note 1. Where a candidate runs but a number it produces is known to be wrong, the row is
+// `runs`, the note says exactly which number and why, and the asserted floor is set BELOW both
+// today's value and the value the corrected model gives, so the assertion neither freezes the
+// defect in nor fails the day it is fixed. A candidate that starts producing non-finite or
+// frozen state fails its own case.
 //
 // ── WHAT THE SWEEP FOUND (and what is therefore asserted below) ──────────────────────────────
 // 1. `iafRefCell` and `iafTauRefCell` -- two of the four core NeuroML integrate-and-fire point
-//    cells -- CANNOT BE CONSTRUCTED. Both are refused with "'v' carries both a regime-scoped
-//    TimeDerivative and one outside any Regime". Neither declares a regime-free TimeDerivative:
-//    it arrives from the parent they extend (`iafCell` / `iafTauCell`) through extends
-//    flattening, and the child re-expresses the same derivative inside its `integrating` Regime.
-//    `an_iaf_refractory_cell_rebased_off_its_parent_compiles` is the control: iafRefCell's
-//    Dynamics body VERBATIM, rebased onto `baseIafCapCell` so nothing regime-free is inherited,
-//    compiles and fires. So the refusal is the flattening, not the dynamics. This is a GAP, and
-//    the expectation below records the refusal as today's honest state, not as correct.
+//    cells -- now CONSTRUCT AND RUN, and their refractory period DOES NOTHING. Two separate
+//    consequences of the same shape, a subtype re-expressing inherited Dynamics inside its own
+//    Regimes; the first is fixed, the second is not.
+//
+//    (a) FIXED. Both used to be refused with "'v' carries both a regime-scoped TimeDerivative
+//        and one outside any Regime". Neither declares a regime-free TimeDerivative: it arrived
+//        from the parent they extend (`iafCell` / `iafTauCell`) through extends flattening,
+//        which merged it in alongside the child's regime-scoped one.
+//        `an_iaf_refractory_cell_rebased_off_its_parent_compiles` was the control that isolated
+//        it -- iafRefCell's Dynamics body VERBATIM, rebased onto `baseIafCapCell` so nothing
+//        regime-free is inherited, compiled and fired. The flattening now treats a subtype's
+//        regime-scoped TimeDerivative as an OVERRIDE of an inherited regime-free one for the
+//        same variable (src/nml/nml.cpp), and both types construct.
+//
+//    (b) OPEN. The same flattening also hands both types their parent's regime-free
+//        `<OnCondition test="v .gt. thresh">`, whose `<StateAssignment variable="v"
+//        value="reset"/>` neither subtype redeclares. A regime-free handler applies in every
+//        regime, so it resets v in the same tick the `integrating` Regime's own OnCondition
+//        would have tested it -- and that condition, reading the already-reset v, never fires
+//        its `<Transition regime="refractory"/>`. Neither cell ever enters its refractory
+//        regime. MEASURED: iafRefCell fires 58 times under the drive that makes iafCell fire 58
+//        times, where a held 5ms refractory period gives ~30; iafTauRefCell fires 51 where ~29
+//        is the held rate. `an_inherited_regime_free_reset_pre_empts_the_regime_transition` is
+//        the control -- the rebased ComponentType above plus that one inherited handler and
+//        nothing else, which takes it from ~30 to 58.
+//
+//        This file does not decide (b). Whether a subtype re-expressing a handler inside a
+//        Regime should override the inherited regime-free one is the same question the
+//        TimeDerivative override answers for derivatives, and unlike a derivative a handler has
+//        no name to override THROUGH -- `namespace_key()` returns "" for OnCondition precisely
+//        because handlers accumulate. It is recorded here, with its control and its numbers.
 // 2. `HH_cond_exp` diverges to NaN at the 0.1ms step every other model here uses, and integrates
 //    clean action potentials at 0.001ms. Forward Euler on Traub gate kinetics is unstable at
 //    0.1ms (the gate time constants fall below 0.1ms during the upstroke), so this is a
@@ -120,12 +146,10 @@ using namespace spikecorec;
 //    (`expected_delivered_current_per_event`), because it is the one check that discriminates a
 //    unit scale, a sign and a weight all at once. The agreement measured is nine significant
 //    figures, so the check has room to discriminate rather than being met by luck.
-// 5. A `pulseGenerator` declaring `amplitude="0nA"` injects ONE AMPERE. That is a defect in
-//    src/core/engine.cpp, not in any ComponentType, and this file does not own that file -- it
-//    is recorded here, where the sweep found it, as the DISABLED reproduction
-//    `DISABLED_a_zero_amplitude_current_injector_delivers_no_current`, which carries the full
-//    diagnosis. It is disabled rather than deleted, and asserts what is CORRECT rather than
-//    what happens, so it starts passing when the defect is fixed instead of freezing it in.
+// 5. A `pulseGenerator` declaring `amplitude="0nA"` injected ONE AMPERE. That was a defect in
+//    src/core/engine.cpp, not in any ComponentType; it is FIXED, and the reproduction the sweep
+//    left behind is now the live regression
+//    `a_zero_amplitude_current_injector_delivers_no_current`, which carries the full diagnosis.
 //
 // ── COST ─────────────────────────────────────────────────────────────────────────────────────
 // Single cells, a few thousand ticks each; the whole file is roughly 20 seconds, of which
@@ -573,11 +597,16 @@ const CandidateModel CANDIDATE_MODELS[] = {
                 "  </network>\n"
                 "  <Simulation id=\"coverageSim\" length=\"350ms\" step=\"0.1ms\"\n"
                 "              target=\"CoverageNet\"/>\n",
-                0, ExpectedVerdict::REFUSED, 0, 0.0, 0.0,
-                "carries both a regime-scoped TimeDerivative and one outside any Regime",
-                "GAP, not a correct refusal. iafRefCell declares no regime-free TimeDerivative "
-                "of its own -- it inherits one from iafCell and re-expresses it inside its "
-                "integrating Regime. See the control test in this file.",
+                0, ExpectedVerdict::RUNS, 20, 0.015, 0.0, "",
+                "Same textbook LIF parameters and drive as iafCell above, plus refract=5ms, so "
+                "the two are directly comparable. MEASURED: 3500 ticks, 58 spikes, membrane "
+                "[-70mV, -50.25mV], finite in every slot. 58 is iafCell's own count -- the "
+                "refractory period is NOT holding, because iafCell's regime-free OnCondition is "
+                "inherited and resets v before the integrating Regime's own OnCondition can fire "
+                "its Transition. See header note 1 and the control "
+                "`an_inherited_regime_free_reset_pre_empts_the_regime_transition`. The floor of "
+                "20 is deliberately below BOTH 58 and the ~30 a held refractory period gives, so "
+                "it neither freezes the gap in nor fails the day it closes.",
         },
         {
                 "iafTauCell",
@@ -598,17 +627,26 @@ const CandidateModel CANDIDATE_MODELS[] = {
         {
                 "iafTauRefCell",
                 "  <iafTauRefCell id=\"coverageCell\" leakReversal=\"-70mV\" tau=\"10ms\"\n"
-                "                 thresh=\"-50mV\" reset=\"-70mV\" refract=\"5ms\"/>\n"
+                "                 thresh=\"-80mV\" reset=\"-90mV\" refract=\"5ms\"/>\n"
                 "  <network id=\"CoverageNet\">\n"
                 "    <population id=\"CoveragePop\" component=\"coverageCell\" size=\"1\"/>\n"
                 "  </network>\n"
                 "  <Simulation id=\"coverageSim\" length=\"350ms\" step=\"0.1ms\"\n"
                 "              target=\"CoverageNet\"/>\n",
-                0, ExpectedVerdict::REFUSED, 0, 0.0, 0.0,
-                "carries both a regime-scoped TimeDerivative and one outside any Regime",
-                "Same GAP as iafRefCell, inherited from iafTauCell instead. Note this type is "
-                "unreachable for two independent reasons: even once the flattening is fixed it "
-                "is inert, exactly like its parent.",
+                0, ExpectedVerdict::RUNS, 20, 0.015, 0.0, "",
+                "THRESHOLD BELOW REST, DELIBERATELY. iafTauCell and iafTauRefCell declare no "
+                "<Attachments> and no iSyn term, so no stimulus can reach either -- iafTauCell "
+                "above is INERT for exactly that reason, and iafTauRefCell driven the same way "
+                "would be too. The only drive this ComponentType admits is its own geometry: "
+                "thresh=-80mV sits BELOW leakReversal=-70mV, so the cell crosses threshold from "
+                "its own OnStart value, and reset=-90mV puts it below leakReversal so it charges "
+                "back up with tau=10ms and crosses again. That exercises the refractory Regime, "
+                "the Transition and the OnEntry reset, which is what this entry is here to show. "
+                "MEASURED: 3500 ticks, 51 spikes, membrane [-90mV, -70mV], finite in every slot. "
+                "-90mV to -80mV at tau=10ms is 6.93ms, i.e. 50 crossings over 350ms, so 51 is "
+                "the UNREFRACTED rate -- the same inherited-regime-free-reset gap iafRefCell "
+                "has, reached through iafTauCell instead. A held 5ms refractory period gives "
+                "~29, which the floor of 20 also admits.",
         },
         {
                 "izhikevichCell",
@@ -1167,11 +1205,15 @@ TEST(StandardLibraryCoverageInventory, every_candidate_role_has_a_driven_model) 
 
 // The control for the iafRefCell / iafTauRefCell gap. This is iafRefCell's Dynamics body
 // VERBATIM -- same StateVariables, same DerivedVariables, same OnStart, same two Regimes -- with
-// exactly one thing changed: it extends baseIafCapCell rather than iafCell, so no regime-free
-// TimeDerivative for 'v' is inherited. It compiles and fires. That isolates the refusal to
-// extends flattening merging a parent's unregimed TimeDerivative into a child that re-expresses
-// the same derivative inside a Regime, and rules out the regime machinery, the refractory
-// transition and the dynamics themselves.
+// exactly one thing changed: it extends baseIafCapCell rather than iafCell, so NOTHING
+// regime-free is inherited. It compiles and fires.
+//
+// It isolated the refusal that header note 1(a) records, and it still earns its place now that
+// the refusal is gone: it is the only cell in this file that runs iafRefCell's dynamics with no
+// inherited regime-free handler, so its spike count is the rate a HELD refractory period gives.
+// That is the reference the iafRefCell row's 58 is measured against, and the counterpart of
+// `an_inherited_regime_free_reset_pre_empts_the_regime_transition` below, which adds back the
+// one inherited handler and nothing else.
 TEST(StandardLibraryCoverageControl, an_iaf_refractory_cell_rebased_off_its_parent_compiles) {
     CandidateModel rebased_candidate{};
     rebased_candidate.component_type_name = "iafRefCell_rebased_control";
@@ -1243,6 +1285,104 @@ TEST(StandardLibraryCoverageControl, an_iaf_refractory_cell_rebased_off_its_pare
             << "the rebased cell fired " << outcome.observed_spike_count
             << " times, which is the rate of a cell with NO refractory period -- the refractory "
                "Regime is not being honoured";
+}
+
+// The control for the SECOND gap, the one left standing after the regime-free TimeDerivative
+// override above: iafRefCell now constructs and runs, but its `refract` does nothing.
+//
+// This is the rebased control's ComponentType with exactly ONE thing added -- iafCell's own
+// regime-free OnCondition, verbatim:
+//
+//     <OnCondition test="v .gt. thresh">
+//       <StateAssignment variable="v" value="reset"/>
+//       <EventOut port="spike"/>
+//     </OnCondition>
+//
+// which is what iafRefCell inherits from iafCell and never redeclares. A regime-free handler
+// applies in every regime (docs/nml_general_notes.md, "Regime"), so it resets v in the same tick
+// the `integrating` regime's own OnCondition would have tested it -- and that condition, reading
+// the already-reset v, never fires its <Transition regime="refractory"/>. The cell therefore
+// never enters the refractory regime at all and free-runs at the unrefracted rate.
+//
+// Measured: 58 spikes here, against the rebased control's ~30 under the identical drive, and
+// against iafCell's own 58. Those are the same three numbers the inventory shows for iafRefCell.
+//
+// Note what this control does NOT claim: 58 is the CORRECT count for the ComponentType written
+// out below, which declares an always-apply reset explicitly. What is open is whether extends
+// flattening should hand iafRefCell that reset at all when the subtype re-expresses the same
+// handler inside a Regime -- the same question the TimeDerivative override answers for
+// derivatives, unanswered for event handlers, and not decidable inside this file.
+TEST(StandardLibraryCoverageControl,
+     an_inherited_regime_free_reset_pre_empts_the_regime_transition) {
+    CandidateModel probe_candidate{};
+    probe_candidate.component_type_name = "iafRefCell_regime_free_reset_control";
+    probe_candidate.observed_neuron_index = 0;
+    probe_candidate.model_body =
+            "  <ComponentType name=\"ProbeIafRefCell\" extends=\"baseIafCapCell\">\n"
+            "    <Parameter name=\"leakConductance\" dimension=\"conductance\"/>\n"
+            "    <Parameter name=\"leakReversal\" dimension=\"voltage\"/>\n"
+            "    <Parameter name=\"refract\" dimension=\"time\"/>\n"
+            "    <Attachments name=\"synapses\" type=\"basePointCurrent\"/>\n"
+            "    <EventPort name=\"spike\" direction=\"out\"/>\n"
+            "    <Dynamics>\n"
+            "      <StateVariable name=\"v\" exposure=\"v\" dimension=\"voltage\"/>\n"
+            "      <StateVariable name=\"lastSpikeTime\" dimension=\"time\"/>\n"
+            "      <DerivedVariable name=\"iSyn\" dimension=\"current\" exposure=\"iSyn\"\n"
+            "                       select=\"synapses[*]/i\" reduce=\"add\"/>\n"
+            "      <DerivedVariable name=\"iMemb\" dimension=\"current\" exposure=\"iMemb\"\n"
+            "                       value=\"leakConductance * (leakReversal - v) + iSyn\"/>\n"
+            "      <OnStart>\n"
+            "        <StateAssignment variable=\"v\" value=\"leakReversal\"/>\n"
+            "      </OnStart>\n"
+            "      <OnCondition test=\"v .gt. thresh\">\n"
+            "        <StateAssignment variable=\"v\" value=\"reset\"/>\n"
+            "        <EventOut port=\"spike\"/>\n"
+            "      </OnCondition>\n"
+            "      <Regime name=\"refractory\">\n"
+            "        <OnEntry>\n"
+            "          <StateAssignment variable=\"lastSpikeTime\" value=\"t\"/>\n"
+            "          <StateAssignment variable=\"v\" value=\"reset\"/>\n"
+            "        </OnEntry>\n"
+            "        <OnCondition test=\"t .gt. lastSpikeTime + refract\">\n"
+            "          <Transition regime=\"integrating\"/>\n"
+            "        </OnCondition>\n"
+            "      </Regime>\n"
+            "      <Regime name=\"integrating\" initial=\"true\">\n"
+            "        <TimeDerivative variable=\"v\" value=\"iMemb / C\"/>\n"
+            "        <OnCondition test=\"v .gt. thresh\">\n"
+            "          <EventOut port=\"spike\"/>\n"
+            "          <Transition regime=\"refractory\"/>\n"
+            "        </OnCondition>\n"
+            "      </Regime>\n"
+            "    </Dynamics>\n"
+            "  </ComponentType>\n"
+            "  <ProbeIafRefCell id=\"coverageCell\" C=\"100pF\" leakConductance=\"10nS\"\n"
+            "                   leakReversal=\"-70mV\" thresh=\"-50mV\" reset=\"-70mV\"\n"
+            "                   refract=\"5ms\"/>\n"
+            "  <pulseGenerator id=\"coverageDrive\" delay=\"20ms\" duration=\"300ms\"\n"
+            "                  amplitude=\"0.5nA\"/>\n"
+            "  <network id=\"CoverageNet\">\n"
+            "    <population id=\"CoveragePop\" component=\"coverageCell\" size=\"1\"/>\n"
+            "    <explicitInput target=\"CoveragePop[0]\" input=\"coverageDrive\"/>\n"
+            "  </network>\n"
+            "  <Simulation id=\"coverageSim\" length=\"350ms\" step=\"0.1ms\"\n"
+            "              target=\"CoverageNet\"/>\n";
+
+    const CandidateOutcome outcome = drive_candidate(probe_candidate);
+
+    ASSERT_TRUE(outcome.constructed) << outcome.failure_message;
+    EXPECT_TRUE(outcome.every_sample_finite);
+
+    // 45 is the same divide `an_iaf_refractory_cell_rebased_off_its_parent_compiles` uses, read
+    // the other way: BELOW it is a cell whose 5ms refractory period is holding, ABOVE it is one
+    // free-running. The two tests differ by the regime-free OnCondition and nothing else, so a
+    // count on this side of 45 and a count on that side of it isolate that handler exactly.
+    EXPECT_GT(outcome.observed_spike_count, 45)
+            << "the regime-free reset fired " << outcome.observed_spike_count
+            << " times, at or below the refractory rate. If the regime's own OnCondition is now "
+               "reached before the regime-free reset -- or the regime-free handler no longer "
+               "applies inside a regime -- then iafRefCell's refractory period works too, and "
+               "its inventory note and spike floor should be raised to say so.";
 }
 
 // ── a defect this sweep found, now fixed and kept as the regression ─────────────────────────

@@ -172,6 +172,24 @@ void DeclarationList::overlay(const NML_Declaration &declaration) {
     insert(declaration);
 }
 
+bool DeclarationList::remove_matching(const NML_Declaration &declaration) {
+    const String key = declaration.namespace_key();
+
+    // An empty key means this tag accumulates rather than overrides, so there is no one
+    // entry it identifies and nothing to drop.
+    if (key.empty()) return false;
+
+    for (usize index = 0; index < declarations.size(); index += 1) {
+        if (declarations[index].namespace_key() != key) continue;
+
+        ordered_declaration_type_counts[declarations[index].tag_type] -= 1;
+        declarations.erase(declarations.begin() + static_cast<s64>(index));
+        return true;
+    }
+
+    return false;
+}
+
 const NML_Declaration *DeclarationList::find(NML_DeclarationType type,
                                              const String &name) const {
     for (const NML_Declaration &declaration : declarations) {
@@ -898,6 +916,63 @@ static void collect_declarations_in_source_order(const NML_Node &node,
     }
 }
 
+// Every TimeDerivative anywhere beneath `declaration`, which is called on a Regime, so what
+// it collects is that Regime's scoped derivatives. Pointers into the caller's own
+// declaration tree, which outlives them.
+static void collect_time_derivatives_beneath(
+    const NML_Declaration &declaration,
+    Vector<const NML_Declaration *> &return_value
+) {
+    for (const NML_Declaration &child : declaration.children) {
+        if (child.tag_type == NML_DeclarationType::TimeDerivative) {
+            return_value.push_back(&child);
+        }
+        collect_time_derivatives_beneath(child, return_value);
+    }
+}
+
+// A subtype re-expressing an inherited TimeDerivative inside one of its own Regimes
+// OVERRIDES it -- the same thing `extends` means everywhere else in LEMS, and the same
+// thing overlay() already does for a redeclared Parameter. It just cannot go through
+// overlay(), because the subtype's derivative sits under a Regime rather than at the
+// declaration list's top level, so the two never share a slot to replace.
+//
+// Left alone, the flattened type carries the ancestor's regime-free derivative for `v`
+// ALONGSIDE the subtype's regime-scoped one, and the kernel generator refuses that pair as
+// ambiguous. That refusal is right for one ComponentType declaring both -- nothing in the
+// document says which applies -- and it is what makes iafRefCell and iafTauRefCell, two of
+// the four core NeuroML integrate-and-fire point cells, unconstructible.
+//
+// ONLY the inherited derivative is dropped. A type declaring both a regime-free and a
+// regime-scoped derivative for one variable ITSELF is the genuinely ambiguous case and is
+// deliberately left to be refused, which is what the own_regime_free skip below preserves.
+static void override_inherited_regime_free_time_derivatives(
+    const Vector<NML_Declaration> &own_declarations,
+    DeclarationList &declarations
+) {
+    Set<String> own_regime_free_derivative_variables;
+    Vector<const NML_Declaration *> own_regime_scoped_derivatives;
+
+    for (const NML_Declaration &declaration : own_declarations) {
+        if (declaration.tag_type == NML_DeclarationType::TimeDerivative) {
+            own_regime_free_derivative_variables.insert(declaration.value_or("variable"));
+            continue;
+        }
+        if (declaration.tag_type != NML_DeclarationType::Regime) continue;
+
+        collect_time_derivatives_beneath(declaration, own_regime_scoped_derivatives);
+    }
+
+    for (const NML_Declaration *derivative : own_regime_scoped_derivatives) {
+        if (own_regime_free_derivative_variables.count(derivative->value_or("variable")) > 0) {
+            continue;
+        }
+        // Whatever this removes came from an ancestor: this type's own regime-free
+        // derivatives for the variable are exactly what the skip above ruled out.
+        declarations.remove_matching(*derivative);
+    }
+}
+
 void NML_Parser::extract_all_declarations_nested_in_node(
     NML_Node *node,
     DeclarationList &return_value
@@ -1000,6 +1075,10 @@ const ComponentType &NML_Parser::resolve_component_type(const String &type_name,
     for (const NML_Declaration &declaration : own_declarations) {
         declarations.overlay(declaration);
     }
+
+    // The one override overlay() cannot express, because the subtype's declaration is
+    // nested rather than top-level. Run after the overlay so it sees the merged list.
+    override_inherited_regime_free_time_derivatives(own_declarations, declarations);
 
     // <Fixed parameter="tau" value="10ms"/> pins an inherited Parameter to a constant.
     // Applied after the overlay so it can reach a Parameter this type never declared.
