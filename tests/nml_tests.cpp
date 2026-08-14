@@ -1119,7 +1119,12 @@ TEST(Export, spike_array_inputs_become_tick_indexed_event_trains) {
     ASSERT_EQ(train.targets.size(), 1u);
     EXPECT_EQ(train.targets[0].neuron_index, 1);
     EXPECT_EQ(train.targets[0].event_ticks, (Vector<s32>{1000, 2000, 3000}));
-    EXPECT_EQ(train.max_delay_time, 3000);
+
+    // A spikeArray declares no delay or duration of its own, so the window stays at its
+    // default. The train's own last event is not a "max delay" -- the engine sizes its
+    // delay ring from connection delays, not from how late a stimulus fires.
+    EXPECT_EQ(train.start_tick, 0);
+    EXPECT_EQ(train.end_tick, 0);
 }
 
 TEST(Export, recording_selections_resolve_to_neurons_and_variables) {

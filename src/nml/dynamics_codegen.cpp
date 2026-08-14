@@ -223,7 +223,12 @@ struct Parser {
             const String inner = parse_binary(0);
             if (current().kind != Token::Kind::CloseParen) fail("missing ')'");
             position += 1;
-            return "(" + inner + ")";
+
+            // No parentheses added back. Everything parse_binary returns is already safe
+            // to use as an operand -- either an atom (a name, a literal, a call) or a
+            // binary expression it parenthesised itself -- so re-wrapping only produces
+            // (((A + B)) * C) where (A + B) * C says the same thing and reads.
+            return inner;
         }
 
         if (token.kind == Token::Kind::Operator && (token.text == "-" || token.text == "+")) {
