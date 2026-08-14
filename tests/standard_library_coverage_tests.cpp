@@ -1245,20 +1245,17 @@ TEST(StandardLibraryCoverageControl, an_iaf_refractory_cell_rebased_off_its_pare
                "Regime is not being honoured";
 }
 
-// ── a defect this sweep found, recorded as a DISABLED reproduction ──────────────────────────
+// ── a defect this sweep found, now fixed and kept as the regression ─────────────────────────
 //
-// DISABLED because it FAILS today, and it asserts what is CORRECT rather than what happens.
-// Nothing about it is speculative -- the numbers below were measured.
-//
-// A `pulseGenerator` declaring `amplitude="0nA"` injects ONE AMPERE into its target for every
-// tick of its window. Twelve orders of magnitude, silently: the run is finite throughout, the
-// suite stays green, and the target fires on exactly every tick of the injection window while
-// every post-tick sample of its membrane potential reads exactly the resting potential (it
-// crosses threshold and resets inside the tick). Measured on the iafCell above: amplitude
-// "0nA" -> 3000 spikes over the 3000-tick window, v pinned at -70mV; amplitude "1pA" -> 0
-// spikes and a correct 0.1mV deflection; amplitude "0.5nA" -> 58 spikes. The injected stream's
-// own value reads 1.0 where the declared amplitude is 0 and 1e-12 where it is 1pA, so the
-// parse is fine and the magnitude is chosen wrongly downstream of it.
+// A `pulseGenerator` declaring `amplitude="0nA"` used to inject ONE AMPERE into its target for
+// every tick of its window. Twelve orders of magnitude, silently: the run was finite
+// throughout, the suite stayed green, and the target fired on exactly every tick of the
+// injection window while every post-tick sample of its membrane potential read exactly the
+// resting potential (it crossed threshold and reset inside the tick). Measured on the iafCell
+// above: amplitude "0nA" -> 3000 spikes over the 3000-tick window, v pinned at -70mV; amplitude
+// "1pA" -> 0 spikes and a correct 0.1mV deflection; amplitude "0.5nA" -> 58 spikes. The
+// injected stream's own value read 1.0 where the declared amplitude was 0 and 1e-12 where it
+// was 1pA, so the parse was fine and the magnitude was chosen wrongly downstream of it.
 //
 // Cause, at src/core/engine.cpp create_event_stream():
 //
@@ -1268,17 +1265,15 @@ TEST(StandardLibraryCoverageControl, an_iaf_refractory_cell_rebased_off_its_pare
 //
 // The fallthrough to a bare `weight` is there for `spikeArray`, which carries neither an
 // amplitude nor a rate and whose events legitimately deliver the target's own dimensionless
-// <inputW weight>. But the chain decides which KIND of component it has by looking at the
-// VALUES, so a current injector whose amplitude is genuinely zero is indistinguishable from a
-// component that declares no amplitude at all, and gets weight (1.0) in amps.
-// SimulationInputConfig already carries `input_component_type_name`, so the kind is available
-// without inference.
+// <inputW weight>. But the chain decided which KIND of component it had by looking at the
+// VALUES, so a current injector whose amplitude was genuinely zero was indistinguishable from a
+// component that declared no amplitude at all, and got weight (1.0) in amps.
 //
-// Disabling a stimulus by zeroing its amplitude is an ordinary thing to do to a model, which is
-// what makes this worth a standing record. This file does not own src/core/engine.cpp; when
-// that is fixed, drop the DISABLED_ prefix.
-TEST(StandardLibraryCoverageControl,
-     DISABLED_a_zero_amplitude_current_injector_delivers_no_current) {
+// Fixed by carrying the kind explicitly: SimulationInputConfig::magnitude_source, set from
+// whether the input component DECLARES the attribute, is what create_event_stream now switches
+// on. Disabling a stimulus by zeroing its amplitude is an ordinary thing to do to a model,
+// which is what makes this worth a standing regression.
+TEST(StandardLibraryCoverageControl, a_zero_amplitude_current_injector_delivers_no_current) {
     CandidateModel zero_amplitude_candidate{};
     zero_amplitude_candidate.component_type_name = "pulseGenerator_zero_amplitude";
     zero_amplitude_candidate.observed_neuron_index = 0;

@@ -1241,6 +1241,7 @@ TEST(CreateEventStream, spike_train_is_zero_between_events) {
     const spikecorec::Vector<s32> event_ticks = {2, 5};
     const spikecorec::Vector<f64> stream = create_event_stream(/*rate=*/0.0, /*amplitude=*/0.0,
                                                    /*weight=*/3.0, event_ticks,
+                                                   InputMagnitudeSource::TargetWeight,
                                                    /*continuous_current_injection=*/false);
 
     ASSERT_EQ(stream.size(), 6u);
@@ -1257,6 +1258,7 @@ TEST(CreateEventStream, continuous_injection_fills_its_whole_window) {
     const spikecorec::Vector<s32> event_ticks = {2, 5};
     const spikecorec::Vector<f64> stream = create_event_stream(/*rate=*/0.0, /*amplitude=*/0.5,
                                                    /*weight=*/2.0, event_ticks,
+                                                   InputMagnitudeSource::Amplitude,
                                                    /*continuous_current_injection=*/true);
 
     ASSERT_EQ(stream.size(), 6u);
@@ -1265,23 +1267,62 @@ TEST(CreateEventStream, continuous_injection_fills_its_whole_window) {
     for (usize tick = 2; tick <= 5; ++tick) EXPECT_DOUBLE_EQ(stream[tick], 1.0);
 }
 
-TEST(CreateEventStream, magnitude_comes_from_amplitude_then_rate_then_weight) {
+TEST(CreateEventStream, magnitude_comes_from_the_declared_source_not_from_the_values) {
     const spikecorec::Vector<s32> event_ticks = {0};
 
+    // Every call below carries the SAME rate and amplitude. Only the declared source
+    // differs, so nothing here can be satisfied by reading the numbers.
     const spikecorec::Vector<f64> from_amplitude =
-            create_event_stream(/*rate=*/7.0, /*amplitude=*/0.25, /*weight=*/2.0, event_ticks);
+            create_event_stream(/*rate=*/7.0, /*amplitude=*/0.25, /*weight=*/2.0, event_ticks,
+                                InputMagnitudeSource::Amplitude);
     const spikecorec::Vector<f64> from_rate =
-            create_event_stream(/*rate=*/7.0, /*amplitude=*/0.0, /*weight=*/2.0, event_ticks);
+            create_event_stream(/*rate=*/7.0, /*amplitude=*/0.25, /*weight=*/2.0, event_ticks,
+                                InputMagnitudeSource::Rate);
     const spikecorec::Vector<f64> from_weight =
-            create_event_stream(/*rate=*/0.0, /*amplitude=*/0.0, /*weight=*/2.0, event_ticks);
+            create_event_stream(/*rate=*/7.0, /*amplitude=*/0.25, /*weight=*/2.0, event_ticks,
+                                InputMagnitudeSource::TargetWeight);
 
     EXPECT_DOUBLE_EQ(from_amplitude[0], 0.5);
     EXPECT_DOUBLE_EQ(from_rate[0], 14.0);
     EXPECT_DOUBLE_EQ(from_weight[0], 2.0);
 }
 
+// The defect this source selector exists for. A declared amplitude of exactly zero must
+// deliver zero, NOT the target's weight -- the two are one `if (amplitude != 0.0)` apart and
+// twelve orders of magnitude apart in the value delivered.
+TEST(CreateEventStream, a_declared_amplitude_of_zero_delivers_zero_not_the_target_weight) {
+    const spikecorec::Vector<s32> event_ticks = {0, 3};
+
+    const spikecorec::Vector<f64> stream =
+            create_event_stream(/*rate=*/0.0, /*amplitude=*/0.0, /*weight=*/1.0, event_ticks,
+                                InputMagnitudeSource::Amplitude,
+                                /*continuous_current_injection=*/true);
+
+    ASSERT_EQ(stream.size(), 4u);
+    for (usize tick = 0; tick < stream.size(); ++tick) {
+        EXPECT_DOUBLE_EQ(stream[tick], 0.0)
+                << "tick " << tick << " of a zero-amplitude injector's window carries "
+                << stream[tick] << " rather than 0";
+    }
+}
+
+// The other half of the same distinction: a spikeArray declares no amplitude at all and its
+// events legitimately deliver the bare weight, so the zero above must not be reached by
+// making every zero deliver zero.
+TEST(CreateEventStream, an_undeclared_amplitude_still_delivers_the_target_weight) {
+    const spikecorec::Vector<s32> event_ticks = {1};
+
+    const spikecorec::Vector<f64> stream =
+            create_event_stream(/*rate=*/0.0, /*amplitude=*/0.0, /*weight=*/1.0, event_ticks,
+                                InputMagnitudeSource::TargetWeight);
+
+    ASSERT_EQ(stream.size(), 2u);
+    EXPECT_DOUBLE_EQ(stream[1], 1.0);
+}
+
 TEST(CreateEventStream, no_events_produces_no_stream) {
-    EXPECT_TRUE(create_event_stream(0.0, 0.0, 1.0, {}).empty());
+    EXPECT_TRUE(create_event_stream(0.0, 0.0, 1.0, {}, InputMagnitudeSource::TargetWeight)
+                        .empty());
 }
 
 // ── construction from a NeuroML/LEMS model ─────────────────────────────────────

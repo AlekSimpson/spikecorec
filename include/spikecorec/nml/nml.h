@@ -419,6 +419,21 @@ struct InputTarget {
     Vector<s32> event_ticks; // spike train, empty for a continuous injector
 };
 
+// Which of a profile's scalars carries the magnitude one of its events delivers. This is a
+// DECLARED fact -- whether the input component names the attribute at all -- and never an
+// inference from the value, because the two are not the same question: a current injector
+// declaring amplitude="0nA" holds a genuine zero, and reading that zero as "declares no
+// amplitude" hands the event the target's dimensionless weight (1.0) IN AMPS.
+enum class InputMagnitudeSource {
+    // The component declares neither: a spikeArray, whose events deliver the target's own
+    // <inputW weight> and nothing else.
+    TargetWeight,
+    // A current injector -- pulseGenerator and friends -- scaled by the target's weight.
+    Amplitude,
+    // A rate-driven generator, scaled by the target's weight.
+    Rate,
+};
+
 struct SimulationInputConfig {
     // Which input component produced this profile, so a caller can tell a pulseGenerator
     // from a spikeArray without re-reading the document.
@@ -431,6 +446,7 @@ struct SimulationInputConfig {
     f64 rate = 0.0;
     s64 max_delay_time = 0;
     bool continuous_current_injection = false;
+    InputMagnitudeSource magnitude_source = InputMagnitudeSource::TargetWeight;
 };
 
 struct NML_ParseResult {

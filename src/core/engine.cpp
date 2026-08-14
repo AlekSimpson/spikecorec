@@ -156,6 +156,7 @@ spikecorec::Vector<f64> spikecorec::create_event_stream(
     f64 amplitude,
     f64 weight,
     const spikecorec::Vector<s32> &event_ticks,
+    InputMagnitudeSource magnitude_source,
     bool continuous_current_injection
 ) {
     if (event_ticks.empty()) return {};
@@ -165,12 +166,20 @@ spikecorec::Vector<f64> spikecorec::create_event_stream(
 
     // A NeuroML input component carries an amplitude (a current injector) or a rate (a
     // rate-driven generator), never both; a spikeArray carries neither and its events
-    // deliver the target's own <inputW weight>, which defaults to 1.0.
+    // deliver the target's own <inputW weight>, which defaults to 1.0. WHICH of the three
+    // it is comes from the parser, which knows whether the attribute was declared. Deciding
+    // it here from the values instead would read amplitude="0nA" -- a legitimate way to
+    // disable a stimulus -- as "no amplitude declared" and deliver `weight` amps.
     f64 event_magnitude = weight;
-    if (amplitude != 0.0) {
-        event_magnitude = amplitude * weight;
-    } else if (rate != 0.0) {
-        event_magnitude = rate * weight;
+    switch (magnitude_source) {
+        case InputMagnitudeSource::Amplitude:
+            event_magnitude = amplitude * weight;
+            break;
+        case InputMagnitudeSource::Rate:
+            event_magnitude = rate * weight;
+            break;
+        case InputMagnitudeSource::TargetWeight:
+            break;
     }
 
     Vector<f64> stream(static_cast<usize>(last_event_tick) + 1, 0.0);
@@ -654,7 +663,8 @@ SpikeEngine::SpikeEngine(String &neuroml_input_file, bool enable_hebbian_learnin
 
             Vector<f64> stream_values = create_event_stream(
                     input_profile.rate, input_profile.amplitude, input_target.weight,
-                    input_target.event_ticks, input_profile.continuous_current_injection);
+                    input_target.event_ticks, input_profile.magnitude_source,
+                    input_profile.continuous_current_injection);
             if (stream_values.empty()) continue;
 
             input_neuron_count += 1;

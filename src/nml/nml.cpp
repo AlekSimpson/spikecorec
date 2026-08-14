@@ -1732,11 +1732,19 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             profile.input_component_id = input.id;
             profile.input_component_type_name = input.component_type_name;
 
+            // Which scalar carries the magnitude is decided HERE, from what the component
+            // declares, and travels with the profile. The engine must not re-derive it from
+            // the values: amplitude="0nA" is a declared amplitude that happens to be zero,
+            // and is indistinguishable from an undeclared one once only the number is left.
             if (input.has_value("amplitude")) {
                 profile.amplitude = resolve_quantity(input.value_or("amplitude"));
+                profile.magnitude_source = InputMagnitudeSource::Amplitude;
             }
             if (input.has_value("rate")) {
                 profile.rate = resolve_quantity(input.value_or("rate"));
+                if (!input.has_value("amplitude")) {
+                    profile.magnitude_source = InputMagnitudeSource::Rate;
+                }
             }
 
             // Times are held in ticks so the engine never converts. Every profile reports

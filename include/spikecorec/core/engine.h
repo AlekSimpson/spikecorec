@@ -40,6 +40,12 @@ namespace spikecorec {
     // flows continuously rather than two isolated impulses -- so it needs a flag the tick
     // list alone cannot carry. A spikeArray carries real, isolated spike ticks.
     //
+    // `magnitude_source` names which of `rate` and `amplitude` the events carry, and is
+    // REQUIRED rather than inferred from those two values. Inferring it -- "a nonzero
+    // amplitude means a current injector" -- makes an injector declaring amplitude="0nA"
+    // read as a component with no amplitude at all, which falls through to the bare
+    // `weight` a spikeArray needs and injects 1.0 AMPS where 0 was declared.
+    //
     // THE WINDOW IS CLOSED AT BOTH ENDS: the fill below runs `tick <= end_tick`, so
     // end_tick is the last tick current is delivered on and the window is end_tick -
     // start_tick + 1 ticks long. Whatever computes the pair owes this an INCLUSIVE last
@@ -52,6 +58,7 @@ namespace spikecorec {
         f64 amplitude,
         f64 weight,
         const Vector<s32> &event_ticks,
+        nml::InputMagnitudeSource magnitude_source,
         bool continuous_current_injection = false
     );
 
