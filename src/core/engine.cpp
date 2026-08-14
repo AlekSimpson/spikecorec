@@ -285,22 +285,23 @@ void SpikeEngine::collect_stimulus() {
 
             if (target.event_ticks.empty()) continue;
 
-            ScheduledSpikeTrain train;
-            train.neuron_index = target.neuron_index;
-            train.magnitude = (f32)(profile.amplitude * target.weight);
-            train.event_ticks = target.event_ticks;
-            scheduled_spike_trains.push_back(std::move(train));
-
-            if (profile.amplitude == 0.0) {
-                logger->warn("SpikeEngine: input '{}' delivers a spike train but declares no "
-                             "amplitude, so each of its events injects 0 A and the train has "
-                             "no effect", profile.input_component_id);
-            }
+            // A spike train is not a current. spikeArray is a spike SOURCE -- it emits
+            // events and declares no amplitude at all -- and timedSynapticInput turns its
+            // train into current by routing it through a named synapse. Neither mechanism
+            // exists here yet, and injecting the component's amplitude (zero, for every
+            // standard spike source) would load the model, run it, and write a completely
+            // silent recording with nothing but a log line to say why.
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: input '" + profile.input_component_id + "' of type '" +
+                    profile.input_component_type_name + "' delivers a spike train. A train "
+                    "produces current only through a synapse (timedSynapticInput) or as "
+                    "presynaptic events (spikeArray), and neither is wired up yet — use a "
+                    "pulseGenerator for Phase 1 stimulus rather than have this run silent");
         }
     }
 
-    logger->info("SpikeEngine: stimulus — {} continuous injections, {} spike trains",
-                 continuous_injection_targets.size(), scheduled_spike_trains.size());
+    logger->info("SpikeEngine: stimulus — {} continuous injections",
+                 continuous_injection_targets.size());
 }
 
 SpikeEngine::~SpikeEngine() {
@@ -321,18 +322,6 @@ void SpikeEngine::apply_stimulus(s64 tick) {
 
         input_data[row_base + continuous_injection_targets[index]] +=
                 continuous_injection_amplitudes[index];
-    }
-
-    for (ScheduledSpikeTrain &train : scheduled_spike_trains) {
-        while (train.cursor < train.event_ticks.size() &&
-               (s64)train.event_ticks[train.cursor] < tick) {
-            train.cursor += 1;
-        }
-        while (train.cursor < train.event_ticks.size() &&
-               (s64)train.event_ticks[train.cursor] == tick) {
-            input_data[row_base + train.neuron_index] += train.magnitude;
-            train.cursor += 1;
-        }
     }
 }
 
