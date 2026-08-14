@@ -416,9 +416,13 @@ struct SimulationInputConfig {
 
     f64 amplitude = 0.0;
     f64 rate = 0.0;
-    // s64 start_tick = 0;
-    // s64 end_tick = 0;
-    s64 max_delay_time = 0;
+
+    // <delay> and <delay> + <duration>, in ticks. A continuous injector is live for
+    // start_tick <= tick < end_tick; end_tick == 0 means the component carried no
+    // duration, which LEMS reads as "runs to the end of the simulation".
+    s64 start_tick = 0;
+    s64 end_tick = 0;
+
     bool continuous_current_injection = false;
 };
 

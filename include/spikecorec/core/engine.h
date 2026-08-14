@@ -3,174 +3,153 @@
 //
 #pragma once
 
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/engine_allocator.h"
 #include "spikecorec/core/log.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/recording.h"
 #include "spikecorec/nml/nml.h"
+#include "spikecorec/nml/dynamics_codegen.h"
 
 using namespace std;
-using namespace spikecorec::log;
+using namespace spikecorec::nml;
+
+// spikecorec::log is qualified rather than pulled in: it re-declares Vector and String, so
+// `using namespace spikecorec;` alongside `using namespace spikecorec::log;` makes every
+// bare Vector ambiguous in any translation unit that includes this header.
 
 namespace spikecorec {
-    struct ScaledReservoirResult {
-        ScaleResult weight_scale_result;
-        f32 w_accum;
-        f32 w_instant;
+
+    // One spike, as the model asked for it to be recorded.
+    struct RecordedSpike {
+        f64 time_seconds = 0.0;
+        s64 neuron_index = -1;
     };
 
-    // transform list of event ticks to list of 0s and 1s where the 1 indices correspond 
-    // to the event ticks and the 1 is transformed into actual input value using rate, amplitude and weight
-    Vector<f64> create_event_stream(f64 rate, f64 amplitude, f64 weight, const Vector<s64> &event_ticks);
-
+    // A simulation built entirely from a LEMS/NeuroML document: the model decides the cell
+    // and synapse dynamics, the network, the stimulus, how long to run and what to record.
+    // Nothing about the dynamics is compiled into the engine — the tick kernel is generated
+    // from the model's ComponentTypes at construction and compiled by the backend.
     class SpikeEngine {
     public:
-        SharedPointer<EngineLogger> logger;
+        log::SharedPointer<log::EngineLogger> logger;
 
-        WeightMatrix weights;
-
+        // Two slabs carved into every buffer below. Declared before them because it owns
+        // the storage they alias, so it must outlive them.
         EngineAllocator allocator;
 
-        // GpuPointer<f32> network_inputs; // [neuron_count] — external input accumulator
-        // GpuPointer<f32> membrane_potentials; // [neuron_count]
-        // GpuPointer<s64> last_spiked; // [neuron_count] — tick each neuron last fired
-        // GpuPointer<s64> last_tick_updated; // [neuron_count] — tick each neuron last received input
-        // GpuPointer<s32> active_neuron_indices; // [neuron_count] — current active set (compacted)
-        // GpuPointer<s32> next_active_neuron_indices; // [neuron_count] — active set for next tick
-        // GpuPointer<s32> active_neuron_count; // [1]
-        // GpuPointer<s32> next_active_neuron_count; // [1]
-        // GpuPointer<s32> active_generation; // [neuron_count] — generation tag, -1 = inactive
-        // GpuPointer<s32> input_neuron_indices; // set via set_input_neurons()
+        // Holds every per-edge quantity: the exact connection weight, the per-edge delay,
+        // and one plane per synapse state variable — all indexed by the k^2-tree's own
+        // adjacency, so only real edges are ever addressed. Optional because there is no
+        // network to build one from until a model has been parsed.
+        Optional<WeightMatrix> weights;
 
-        // Persistent step_simulation scratch buffers, sized to neuron_count 
-        // (the existing hard upper bound already relied on by 
-        // input_neuron_indices / active_neuron_indices)
-        // and overwritten in place each tick instead of allocate/copy/free per 
-        // tick (SC-20).
-        // GpuPointer<f32> input_staging; // [neuron_count] — staged input_values
-        // [neuron_count] — staged override_input_neurons
-        // GpuPointer<s64> override_staging; 
-
-        // constexpr (not plain const) so it is implicitly inline in C++17 
-        // it is ODR-used as a default-argument value in the pybind11 bindings
-        // (bindings.cpp), which would otherwise require an out-of-line 
-        // definition.
-        // static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024;
-        // f32 **cell_state_logs = nullptr;
-        RecordingConfig recordings;
         NML_ParseResult network_details;
+        ModelLayout layout;
 
+        // ── model state, carved from the arena ────────────────────────────────────
+        GpuPointer<void> cell_state;         // [layout.cell_state_length]
+        GpuPointer<void> cell_parameters;    // [layout.cell_parameter_length]
+        GpuPointer<void> synapse_parameters; // [layout.synapse_parameter_length]
+
+        // Two rows, alternating by tick parity: a thread drains its slot in one row while
+        // this tick's scatters accumulate into the other. That is what makes the synaptic
+        // latency exactly one tick rather than one-or-two depending on thread order.
+        GpuPointer<void> network_inputs;     // [2][total_neuron_count]
+
+        // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
+        // asking whether the source spiked `delay` ticks ago, so every spike in flight is
+        // remembered, not just the most recent one.
+        GpuPointer<void> spike_history;
+        GpuPointer<void> last_spiked;        // [total_neuron_count]
+
+        // Host-side stimulus, applied before each dispatch.
+        Vector<s64> continuous_injection_targets;
+        Vector<f32> continuous_injection_amplitudes;
+        Vector<s64> continuous_injection_start_ticks;
+        Vector<s64> continuous_injection_end_ticks;
+
+        // One entry per (input profile, target) that carries a spike train, plus a cursor
+        // into that train. Kept sparse rather than expanded into a dense
+        // [target][tick] array, which for a long run is mostly zeros.
+        struct ScheduledSpikeTrain {
+            s64 neuron_index = -1;
+            f32 magnitude = 0.0f;
+            Vector<s32> event_ticks;
+            usize cursor = 0;
+        };
+        Vector<ScheduledSpikeTrain> scheduled_spike_trains;
+
+        // ── recording ─────────────────────────────────────────────────────────────
+        // Every neuron's spike count over the run, accumulated tick by tick. Kept
+        // separately from recorded_spikes because the aliveness metrics need every
+        // neuron's count whether or not the model asked for that neuron to be recorded.
+        Vector<s64> spike_counts_per_neuron;
+        Vector<RecordedSpike> recorded_spikes;
+        // Row-major [recorded tick][traced quantity], parallel to traced_selections.
+        Vector<f32> recorded_traces;
+        Vector<RecordingSelection> traced_selections;
+        Vector<f64> recorded_trace_times;
+
+        KernelHandle master_kernel{};
+        String master_kernel_source;
+
+        s64 total_neuron_count = 0;
         s64 lifetime = 0;
-        s64 total_neuron_count;
-        s64 input_neuron_count;
-
-        s32 thread_count_per_block;
-        s32 block_count;
-
-        // f32 resting_membrane_potential;
-        // f32 decay_rate;
-        // f32 learning_rate;
-        // s32 spike_period;
-        // f32 spike_threshold;
-
-        bool use_constant_weight = false;
-        bool alive = false;
-        bool active_set_optimization_enabled = true;
+        f32 step_dt = 0.0f;
         u64 simulation_seed = 0;
 
+        s32 thread_count_per_block = 256;
+        s32 block_count = 0;
+        bool alive = false;
+
+        SpikeEngine() = delete;
         SpikeEngine(const SpikeEngine &) = delete;
-
         SpikeEngine &operator=(const SpikeEngine &) = delete;
+        SpikeEngine(SpikeEngine &&) = delete;
+        SpikeEngine &operator=(SpikeEngine &&) = delete;
 
-        SpikeEngine(SpikeEngine &&) = default;
-
-        SpikeEngine &operator=(SpikeEngine &&) = default;
-
-        SpikeEngine(String &neuroml_input_file);
-
-        SpikeEngine(
-            vector<vector<s32> > *network,
-            const vector<s64> &shape,
-            s64 rank = 1,
-            f32 resting_mp = 0.1f,
-            f32 decay_rate = 0.01f,
-            f32 learning_rate = 0.00222f,
-            bool plasticity_enabled = true, 
-            bool active_set_optimization_enabled = true
-        );
-
-        SpikeEngine();
+        // Parses `lems_input_file`, allocates every buffer the model needs, fills them from
+        // the model's starting parameters and OnStart initialisers, builds the weight matrix
+        // from the model's connections, and compiles the generated tick kernel. Throws
+        // naming the offending ComponentType if the model uses anything Phase 1 does not
+        // simulate, rather than loading something it would run incorrectly.
+        explicit SpikeEngine(const String &lems_input_file);
 
         ~SpikeEngine();
 
-        void setup_lifetime(
-            int lifetime, 
-            bool allocate_logs, 
-            s64 max_log_bytes = DEFAULT_MAX_LOG_BYTES
-        );
+        // Runs the model for the number of ticks its Simulation asked for, recording as its
+        // OutputFiles ask. Safe to call once.
+        void run();
 
-        void set_input_neurons(const vector<s32> &input_neuron_list);
+        // Advances exactly one tick. run() is this in a loop; separated so a test can step
+        // and inspect state between ticks.
+        void step_simulation(s64 tick);
 
-        void reset_state(s64 last_spiked_value = 0, s32 active_gen_value = -1);
+        // The state variable named `variable_name` for one neuron, read back from the GPU.
+        [[nodiscard]] f32 read_state_variable(s64 neuron_index, const String &variable_name) const;
 
-        void step_simulation(
-            const vector<f32> &input_values,
-            s64 tick,
-            const vector<s64> &override_input_neurons = {},
-            bool decay_all_neurons = false
-        );
+        // Spikes per neuron per second over the whole run, and the fraction of neurons that
+        // spiked at least once. What a demo has to clear to count as alive.
+        [[nodiscard]] f64 mean_firing_rate_hertz() const;
+        [[nodiscard]] f64 fraction_of_neurons_that_spiked() const;
 
-        void start_static_record(
-            const vector<vector<f32>> &input_spikes,
-            s64 lifetime,
-            const string &filename,
-            bool record_membrane = true,
-            s64 record_stride = 1,
-            optional<string> compression = string("auto"),
-            optional<int> compression_level = nullopt,
-            bool full_decay = true,
-            bool compression_async = false,
-            usize compression_queue_max = 8,
-            usize compression_chunk_bytes = 4 * 1024 * 1024
-        );
-
-        [[nodiscard]] 
-        pair<f32, f32> estimate_bifurcation_weight(s32 input_period = 1) const;
-
-        bool plasticity_enabled();
-        void enable_plasticity(f32 _learning_rate = 0.00222f);
-        void disable_plasticity();
-
-        void get_reservoir_features_vector(
-            s64 tick, 
-            f32 spike_tau, 
-            f32 voltage_scale, 
-            GpuPointer<f32> output_buffer
-        );
-
-        // first three args are the return values
-        void scale_uniform_weights_near_bifurcation(
-            f32 *target_,
-            f32 *w_accum_,
-            f32 *w_instant_,
-            s32 input_period = 1,
-            f32 scale = 1.2,
-            bool freeze_learning = false,
-            const bool *use_constant_weight_ = nullptr
-        );
-
-        ScaledReservoirResult scale_randomized_weights_near_bifurcation(
-            s32 input_period = 1, 
-            f32 scale = 1.2, 
-            bool freeze_learning = false
-        );
+        // Writes every recording profile the model declared to the files it named.
+        void write_recordings() const;
 
         void shutdown();
+
+    private:
+        void allocate_model_buffers();
+        void initialize_cell_state();
+        void build_weight_matrix();
+        void collect_stimulus();
+        void apply_stimulus(s64 tick);
+        void record_tick(s64 tick);
     };
 } // namespace spikecorec

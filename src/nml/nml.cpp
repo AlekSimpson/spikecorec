@@ -1526,7 +1526,6 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
             const ComponentInstance &input = input_instance->second;
 
             SimulationInputConfig profile;
-            profile.continuous_current_injection = input.has_value("amplitude");
             profile.input_component_id = input.id;
             profile.input_component_type_name = input.component_type_name;
 
@@ -1564,9 +1563,15 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
                 std::sort(spike_ticks.begin(), spike_ticks.end());
 
                 if (!spike_ticks.empty()) {
-                    profile.max_delay_time = spike_ticks.back();
                     for (InputTarget &target : targets) target.event_ticks = spike_ticks;
                 }
+
+                // A component carrying an explicit spike train is an event source, whatever
+                // else it declares; only one with no train and an amplitude injects current
+                // continuously. Deciding this on `amplitude` alone misreads every spiking
+                // source that also carries one.
+                profile.continuous_current_injection =
+                        spike_ticks.empty() && input.has_value("amplitude");
             }
 
             profile.targets = std::move(targets);
