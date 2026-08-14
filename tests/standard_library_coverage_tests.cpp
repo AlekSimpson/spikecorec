@@ -119,10 +119,10 @@ using namespace spikecorec;
 //        would have tested it -- and that condition, reading the already-reset v, never fires
 //        its `<Transition regime="refractory"/>`. Neither cell ever enters its refractory
 //        regime. MEASURED: iafRefCell fires 58 times under the drive that makes iafCell fire 58
-//        times, where a held 5ms refractory period gives ~30; iafTauRefCell fires 51 where ~29
-//        is the held rate. `an_inherited_regime_free_reset_pre_empts_the_regime_transition` is
-//        the control -- the rebased ComponentType above plus that one inherited handler and
-//        nothing else, which takes it from ~30 to 58.
+//        times, where a held 5ms refractory period gives 30 (measured); iafTauRefCell fires 51
+//        where ~29 is the held rate. `an_inherited_regime_free_reset_pre_empts_the_regime_transition`
+//        is the control -- the rebased ComponentType above plus that one inherited handler and
+//        nothing else, which takes it from 30 to 58.
 //
 //        This file does not decide (b). Whether a subtype re-expressing a handler inside a
 //        Regime should override the inherited regime-free one is the same question the
@@ -605,7 +605,7 @@ const CandidateModel CANDIDATE_MODELS[] = {
                 "inherited and resets v before the integrating Regime's own OnCondition can fire "
                 "its Transition. See header note 1 and the control "
                 "`an_inherited_regime_free_reset_pre_empts_the_regime_transition`. The floor of "
-                "20 is deliberately below BOTH 58 and the ~30 a held refractory period gives, so "
+                "20 is deliberately below BOTH 58 and the 30 a held refractory period gives, so "
                 "it neither freezes the gap in nor fails the day it closes.",
         },
         {
@@ -1304,7 +1304,7 @@ TEST(StandardLibraryCoverageControl, an_iaf_refractory_cell_rebased_off_its_pare
 // the already-reset v, never fires its <Transition regime="refractory"/>. The cell therefore
 // never enters the refractory regime at all and free-runs at the unrefracted rate.
 //
-// Measured: 58 spikes here, against the rebased control's ~30 under the identical drive, and
+// Measured: 58 spikes here, against the rebased control's 30 under the identical drive, and
 // against iafCell's own 58. Those are the same three numbers the inventory shows for iafRefCell.
 //
 // Note what this control does NOT claim: 58 is the CORRECT count for the ComponentType written
