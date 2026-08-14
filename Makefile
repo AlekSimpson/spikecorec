@@ -261,10 +261,12 @@ examples-cuda: check-cuda $(CUDA_LIB)
 	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) $(LIBXML2_LIBS) \
 	    -o $(BUILD_DIR)/cuda_example
 
-examples-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) $(EX_DIR)/metal_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/metal_example
+# Every .cpp directly in examples/ is an example; the headers beside them are shared
+# model generators, not programs of their own.
+EX_PROGRAMS := $(patsubst $(EX_DIR)/%.cpp, $(BUILD_DIR)/examples/%, $(wildcard $(EX_DIR)/*.cpp))
+
+examples-metal: check-metal $(EX_PROGRAMS)
+	@echo "[spikecorec] examples built → $(BUILD_DIR)/examples/"
 
 # One example at a time: `make build/examples/iaf_single_cell_example` builds
 # examples/iaf_single_cell_example.cpp and nothing else.
