@@ -94,7 +94,14 @@ int main(int argument_count, char **arguments) {
                     glif_index, (long long)summary.spike_count, video_path.c_str());
     }
 
-    std::printf("\n=== GLIF recurrent networks, 400 excitatory + 100 inhibitory, 1 s ===\n");
+    // Every count in this heading comes from the parameters the run actually used. The
+    // population sizes and the duration were hardcoded here and went stale the moment the
+    // duration changed, which printed "1 s" over a two-second run.
+    const GlifNetworkParameters heading_parameters;
+    std::printf("\n=== GLIF recurrent networks, %lld excitatory + %lld inhibitory, %g s ===\n",
+                (long long)heading_parameters.excitatory_count,
+                (long long)heading_parameters.inhibitory_count,
+                heading_parameters.simulation_seconds);
     std::printf("%-7s %7s %8s %8s %10s %10s %10s\n",
                 "type", "spikes", "rate Hz", "alive %", "peak sync", "mid Hz", "end Hz");
     for (const NetworkSummary &summary : summaries) {
