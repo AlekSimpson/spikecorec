@@ -1,6 +1,19 @@
 #pragma once
 
 #include <cassert>
+
+// GpuPointer and KernelHandle name platform types by value, so this header cannot be used
+// without them. Including them here rather than requiring every consumer to include the
+// backend's headers first is what makes engine.h usable from an example or a test.
+// metal-cpp's one-definition translation unit is still src/metal/metal_cpp_impl.cpp --
+// only that file defines NS_PRIVATE_IMPLEMENTATION, so this include is declarations only.
+#ifdef SPIKECOREC_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#elif defined(SPIKECOREC_METAL)
+#include <Metal/Metal.hpp>
+#endif
+
 #include "spikecorec/core/types.h"
 
 namespace spikecorec {

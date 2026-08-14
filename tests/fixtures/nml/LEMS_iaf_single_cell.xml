@@ -1,0 +1,23 @@
+<Lems>
+    <!--
+      Drives iaf_single_cell.nml. This is what SpikeEngine is handed: the Simulation
+      instance carries dt, the run length and what to record, none of which live in the
+      NeuroML document itself.
+    -->
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Inputs.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="iaf_single_cell.nml"/>
+
+    <Simulation id="sim1" length="500ms" step="0.05ms" target="singleCellNetwork">
+        <OutputFile id="membrane" fileName="iaf_single_cell_membrane.dat">
+            <OutputColumn id="v" quantity="cellPopulation[0]/v"/>
+        </OutputFile>
+        <EventOutputFile id="spikes" fileName="iaf_single_cell_spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="cellPopulation[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+
+    <Target component="sim1"/>
+</Lems>
