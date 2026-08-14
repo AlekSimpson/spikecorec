@@ -610,6 +610,113 @@ TEST(SpikeEngine, an_edge_uses_the_parameters_of_its_own_synapse_prototype) {
     EXPECT_FLOAT_EQ(engine.read_state_variable(3, "v"), resting);
 }
 
+// The delayed-arrival test above checks the first arrival and stops. That leaves the part
+// that only happens later untested: the spike-history ring wraps every
+// spike_history_length ticks, and a modulo that is subtly wrong past the first wrap would
+// deliver the first spike correctly and then drop or misplace every one after it. A
+// network would still look alive while quietly losing a fraction of its spikes.
+//
+// So: one source firing repeatedly across ~160 wraps of the ring, a single edge at the
+// worst-case delay of ring_length - 1, and a target that never fires. The target is driven
+// by nothing else, so between arrivals it only leaks toward its leak reversal -- every run
+// of rising membrane potential is one arrival, and they have to match the source's spikes
+// one for one, each at exactly the right offset.
+TEST(SpikeEngine, no_arrival_is_dropped_as_the_spike_history_ring_wraps) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("ring_wraparound");
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Wrap">
+  <iafCell id="source" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
+           reset="-70 mV" C="100 pF"/>
+  <iafCell id="listener" leakConductance="0 nS" leakReversal="-65 mV" thresh="1000 mV"
+           reset="-70 mV" C="100 pF"/>
+  <alphaCurrentSynapse id="syn" tau="2 ms" ibase="12 pA"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <network id="wrapNetwork">
+    <population id="popSource" component="source" size="1"/>
+    <population id="popListener" component="listener" size="1"/>
+    <projection id="proj" presynapticPopulation="popSource"
+                postsynapticPopulation="popListener" synapse="syn">
+      <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popListener[0]"
+                    weight="1" delay="3 ms"/>
+    </projection>
+    <explicitInput target="popSource[0]" input="drive"/>
+  </network>
+</neuroml>
+)");
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "wrapNetwork", "500ms", "0.1ms"));
+
+    SpikeEngine engine(lems_path);
+
+    // Worst case: the delay is one short of the ring, so the row a delayed arrival reads is
+    // the one about to be overwritten.
+    const s64 delay_ticks = 30;
+    ASSERT_EQ(engine.layout.maximum_edge_delay, delay_ticks);
+    ASSERT_EQ(engine.layout.spike_history_length, delay_ticks + 1);
+
+    // The run has to cross the ring many times for this to mean anything.
+    EXPECT_GT(engine.lifetime / engine.layout.spike_history_length, 100);
+
+    Vector<s64> source_spike_ticks;
+    Vector<s64> arrival_onset_ticks;
+
+    // An arrival's first tick raises the listener by dt * i / C. With tau = 2 ms the
+    // synapse's current on that tick is dt*e*(weight*ibase)/tau = 1.6e-12 A, so the step is
+    // about 1.6e-6 V. Between arrivals the alpha tail has decayed for a full interspike
+    // interval -- twenty time constants -- leaving a per-tick residual around 1e-14 V,
+    // which never reaches zero in f32 and is why a plain `v increased` test either counts
+    // one endless arrival or, with a leak added, counts the wrong tick. This threshold sits
+    // two orders below the step and many above the tail.
+    const f32 arrival_rise_threshold = 1e-8f;
+
+    f32 previous_potential = engine.read_state_variable(1, "v");
+    bool was_rising = false;
+    usize spikes_seen = 0;
+
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+
+        while (spikes_seen < engine.recorded_spikes.size()) {
+            source_spike_ticks.push_back(tick);
+            spikes_seen += 1;
+        }
+
+        // The listener has no leak conductance and a threshold far out of reach, so it is
+        // a pure integrator that never fires: dv/dt is exactly the synaptic current over
+        // C. Between arrivals it holds perfectly flat, so the first tick it rises is the
+        // tick the arrival reached it -- with a leak, a later arrival has to first
+        // overcome the residual decay of the previous one, which moves the measurement.
+        const f32 potential = engine.read_state_variable(1, "v");
+        const bool rising = (potential - previous_potential) > arrival_rise_threshold;
+        if (rising && !was_rising) arrival_onset_ticks.push_back(tick);
+
+        was_rising = rising;
+        previous_potential = potential;
+    }
+
+    ASSERT_GT(source_spike_ticks.size(), 8u) << "the source barely fired";
+
+    // Arrivals still in flight when the run ends have no onset to match.
+    const s64 last_tick_that_can_arrive = engine.lifetime - (delay_ticks + 2);
+    Vector<s64> expected_source_ticks;
+    for (s64 spike_tick : source_spike_ticks) {
+        if (spike_tick <= last_tick_that_can_arrive) expected_source_ticks.push_back(spike_tick);
+    }
+
+    ASSERT_EQ(arrival_onset_ticks.size(), expected_source_ticks.size())
+            << "the source fired " << expected_source_ticks.size()
+            << " times with time to arrive, and the target saw " << arrival_onset_ticks.size()
+            << " arrivals";
+
+    // Every one of them lands at the same offset, not just the first: delay, plus one tick
+    // for the alpha response to leave zero, plus one for the engine's input latency.
+    for (usize index = 0; index < expected_source_ticks.size(); index += 1) {
+        EXPECT_EQ(arrival_onset_ticks[index] - expected_source_ticks[index], delay_ticks + 2)
+                << "arrival " << index << " of " << expected_source_ticks.size();
+    }
+}
+
 TEST(SpikeEngine, connection_weights_and_delays_survive_the_weight_matrix_exactly) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
