@@ -64,7 +64,15 @@ static void check_nvrtc_compile_result(nvrtcResult result, nvrtcProgram program)
 static MTL::Device       *global_device          = nullptr;
 static MTL::CommandQueue *global_queue           = nullptr;
 static MTL::Library      *global_default_library = nullptr;
-static unordered_map<void *, MTL::Buffer *> global_buffer_map;
+
+// What each address callers hand around binds to. Two kinds of entry live here, keyed the same
+// way and looked up the same way:
+//   - every whole allocation, keyed by its own data pointer at offset 0 (allocate_bytes)
+//   - every EngineAllocator sub-range, keyed by the address inside the slab where it begins,
+//     bound to the slab's buffer at that sub-range's offset (register_buffer_sub_range)
+// The second kind is why the value is a pair rather than a bare buffer: Metal binds buffer
+// objects, not addresses, so a sub-range can only reach a kernel as (slab buffer, its offset).
+static unordered_map<const void *, BufferBinding> global_buffer_map;
 
 // The shaders in src/metal/kernels.metal are compiled ahead-of-time by the
 // Makefile into default.metallib, placed alongside the build artifacts. Command
@@ -89,18 +97,9 @@ static MTL::Library *load_default_metal_library(MTL::Device *device) {
 #endif
 
 // ── KernelHandle ─────────────────────────────────────────────────────────────
-// Defined for both backends (must be a complete type wherever compile_kernel /
+// Defined in backend.h (must be a complete type wherever compile_kernel /
 // dispatch / release_kernel are compiled). The Metal-only helper below stays
 // guarded since it touches MTL types.
-
-struct KernelHandle {
-#ifdef SPIKECOREC_CUDA
-    CUfunction cuda_kernel_function{};
-    CUmodule   cuda_module{};
-#elif defined(SPIKECOREC_METAL)
-    MTL::ComputePipelineState *pipeline_state = nullptr;
-#endif
-};
 
 #ifdef SPIKECOREC_METAL
 // Looks up a kernel function compiled ahead-of-time into default.metallib and
@@ -145,6 +144,18 @@ void initialize_gpu_context() {
     log::logger().debug("initialize_gpu_context: done");
 }
 
+bool gpu_context_is_initialized() {
+#ifdef SPIKECOREC_CUDA
+    return global_context != nullptr;
+#elif defined(SPIKECOREC_METAL)
+    return global_device != nullptr;
+#else
+    // No GPU backend compiled in at all — there is no context to initialize, so callers
+    // guarding an allocation on this must not be blocked by it.
+    return true;
+#endif
+}
+
 void release_gpu_resources() {
 #ifdef SPIKECOREC_CUDA
     log::logger().debug("release_gpu_resources: backend=CUDA");
@@ -152,9 +163,13 @@ void release_gpu_resources() {
     global_context = nullptr;
 
 #elif defined(SPIKECOREC_METAL)
-    log::logger().debug("release_gpu_resources: releasing buffer_count={}", global_buffer_map.size());
-    for (auto& [pointer, buffer] : global_buffer_map) {
-        buffer->release();
+    log::logger().debug("release_gpu_resources: releasing binding_count={}", global_buffer_map.size());
+    for (auto& [address, binding] : global_buffer_map) {
+        // Sub-range entries alias a buffer some other entry already owns; releasing them too
+        // would over-release it. A sub-range starting at offset 0 shares the whole
+        // allocation's key, so it replaces that entry rather than adding one, and the buffer
+        // is still released exactly once.
+        if (binding.offset_bytes == 0) static_cast<MTL::Buffer *>(binding.platform_handle)->release();
     }
     global_buffer_map.clear();
 
@@ -183,10 +198,31 @@ void* allocate_bytes(usize byte_size) {
     return pointer;
 
 #elif defined(SPIKECOREC_METAL)
+    // Metal cannot represent a zero-length buffer, and a zero-length request is legitimate
+    // here: a cell type with no parameters, a graph with no edges, an empty arena slab.
+    // Callers already cope with a null handle (see buffer_contents_or_null in engine.cpp and
+    // EngineAllocator's zero-size contract), so hand one back rather than calling newBuffer
+    // and turning a legal empty buffer into a device error.
+    if (byte_size == 0) return nullptr;
+
     MTL::Buffer *buffer = global_device->newBuffer(byte_size, MTL::ResourceStorageModeShared);
+
+    // newBuffer returns null when the device cannot satisfy the request. Every caller
+    // immediately writes through get_contents(), so an unchecked null here surfaces as a
+    // segfault inside a memset somewhere downstream rather than as an allocation failure —
+    // which is exactly what it looked like when two processes contended for the GPU and the
+    // crash report pointed at WeightMatrix::load_from_disk. Exhaustion is the *expected*
+    // failure mode for the network sizes this engine targets, so it has to be reportable.
+    if (buffer == nullptr) {
+        log::throw_runtime_error(log::logger(),
+            fmt::format("allocate_bytes: the GPU device could not allocate {} bytes "
+                        "({:.2f} MiB) — out of device memory",
+                        byte_size, static_cast<f64>(byte_size) / (1024.0 * 1024.0)));
+    }
+
     // index by the unified-memory data pointer — that's what callers pass around
     // (GpuPointer::get_contents()), and what dispatch() must resolve back to a buffer
-    global_buffer_map[buffer->contents()] = buffer;
+    global_buffer_map[buffer->contents()] = BufferBinding{buffer, 0};
     return buffer;
 
 #else
@@ -205,6 +241,43 @@ void deallocate_bytes(void *platform_handle) {
     auto *buffer = static_cast<MTL::Buffer *>(platform_handle);
     global_buffer_map.erase(buffer->contents());
     buffer->release();
+#endif
+}
+
+BufferBinding resolve_buffer_binding(const void *address) {
+#ifdef SPIKECOREC_METAL
+    if (!address) return BufferBinding{};
+
+    auto entry = global_buffer_map.find(address);
+    if (entry == global_buffer_map.end()) return BufferBinding{};
+    return entry->second;
+
+#else
+    (void)address;
+    return BufferBinding{};
+#endif
+}
+
+void register_buffer_sub_range(void *sub_range_address, void *platform_handle, u64 offset_bytes) {
+#ifdef SPIKECOREC_METAL
+    if (!sub_range_address || !platform_handle) return;
+    log::logger().trace("register_buffer_sub_range: offset_bytes={}", offset_bytes);
+    global_buffer_map[sub_range_address] = BufferBinding{platform_handle, offset_bytes};
+
+#else
+    (void)sub_range_address;
+    (void)platform_handle;
+    (void)offset_bytes;
+#endif
+}
+
+void unregister_buffer_sub_range(void *sub_range_address) {
+#ifdef SPIKECOREC_METAL
+    if (!sub_range_address) return;
+    global_buffer_map.erase(sub_range_address);
+
+#else
+    (void)sub_range_address;
 #endif
 }
 
@@ -336,7 +409,26 @@ void metal_dispatch(
     u32 arg_count,
     MetalCommandBatch *batch
 ) {
-#ifdef SPIKECOREC_METAL
+#ifndef SPIKECOREC_METAL
+    // There is no generic positional-argument launcher on CUDA yet: the CUDA backend only
+    // launches its own fixed, precompiled kernels. Returning here instead would be far worse
+    // than not compiling -- every other signal says the path works (kernel_codegen emits valid
+    // CUDA and compile_kernel really does NVRTC-compile it), so step_simulation would add its
+    // stimulus, clear the spike flags, record a frame of unchanged state and report success
+    // while running no dynamics at all. The generic launcher is ticket #56 (C4), cuda_dispatch.
+    (void)handle;
+    (void)args;
+    (void)arg_sizes;
+    (void)batch;
+    log::logger().critical("metal_dispatch: no generic kernel launcher on this backend "
+                           "(grid_size={} block_size={} arg_count={})",
+                           config.grid_size, config.block_size, arg_count);
+    throw runtime_error(
+            "spikecorec: dispatching a generated kernel needs a generic positional-argument "
+            "launcher, which only the Metal backend provides. The CUDA equivalent, "
+            "cuda_dispatch(CUfunction, grid, block, void **params), is ticket #56 (C4) and is "
+            "not implemented, so no simulation can run on this backend.");
+#else
     log::logger().trace("metal dispatch: grid_size={} block_size={} arg_count={} batched={}",
                         config.grid_size, config.block_size, arg_count, batch != nullptr);
 
@@ -345,23 +437,29 @@ void metal_dispatch(
 
     encoder->setComputePipelineState(handle.pipeline_state);
 
-    for (u32 i = 0; i < arg_count; ++i) {
-        // convention: args[i] always points to the argument's storage (matches
+    for (u32 argument_index = 0; argument_index < arg_count; ++argument_index) {
+        // convention: args[argument_index] always points to the argument's storage (matches
         // CUDA's cuLaunchKernel kernelParams). For pointer-typed arguments that
         // storage holds a data pointer — try to resolve it back to its MTLBuffer.
         // Only attempt this when the slot is pointer-sized, so scalar args (which
         // may be smaller than sizeof(void*)) are never over-read.
         void *candidate = nullptr;
-        if (arg_sizes[i] == sizeof(void *)) {
-            candidate = *reinterpret_cast<void * const *>(args[i]);
+        if (arg_sizes[argument_index] == sizeof(void *)) {
+            candidate = *reinterpret_cast<void * const *>(args[argument_index]);
         }
-        auto it = candidate ? global_buffer_map.find(candidate) : global_buffer_map.end();
-        if (it != global_buffer_map.end()) {
-            // resolved to a unified memory allocation — bind its MTLBuffer
-            encoder->setBuffer(it->second, 0, i);
+
+        BufferBinding binding =
+                candidate ? resolve_buffer_binding(candidate) : BufferBinding{};
+
+        if (binding.platform_handle) {
+            // resolved to a unified memory allocation — bind its MTLBuffer. The offset is 0
+            // for a whole allocation and the sub-range's own offset for an arena sub-range,
+            // which is how an address inside a slab reaches the kernel as just that range.
+            encoder->setBuffer(static_cast<MTL::Buffer *>(binding.platform_handle),
+                               binding.offset_bytes, argument_index);
         } else {
             // scalar argument — pass by value
-            encoder->setBytes(args[i], arg_sizes[i], i);
+            encoder->setBytes(args[argument_index], arg_sizes[argument_index], argument_index);
         }
     }
 
@@ -404,22 +502,30 @@ void gpu_neighbor_weights(
     s64 node_count,
     s64 max_neighbor_count,
     s64 rank_float4_stride,
+    const f32 *coefficients,
     f32 *output_weights
 ) {
     s64 total_pairs = node_count * max_neighbor_count;
     if (total_pairs <= 0) return;
-    log::logger().trace("gpu_neighbor_weights: node_count={} max_neighbor_count={} total_pairs={}",
-                        node_count, max_neighbor_count, total_pairs);
+    log::logger().trace("gpu_neighbor_weights: node_count={} max_neighbor_count={} total_pairs={} "
+                        "coefficients_present={}",
+                        node_count, max_neighbor_count, total_pairs, coefficients != nullptr);
+
+    // Whether the kernel should read `coefficients` at all, passed as its own scalar argument
+    // rather than left for the kernel to infer from a null pointer. Metal binds a pointer-typed
+    // argument whose value is null via setBytes (as an 8-byte scalar blob), so the address the
+    // kernel actually sees in that case is a valid-but-unrelated one, not null — the kernel
+    // cannot detect the null itself. CUDA takes the same flag so both kernels stay mirror images.
+    s32 coefficients_present = (coefficients != nullptr) ? 1 : 0;
 
 #ifdef SPIKECOREC_CUDA
-    s64 total_pairs = node_count * max_neighbor_count;
-    if (total_pairs <= 0) return;
     LaunchConfig config = cuda::default_launch_config(static_cast<usize>(total_pairs));
     cuda::neighbor_weights_kernel<<<config.grid, config.block, 0, stream>>>(
         U, V,
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
         branching_factor, superblock_size_words, padded_node_count, tree_height, internal_bit_count,
-        node_count, max_neighbor_count, rank_float4_stride, output_weights
+        node_count, max_neighbor_count, rank_float4_stride,
+        coefficients, coefficients_present, output_weights
     );
     synchronize_gpu_work(); // concurrentManagedAccess=0: finish before host touches managed memory
 
@@ -436,6 +542,7 @@ void gpu_neighbor_weights(
         &internal_node_words, &leaf_node_words, &rank_superblock_table, &rank_subblock_table,
         &branching_factor, &superblock_size_words, &padded_node_count, &tree_height, &internal_bit_count,
         &node_count, &max_neighbor_count, &rank_float4_stride,
+        &coefficients, &coefficients_present,
         &output_weights
     };
     const usize arg_sizes[] = {
@@ -443,9 +550,10 @@ void gpu_neighbor_weights(
         sizeof(void*), sizeof(void*), sizeof(void*), sizeof(void*),
         sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
         sizeof(s64), sizeof(s64), sizeof(s64),
+        sizeof(void*), sizeof(s32),
         sizeof(void*)
     };
-    metal_dispatch(kernel_handle, config, args, arg_sizes, 15);
+    metal_dispatch(kernel_handle, config, args, arg_sizes, 17);
 
 #endif
 }

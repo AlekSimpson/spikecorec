@@ -85,14 +85,22 @@ namespace spikecorec {
         // factory: deserialize from file
         static K2Tree load(const char *path);
 
-        // single edge query: returns 1 if edge (u,v) exists, 0 otherwise
-        [[nodiscard]] s32 adjacent(s32 u, s32 v) const;
+        // single edge query: returns 1 if the edge source_node -> target_node exists, 0 otherwise
+        [[nodiscard]] s32 adjacent(s32 source_node, s32 target_node) const;
 
         // row enumeration: writes up to max_neighbor_count neighbor indices of `node_index`
         // into output_buffer (caller-allocated, at least max_neighbor_count elements), in
         // tree-traversal order. Returns the number of neighbors written (<= max_neighbor_count).
         // Walks only the populated subtrees of the row — never touches unrelated regions.
         [[nodiscard]] s64 get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const;
+
+        // column enumeration (the exact mirror of get_neighbors): writes up to max_neighbor_count
+        // PREDECESSOR indices of `node_index` into output_buffer — every node `u` for which the edge
+        // u -> node_index exists (i.e. `node_index` acting as the target/column). Returns the number
+        // written (<= max_neighbor_count). Reads the SAME stored bits get_neighbors does; it simply
+        // fixes the column (from node_index) and walks the rows at each tree level instead of fixing
+        // the row and walking the columns. Walks only populated subtrees of the column.
+        [[nodiscard]] s64 get_predecessors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const;
 
         // batched edge query: writes 0 or 1 into output_buffer[i] for each (source_indices[i], target_indices[i])
         void adjacent_batch(
@@ -102,8 +110,9 @@ namespace spikecorec {
             s32 query_count
         ) const;
 
-        // debug: prints the full tree traversal path for (u,v) and returns the result
-        [[nodiscard]] s32 trace(s32 u, s32 v) const;
+        // debug: prints the full tree traversal path for the edge source_node -> target_node
+        // and returns the result
+        [[nodiscard]] s32 trace(s32 source_node, s32 target_node) const;
 
         // serialize to file
         void save(const char *path) const;
