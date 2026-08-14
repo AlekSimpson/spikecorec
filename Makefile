@@ -387,6 +387,11 @@ DEMO_SIDE       := 48
 # markers are widened to about a cell. Retune this alongside DEMO_SIDE.
 DEMO_SPIKE_SIZE := 34
 
+# mp4 rather than gif: the renderer supports both, and for a 48x48 grid over 2500
+# ticks an mp4 is 10-40x smaller (307 KB vs 3.1 MB for glif1) and actually seeks in
+# a player. Override with DEMO_VIDEO_FORMAT=gif if you need a gif for embedding.
+DEMO_VIDEO_FORMAT ?= mp4
+
 # Rendering needs numpy + matplotlib, which the C++/Metal/CUDA build itself does not. Point this
 # at any interpreter that has them:
 #     make demo-videos DEMO_PYTHON=/path/to/venv/bin/python
@@ -445,9 +450,9 @@ demo-videos: run-demos
 	        $$run_directory/$${demo_variant}_demo_spikes.spire \
 	        --membrane $$run_directory/$${demo_variant}_demo_membrane.spire \
 	        --side $(DEMO_SIDE) --spike-size $(DEMO_SPIKE_SIZE) \
-	        --output $(abspath $(DEMO_OUTPUT_DIR))/$${demo_variant}_demo.gif; \
+	        --output $(abspath $(DEMO_OUTPUT_DIR))/$${demo_variant}_demo.$(DEMO_VIDEO_FORMAT); \
 	done
-	@echo "[spikecorec] demo videos → $(DEMO_OUTPUT_DIR)/<variant>_demo.gif"
+	@echo "[spikecorec] demo videos → $(DEMO_OUTPUT_DIR)/<variant>_demo.$(DEMO_VIDEO_FORMAT)"
 
 # ── Utilities ────────────────────────────────────────────────
 info:
