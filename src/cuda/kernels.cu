@@ -193,6 +193,13 @@ __device__ __forceinline__ s32 k2t_next_neighbor(
 // node's row in the k^2-tree (descending only into populated subtrees) to discover
 // up to max_neighbor_count targets, then dot-products U[source]·V[target]. Slots
 // beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
+// `coefficients` is the shared-basis Ck vector (rank_float4_stride*4 scalar f32
+// elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r].
+// `coefficients_present` says whether to read it at all: the host passes 0 for a null
+// coefficient vector, and the 0 branch below is the pre-shared-basis dot(U,V) statement
+// preserved verbatim, so a null Ck reproduces the pre-#52 numerics exactly. The flag is a
+// separate argument rather than a null-pointer test purely to stay a mirror image of the
+// Metal kernel, which cannot test for null (see gpu_neighbor_weights in backend.cpp).
 
 __global__ void neighbor_weights_kernel(
     const float4 *__restrict__ U,
@@ -209,6 +216,8 @@ __global__ void neighbor_weights_kernel(
     s64 node_count,
     s64 max_neighbor_count,
     s64 rank_float4_stride,
+    const f32 *__restrict__ coefficients,
+    s32 coefficients_present,
     f32 *__restrict__ output_weights
 ) {
     s64 pair_index = static_cast<s64>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -231,11 +240,27 @@ __global__ void neighbor_weights_kernel(
     const float4 *v_row = V + static_cast<s64>(target_node) * rank_float4_stride;
 
     f32 dot_product = 0.0f;
-    #pragma unroll 4
-    for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
-        float4 u4 = u_row[lane];
-        float4 v4 = v_row[lane];
-        dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;
+    if (coefficients_present != 0) {
+        // Ck folded inline into the same accumulation loop/position as the plain U*V
+        // dot product below, so an all-ones Ck reduces to it bit-for-bit (1.0f * v is
+        // exactly v under IEEE-754).
+        #pragma unroll 4
+        for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+            float4 u4 = u_row[lane];
+            float4 v4 = v_row[lane];
+            const f32 *lane_coefficients = coefficients + lane * 4;
+            dot_product += u4.x * (lane_coefficients[0] * v4.x)
+                         + u4.y * (lane_coefficients[1] * v4.y)
+                         + u4.z * (lane_coefficients[2] * v4.z)
+                         + u4.w * (lane_coefficients[3] * v4.w);
+        }
+    } else {
+        #pragma unroll 4
+        for (s64 lane = 0; lane < rank_float4_stride; ++lane) {
+            float4 u4 = u_row[lane];
+            float4 v4 = v_row[lane];
+            dot_product += u4.x * v4.x + u4.y * v4.y + u4.z * v4.z + u4.w * v4.w;
+        }
     }
     output_weights[pair_index] = dot_product;
 }
@@ -568,8 +593,10 @@ __global__ void reservoir_features_kernel(
     membrane_potentials[neuron_index] = membrane_potential;
     last_tick_updated[neuron_index] = tick;
 
+    // last_spiked < 0 is "has never spiked" — the engine seeds the buffer with
+    // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
     s64 since_spike = tick - last_spiked[neuron_index];
-    f32 trace = (last_spiked[neuron_index] > 0) ? expf(-(f32)since_spike / spike_tau) : 0.0f;
+    f32 trace = (last_spiked[neuron_index] >= 0) ? expf(-(f32)since_spike / spike_tau) : 0.0f;
 
     output_buffer[neuron_index] = trace;
     output_buffer[neuron_count + neuron_index] = (membrane_potential - resting_mp) / voltage_scale;
@@ -759,9 +786,11 @@ __global__ void step_kernel(
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
 
-        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick.
+        // "Never spiked" is last_spiked < 0: the engine seeds the buffer with
+        // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
         s64 child_last_spiked = last_spiked[child];
-        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+        if (learning_rate != 0.0f && !(child_last_spiked < 0 || child_last_spiked == tick)) {
             s64 delta_ticks = tick - child_last_spiked;
             f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
             f32 decay_delta = -learning_rate * powf(tick_delta, -3.0f);
@@ -904,9 +933,11 @@ __global__ void step_kernel_no_active_optimization(
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
 
-        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick
+        // STDP Hebbian update — skip neighbors that have never spiked or spiked this tick.
+        // "Never spiked" is last_spiked < 0: the engine seeds the buffer with
+        // SpikeEngine::NEURON_NEVER_SPIKED_TICK (-1), and tick 0 is a real spike tick.
         s64 child_last_spiked = last_spiked[child];
-        if (learning_rate != 0.0f && !(child_last_spiked == 0 || child_last_spiked == tick)) {
+        if (learning_rate != 0.0f && !(child_last_spiked < 0 || child_last_spiked == tick)) {
             s64 delta_ticks = tick - child_last_spiked;
             f32 tick_delta = (f32)(delta_ticks < 0 ? -delta_ticks : delta_ticks);
             f32 decay_delta = -learning_rate * powf(tick_delta, -3.0f);

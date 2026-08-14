@@ -10,9 +10,20 @@ namespace spikecorec {
     // Called once at program shutdown to release GPU resources.
     void release_gpu_resources();
 
+    // True once initialize_gpu_context() has run and the backend's device/context is live.
+    // Every allocate() call needs it: the Metal path hands back a null buffer without one
+    // and the first write through the resulting pointer segfaults with no diagnostic at all,
+    // so construction paths that allocate check this first and fail by name instead.
+    bool gpu_context_is_initialized();
+
+    // Both backends obey one rule: get_contents() is the first byte of the range the handle
+    // stands for, and every allocator hands out handles that are already positioned there —
+    // EngineAllocator's sub-ranges included, so nothing downstream has to carry an offset
+    // alongside a pointer. The backends only differ in what it takes to honour that rule.
     template<typename T>
     struct GpuPointer {
     #ifdef SPIKECOREC_CUDA
+        // A device address, already the range's first byte, so there is nothing to offset.
         T *pointer = nullptr;
 
         T *get_contents() {
@@ -25,12 +36,21 @@ namespace spikecorec {
     #elif defined(SPIKECOREC_METAL)
         MTL::Buffer *pointer = nullptr;
 
-        T *get_contents() { 
-            return static_cast<T *>(pointer->contents()); 
+        // How far into `pointer`'s buffer this handle's range starts. Zero for a whole
+        // allocation, which is every handle allocate() hands out; non-zero only for an
+        // EngineAllocator sub-range, where `pointer` has to name the whole slab because Metal
+        // has no sub-buffer object to name instead. It is what keeps get_contents() honest on
+        // this backend.
+        u64 offset_bytes = 0;
+
+        T *get_contents() {
+            return static_cast<T *>(static_cast<void *>(
+                    static_cast<char *>(pointer->contents()) + offset_bytes));
         }
 
-        const T *get_contents() const { 
-            return static_cast<const T *>(pointer->contents()); 
+        const T *get_contents() const {
+            return static_cast<const T *>(static_cast<const void *>(
+                    static_cast<const char *>(pointer->contents()) + offset_bytes));
         }
     #endif
 
@@ -43,6 +63,12 @@ namespace spikecorec {
         GpuPointer(GpuPointer &&other) noexcept {
             pointer = other.pointer;
             other.pointer = nullptr;
+        #ifdef SPIKECOREC_METAL
+            // Moving the buffer without its offset would silently re-aim the handle at the
+            // start of the slab instead of at its own sub-range.
+            offset_bytes = other.offset_bytes;
+            other.offset_bytes = 0;
+        #endif
         }
 
         GpuPointer &operator=(GpuPointer &&other) noexcept {
@@ -53,6 +79,10 @@ namespace spikecorec {
             if (this != &other) {
                 pointer = other.pointer;
                 other.pointer = nullptr;
+            #ifdef SPIKECOREC_METAL
+                offset_bytes = other.offset_bytes;
+                other.offset_bytes = 0;
+            #endif
             }
             return *this;
         }
@@ -62,6 +92,35 @@ namespace spikecorec {
     // non-template bridges — defined in backend.cpp, hide platform types from callers
     void *allocate_bytes(usize byte_size);
     void deallocate_bytes(void *platform_handle);
+
+    // What a unified-memory address binds to on Metal: the buffer object holding it and how far
+    // into that buffer the address sits. platform_handle is the MTL::Buffer * allocate_bytes()
+    // returned, behind a void * so this header stays free of platform types.
+    struct BufferBinding {
+        void *platform_handle = nullptr;
+        u64   offset_bytes    = 0;
+    };
+
+    // Metal only. Looks an address up in the registry of addresses the backend has been told
+    // about — every whole allocation, registered at offset 0 by allocate_bytes(), plus every
+    // arena sub-range, registered by EngineAllocator::allocate_gpu(). metal_dispatch binds a
+    // pointer argument with exactly the pair this returns, which is how a sub-range address
+    // reaches a kernel as its own range: Metal binds buffer objects rather than addresses, so
+    // the offset has to travel separately and be applied at setBuffer time.
+    //
+    // The match is exact, not by containing range: an address that was never registered — an
+    // arbitrary interior pointer, say — resolves to a null platform_handle, and metal_dispatch
+    // then treats the argument as a scalar, exactly as it did before sub-ranges existed.
+    // Always resolves to null on CUDA, where a device pointer is already what the kernel wants.
+    BufferBinding resolve_buffer_binding(const void *address);
+
+    // Metal only. Registers/withdraws one sub-range of an existing allocation so the address
+    // above resolves to (that allocation, that offset). Registering an address that is already
+    // known replaces its binding. Whoever registers a sub-range owns withdrawing it, and must do
+    // so before the underlying allocation is released — otherwise an address recycled by a later
+    // allocation would resolve to a buffer that no longer exists. No-ops on CUDA.
+    void register_buffer_sub_range(void *sub_range_address, void *platform_handle, u64 offset_bytes);
+    void unregister_buffer_sub_range(void *sub_range_address);
 
     template<typename T>
     GpuPointer<T> allocate(usize byte_size) {
@@ -74,8 +133,19 @@ namespace spikecorec {
         return wrapper;
     }
 
+    // Releases a whole allocation. Only the handle allocate() returned may be passed: an
+    // EngineAllocator sub-range aliases its arena's slab and owns nothing, so releasing one
+    // would take the whole slab down with it. The assert catches that mistake for every
+    // sub-range except one starting at offset 0, which is byte-for-byte the same handle as the
+    // slab and so cannot be told apart here — the arena's own destructor is what keeps that
+    // case right, by being the only code that ever releases the slab.
     template<typename T>
     void deallocate(GpuPointer<T> wrapper) {
+    #ifdef SPIKECOREC_METAL
+        assert(wrapper.offset_bytes == 0 &&
+               "deallocate() on an arena sub-range would release the whole slab — "
+               "only EngineAllocator releases its own pools");
+    #endif
         deallocate_bytes(wrapper.pointer);
     }
 
@@ -125,9 +195,17 @@ namespace spikecorec {
     void synchronize_gpu_work();
 
     // --- kernel lifecycle ---
-    // opaque — MTLComputePipelineState* on Metal,
-    // CUfunction on CUDA
-    struct KernelHandle;
+    // MTLComputePipelineState* on Metal, CUfunction on CUDA. Defined here rather than in
+    // backend.cpp because compile_kernel / release_kernel / metal_dispatch all take it by
+    // value, so every translation unit that calls one of them needs the complete type.
+    struct KernelHandle {
+    #ifdef SPIKECOREC_CUDA
+        CUfunction cuda_kernel_function{};
+        CUmodule   cuda_module{};
+    #elif defined(SPIKECOREC_METAL)
+        MTL::ComputePipelineState *pipeline_state = nullptr;
+    #endif
+    };
 
     KernelHandle compile_kernel(const char *source, const char *function_name);
 
@@ -159,6 +237,10 @@ namespace spikecorec {
     // - if batch is non-null, encodes into the batch's already-open command buffer
     //   instead of creating/committing/waiting on one of its own (Metal); the caller
     //   is responsible for calling commit_command_batch() once all encodes are queued
+    // - Metal only. Every other backend THROWS rather than returning: this is the generic
+    //   positional-argument launcher the generated master kernel runs through, and CUDA has
+    //   no equivalent yet (ticket #56, C4, cuda_dispatch). Returning quietly would leave a
+    //   CUDA build reporting successful ticks while running no dynamics at all.
     void metal_dispatch(
         KernelHandle handle,
         LaunchConfig config,
@@ -179,6 +261,12 @@ namespace spikecorec {
     // row-major by source node. Adjacency is resolved via the bit-packed k^2-tree — each thread
     // walks its source node's row in the tree to discover up to max_neighbor_count targets;
     // slots beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
+    // `coefficients` is the shared-basis coefficient vector Ck (rank_float4_stride*4 scalar f32
+    // elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r], with the
+    // WeightMatrix::DEFAULT_MATRIX_INDEX case's all-ones coefficients reducing this to the
+    // original dot(U,V). Passing nullptr selects the pre-shared-basis path in the kernel — the
+    // literal dot(U,V) statement this kernel ran before Ck existed, so a null `coefficients`
+    // reproduces the pre-change numerics exactly rather than merely approximately.
     void gpu_neighbor_weights(
         const float4 *U,
         const float4 *V,
@@ -194,6 +282,7 @@ namespace spikecorec {
         s64           node_count,
         s64           max_neighbor_count,
         s64           rank_float4_stride,
+        const f32    *coefficients,
         f32          *output_weights
     );
 

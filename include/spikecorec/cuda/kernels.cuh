@@ -22,6 +22,9 @@ LaunchConfig default_launch_config(usize n, usize threads_per_block = 256);
 // row-major by source node. Adjacency is resolved via the bit-packed k^2-tree — each thread
 // walks its source node's row in the tree to discover up to max_neighbor_count targets;
 // slots beyond a node's actual neighbor count are sentinel-padded (target -1 -> weight 0).
+// `coefficients` is the shared-basis Ck vector (rank_float4_stride*4 scalar f32 elements —
+// ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r]. `coefficients_present`
+// selects whether it is read at all; 0 runs the pre-shared-basis dot(U,V) path verbatim.
 void launch_neighbor_weights(
     const float4 *U,
     const float4 *V,
@@ -37,6 +40,8 @@ void launch_neighbor_weights(
     s64           node_count,
     s64           max_neighbor_count,
     s64           rank_float4_stride,
+    const f32    *coefficients,
+    s32           coefficients_present,
     f32          *output_weights,
     cudaStream_t  stream = nullptr
 );
