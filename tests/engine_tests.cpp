@@ -714,6 +714,159 @@ TEST(SpikeEngine, declared_output_files_are_written_with_the_shape_the_model_ask
     EXPECT_GT(spike_rows, 0);
 }
 
+// ── more than one cell type in a model ────────────────────────────────────────────
+
+// Every other test in this file has exactly one cell type, which leaves the parts of the
+// design that exist only for heterogeneity completely unexercised: the generated switch's
+// second arm, a cell-state buffer whose populations have different widths, and a parameter
+// table whose rows have different lengths.
+//
+// iafCell has one state variable; izhikevich2007Cell has two and roughly twice the
+// parameters. Their OnStart values differ too, which is what makes a layout mistake
+// visible rather than merely possible: if the two populations' chunks overlapped, one
+// type's starting values would appear in the other's.
+namespace {
+
+String two_cell_type_model() {
+    return R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="TwoTypes">
+  <iafCell id="integrateAndFire" leakConductance="5 nS" leakReversal="-65 mV"
+           thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <izhikevich2007Cell id="izhikevich" C="100pF" v0="-50mV" k="0.7nS_per_mV"
+                      vr="-60mV" vt="-40mV" vpeak="35mV" a="0.03per_ms"
+                      b="-2nS" c="-50mV" d="100pA"/>
+  <pulseGenerator id="iafDrive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <pulseGenerator id="izhikevichDrive" delay="0 ms" duration="1000 ms" amplitude="200 pA"/>
+  <network id="twoTypeNetwork">
+    <population id="popIaf" component="integrateAndFire" size="4"/>
+    <population id="popIzhikevich" component="izhikevich" size="3"/>
+    <inputList id="iafInput" component="iafDrive" population="popIaf">
+      <input id="0" target="../popIaf[0]" destination="synapses"/>
+      <input id="1" target="../popIaf[1]" destination="synapses"/>
+    </inputList>
+    <inputList id="izhikevichInput" component="izhikevichDrive" population="popIzhikevich">
+      <input id="0" target="../popIzhikevich[0]" destination="synapses"/>
+    </inputList>
+  </network>
+</neuroml>
+)";
+}
+
+} // namespace
+
+// Host side only: this asserts what the layout says and what read_state_variable does with
+// it, both of which run on the CPU. It cannot see whether the kernel agrees — the offsets
+// reach the kernel as a baked `constant` table, and corrupting that table leaves every
+// assertion here passing. both_cell_types_integrate_their_own_equations below is what
+// covers the kernel's half, and it was checked against exactly that injected fault.
+TEST(SpikeEngine, two_cell_types_get_separate_state_and_parameter_chunks) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("two_cell_types");
+    directory.write("model.nml", two_cell_type_model());
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "twoTypeNetwork", "1ms", "0.01ms"));
+
+    SpikeEngine engine(lems_path);
+
+    ASSERT_EQ(engine.network_details.cell_types.size(), 2u);
+    ASSERT_EQ(engine.network_details.populations.size(), 2u);
+
+    // Sizes come from the types, not from a shared maximum: four one-variable cells and
+    // three two-variable cells is ten slots, not fourteen.
+    const CellTypeSpecification &iaf_type = engine.network_details.cell_types[0];
+    const CellTypeSpecification &izhikevich_type = engine.network_details.cell_types[1];
+    ASSERT_EQ(iaf_type.state_variable_names.size(), 1u);
+    ASSERT_EQ(izhikevich_type.state_variable_names.size(), 2u);
+    EXPECT_EQ(engine.layout.cell_state_length, 4 * 1 + 3 * 2);
+
+    // The two populations' chunks are disjoint and the second starts where the first ends.
+    EXPECT_EQ(engine.layout.population_state_base[0], 0);
+    EXPECT_EQ(engine.layout.population_state_base[1], 4);
+
+    // Parameter rows differ in length, so the second prototype's row cannot start at a
+    // fixed stride.
+    EXPECT_GT(izhikevich_type.parameter_names.size(), iaf_type.parameter_names.size());
+    EXPECT_EQ(engine.layout.cell_prototype_parameter_base[0], 0);
+    EXPECT_EQ(engine.layout.cell_prototype_parameter_base[1],
+              (s64)iaf_type.parameter_names.size());
+    EXPECT_EQ(engine.layout.cell_parameter_length,
+              (s64)(iaf_type.parameter_names.size() + izhikevich_type.parameter_names.size()));
+
+    // OnStart: iafCell starts at leakReversal, izhikevich2007Cell at v0 with u at zero.
+    // Three different starting values across the two chunks, so any overlap shows up here.
+    for (s64 neuron_index = 0; neuron_index < 4; neuron_index += 1) {
+        EXPECT_NEAR(engine.read_state_variable(neuron_index, "v"), -0.065f, 1e-7f)
+                << "iafCell " << neuron_index;
+    }
+    for (s64 neuron_index = 4; neuron_index < 7; neuron_index += 1) {
+        EXPECT_NEAR(engine.read_state_variable(neuron_index, "v"), -0.050f, 1e-7f)
+                << "izhikevich " << neuron_index;
+        EXPECT_NEAR(engine.read_state_variable(neuron_index, "u"), 0.0f, 1e-12f)
+                << "izhikevich " << neuron_index;
+    }
+
+    // `u` belongs to one type only, and asking the wrong population for it is an error
+    // rather than a read of whatever happens to sit at that offset.
+    EXPECT_THROW((void)engine.read_state_variable(0, "u"), std::runtime_error);
+}
+
+TEST(SpikeEngine, both_cell_types_integrate_their_own_equations) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("two_cell_types_running");
+    directory.write("model.nml", two_cell_type_model());
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "twoTypeNetwork", "60ms", "0.01ms"));
+
+    SpikeEngine engine(lems_path);
+    engine.run();
+
+    // Both arms of the generated switch ran: each driven population produced spikes. A
+    // switch that fell through to one arm would leave the other population silent.
+    Vector<s64> spikes_by_population(2, 0);
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        spikes_by_population[spike.neuron_index < 4 ? 0 : 1] += 1;
+    }
+    EXPECT_GT(spikes_by_population[0], 0) << "no iafCell fired";
+    EXPECT_GT(spikes_by_population[1], 0) << "no izhikevich2007Cell fired";
+
+    // An undriven iafCell sits at a genuine fixed point: at v = leakReversal its whole
+    // derivative is gL*(leakReversal - v)/C = 0, so it must not have moved at all. That is
+    // the strongest available statement that the driven cells' integration did not reach
+    // across the chunk boundary.
+    EXPECT_NEAR(engine.read_state_variable(2, "v"), -0.065f, 1e-7f);
+    EXPECT_NEAR(engine.read_state_variable(3, "v"), -0.065f, 1e-7f);
+
+    // An undriven izhikevich2007Cell does not stay at v0 — v0 is an initial condition, not
+    // a resting potential. At v0 = -50 mV, between vr = -60 mV and vt = -40 mV, the
+    // quadratic term k*(v-vr)*(v-vt) is 0.7 nS/mV * 10 mV * -10 mV = -70 pA, so the cell
+    // relaxes downward and settles at vr, taking u to zero with it. Asserting it stayed at
+    // v0 would be asserting the model is wrong.
+    EXPECT_NEAR(engine.read_state_variable(6, "v"), -0.060f, 5e-4f);
+    EXPECT_NEAR(engine.read_state_variable(6, "u"), 0.0f, 1e-11f);
+
+    // The two undriven izhikevich cells have identical parameters, identical (zero) input
+    // and identical initial state, so they must be identical to the bit. Anything writing
+    // outside its own slot — a stride mistake, a chunk overlap — separates them.
+    EXPECT_FLOAT_EQ(engine.read_state_variable(5, "v"), engine.read_state_variable(6, "v"));
+    EXPECT_FLOAT_EQ(engine.read_state_variable(5, "u"), engine.read_state_variable(6, "u"));
+
+    // Neither undriven izhikevich cell ever reached vpeak.
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        EXPECT_NE(spike.neuron_index, 5);
+        EXPECT_NE(spike.neuron_index, 6);
+    }
+
+    // izhikevich2007Cell's recovery variable u is driven by its own second
+    // TimeDerivative, so a driven one has moved away from zero while the undriven one has
+    // not. That is the only place a second state variable per cell is exercised at all.
+    EXPECT_NE(engine.read_state_variable(4, "u"), 0.0f);
+
+    // Its OnCondition assigns both v and u (v = c, u = u + d), so a spiking izhikevich
+    // cell must sit at or below its reset value rather than above vpeak.
+    EXPECT_LE(engine.read_state_variable(4, "v"), 0.035f);
+}
+
 // ── the demo is alive ─────────────────────────────────────────────────────────────
 
 // The check that a passing suite is supposed to earn: a network that runs without error,
