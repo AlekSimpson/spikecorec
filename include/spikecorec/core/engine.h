@@ -68,6 +68,13 @@ namespace spikecorec {
         GpuPointer<void> spike_history;
         GpuPointer<void> last_spiked;        // [total_neuron_count]
 
+        // One element, bound in place of any per-edge plane the model never caused to be
+        // allocated. A model with no connections registers no delay matrix and no per-edge
+        // variable storage, and metal_dispatch binds an address it cannot resolve as raw
+        // bytes rather than as a buffer -- so every argument must be a real address even
+        // when the kernel provably never reads it.
+        GpuPointer<void> edge_placeholder;
+
         // Host-side stimulus, applied before each dispatch.
         Vector<s64> continuous_injection_targets;
         Vector<f32> continuous_injection_amplitudes;
@@ -150,6 +157,7 @@ namespace spikecorec {
         void build_weight_matrix();
         void collect_stimulus();
         void apply_stimulus(s64 tick);
+        void *resolve_edge_plane(s64 matrix_index);
         void record_tick(s64 tick);
     };
 } // namespace spikecorec

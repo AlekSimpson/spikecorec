@@ -126,7 +126,8 @@ void SpikeEngine::allocate_model_buffers() {
             aligned_byte_count(sizeof(f32), layout.synapse_parameter_length) +
             aligned_byte_count(sizeof(f32), 2 * total_neuron_count) +
             aligned_byte_count(sizeof(u8), layout.spike_history_length * total_neuron_count) +
-            aligned_byte_count(sizeof(s64), total_neuron_count);
+            aligned_byte_count(sizeof(s64), total_neuron_count) +
+            aligned_byte_count(sizeof(f32), 1);
 
     allocator = EngineAllocator(0, gpu_bytes);
 
@@ -137,6 +138,7 @@ void SpikeEngine::allocate_model_buffers() {
     spike_history      = allocator.allocate_gpu(
             sizeof(u8), layout.spike_history_length * total_neuron_count);
     last_spiked        = allocator.allocate_gpu(sizeof(s64), total_neuron_count);
+    edge_placeholder   = allocator.allocate_gpu(sizeof(f32), 1);
 
     // The arena does not clear its slab, and every one of these is read before it is
     // written on the first tick.
@@ -334,6 +336,23 @@ void SpikeEngine::apply_stimulus(s64 tick) {
     }
 }
 
+// The Sk plane of one matrix in the weight family, or the placeholder when that matrix was
+// never registered. `matrix_index` is checked rather than trusted: delay_matrix_index is
+// -1 until the first connection sets a delay, and indexing sparse_delta_buffers with it is
+// an out-of-bounds read that returns a plausible-looking pointer instead of crashing where
+// the mistake is.
+void *SpikeEngine::resolve_edge_plane(s64 matrix_index) {
+    if (matrix_index < 0) return edge_placeholder.get_contents();
+    if (matrix_index >= (s64)weights->sparse_delta_buffers.size()) {
+        return edge_placeholder.get_contents();
+    }
+
+    GpuPointer<f32> &plane = weights->sparse_delta_buffers[(usize)matrix_index];
+    if (plane.pointer == nullptr) return edge_placeholder.get_contents();
+
+    return (void *)plane.get_contents();
+}
+
 void SpikeEngine::step_simulation(s64 tick) {
     apply_stimulus(tick);
 
@@ -354,13 +373,15 @@ void SpikeEngine::step_simulation(s64 tick) {
     void *superblock_table_pointer = (void *)tree.rank_superblock_table.get_contents();
     void *subblock_table_pointer   = (void *)tree.rank_subblock_table.get_contents();
 
-    void *edge_weights_pointer =
-            (void *)weights->sparse_delta_buffers[WeightMatrix::DEFAULT_MATRIX_INDEX]
-                    .get_contents();
-    void *edge_delays_pointer =
-            (void *)weights->sparse_delta_buffers[(usize)weights->delay_matrix_index]
-                    .get_contents();
-    void *edge_variables_pointer = (void *)weights->per_edge_variable_values.get_contents();
+    // A model with no connections registers no delay matrix and allocates no per-edge
+    // planes, so these are absent rather than empty. The kernel never reads them -- there
+    // is no adjacency row to walk -- but every argument still has to be a real registered
+    // address, because metal_dispatch binds a pointer it cannot resolve as raw bytes.
+    void *edge_weights_pointer = resolve_edge_plane(WeightMatrix::DEFAULT_MATRIX_INDEX);
+    void *edge_delays_pointer = resolve_edge_plane(weights->delay_matrix_index);
+    void *edge_variables_pointer = weights->per_edge_variable_values.pointer != nullptr
+            ? (void *)weights->per_edge_variable_values.get_contents()
+            : edge_placeholder.get_contents();
 
     const void *arguments[] = {
         &tick, &step_dt, &neuron_count_argument, &spike_history_length_argument,
