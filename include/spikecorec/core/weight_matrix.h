@@ -116,15 +116,15 @@ namespace spikecorec {
         // set_edge_delay_ticks/refit in weight_matrix.cpp.
         s64 delay_matrix_index = -1;
 
-        s64 node_count;
-        s64 max_neighbor_count;             // upper bound on neighbors per node — bounds the padded
+        s64 node_count = 0;
+        s64 max_neighbor_count = 0;             // upper bound on neighbors per node — bounds the padded
                                             // [node_count * max_neighbor_count] neighbor_weights output;
                                             // rows for nodes with fewer neighbors are sentinel-padded (-1)
-        s64 rank;                           // latent factor dimensionality
-        s64 rank_float4_stride;             // ceil(rank / 4) — float4 elements per row
-        f32 constant_weight;
-        bool check_indexing;
-        bool using_constant_weight;
+        s64 rank = 0;                       // latent factor dimensionality
+        s64 rank_float4_stride = 0;         // ceil(rank / 4) — float4 elements per row
+        f32 constant_weight = 0.0f;
+        bool check_indexing = true;
+        bool using_constant_weight = false;
 
         // True once set_edge_weight() has switched the DEFAULT_MATRIX_INDEX weight matrix
         // into EXACT mode: its Ck is pinned to all-zero in every lane (padding included), so
@@ -162,7 +162,7 @@ namespace spikecorec {
         //     delay matrix's alone.
         // Never set on a WeightMatrix that is only ever used as a random reservoir: nothing
         // turns this on but set_edge_weight().
-        bool using_exact_edge_weights;
+        bool using_exact_edge_weights = false;
 
         // Delay (in whole ticks) every edge uses when using_constant_delay_ticks is
         // true. Defaults to 1 — the engine's existing implicit one-tick
@@ -170,7 +170,7 @@ namespace spikecorec {
         // ordinary WeightMatrix, constructed the same way it always has been, needs
         // zero new caller-side work to keep behaving exactly like today's undelayed
         // engine.
-        s32 constant_delay_ticks;
+        s32 constant_delay_ticks = 1;
 
         // True by default (see constant_delay_ticks): whether a "no explicit delay
         // configured" WeightMatrix should read as constant_delay_ticks everywhere,
@@ -180,7 +180,7 @@ namespace spikecorec {
         // future stage is responsible for choosing per-edge vs constant, the same
         // way propagate-kernel dispatch already chooses constant_weight vs U*V via
         // using_constant_weight.
-        bool using_constant_delay_ticks;
+        bool using_constant_delay_ticks = true;
 
         // Number of per-edge synapse-state variables (arch §4.3's `Ck`/`Sk` family)
         // this WeightMatrix's shared U/V basis carries, on top of the weight itself —
@@ -228,7 +228,7 @@ namespace spikecorec {
         // weight_matrix.cpp). Used by the periodic refit (ticket #54/D4) to
         // size its point cloud and by max_sparse_delta_occupancy_fraction()
         // to normalize Sk size into a fraction of the graph.
-        s64 total_edge_count;
+        s64 total_edge_count = 0;
 
         // Refit-interval knob (ticket #54/D4, arch §4.3's "one open knob"):
         // primary tick-count trigger. A plain, directly-settable field (like
@@ -236,20 +236,25 @@ namespace spikecorec {
         // since it is a runtime-tunable knob, not fixed structure. Default is
         // a starting-point heuristic (the D4 math memo §5: "low hundreds of
         // ticks" for typical spiking rates/dt), not a universal constant.
-        s64 refit_every_n_ticks;
+        static constexpr s64 DEFAULT_REFIT_EVERY_N_TICKS = 200;
+        s64 refit_every_n_ticks = DEFAULT_REFIT_EVERY_N_TICKS;
 
         // Optional secondary Sk-occupancy-threshold trigger (memo §5).
         // Negative = disabled (the default) -- refit is due only via the
         // tick-count knob above unless the caller opts in by setting this to
         // a fraction in (0, 1].
-        f32 refit_occupancy_threshold_fraction;
+        f32 refit_occupancy_threshold_fraction = -1.0f;
 
         // Ticks elapsed since the last refit() call (or since construction, if
         // refit() has never been called). Advanced by advance_tick(), reset to
         // 0 by refit().
-        s64 ticks_since_last_refit;
+        s64 ticks_since_last_refit = 0;
 
-        WeightMatrix() = delete;
+        // A network with no connections: an empty k^2-tree, no U/V basis, no per-edge
+        // storage. This is what an engine holds before it has parsed a model, and what it
+        // keeps for a model whose populations are never wired together -- both are ordinary
+        // states rather than errors, so they are the default rather than an absent value.
+        WeightMatrix() = default;
 
         WeightMatrix(const WeightMatrix &) = delete;
 

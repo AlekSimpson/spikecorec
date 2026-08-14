@@ -100,6 +100,15 @@ String single_cell_model(const String &amplitude = "90 pA") {
 )";
 }
 
+// Spike times of one neuron, in order.
+Vector<f64> spike_times_of(const SpikeEngine &engine, s64 neuron_index) {
+    Vector<f64> times;
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        if (spike.neuron_index == neuron_index) times.push_back(spike.time_seconds);
+    }
+    return times;
+}
+
 f64 analytic_interspike_interval() {
     const f64 membrane_time_constant = 100e-12 / 5e-9;
     const f64 drive_in_volts = 90e-12 / 5e-9;
@@ -743,27 +752,26 @@ TEST(SpikeEngine, connection_weights_and_delays_survive_the_weight_matrix_exactl
             "LEMS.xml", lems_wrapper("model.nml", "weightNetwork", "10ms", "0.1ms"));
 
     SpikeEngine engine(lems_path);
-    ASSERT_TRUE(engine.weights.has_value());
 
     // Exactly, not approximately: the default matrix's coefficient vector is pinned to
     // zero, so an edge's weight is the stored value rather than a low-rank reconstruction
     // near it. A weight that came back as 0.2497 would still look plausible in a plot.
-    EXPECT_FLOAT_EQ(engine.weights->get(0, 1), 0.25f);
-    EXPECT_FLOAT_EQ(engine.weights->get(0, 2), 1.75f);
-    EXPECT_FLOAT_EQ(engine.weights->get(1, 3), 0.001f);
+    EXPECT_FLOAT_EQ(engine.weights.get(0, 1), 0.25f);
+    EXPECT_FLOAT_EQ(engine.weights.get(0, 2), 1.75f);
+    EXPECT_FLOAT_EQ(engine.weights.get(1, 3), 0.001f);
 
-    EXPECT_EQ(engine.weights->get_edge_delay_ticks(0, 1), 10);
-    EXPECT_EQ(engine.weights->get_edge_delay_ticks(0, 2), 20);
-    EXPECT_EQ(engine.weights->get_edge_delay_ticks(1, 3), 30);
+    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 1), 10);
+    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 2), 20);
+    EXPECT_EQ(engine.weights.get_edge_delay_ticks(1, 3), 30);
 
     // Plane 0 of the per-edge family carries each edge's synapse prototype, and there is
     // only one prototype in this model.
-    EXPECT_FLOAT_EQ(engine.weights->get_edge_variable(0, 0, 1), 0.0f);
-    EXPECT_FLOAT_EQ(engine.weights->get_edge_variable(0, 1, 3), 0.0f);
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, 0, 1), 0.0f);
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, 1, 3), 0.0f);
 
     // alphaCurrentSynapse's OnStart sets both state variables to zero.
-    EXPECT_FLOAT_EQ(engine.weights->get_edge_variable(1, 0, 1), 0.0f);
-    EXPECT_FLOAT_EQ(engine.weights->get_edge_variable(2, 0, 1), 0.0f);
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(1, 0, 1), 0.0f);
+    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(2, 0, 1), 0.0f);
 }
 
 TEST(SpikeEngine, declared_output_files_are_written_with_the_shape_the_model_asked_for) {
@@ -822,11 +830,65 @@ TEST(SpikeEngine, declared_output_files_are_written_with_the_shape_the_model_ask
     EXPECT_GT(spike_rows, 0);
 }
 
-// A spikeArray declares no amplitude, because it is a spike source rather than a current
-// injector — its train becomes current only by going through a synapse. Treating it as a
-// current injection would load the model, run every tick, and write a recording with
-// nothing in it, which is the failure that is hardest to notice.
-TEST(SpikeEngine, a_spike_train_stimulus_is_refused_rather_than_run_silent) {
+// A spike train injects its amplitude for one tick per event. The cell has to fire on
+// exactly the ticks the train specifies and nowhere else -- the drive is otherwise zero,
+// so any spike it produces was caused by an event.
+//
+// The amplitude is nanoamps rather than picoamps because a one-tick pulse delivers a
+// charge of amplitude * dt: moving a 100 pF membrane the 20 mV from rest to threshold in a
+// single 0.1 ms tick takes 20 nA.
+TEST(SpikeEngine, a_spike_train_drives_the_cell_on_the_ticks_it_names) {
+    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+
+    ModelDirectory directory("spike_train_drive");
+    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
+           reset="-70 mV" C="100 pF"/>
+  <!--
+    A standard spikeArray is a spike source and declares no amplitude, so LEMS drops an
+    amplitude attribute written on one: only attributes matching a declared Parameter are
+    bound to an instance. A train that is to inject current has to say how much, so the
+    model declares a subtype that carries it.
+  -->
+  <ComponentType name="spikeArrayCurrent" extends="spikeArray">
+    <Parameter name="amplitude" dimension="current"/>
+  </ComponentType>
+
+  <spikeArrayCurrent id="train" amplitude="25 nA">
+    <spike id="0" time="10 ms"/>
+    <spike id="1" time="25 ms"/>
+    <spike id="2" time="40 ms"/>
+  </spikeArrayCurrent>
+  <network id="trainNetwork">
+    <population id="pop" component="c" size="1"/>
+    <explicitInput target="pop[0]" input="train"/>
+  </network>
+</neuroml>
+)");
+    const String lems_path = directory.write(
+            "LEMS.xml", lems_wrapper("model.nml", "trainNetwork", "60ms", "0.1ms"));
+
+    SpikeEngine engine(lems_path);
+    ASSERT_EQ(engine.scheduled_spike_trains.size(), 1u);
+    EXPECT_EQ(engine.scheduled_spike_trains[0].event_ticks,
+              (Vector<s32>{100, 250, 400}));
+
+    engine.run();
+
+    // One spike per event, and no others: nothing else drives this cell.
+    const Vector<f64> times = spike_times_of(engine, 0);
+    ASSERT_EQ(times.size(), 3u) << "expected one spike per event, got " << times.size();
+
+    // The event injects on its own tick, the cell crosses threshold in that same tick.
+    EXPECT_NEAR(times[0], 0.010, 1.5e-4);
+    EXPECT_NEAR(times[1], 0.025, 1.5e-4);
+    EXPECT_NEAR(times[2], 0.040, 1.5e-4);
+}
+
+// The one case still worth refusing: a train that would inject nothing. A component with
+// event times and no amplitude loads, runs every tick and writes an empty recording, which
+// is the failure hardest to notice.
+TEST(SpikeEngine, a_spike_train_with_no_amplitude_is_refused_rather_than_run_silent) {
     if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
 
     ModelDirectory directory("spike_train_refused");
@@ -852,7 +914,7 @@ TEST(SpikeEngine, a_spike_train_stimulus_is_refused_rather_than_run_silent) {
     } catch (const std::runtime_error &error) {
         const String message = error.what();
         EXPECT_NE(message.find("train"), String::npos) << message;
-        EXPECT_NE(message.find("spike train"), String::npos) << message;
+        EXPECT_NE(message.find("no amplitude"), String::npos) << message;
     }
 }
 
@@ -1013,14 +1075,6 @@ TEST(SpikeEngine, both_cell_types_integrate_their_own_equations) {
 
 namespace {
 
-// Spike times of one neuron, in order.
-Vector<f64> spike_times_of(const SpikeEngine &engine, s64 neuron_index) {
-    Vector<f64> times;
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        if (spike.neuron_index == neuron_index) times.push_back(spike.time_seconds);
-    }
-    return times;
-}
 
 } // namespace
 

@@ -64,7 +64,7 @@ SpikeEngine::SpikeEngine(const String &lems_input_file)
     NML_Parser parser;
     if (!parser.validate_against_schema(lems_input_file)) {
         log::throw_runtime_error(*logger,
-                "SpikeEngine: " + lems_input_file + " failed NeuroML schema validation:\n" +
+                "SpikeEngine: " + lems_input_file + " failed lems schema validation:\n" +
                 parser.last_schema_validation_errors);
     }
 
@@ -225,20 +225,20 @@ void SpikeEngine::build_weight_matrix() {
         for (s64 target : adjacency[source]) network[source].push_back((s32)target);
     }
 
-    weights.emplace(network, /*rank=*/1, /*check_indexing=*/true, /*max_neighbor_count=*/-1,
-                    /*weight_seed=*/(s64)simulation_seed);
-    weights->configure_per_edge_variable_count(layout.per_edge_variable_count);
+    weights = WeightMatrix(network, /*rank=*/1, /*check_indexing=*/true,
+                           /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed);
+    weights.configure_per_edge_variable_count(layout.per_edge_variable_count);
 
     for (usize source = 0; source < network_details.neurons.size(); source += 1) {
         for (const NetworkEdge &edge : network_details.neurons[source].outgoing_edges) {
             const s32 source_node = (s32)source;
             const s32 target_node = (s32)edge.target_neuron_index;
 
-            weights->set_edge_weight(source_node, target_node, (f32)edge.weight);
+            weights.set_edge_weight(source_node, target_node, (f32)edge.weight);
 
             // The engine's synaptic latency is one tick, so a connection that names no
             // delay still arrives a tick later rather than instantaneously.
-            weights->set_edge_delay_ticks(source_node, target_node,
+            weights.set_edge_delay_ticks(source_node, target_node,
                                           (s32)std::max<s64>(1, edge.delay_tick_count));
 
             if (edge.synapse_prototype_index < 0) {
@@ -247,7 +247,7 @@ void SpikeEngine::build_weight_matrix() {
                         to_string(edge.target_neuron_index) +
                         " names no synapse, so there is nothing to carry its current");
             }
-            weights->set_edge_variable(0, source_node, target_node,
+            weights.set_edge_variable(0, source_node, target_node,
                                        (f32)edge.synapse_prototype_index);
 
             const ComponentPrototype &prototype =
@@ -261,7 +261,7 @@ void SpikeEngine::build_weight_matrix() {
                         synapse_type.parameter_names, prototype.starting_parameters,
                         synapse_type.name);
 
-                weights->set_edge_variable((s64)slot + 1, source_node, target_node,
+                weights.set_edge_variable((s64)slot + 1, source_node, target_node,
                                            (f32)initial);
             }
         }
@@ -269,8 +269,8 @@ void SpikeEngine::build_weight_matrix() {
 
     logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, "
                   "max_neighbor_count {}, {} per-edge variables",
-                  weights->node_count, weights->total_edge_count,
-                  weights->max_neighbor_count, layout.per_edge_variable_count);
+                  weights.node_count, weights.total_edge_count,
+                  weights.max_neighbor_count, layout.per_edge_variable_count);
 }
 
 void SpikeEngine::collect_stimulus() {
@@ -290,23 +290,34 @@ void SpikeEngine::collect_stimulus() {
 
             if (target.event_ticks.empty()) continue;
 
-            // A spike train is not a current. spikeArray is a spike SOURCE -- it emits
-            // events and declares no amplitude at all -- and timedSynapticInput turns its
-            // train into current by routing it through a named synapse. Neither mechanism
-            // exists here yet, and injecting the component's amplitude (zero, for every
-            // standard spike source) would load the model, run it, and write a completely
-            // silent recording with nothing but a log line to say why.
-            log::throw_runtime_error(*logger,
-                    "SpikeEngine: input '" + profile.input_component_id + "' of type '" +
-                    profile.input_component_type_name + "' delivers a spike train. A train "
-                    "produces current only through a synapse (timedSynapticInput) or as "
-                    "presynaptic events (spikeArray), and neither is wired up yet — use a "
-                    "pulseGenerator for Phase 1 stimulus rather than have this run silent");
+            // A spike train injects its amplitude for one tick at each event time. What it
+            // cannot do is inject nothing: a component that declares no amplitude would
+            // load, run every tick, and write a silent recording. That is the one case
+            // worth refusing, and it names what to add rather than refusing trains at all.
+            if (profile.amplitude == 0.0) {
+                log::throw_runtime_error(*logger,
+                        "SpikeEngine: input '" + profile.input_component_id + "' of type '" +
+                        profile.input_component_type_name + "' carries " +
+                        to_string(target.event_ticks.size()) +
+                        " spike times but declares no amplitude, so every one of them would "
+                        "inject 0 A. LEMS binds only attributes that match a declared "
+                        "Parameter, so writing amplitude= on a standard spikeArray is "
+                        "dropped — the model needs a ComponentType that declares one. An "
+                        "event injects it for a single tick, so the charge is amplitude * dt "
+                        "and the figure is nanoamps rather than the picoamps a sustained "
+                        "injector uses");
+            }
+
+            ScheduledSpikeTrain train;
+            train.neuron_index = target.neuron_index;
+            train.magnitude = (f32)(profile.amplitude * target.weight);
+            train.event_ticks = target.event_ticks;
+            scheduled_spike_trains.push_back(std::move(train));
         }
     }
 
-    logger->info("SpikeEngine: stimulus — {} continuous injections",
-                 continuous_injection_targets.size());
+    logger->info("SpikeEngine: stimulus — {} continuous injections, {} spike trains",
+                 continuous_injection_targets.size(), scheduled_spike_trains.size());
 }
 
 SpikeEngine::~SpikeEngine() {
@@ -328,6 +339,21 @@ void SpikeEngine::apply_stimulus(s64 tick) {
         input_data[row_base + continuous_injection_targets[index]] +=
                 continuous_injection_amplitudes[index];
     }
+
+    // Event times are sorted, so each train only ever walks forward. The first loop skips
+    // any event the run has already passed, which matters when a model schedules several
+    // events inside one tick or when step() is called out of order by a test.
+    for (ScheduledSpikeTrain &train : scheduled_spike_trains) {
+        while (train.cursor < train.event_ticks.size() &&
+               (s64)train.event_ticks[train.cursor] < tick) {
+            train.cursor += 1;
+        }
+        while (train.cursor < train.event_ticks.size() &&
+               (s64)train.event_ticks[train.cursor] == tick) {
+            input_data[row_base + train.neuron_index] += train.magnitude;
+            train.cursor += 1;
+        }
+    }
 }
 
 // The Sk plane of one matrix in the weight family, or the placeholder when that matrix was
@@ -337,11 +363,11 @@ void SpikeEngine::apply_stimulus(s64 tick) {
 // the mistake is.
 void *SpikeEngine::resolve_edge_plane(s64 matrix_index) {
     if (matrix_index < 0) return edge_placeholder.get_contents();
-    if (matrix_index >= (s64)weights->sparse_delta_buffers.size()) {
+    if (matrix_index >= (s64)weights.sparse_delta_buffers.size()) {
         return edge_placeholder.get_contents();
     }
 
-    GpuPointer<f32> &plane = weights->sparse_delta_buffers[(usize)matrix_index];
+    GpuPointer<f32> &plane = weights.sparse_delta_buffers[(usize)matrix_index];
     if (plane.pointer == nullptr) return edge_placeholder.get_contents();
 
     return (void *)plane.get_contents();
@@ -352,7 +378,7 @@ void SpikeEngine::step_simulation(s64 tick) {
 
     const s32 neuron_count_argument = (s32)total_neuron_count;
     const s32 spike_history_length_argument = (s32)layout.spike_history_length;
-    const s32 max_neighbor_count_argument = (s32)weights->max_neighbor_count;
+    const s32 max_neighbor_count_argument = (s32)weights.max_neighbor_count;
 
     void *cell_state_pointer         = cell_state.get_contents();
     void *cell_parameters_pointer    = cell_parameters.get_contents();
@@ -361,7 +387,7 @@ void SpikeEngine::step_simulation(s64 tick) {
     void *spike_history_pointer      = spike_history.get_contents();
     void *last_spiked_pointer        = last_spiked.get_contents();
 
-    const K2Tree &tree = weights->k2tree;
+    const K2Tree &tree = weights.k2tree;
     void *internal_words_pointer   = (void *)tree.internal_node_words.get_contents();
     void *leaf_words_pointer       = (void *)tree.leaf_node_words.get_contents();
     void *superblock_table_pointer = (void *)tree.rank_superblock_table.get_contents();
@@ -372,9 +398,9 @@ void SpikeEngine::step_simulation(s64 tick) {
     // is no adjacency row to walk -- but every argument still has to be a real registered
     // address, because metal_dispatch binds a pointer it cannot resolve as raw bytes.
     void *edge_weights_pointer = resolve_edge_plane(WeightMatrix::DEFAULT_MATRIX_INDEX);
-    void *edge_delays_pointer = resolve_edge_plane(weights->delay_matrix_index);
-    void *edge_variables_pointer = weights->per_edge_variable_values.pointer != nullptr
-            ? (void *)weights->per_edge_variable_values.get_contents()
+    void *edge_delays_pointer = resolve_edge_plane(weights.delay_matrix_index);
+    void *edge_variables_pointer = weights.per_edge_variable_values.pointer != nullptr
+            ? (void *)weights.per_edge_variable_values.get_contents()
             : edge_placeholder.get_contents();
 
     const void *arguments[] = {
@@ -610,7 +636,9 @@ void SpikeEngine::shutdown() {
     logger->info("SpikeEngine: shutting down");
 
     release_kernel(master_kernel);
-    weights.reset();
+    // Move-assigning an empty one releases this matrix's GPU buffers, which has to happen
+    // before the arena and the GPU context go.
+    weights = WeightMatrix();
     allocator = EngineAllocator();
 
     alive = false;

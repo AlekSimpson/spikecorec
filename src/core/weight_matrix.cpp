@@ -36,7 +36,6 @@ static constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5458;
 // fraction bounded to a modest portion of the matrix's edge set between
 // refits without refitting too frequently. Callers should tune
 // refit_every_n_ticks (a plain public field) for their own workload.
-static constexpr s64 DEFAULT_REFIT_EVERY_N_TICKS = 200;
 
 const vector<vector<s32>> &WeightMatrix::validate_network(const vector<vector<s32>> &network) {
     if (network.empty()) {
@@ -65,7 +64,7 @@ WeightMatrix::WeightMatrix(
     , constant_delay_ticks(1)
     , using_constant_delay_ticks(true)
     , total_edge_count(0)
-    , refit_every_n_ticks(DEFAULT_REFIT_EVERY_N_TICKS)
+    , refit_every_n_ticks(WeightMatrix::DEFAULT_REFIT_EVERY_N_TICKS)
     , refit_occupancy_threshold_fraction(-1.0f)
     , ticks_since_last_refit(0)
 {
