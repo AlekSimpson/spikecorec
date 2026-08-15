@@ -18,8 +18,7 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/topologies.h"
 #include "spikecorec/nml/dynamics_codegen.h"
-#include "../examples/balanced_network_model.h"
-#include "../examples/glif_network_model.h"
+#include "../examples/demos/network_model.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -1434,17 +1433,23 @@ struct NetworkActivity {
     f64 final_rate = 0.0;
 };
 
+// How many spikes landed on each tick of the run.
+Vector<s64> spikes_per_tick_of(const SpikeEngine &engine, f64 step_seconds) {
+    Vector<s64> spikes_per_tick((usize)engine.lifetime, 0);
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        const s64 tick = (s64)(spike.time_seconds / step_seconds + 0.5);
+        if (tick >= 0 && tick < engine.lifetime) spikes_per_tick[(usize)tick] += 1;
+    }
+    return spikes_per_tick;
+}
+
 NetworkActivity measure_activity(const SpikeEngine &engine, f64 step_seconds,
                                  f64 total_seconds) {
     NetworkActivity activity;
     activity.mean_rate = engine.mean_firing_rate_hertz();
     activity.participation = engine.fraction_of_neurons_that_spiked();
 
-    Vector<s64> spikes_per_tick((usize)engine.lifetime, 0);
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        const s64 tick = (s64)(spike.time_seconds / step_seconds + 0.5);
-        if (tick >= 0 && tick < engine.lifetime) spikes_per_tick[(usize)tick] += 1;
-    }
+    const Vector<s64> spikes_per_tick = spikes_per_tick_of(engine, step_seconds);
     activity.peak_synchrony =
             (f64)*std::max_element(spikes_per_tick.begin(), spikes_per_tick.end()) /
             (f64)engine.total_neuron_count;
@@ -1479,11 +1484,11 @@ TEST_P(GlifNetworkAliveness, sustains_asynchronous_recurrent_activity) {
     const s32 glif_index = GetParam();
     ModelDirectory directory("glif" + to_string(glif_index) + "_network");
 
-    examples::GlifNetworkParameters parameters;
+    demos::NetworkDemoParameters parameters;
     parameters.glif_index = glif_index;
-    parameters.cell_types_path = "tests/fixtures/nml/glif_cell_types.nml";
 
-    const String lems_path = examples::write_glif_network_model(directory.path(), parameters);
+    const String lems_path = demos::write_network_model(
+            "glif" + to_string(glif_index) + "_network", parameters, directory.path());
 
     SpikeEngine engine(lems_path);
     EXPECT_EQ(engine.total_neuron_count, 500);
@@ -1501,6 +1506,25 @@ TEST_P(GlifNetworkAliveness, sustains_asynchronous_recurrent_activity) {
 
     // Broadly alive rather than a few cells carrying the whole rate.
     EXPECT_GT(activity.participation, 0.85);
+
+    // A synchrony FLOOR as well as a ceiling. The million-cell torus run scored a healthy
+    // rate and 100% participation while every cell fired on the same ticks as every other
+    // one -- the metrics above cannot tell a network apart from a metronome, because they
+    // only ask whether cells fire. Requiring some spread in when they fire is what closes
+    // that. A perfectly locked population puts every spike on a handful of ticks, so the
+    // fraction of ticks carrying any activity collapses.
+    s64 ticks_with_activity = 0;
+    for (s64 count : spikes_per_tick_of(engine, parameters.step_seconds)) {
+        ticks_with_activity += count > 0 ? 1 : 0;
+    }
+    // Five percent, not something tighter: a rhythmic network is not a locked one. GLIF3
+    // and GLIF5 band at about 10 Hz from their after-spike currents, which over two seconds
+    // is twenty bands of a few milliseconds each and lands near 19% -- legitimate, and a
+    // stricter floor fails it. True lockstep puts the whole population on a handful of
+    // ticks and comes in an order of magnitude below that.
+    EXPECT_GT((f64)ticks_with_activity / (f64)engine.lifetime, 0.05)
+            << "only " << ticks_with_activity << " of " << engine.lifetime
+            << " ticks carried any spike; the population is firing in lockstep";
 
     // Not a lockstep volley: no tick where a large part of the population fires together.
     // This is a ceiling, not a demand for a flat raster -- the adapting types develop a
@@ -1539,15 +1563,15 @@ TEST(SpikeEngine, adapting_glif_networks_settle_below_non_adapting_ones) {
     for (s32 glif_index : {1, 3, 5}) {
         ModelDirectory directory("glif_rate_" + to_string(glif_index));
 
-        examples::GlifNetworkParameters parameters;
+        demos::NetworkDemoParameters parameters;
         parameters.glif_index = glif_index;
-        parameters.cell_types_path = "tests/fixtures/nml/glif_cell_types.nml";
         // Half the run of the aliveness tests: the rate separation is fully developed
         // within a second (23 Hz against 5 Hz), and three networks at full length is two
         // minutes of suite time for a comparison that is already clear.
         parameters.simulation_seconds = 1.0;
 
-        SpikeEngine engine(examples::write_glif_network_model(directory.path(), parameters));
+        SpikeEngine engine(demos::write_network_model(
+                "glif" + to_string(glif_index) + "_rate", parameters, directory.path()));
         engine.run();
         rate_by_type[(usize)glif_index] = engine.mean_firing_rate_hertz();
     }
@@ -1560,60 +1584,9 @@ TEST(SpikeEngine, adapting_glif_networks_settle_below_non_adapting_ones) {
             << "GLIF5 " << rate_by_type[5] << " Hz vs GLIF1 " << rate_by_type[1] << " Hz";
 }
 
-// ── the demo is alive ─────────────────────────────────────────────────────────────
+// The balanced iafCell demo that used to be asserted here is gone: every demo now
+// has exactly one program, and that one was superseded by the five GLIF network
+// demos. The property it checked -- a recurrent network that runs, records and
+// produces almost nothing is the failure this file exists to prevent -- is asserted
+// five times over by GlifNetworkAliveness above, across five cell types.
 
-// The check that a passing suite is supposed to earn: a network that runs without error,
-// records without error and produces almost nothing is the failure mode this whole test
-// file exists to make impossible to ship.
-TEST(SpikeEngine, the_balanced_network_demo_sustains_asynchronous_activity) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("balanced_network");
-
-    examples::BalancedNetworkParameters parameters;
-    const String lems_path =
-            examples::write_balanced_network_model(directory.path(), parameters);
-
-    SpikeEngine engine(lems_path);
-    EXPECT_EQ(engine.total_neuron_count, 1000);
-    EXPECT_EQ(engine.layout.total_edge_count, 20000);
-
-    engine.run();
-
-    // Alive: a population rate in the range a cortical network is usually simulated at.
-    EXPECT_GT(engine.mean_firing_rate_hertz(), 5.0);
-    EXPECT_LT(engine.mean_firing_rate_hertz(), 40.0);
-
-    // Broadly alive, not a handful of cells carrying the whole rate.
-    EXPECT_GT(engine.fraction_of_neurons_that_spiked(), 0.85);
-
-    // Asynchronous: no tick where a large part of the population fires together. A
-    // network locked into one repeating volley has a healthy mean rate and a useless
-    // raster.
-    Vector<s64> spikes_per_tick((usize)engine.lifetime, 0);
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        const s64 tick = (s64)(spike.time_seconds / parameters.step_seconds + 0.5);
-        if (tick >= 0 && tick < engine.lifetime) spikes_per_tick[(usize)tick] += 1;
-    }
-    const s64 busiest = *std::max_element(spikes_per_tick.begin(), spikes_per_tick.end());
-    EXPECT_LT((f64)busiest / (f64)engine.total_neuron_count, 0.5);
-
-    // Sustained: the end of the run fires at close to the rate of the middle, rather than
-    // ringing once and decaying.
-    auto rate_over = [&](f64 from_seconds, f64 to_seconds) {
-        s64 count = 0;
-        for (const RecordedSpike &spike : engine.recorded_spikes) {
-            if (spike.time_seconds >= from_seconds && spike.time_seconds < to_seconds) {
-                count += 1;
-            }
-        }
-        return (f64)count / ((f64)engine.total_neuron_count * (to_seconds - from_seconds));
-    };
-
-    const f64 total_seconds = parameters.simulation_seconds;
-    const f64 middle_rate = rate_over(0.4 * total_seconds, 0.6 * total_seconds);
-    const f64 final_rate = rate_over(0.8 * total_seconds, total_seconds);
-
-    ASSERT_GT(middle_rate, 0.0);
-    EXPECT_LT(std::fabs(final_rate - middle_rate) / middle_rate, 0.3);
-}

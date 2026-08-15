@@ -757,6 +757,19 @@ void SpikeEngine::record_membrane_video(const String &path, s64 frame_stride) {
                  total_neuron_count, frame_stride, path);
 }
 
+void SpikeEngine::write_spike_file(const String &path) const {
+    ofstream file(path);
+    if (!file) {
+        logger->error("write_spike_file: cannot open '{}' for writing", path);
+        return;
+    }
+
+    for (const RecordedSpike &spike : recorded_spikes) {
+        file << setprecision(9) << spike.time_seconds << "\t" << spike.neuron_index << "\n";
+    }
+    logger->info("write_spike_file: wrote {} spikes to {}", recorded_spikes.size(), path);
+}
+
 // ── recording output ──────────────────────────────────────────────────────────────
 
 void SpikeEngine::write_recordings() {

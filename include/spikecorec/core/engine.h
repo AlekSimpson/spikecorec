@@ -194,6 +194,12 @@ namespace spikecorec {
         // turn into a video. Call before run(); finished by write_recordings()/shutdown().
         void record_membrane_video(const String &path, s64 frame_stride = 1);
 
+        // Every spike of the run as "time<tab>neuron", which is the TIME_ID form an
+        // EventOutputFile writes. Here for the same reason record_membrane_video is: LEMS
+        // names its recorded cells one EventSelection at a time, and a million of those is
+        // a million elements to express "all of them". Call after run().
+        void write_spike_file(const String &path) const;
+
         void shutdown();
 
     private:

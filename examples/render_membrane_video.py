@@ -166,7 +166,16 @@ def main(argument_list):
     if high - low < 1e-6:
         high = low + 1e-6
 
-    figure = pyplot.figure(figsize=(11, 7), facecolor="#0e1416")
+    # The grid panel is about 40% of the figure's width, so the figure is sized to give it
+    # roughly one pixel per neuron rather than squeezing a 1024x1024 sheet into 450 px and
+    # letting the resampler decide what survives. Floored so small grids still get a
+    # readable figure, capped so a very large one stays a sane video size.
+    grid_panel_pixels = min(side, 1100)
+    figure_width_pixels = int(min(max(grid_panel_pixels / 0.40, 1100), 2600))
+    figure_width_inches = figure_width_pixels / 100.0
+
+    figure = pyplot.figure(figsize=(figure_width_inches, figure_width_inches * 0.636),
+                           facecolor="#0e1416")
     # Generous wspace: the grid's colour bar sits between the two top panels, and a
     # tighter column gap puts its tick labels on top of the trace axis's.
     layout = gridspec.GridSpec(2, 2, height_ratios=[3, 1.4], width_ratios=[1.15, 1],
@@ -260,7 +269,8 @@ def main(argument_list):
 
     print(f"{arguments.recording}: {frame_count} frames of {neuron_count} neurons "
           f"-> {output_path} ({grid_frames.shape[0]} rendered at "
-          f"{arguments.frames_per_second} fps)")
+          f"{arguments.frames_per_second} fps, {side}x{side} grid in a "
+          f"{figure_width_pixels}px figure)")
     return 0
 
 

@@ -153,7 +153,7 @@ PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('
 PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
 
 # ── Top-level targets ────────────────────────────────────────
-.PHONY: all cuda metal python test examples clean info
+.PHONY: demos all cuda metal python test examples clean info
 
 all: $(BACKEND)
 
@@ -267,6 +267,22 @@ EX_PROGRAMS := $(patsubst $(EX_DIR)/%.cpp, $(BUILD_DIR)/examples/%, $(wildcard $
 
 examples-metal: check-metal $(EX_PROGRAMS)
 	@echo "[spikecorec] examples built → $(BUILD_DIR)/examples/"
+
+# ── Demos ────────────────────────────────────────────────────
+# One program per video, in examples/demos/. `make demos` builds them all;
+# `make build/demos/glif1_million_demo` builds one.
+DEMO_DIR      := $(EX_DIR)/demos
+DEMO_HEADERS  := $(wildcard $(DEMO_DIR)/*.h)
+DEMO_PROGRAMS := $(patsubst $(DEMO_DIR)/%.cpp, $(BUILD_DIR)/demos/%, $(wildcard $(DEMO_DIR)/*.cpp))
+
+demos: check-metal $(DEMO_PROGRAMS)
+	@echo "[spikecorec] demos built → $(BUILD_DIR)/demos/"
+
+$(BUILD_DIR)/demos/%: $(DEMO_DIR)/%.cpp $(DEMO_HEADERS) $(METAL_LIB) $(BUILD_DIR)/default.metallib
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -I$(DEMO_DIR) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
+	    -o $@
 
 # One example at a time: `make build/examples/iaf_single_cell_example` builds
 # examples/iaf_single_cell_example.cpp and nothing else.
