@@ -1,0 +1,51 @@
+spike engine gpu backend notes:
+
+requirements:
+1. fast
+2. supports both metal & cuda & eventually amd
+3. handles memory allocation
+4. handles command dispatching
+
+
+Metal specific notes:
+* To do anything with metal you first need to instantiate the metal device, all requests go through that
+
+1. memory allocation 
+    - allocation command:
+        - MTL::Device::newBuffer(u64 bytes, MTL::ResourceStorageModeShared)
+            * pass ResourceStorageModeShared for unified memory
+            * when a metal buffer pointer is allocated you can use get_contents() save the cpu pointer (both the buffer and pointer will share the memory)
+    - deallocate: MTL::Buffer::release()
+
+2. command dispatching
+    - to compile a kernel: 
+        ```
+        NS::Error* error = nullptr;
+
+        MTL::Library* library = device->newLibrary(
+            NS::String::string(source_code, NS::UTF8StringEncoding), nullptr, &error);
+        
+        MTL::Function* function = library->newFunction(
+            NS::String::string("my_kernel", NS::UTF8StringEncoding));
+        
+        MTL::ComputePipelineState* pipeline =
+            device->newComputePipelineState(function, &error);
+        ```
+    - dispatch a kernel (run a function on the gpu):
+        ```
+        MTL::CommandQueue* queue = device->newCommandQueue();          // once
+
+        MTL::CommandBuffer* command_buffer = queue->commandBuffer();   // per submission
+        MTL::ComputeCommandEncoder* encoder = command_buffer->computeCommandEncoder();
+        
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(buffer, 0, 0); // dependent on  
+        encoder->dispatchThreads(MTL::Size(element_count, 1, 1),
+                                 MTL::Size(threads_per_group, 1, 1));
+        encoder->endEncoding();
+        
+        command_buffer->commit();
+        command_buffer->waitUntilCompleted();
+        ```
+
+

@@ -23,16 +23,6 @@ using namespace spikecorec::nml;
 
 namespace {
 
-// Every arena carve is rounded up to EngineAllocator::ALLOCATION_ALIGNMENT, so the slab
-// has to be sized with that rounding included or the last few buffers do not fit.
-u64 aligned_byte_count(u64 element_bytes, s64 length) {
-    if (length <= 0) return 0;
-
-    const u64 alignment = EngineAllocator::ALLOCATION_ALIGNMENT;
-    const u64 requested = element_bytes * (u64)length;
-    return (requested + alignment - 1) / alignment * alignment;
-}
-
 // The starting value of `variable_name` for a type, folded from its OnStart.
 f64 starting_value_for(const Vector<DynamicsInstruction> &dynamics,
                        const String &variable_name,
@@ -77,8 +67,6 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
 
     network_details = parser.parse_lems(lems_input_file);
 
-    // Before the layout, so the edge count, the delay ring and the weight matrix are all
-    // sized from the connectivity that will actually be simulated.
     if (!adjacency.empty()) {
         apply_topology(adjacency, synapse_component_id, connection_weight,
                        connection_delay_seconds);
@@ -110,10 +98,10 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     build_weight_matrix();
     collect_stimulus();
 
-    master_kernel_source = generate_master_kernel(network_details, layout);
-    logger->debug("SpikeEngine: generated master kernel, {} bytes:\n{}",
-                  master_kernel_source.size(), master_kernel_source);
-    master_kernel = compile_kernel(master_kernel_source.c_str(), "master_step");
+    String master_kernel_source = generate_master_kernel(network_details, layout);
+    logger->debug("SpikeEngine: generated master kernel, bytes: {}\n",
+                  master_kernel_source.size());
+    kernel_function = gpu.create_function("master_step", master_kernel_source);
 
     spike_counts_per_neuron.assign((usize)total_neuron_count, 0);
 
@@ -842,7 +830,6 @@ void SpikeEngine::shutdown() {
     // Move-assigning an empty one releases this matrix's GPU buffers, which has to happen
     // before the arena and the GPU context go.
     weights = WeightMatrix();
-    allocator = EngineAllocator();
 
     alive = false;
 }
