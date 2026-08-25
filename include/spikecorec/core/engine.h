@@ -10,7 +10,6 @@
 
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/backend.h"
-#include "spikecorec/core/engine_allocator.h"
 #include "spikecorec/core/log.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/recording.h"
@@ -20,16 +19,9 @@
 using namespace std;
 using namespace spikecorec::nml;
 
-// spikecorec::log is qualified rather than pulled in: it re-declares Vector and String, so
-// `using namespace spikecorec;` alongside `using namespace spikecorec::log;` makes every
-// bare Vector ambiguous in any translation unit that includes this header.
-
 namespace spikecorec {
 
-    // What last_spiked holds for a neuron that has not fired yet. A refractory gate
-    // compares tick - last_spiked against the cell's refractory time, so this has to read
-    // as "long ago" rather than as tick 0.
-    constexpr s64 NEVER_SPIKED_TICK = -((s64)1 << 32);
+    // constexpr s64 NEVER_SPIKED_TICK = -((s64)1 << 32);
 
     // One spike, as the model asked for it to be recorded.
     struct RecordedSpike {
@@ -37,51 +29,35 @@ namespace spikecorec {
         s64 neuron_index = -1;
     };
 
-    // A simulation built entirely from a LEMS/NeuroML document: the model decides the cell
-    // and synapse dynamics, the network, the stimulus, how long to run and what to record.
-    // Nothing about the dynamics is compiled into the engine — the tick kernel is generated
-    // from the model's ComponentTypes at construction and compiled by the backend.
+
     class SpikeEngine {
     public:
         log::SharedPointer<log::EngineLogger> logger;
 
-        // Two slabs carved into every buffer below. Declared before them because it owns
-        // the storage they alias, so it must outlive them.
-        EngineAllocator allocator;
+        EngineBackend gpu;
 
-        // Holds every per-edge quantity: the exact connection weight, the per-edge delay,
-        // and one plane per synapse state variable — all indexed by the k^2-tree's own
-        // adjacency, so only real edges are ever addressed. Default-constructed until the
-        // model has been parsed, and left that way for a model whose populations are never
-        // wired together: an empty weight matrix is a network with no connections, which
-        // is an ordinary state rather than an absent one.
         WeightMatrix weights;
 
         NML_ParseResult network_details;
         ModelLayout layout;
 
+        EngineFunction kernel_function;
+
         // ── model state, carved from the arena ────────────────────────────────────
-        GpuPointer<void> cell_state;         // [layout.cell_state_length]
-        GpuPointer<void> cell_parameters;    // [layout.cell_parameter_length]
-        GpuPointer<void> synapse_parameters; // [layout.synapse_parameter_length]
+        EnginePointer cell_state;         // [layout.cell_state_length]
+        EnginePointer cell_parameters;    // [layout.cell_parameter_length]
+        EnginePointer synapse_parameters; // [layout.synapse_parameter_length]
 
         // Two rows, alternating by tick parity: a thread drains its slot in one row while
         // this tick's scatters accumulate into the other. That is what makes the synaptic
         // latency exactly one tick rather than one-or-two depending on thread order.
-        GpuPointer<void> network_inputs;     // [2][total_neuron_count]
+        EnginePointer network_inputs;     // [2][total_neuron_count]
 
         // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
         // asking whether the source spiked `delay` ticks ago, so every spike in flight is
         // remembered, not just the most recent one.
-        GpuPointer<void> spike_history;
-        GpuPointer<void> last_spiked;        // [total_neuron_count]
-
-        // One element, bound in place of any per-edge plane the model never caused to be
-        // allocated. A model with no connections registers no delay matrix and no per-edge
-        // variable storage, and metal_dispatch binds an address it cannot resolve as raw
-        // bytes rather than as a buffer -- so every argument must be a real address even
-        // when the kernel provably never reads it.
-        GpuPointer<void> edge_placeholder;
+        // GpuPointer<void> spike_history;
+        EnginePointer last_spiked;        // [total_neuron_count]
 
         // Host-side stimulus, applied before each dispatch.
         Vector<s64> continuous_injection_targets;
@@ -121,23 +97,18 @@ namespace spikecorec {
         // model's own OutputFiles because LEMS has no way to ask for "every neuron, every
         // Nth tick", and pretending one of its elements meant that would be inventing
         // semantics the format does not have.
-        std::unique_ptr<SimulationRecorder> membrane_video_recorder;
-        s64 membrane_video_frame_stride = 1;
+        // std::unique_ptr<SimulationRecorder> membrane_video_recorder;
+        // s64 membrane_video_frame_stride = 1;
         // Where each neuron's `v` sits in cell_state, precomputed so a frame is a gather
         // rather than a per-neuron name lookup.
         Vector<s64> membrane_offset_per_neuron;
         Vector<f32> membrane_frame_scratch;
-
-        KernelHandle master_kernel{};
-        String master_kernel_source;
 
         s64 total_neuron_count = 0;
         s64 lifetime = 0;
         f32 step_dt = 0.0f;
         u64 simulation_seed = 0;
 
-        s32 thread_count_per_block = 256;
-        s32 block_count = 0;
         bool alive = false;
 
         SpikeEngine() = delete;
@@ -170,12 +141,8 @@ namespace spikecorec {
 
         ~SpikeEngine();
 
-        // Runs the model for the number of ticks its Simulation asked for, recording as its
-        // OutputFiles ask. Safe to call once.
         void run();
 
-        // Advances exactly one tick. run() is this in a loop; separated so a test can step
-        // and inspect state between ticks.
         void step_simulation(s64 tick);
 
         // The state variable named `variable_name` for one neuron, read back from the GPU.
@@ -186,12 +153,8 @@ namespace spikecorec {
         [[nodiscard]] f64 mean_firing_rate_hertz() const;
         [[nodiscard]] f64 fraction_of_neurons_that_spiked() const;
 
-        // Writes every recording profile the model declared to the files it named.
         void write_recordings();
 
-        // Records every neuron's membrane potential into `path` as a .spire recording,
-        // one frame every `frame_stride` ticks, for examples/render_membrane_video.py to
-        // turn into a video. Call before run(); finished by write_recordings()/shutdown().
         void record_membrane_video(const String &path, s64 frame_stride = 1);
 
         // Every spike of the run as "time<tab>neuron", which is the TIME_ID form an
@@ -215,7 +178,9 @@ namespace spikecorec {
                             const String &synapse_component_id,
                             f64 connection_weight,
                             f64 connection_delay_seconds);
+
         void apply_stimulus(s64 tick);
+
         void *resolve_edge_plane(s64 matrix_index);
 
         // The current one event of a spike train injects when the model names no
@@ -223,6 +188,7 @@ namespace spikecorec {
         // starts to where it fires. Derived from the target's own declared quantities, so
         // it follows whatever cell the train is wired to.
         [[nodiscard]] f64 default_spike_amplitude_for(s64 neuron_index) const;
+
         void record_tick(s64 tick);
     };
 } // namespace spikecorec
