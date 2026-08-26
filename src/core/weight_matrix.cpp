@@ -27,6 +27,55 @@ s64 round_up_to_lane_group(s64 value) {
     return ((max<s64>(value, 1) + group - 1) / group) * group;
 }
 
+// Solves (gram + ridge*I) x = right_hand_side in place, by Cholesky. The system is small --
+// one per node, of dimension rank -- and symmetric positive definite once the ridge term is
+// added, which is the whole reason the ridge is there rather than for regularisation alone:
+// a node whose edges do not span the rank leaves the Gram matrix singular.
+//
+// Returns false when even the ridged system is not decomposable, in which case the caller
+// leaves that row alone rather than writing a NaN into the basis.
+bool solve_symmetric_in_place(vector<f64> &gram, vector<f64> &right_hand_side, s64 dimension,
+                              f64 ridge_regularization) {
+    for (s64 index = 0; index < dimension; index += 1) {
+        gram[(usize)(index * dimension + index)] += ridge_regularization;
+    }
+
+    // Cholesky: gram = L * L^T, computed in the lower triangle.
+    for (s64 row = 0; row < dimension; row += 1) {
+        for (s64 column = 0; column <= row; column += 1) {
+            f64 sum = gram[(usize)(row * dimension + column)];
+            for (s64 index = 0; index < column; index += 1) {
+                sum -= gram[(usize)(row * dimension + index)] *
+                       gram[(usize)(column * dimension + index)];
+            }
+            if (row == column) {
+                if (sum <= 0.0) return false;
+                gram[(usize)(row * dimension + column)] = sqrt(sum);
+            } else {
+                gram[(usize)(row * dimension + column)] =
+                        sum / gram[(usize)(column * dimension + column)];
+            }
+        }
+    }
+
+    // Forward substitution, then back substitution.
+    for (s64 row = 0; row < dimension; row += 1) {
+        f64 sum = right_hand_side[(usize)row];
+        for (s64 index = 0; index < row; index += 1) {
+            sum -= gram[(usize)(row * dimension + index)] * right_hand_side[(usize)index];
+        }
+        right_hand_side[(usize)row] = sum / gram[(usize)(row * dimension + row)];
+    }
+    for (s64 row = dimension - 1; row >= 0; row -= 1) {
+        f64 sum = right_hand_side[(usize)row];
+        for (s64 index = row + 1; index < dimension; index += 1) {
+            sum -= gram[(usize)(index * dimension + row)] * right_hand_side[(usize)index];
+        }
+        right_hand_side[(usize)row] = sum / gram[(usize)(row * dimension + row)];
+    }
+    return true;
+}
+
 } // namespace
 
 namespace spikecorec {
@@ -52,10 +101,10 @@ WeightMatrix::WeightMatrix(
     bool check_indexing,
     s64 max_neighbor_count,
     s64 weight_seed,
-    s64 plasticity_delta_capacity
+    s64 sparse_delta_capacity
 )
     : k2tree(*K2Tree::from_adjacency_list(backend, validate_network(network), (s32)network.size()))
-    , plasticity_delta_capacity(max<s64>(plasticity_delta_capacity, 0))
+    , sparse_delta_capacity(max<s64>(sparse_delta_capacity, 0))
     , owning_backend(&backend)
     , node_count((s64)network.size())
     , check_indexing(check_indexing)
@@ -82,39 +131,13 @@ WeightMatrix::WeightMatrix(
     build_edge_row_offset();
     allocate_storage();
 
-    // Seeded noise, not a fit: declare_projections replaces every lane the moment a model
-    // states what its edges are worth. A matrix used as a random reservoir keeps this.
-    const unsigned resolved_weight_seed =
-            (weight_seed >= 0) ? (unsigned)weight_seed : random_device{}();
-    mt19937 random_engine(resolved_weight_seed);
-    normal_distribution<f32> normal_distribution_unit(0.0f, 1.0f);
-
-    float4 *u_data = U_matrix.get_contents_as<float4>();
-    float4 *v_data = V_matrix.get_contents_as<float4>();
-    const s64 total_float4_element_count = node_count * rank_float4_stride;
-    for (s64 element_index = 0; element_index < total_float4_element_count; element_index += 1) {
-        u_data[element_index] = {normal_distribution_unit(random_engine),
-                                 normal_distribution_unit(random_engine),
-                                 normal_distribution_unit(random_engine),
-                                 normal_distribution_unit(random_engine)};
-        v_data[element_index] = {normal_distribution_unit(random_engine),
-                                 normal_distribution_unit(random_engine),
-                                 normal_distribution_unit(random_engine),
-                                 normal_distribution_unit(random_engine)};
-    }
-
-    // Both coefficient rows start neutral, so an unfitted matrix reconstructs the plain
-    // dot(U, V) it always did.
-    const s64 lane_count = rank_float4_stride * LANE_GROUP;
-    f32 *coefficient_data = coefficients.get_contents_as<f32>();
-    for (s64 lane_index = 0; lane_index < MATRIX_COUNT * lane_count; lane_index += 1) {
-        coefficient_data[lane_index] = 1.0f;
-    }
+    basis_seed = (weight_seed >= 0) ? (unsigned)weight_seed : random_device{}();
+    seed_basis(basis_seed);
 
     log::logger().debug("WeightMatrix constructed: node_count={} edges={} rank={} "
                         "max_neighbor_count={} plasticity_capacity={}",
                         node_count, total_edge_count, this->rank,
-                        this->max_neighbor_count, this->plasticity_delta_capacity);
+                        this->max_neighbor_count, this->sparse_delta_capacity);
 }
 
 // Walks every row once to number the edges. This is also where total_edge_count comes
@@ -148,11 +171,18 @@ void WeightMatrix::allocate_storage() {
         // reintroduce exactly the allocation this class exists to avoid, and it would be
         // resident for the object's whole life.
         .partition((u64)total_edge_count * sizeof(f32), EngineDatatype::FLOAT32, partitions)
-        // Zero capacity means plasticity is off, and partition() hands back empty handles
-        // for a zero-byte request -- so the default build allocates nothing for these.
-        .partition((u64)plasticity_delta_capacity * sizeof(s64), EngineDatatype::SIGNED64, partitions)
-        .partition((u64)plasticity_delta_capacity * sizeof(f32), EngineDatatype::FLOAT32, partitions)
-        .partition(plasticity_delta_capacity > 0 ? sizeof(s32) : 0, EngineDatatype::SIGNED32, partitions);
+        // The sparse correction layer. Row starts always exist -- an empty CSR is all
+        // zeros, which is a valid "no corrections anywhere" rather than an absent buffer
+        // the read path has to test for.
+        .partition((u64)MATRIX_COUNT * (u64)(node_count + 1) * sizeof(s32),
+                   EngineDatatype::SIGNED32, partitions)
+        .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(s64),
+                   EngineDatatype::SIGNED64, partitions)
+        .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(f32),
+                   EngineDatatype::FLOAT32, partitions)
+        .partition((u64)sparse_delta_capacity * sizeof(s64), EngineDatatype::SIGNED64, partitions)
+        .partition((u64)sparse_delta_capacity * sizeof(f32), EngineDatatype::FLOAT32, partitions)
+        .partition(sparse_delta_capacity > 0 ? sizeof(s32) : 0, EngineDatatype::SIGNED32, partitions);
 
     owning_slab = owning_backend->allocate(partitions);
 
@@ -161,15 +191,23 @@ void WeightMatrix::allocate_storage() {
     coefficients = partitions[2];
     edge_row_offset = partitions[3];
     neighbor_weight_scratch = partitions[4];
-    plasticity_edge_ordinals = partitions[5];
-    plasticity_delta_values = partitions[6];
-    plasticity_delta_count = partitions[7];
+    sparse_delta_row_start = partitions[5];
+    sparse_delta_edge_ordinal = partitions[6];
+    sparse_delta_value = partitions[7];
+    pending_delta_edge_ordinal = partitions[8];
+    pending_delta_value = partitions[9];
+    pending_delta_count = partitions[10];
 
     memcpy(edge_row_offset.get_contents(), edge_row_offset_host.data(),
            ((usize)node_count + 1) * sizeof(s64));
 
-    if (plasticity_delta_capacity > 0) {
-        *plasticity_delta_count.get_contents_as<s32>() = 0;
+    if (!sparse_delta_row_start.is_empty()) {
+        memset(sparse_delta_row_start.get_contents(), 0,
+               (usize)MATRIX_COUNT * ((usize)node_count + 1) * sizeof(s32));
+    }
+    sparse_delta_entry_count.assign((usize)MATRIX_COUNT, 0);
+    if (sparse_delta_capacity > 0) {
+        *pending_delta_count.get_contents_as<s32>() = 0;
     }
 
     owning_backend->advise_read_mostly(edge_row_offset, (u64)(node_count + 1) * sizeof(s64));
@@ -194,6 +232,41 @@ void WeightMatrix::resize_basis(s64 new_rank) {
     rank = rounded_rank;
     rank_float4_stride = rank / LANE_GROUP;
     allocate_storage();
+
+    // A fresh slab is uninitialised memory, and alternating least squares started from
+    // whatever was there converges to nothing -- it was reading the previous allocation's
+    // bytes as a starting basis. Seed it the same way the constructor does.
+    seed_basis(basis_seed);
+}
+
+// Independent N(0,1) in every lane. Not a fit: it is the starting point one becomes, and
+// what a matrix used as a random reservoir keeps. The seed is held so a resize reproduces
+// the same starting basis rather than drifting on re-allocation.
+void WeightMatrix::seed_basis(unsigned seed) {
+    mt19937 random_engine(seed);
+    normal_distribution<f32> normal_distribution_unit(0.0f, 1.0f);
+
+    float4 *u_data = U_matrix.get_contents_as<float4>();
+    float4 *v_data = V_matrix.get_contents_as<float4>();
+    const s64 total_float4_element_count = node_count * rank_float4_stride;
+    for (s64 element_index = 0; element_index < total_float4_element_count; element_index += 1) {
+        u_data[element_index] = {normal_distribution_unit(random_engine),
+                                 normal_distribution_unit(random_engine),
+                                 normal_distribution_unit(random_engine),
+                                 normal_distribution_unit(random_engine)};
+        v_data[element_index] = {normal_distribution_unit(random_engine),
+                                 normal_distribution_unit(random_engine),
+                                 normal_distribution_unit(random_engine),
+                                 normal_distribution_unit(random_engine)};
+    }
+
+    // Both coefficient rows start neutral, so an unfitted basis reconstructs the plain
+    // dot(U, V) it always did.
+    const s64 lane_count = rank_float4_stride * LANE_GROUP;
+    f32 *coefficient_data = coefficients.get_contents_as<f32>();
+    for (s64 lane_index = 0; lane_index < MATRIX_COUNT * lane_count; lane_index += 1) {
+        coefficient_data[lane_index] = 1.0f;
+    }
 }
 
 WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
@@ -203,10 +276,13 @@ WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
     , coefficients(other.coefficients)
     , edge_row_offset(other.edge_row_offset)
     , neighbor_weight_scratch(other.neighbor_weight_scratch)
-    , plasticity_edge_ordinals(other.plasticity_edge_ordinals)
-    , plasticity_delta_values(other.plasticity_delta_values)
-    , plasticity_delta_count(other.plasticity_delta_count)
-    , plasticity_delta_capacity(other.plasticity_delta_capacity)
+    , sparse_delta_row_start(other.sparse_delta_row_start)
+    , sparse_delta_edge_ordinal(other.sparse_delta_edge_ordinal)
+    , sparse_delta_value(other.sparse_delta_value)
+    , pending_delta_edge_ordinal(other.pending_delta_edge_ordinal)
+    , pending_delta_value(other.pending_delta_value)
+    , pending_delta_count(other.pending_delta_count)
+    , sparse_delta_capacity(other.sparse_delta_capacity)
     , projection_first_edge_ordinal(std::move(other.projection_first_edge_ordinal))
     , projection_edge_count(std::move(other.projection_edge_count))
     , projection_synapse_prototype(std::move(other.projection_synapse_prototype))
@@ -244,10 +320,14 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     coefficients = other.coefficients;
     edge_row_offset = other.edge_row_offset;
     neighbor_weight_scratch = other.neighbor_weight_scratch;
-    plasticity_edge_ordinals = other.plasticity_edge_ordinals;
-    plasticity_delta_values = other.plasticity_delta_values;
-    plasticity_delta_count = other.plasticity_delta_count;
-    plasticity_delta_capacity = other.plasticity_delta_capacity;
+    sparse_delta_row_start = other.sparse_delta_row_start;
+    sparse_delta_edge_ordinal = other.sparse_delta_edge_ordinal;
+    sparse_delta_value = other.sparse_delta_value;
+    pending_delta_edge_ordinal = other.pending_delta_edge_ordinal;
+    pending_delta_value = other.pending_delta_value;
+    pending_delta_count = other.pending_delta_count;
+    sparse_delta_entry_count = other.sparse_delta_entry_count;
+    sparse_delta_capacity = other.sparse_delta_capacity;
     projection_first_edge_ordinal = std::move(other.projection_first_edge_ordinal);
     projection_edge_count = std::move(other.projection_edge_count);
     projection_synapse_prototype = std::move(other.projection_synapse_prototype);
@@ -366,26 +446,60 @@ f32 WeightMatrix::reconstruct_entry(
     return dot_product;
 }
 
-f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
-    if (!check_index_inbounds(source_node, target_node)) return 0.0f;
-    return reconstruct_entry(source_node, target_node, coefficient_row(DEFAULT_MATRIX_INDEX));
+// The correction Sk holds for one edge, or zero. Binary search inside the source row's
+// slice, which is what the CSR layout buys: rows are contiguous and short.
+f32 WeightMatrix::sparse_delta_for(s64 matrix_index, s32 source_node, s64 edge_ordinal) const {
+    if (sparse_delta_entry_count[(usize)matrix_index] == 0) return 0.0f;
+    if (sparse_delta_row_start.is_empty()) return 0.0f;
+
+    const s32 *row_start = sparse_delta_row_start.get_contents_as<s32>() +
+                           matrix_index * (node_count + 1);
+    const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
+                              matrix_index * sparse_delta_capacity;
+    const f32 *entry_value = sparse_delta_value.get_contents_as<f32>() +
+                             matrix_index * sparse_delta_capacity;
+
+    s32 low = row_start[source_node];
+    s32 high = row_start[source_node + 1];
+    while (low < high) {
+        const s32 middle = low + (high - low) / 2;
+        if (entry_ordinal[middle] < edge_ordinal) low = middle + 1;
+        else high = middle;
+    }
+    if (low < row_start[source_node + 1] && entry_ordinal[low] == edge_ordinal) {
+        return entry_value[low];
+    }
+    return 0.0f;
 }
 
+// Basis plus correction. The basis is a lossy projection and Sk is what the rank did not
+// capture, so neither half is the value on its own -- every read path goes through here.
 f32 WeightMatrix::get_for_matrix(s32 source_node, s32 target_node, s64 matrix_index) const {
     validate_matrix_index(matrix_index);
     if (!check_index_inbounds(source_node, target_node)) return 0.0f;
-    return reconstruct_entry(source_node, target_node, coefficient_row(matrix_index));
+
+    const f32 reconstructed = reconstruct_entry(source_node, target_node,
+                                                coefficient_row(matrix_index));
+
+    const optional<s64> ordinal = edge_ordinal(source_node, target_node);
+    if (!ordinal.has_value()) return reconstructed;
+
+    return reconstructed + sparse_delta_for(matrix_index, source_node, *ordinal);
+}
+
+f32 WeightMatrix::get(s32 source_node, s32 target_node) const {
+    return get_for_matrix(source_node, target_node, DEFAULT_MATRIX_INDEX);
 }
 
 s32 WeightMatrix::get_edge_delay_ticks(s32 source_node, s32 target_node) const {
     if (using_constant_delay_ticks) return constant_delay_ticks;
     if (!check_index_inbounds(source_node, target_node)) return constant_delay_ticks;
 
-    const f32 reconstructed = reconstruct_entry(source_node, target_node,
-                                                coefficient_row(DELAY_MATRIX_INDEX));
-    // A delay is a whole number of ticks, so rounding is what absorbs a small fit error
-    // here -- and the minimum of one tick is the engine's own synaptic latency.
-    return max<s32>((s32)lroundf(reconstructed), 1);
+    // A delay is a whole number of ticks, so rounding absorbs fit error the way it cannot
+    // for a weight: the basis only has to land within half a tick. That slack is why the
+    // delay matrix usually needs no corrections at all even when the weights do.
+    const f32 corrected = get_for_matrix(source_node, target_node, DELAY_MATRIX_INDEX);
+    return max<s32>((s32)lroundf(corrected), 1);
 }
 
 s32 WeightMatrix::get_edge_synapse_prototype(s32 source_node, s32 target_node) const {
@@ -403,6 +517,164 @@ s32 WeightMatrix::get_edge_synapse_prototype(s32 source_node, s32 target_node) c
         return -1;
     }
     return projection_synapse_prototype[run_index];
+}
+
+// ── the sparse delta matrix ───────────────────────────────────────────────────────
+
+// Rebuilds one matrix's CSR from a full correction list. When there are more corrections
+// than capacity the largest by magnitude are kept: truncating by size makes the residual
+// error bounded by the smallest kept correction, where truncating arbitrarily would leave
+// the worst edges wrong.
+void WeightMatrix::rebuild_sparse_delta(s64 matrix_index, Vector<Pair<s64, f32>> &corrections) {
+    validate_matrix_index(matrix_index);
+    if (sparse_delta_capacity <= 0 || sparse_delta_row_start.is_empty()) return;
+
+    if ((s64)corrections.size() > sparse_delta_capacity) {
+        nth_element(corrections.begin(), corrections.begin() + sparse_delta_capacity,
+                    corrections.end(),
+                    [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
+                        return fabsf(left.second) > fabsf(right.second);
+                    });
+        corrections.resize((usize)sparse_delta_capacity);
+    }
+
+    // The CSR wants entries ascending by ordinal, and ordinals are already grouped by
+    // source row -- so one sort puts both the rows and their contents in order.
+    sort(corrections.begin(), corrections.end(),
+         [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
+             return left.first < right.first;
+         });
+
+    s32 *row_start = sparse_delta_row_start.get_contents_as<s32>() +
+                     matrix_index * (node_count + 1);
+    s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
+                        matrix_index * sparse_delta_capacity;
+    f32 *entry_value = sparse_delta_value.get_contents_as<f32>() +
+                       matrix_index * sparse_delta_capacity;
+
+    for (usize index = 0; index < corrections.size(); index += 1) {
+        entry_ordinal[index] = corrections[index].first;
+        entry_value[index] = corrections[index].second;
+    }
+
+    // Row starts from the prefix sum of how many corrections fall in each row. An edge's
+    // row is the one whose edge_row_offset range contains its ordinal.
+    s64 correction_index = 0;
+    for (s64 node_index = 0; node_index <= node_count; node_index += 1) {
+        const s64 row_first_ordinal = edge_row_offset_host[(usize)node_index];
+        while (correction_index < (s64)corrections.size() &&
+               corrections[(usize)correction_index].first < row_first_ordinal) {
+            correction_index += 1;
+        }
+        row_start[node_index] = (s32)correction_index;
+    }
+
+    sparse_delta_entry_count[(usize)matrix_index] = (s64)corrections.size();
+}
+
+void WeightMatrix::accumulate_edge_delta(
+    s64 matrix_index, s32 source_node, s32 target_node, f32 delta
+) {
+    validate_matrix_index(matrix_index);
+    if (sparse_delta_capacity <= 0) return;
+
+    const optional<s64> ordinal = edge_ordinal(source_node, target_node);
+    if (!ordinal.has_value()) {
+        log::throw_invalid_argument(log::logger(),
+            "WeightMatrix::accumulate_edge_delta: (" + to_string(source_node) + ", " +
+            to_string(target_node) + ") is not an edge, so it has nothing to correct");
+    }
+
+    // Read, add, rebuild. Correct and simple; the device path queues into the pending
+    // buffer instead precisely because doing this per update is what batching avoids.
+    Vector<Pair<s64, f32>> corrections;
+    const s64 existing_count = sparse_delta_entry_count[(usize)matrix_index];
+    const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
+                              matrix_index * sparse_delta_capacity;
+    const f32 *entry_value = sparse_delta_value.get_contents_as<f32>() +
+                             matrix_index * sparse_delta_capacity;
+
+    bool merged = false;
+    for (s64 index = 0; index < existing_count; index += 1) {
+        const f32 value = (entry_ordinal[index] == *ordinal) ? entry_value[index] + delta
+                                                             : entry_value[index];
+        if (entry_ordinal[index] == *ordinal) merged = true;
+        corrections.push_back({entry_ordinal[index], value});
+    }
+    if (!merged) corrections.push_back({*ordinal, delta});
+
+    rebuild_sparse_delta(matrix_index, corrections);
+}
+
+// Merges what the device staged this interval into the CSR. Until this runs, those updates
+// are queued but not yet visible to a read -- which is the batching latency the design
+// accepts in exchange for not sorting on every update.
+void WeightMatrix::compact_pending_deltas() {
+    if (sparse_delta_capacity <= 0 || pending_delta_count.is_empty()) return;
+
+    s32 *pending_count = pending_delta_count.get_contents_as<s32>();
+    const s64 staged = min<s64>((s64)*pending_count, sparse_delta_capacity);
+    if (staged <= 0) {
+        *pending_count = 0;
+        return;
+    }
+
+    if ((s64)*pending_count > sparse_delta_capacity) {
+        log::logger().warn("compact_pending_deltas: {} updates were dropped this interval "
+                           "(capacity {}); compact more often",
+                           (s64)*pending_count - sparse_delta_capacity, sparse_delta_capacity);
+    }
+
+    const s64 *staged_ordinal = pending_delta_edge_ordinal.get_contents_as<s64>();
+    const f32 *staged_value = pending_delta_value.get_contents_as<f32>();
+
+    // Corrections go to the weight matrix: an update changes what an edge is worth.
+    Vector<Pair<s64, f32>> corrections;
+    const s64 existing_count = sparse_delta_entry_count[(usize)DEFAULT_MATRIX_INDEX];
+    const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
+                              DEFAULT_MATRIX_INDEX * sparse_delta_capacity;
+    const f32 *entry_value = sparse_delta_value.get_contents_as<f32>() +
+                             DEFAULT_MATRIX_INDEX * sparse_delta_capacity;
+    for (s64 index = 0; index < existing_count; index += 1) {
+        corrections.push_back({entry_ordinal[index], entry_value[index]});
+    }
+    for (s64 index = 0; index < staged; index += 1) {
+        corrections.push_back({staged_ordinal[index], staged_value[index]});
+    }
+
+    // Sum duplicates rather than letting the later one win: two arrivals on one edge in an
+    // interval are two updates, not a correction and a replacement.
+    sort(corrections.begin(), corrections.end(),
+         [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
+             return left.first < right.first;
+         });
+    Vector<Pair<s64, f32>> merged;
+    for (const Pair<s64, f32> &correction : corrections) {
+        if (!merged.empty() && merged.back().first == correction.first) {
+            merged.back().second += correction.second;
+        } else {
+            merged.push_back(correction);
+        }
+    }
+
+    rebuild_sparse_delta(DEFAULT_MATRIX_INDEX, merged);
+    *pending_count = 0;
+
+    log::logger().debug("compact_pending_deltas: merged {} updates, Sk now holds {} entries",
+                        staged, sparse_delta_entry_count[(usize)DEFAULT_MATRIX_INDEX]);
+}
+
+f32 WeightMatrix::sparse_delta_occupancy_fraction() const {
+    if (total_edge_count <= 0) return 0.0f;
+
+    s64 worst = 0;
+    for (s64 count : sparse_delta_entry_count) worst = max(worst, count);
+    return (f32)worst / (f32)total_edge_count;
+}
+
+bool WeightMatrix::is_refit_due() const {
+    if (refit_occupancy_threshold_fraction <= 0.0f) return false;
+    return sparse_delta_occupancy_fraction() >= refit_occupancy_threshold_fraction;
 }
 
 // ── declaring the network's values ────────────────────────────────────────────────
@@ -436,48 +708,104 @@ void WeightMatrix::declare_projections(
     for (usize run_index = 1; run_index < run_count; run_index += 1) {
         if (delay_ticks[run_index] != delay_ticks[0]) every_delay_matches = false;
     }
-    if (every_delay_matches) set_constant_delay_ticks(max<s32>(delay_ticks[0], 1));
+    // Decided here rather than inside either fit, because it is a property of what was
+    // declared. Leaving it set when the delays vary makes get_edge_delay_ticks answer the
+    // constant for every edge and ignore the basis entirely -- silently, and only for
+    // models whose delays are not uniform.
+    if (every_delay_matches) {
+        set_constant_delay_ticks(max<s32>(delay_ticks[0], 1));
+    } else {
+        using_constant_delay_ticks = false;
+    }
 
-    const s64 derived_rank = fit_basis_from_projections(weight, delay_ticks);
+    const Vector<Vector<f32>> targets = targets_from_projections(weight, delay_ticks);
+
+    // Two ways to get a basis. When the runs fit in the lane budget the indicator
+    // construction is exact and free, so take it. Otherwise fit -- a projection onto a
+    // linear subspace, approximate by design, with the residual left for Sk.
+    if (!fit_basis_from_projections(weight, delay_ticks)) {
+        // Rank from the dimension count: MATRIX_COUNT * total_edge_count constraints against
+        // 2 * node_count * rank parameters. That is the rank at which an ARBITRARY field
+        // becomes representable, so it is a ceiling -- capped again by what the kernel can
+        // index, and by a default budget, because spending the ceiling on every model would
+        // give up the compression this exists for.
+        const s64 dimension_count_rank =
+                (MATRIX_COUNT * total_edge_count) / max<s64>(2 * node_count, 1) + 1;
+        const s64 budget_rank = min<s64>(dimension_count_rank, DEFAULT_FIT_RANK_BUDGET);
+        resize_basis(min<s64>(budget_rank, MAX_RANK_FLOAT4_STRIDE * LANE_GROUP));
+
+        log::logger().debug("declare_projections: {} runs exceed the lane budget; fitting at "
+                            "rank {} instead of one lane per run", run_count, rank);
+        fit_basis_to_targets(targets, DEFAULT_FIT_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
+    }
+
+    // Whatever the basis did not capture goes into Sk, which is what turns an approximate
+    // projection into an accurate read. An exact fit leaves it empty; an approximate one
+    // leaves corrections behind, and refit() folds them back in once there are enough.
+    const s64 weight_corrections =
+            store_residual_corrections(DEFAULT_MATRIX_INDEX, targets[(usize)DEFAULT_MATRIX_INDEX]);
+    const s64 delay_corrections =
+            every_delay_matches
+                    ? 0
+                    : store_residual_corrections(DELAY_MATRIX_INDEX,
+                                                 targets[(usize)DELAY_MATRIX_INDEX]);
 
     measured_weight_fit_error = measure_worst_relative_weight_error(weight);
-    const s64 delay_mismatch_count = every_delay_matches ? 0 : count_delay_mismatches(delay_ticks);
-
-    if (measured_weight_fit_error > WEIGHT_FIT_MAXIMUM_TOLERANCE) {
-        // With no per-edge storage to fall back on, a model whose weights the basis cannot
-        // express is a model this engine cannot simulate correctly. Saying so beats
-        // producing plausible spike trains from weights nobody asked for.
-        log::throw_runtime_error(log::logger(),
-            "WeightMatrix: rank " + to_string(derived_rank) + " reproduces this model's " +
-            to_string(run_count) + " projections only to " +
-            to_string(measured_weight_fit_error) + " relative error, past the " +
-            to_string(WEIGHT_FIT_MAXIMUM_TOLERANCE) + " ceiling. The weight field is not "
-            "low-rank on this network's edge set, so the engine would simulate weights the "
-            "model did not specify.");
-    }
 
     if (measured_weight_fit_error > WEIGHT_FIT_WARNING_TOLERANCE) {
-        log::logger().warn("WeightMatrix: rank {} reproduces the declared weights to {:.3e} "
-                           "relative error, past the {:.0e} warning line. Simulated weights "
-                           "differ from the declared ones by up to that much.",
-                           derived_rank, measured_weight_fit_error, WEIGHT_FIT_WARNING_TOLERANCE);
+        // Reported, not refused. The basis is a lossy projection by design and the residual
+        // is the accepted price of the storage -- what matters is that the number is visible
+        // rather than that it is zero.
+        log::logger().warn("WeightMatrix: after corrections the worst declared weight is still "
+                           "off by {:.3e} relative, past the {:.0e} line. Raise the rank or "
+                           "the correction capacity if that matters for this model.",
+                           measured_weight_fit_error, WEIGHT_FIT_WARNING_TOLERANCE);
     }
 
-    if (delay_mismatch_count > 0) {
-        // Delay is not a tolerance question: one tick out indexes the wrong row of the
-        // spike-history ring, which is a different simulation rather than a rounder one.
-        log::throw_runtime_error(log::logger(),
-            "WeightMatrix: rank " + to_string(derived_rank) + " fails to reproduce the "
-            "declared delay on " + to_string(delay_mismatch_count) + " of " +
-            to_string(total_edge_count) + " edges. A delay must round-trip exactly.");
-    }
-
-    log::logger().info("WeightMatrix: {} projections over {} edges represented at rank {} "
-                       "-- basis is {} bytes against {} for one float per edge, worst weight "
-                       "error {:.3e}",
+    log::logger().info("WeightMatrix: {} projections over {} edges at rank {} -- basis {} bytes, "
+                       "{} weight and {} delay corrections held ({:.1f}% of edges), worst "
+                       "weight error {:.3e}",
                        run_count, total_edge_count, rank,
                        2 * node_count * rank * (s64)sizeof(f32),
-                       total_edge_count * (s64)sizeof(f32), measured_weight_fit_error);
+                       weight_corrections, delay_corrections,
+                       100.0 * sparse_delta_occupancy_fraction(), measured_weight_fit_error);
+}
+
+// Walks the edge set, compares the basis against the targets, and hands whatever differs
+// to Sk. An edge the basis already reproduces needs no entry, which is what keeps Sk empty
+// for a projection-structured network rather than merely small.
+//
+// Delay gets half a tick of slack, because rounding absorbs anything smaller: a basis that
+// lands within 0.4 of the right integer already reads back correctly, and an entry for it
+// would be storage bought for nothing.
+s64 WeightMatrix::store_residual_corrections(
+    s64 matrix_index, const Vector<f32> &targets_by_edge_ordinal
+) {
+    if (sparse_delta_capacity <= 0 || total_edge_count == 0) return 0;
+    if ((s64)targets_by_edge_ordinal.size() < total_edge_count) return 0;
+
+    const f32 *coefficient_values = coefficient_row(matrix_index);
+    const f32 negligible_residual =
+            (matrix_index == DELAY_MATRIX_INDEX) ? 0.4f : 0.0f;
+
+    vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
+    Vector<Pair<s64, f32>> corrections;
+
+    for (s64 source_node = 0; source_node < node_count; source_node += 1) {
+        const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
+                                                max_neighbor_count);
+        for (s64 slot = 0; slot < degree; slot += 1) {
+            const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
+            const f32 reconstructed = reconstruct_entry((s32)source_node,
+                                                        neighbor_buffer[(usize)slot],
+                                                        coefficient_values);
+            const f32 residual = targets_by_edge_ordinal[(usize)ordinal] - reconstructed;
+            if (fabsf(residual) > negligible_residual) corrections.push_back({ordinal, residual});
+        }
+    }
+
+    rebuild_sparse_delta(matrix_index, corrections);
+    return sparse_delta_entry_count[(usize)matrix_index];
 }
 
 // Builds U, V and both coefficient rows straight from the projection structure rather than
@@ -495,10 +823,15 @@ void WeightMatrix::declare_projections(
 // belongs to one source population and one target population -- meaning both can only hold
 // for m == k. Where that disjointness does not hold, the measurement in
 // declare_projections is what catches it.
-s64 WeightMatrix::fit_basis_from_projections(
+bool WeightMatrix::fit_basis_from_projections(
     const Vector<f32> &weight, const Vector<s32> &delay_ticks
 ) {
     const s64 run_count = (s64)projection_first_edge_ordinal.size();
+
+    // Only available while every run can have its own lane. Past that the construction has
+    // no exactness left to offer and the general fit is the honest path.
+    if (round_up_to_lane_group(run_count) > MAX_RANK_FLOAT4_STRIDE * LANE_GROUP) return false;
+
     resize_basis(run_count);
 
     const s64 lane_count = rank_float4_stride * LANE_GROUP;
@@ -540,7 +873,291 @@ s64 WeightMatrix::fit_basis_from_projections(
 
     using_constant_weight = false;
     using_constant_delay_ticks = using_constant_delay_ticks && run_count <= 1;
-    return rank;
+    return true;
+}
+
+// ── fitting the basis ─────────────────────────────────────────────────────────────
+
+Vector<Vector<f32>> WeightMatrix::targets_from_projections(
+    const Vector<f32> &weight, const Vector<s32> &delay_ticks
+) const {
+    Vector<Vector<f32>> targets((usize)MATRIX_COUNT,
+                                Vector<f32>((usize)max<s64>(total_edge_count, 0), 0.0f));
+    const s64 run_count = (s64)projection_first_edge_ordinal.size();
+    if (run_count == 0) return targets;
+
+    for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+        // Runs are sorted and contiguous, so the run containing an ordinal is the last one
+        // starting at or below it.
+        const auto entry = upper_bound(projection_first_edge_ordinal.begin(),
+                                       projection_first_edge_ordinal.end(), ordinal);
+        const s64 run_index = max<s64>(entry - projection_first_edge_ordinal.begin() - 1, 0);
+
+        targets[(usize)DEFAULT_MATRIX_INDEX][(usize)ordinal] = weight[(usize)run_index];
+        targets[(usize)DELAY_MATRIX_INDEX][(usize)ordinal] =
+                (f32)max<s32>(delay_ticks[(usize)run_index], 1);
+    }
+    return targets;
+}
+
+Vector<Vector<f32>> WeightMatrix::targets_from_current_values() const {
+    Vector<Vector<f32>> targets((usize)MATRIX_COUNT,
+                                Vector<f32>((usize)max<s64>(total_edge_count, 0), 0.0f));
+    if (total_edge_count == 0) return targets;
+
+    vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
+    for (s64 source_node = 0; source_node < node_count; source_node += 1) {
+        const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
+                                                max_neighbor_count);
+        for (s64 slot = 0; slot < degree; slot += 1) {
+            const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
+            const s32 target_node = neighbor_buffer[(usize)slot];
+            for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                // Reconstruction PLUS correction: the corrected value is what this matrix
+                // currently reads, and re-optimising the basis toward it is exactly how a
+                // correction gets absorbed into the basis and stops needing an entry.
+                targets[(usize)matrix_index][(usize)ordinal] =
+                        reconstruct_entry((s32)source_node, target_node,
+                                          coefficient_row(matrix_index)) +
+                        sparse_delta_for(matrix_index, (s32)source_node, ordinal);
+            }
+        }
+    }
+    return targets;
+}
+
+// Alternating least squares over the edge support. Three phases per sweep -- solve every
+// U row, then every V row, then every coefficient row -- each of which is a small dense
+// least-squares problem in `rank` unknowns.
+//
+// The support is what keeps this affordable: a row of U is fitted against that node's own
+// out-edges, not against a whole matrix row, so a sweep costs O(total_edge_count * rank^2)
+// rather than O(node_count^2 * rank^2). At a million nodes that is the difference between
+// a construction step and an impossibility.
+void WeightMatrix::fit_basis_to_targets(
+    const Vector<Vector<f32>> &targets_per_matrix, s32 sweep_count, f32 ridge_regularization
+) {
+    if (total_edge_count == 0 || node_count == 0) return;
+
+    const s64 lane_count = rank_float4_stride * LANE_GROUP;
+    f32 *u_data = U_matrix.get_contents_as<f32>();
+    f32 *v_data = V_matrix.get_contents_as<f32>();
+
+    // Every matrix shares one basis, and least squares minimises ABSOLUTE error -- so a
+    // matrix whose values are numerically larger dominates the objective and the others are
+    // fitted to whatever is left. Delay in ticks runs 10-40 while a weight is order 1, which
+    // is enough for the weight field to be neglected entirely: a constant weight of 1.0,
+    // representable at rank 1, came back with 100% error.
+    //
+    // Normalising each matrix by its own scale makes them contribute comparably. The scale
+    // is folded back into that matrix's coefficient row afterwards, so the reconstruction
+    // still lands on the original magnitude.
+    Vector<f64> matrix_scale((usize)MATRIX_COUNT, 1.0);
+    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+        f64 sum_of_squares = 0.0;
+        for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+            const f64 value = (f64)targets_per_matrix[(usize)matrix_index][(usize)ordinal];
+            sum_of_squares += value * value;
+        }
+        const f64 root_mean_square = sqrt(sum_of_squares / (f64)total_edge_count);
+        matrix_scale[(usize)matrix_index] = (root_mean_square > 0.0) ? root_mean_square : 1.0;
+    }
+
+    Vector<Vector<f32>> normalised_targets = targets_per_matrix;
+    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+        const f64 scale = matrix_scale[(usize)matrix_index];
+        for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+            normalised_targets[(usize)matrix_index][(usize)ordinal] =
+                    (f32)((f64)targets_per_matrix[(usize)matrix_index][(usize)ordinal] / scale);
+        }
+    }
+
+    // Flat edge list, built once: every phase walks it, and re-walking the k^2-tree per
+    // sweep would dominate the arithmetic it is there to serve.
+    vector<s32> edge_source((usize)total_edge_count);
+    vector<s32> edge_target((usize)total_edge_count);
+    {
+        vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
+        for (s64 source_node = 0; source_node < node_count; source_node += 1) {
+            const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
+                                                    max_neighbor_count);
+            for (s64 slot = 0; slot < degree; slot += 1) {
+                const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
+                edge_source[(usize)ordinal] = (s32)source_node;
+                edge_target[(usize)ordinal] = neighbor_buffer[(usize)slot];
+            }
+        }
+    }
+
+    // Incoming edges per node, so the V phase can gather its own equations without a
+    // second tree walk per sweep.
+    vector<vector<s64>> incoming_edges((usize)node_count);
+    for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+        incoming_edges[(usize)edge_target[(usize)ordinal]].push_back(ordinal);
+    }
+
+    vector<f64> gram((usize)(lane_count * lane_count));
+    vector<f64> right_hand_side((usize)lane_count);
+    vector<f64> basis_row((usize)lane_count);
+
+    for (s32 sweep = 0; sweep < sweep_count; sweep += 1) {
+        // ── U rows ───────────────────────────────────────────────────────────────
+        for (s64 source_node = 0; source_node < node_count; source_node += 1) {
+            const s64 first = edge_row_offset_host[(usize)source_node];
+            const s64 last = edge_row_offset_host[(usize)source_node + 1];
+            if (first == last) continue;
+
+            fill(gram.begin(), gram.end(), 0.0);
+            fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
+
+            for (s64 ordinal = first; ordinal < last; ordinal += 1) {
+                const s64 target_node = edge_target[(usize)ordinal];
+                for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                    const f32 *coefficient_values = coefficient_row(matrix_index);
+                    for (s64 lane = 0; lane < lane_count; lane += 1) {
+                        basis_row[(usize)lane] = (f64)coefficient_values[lane] *
+                                                 (f64)v_data[target_node * lane_count + lane];
+                    }
+                    const f64 target =
+                            (f64)normalised_targets[(usize)matrix_index][(usize)ordinal];
+                    for (s64 row = 0; row < lane_count; row += 1) {
+                        right_hand_side[(usize)row] += basis_row[(usize)row] * target;
+                        for (s64 column = 0; column <= row; column += 1) {
+                            gram[(usize)(row * lane_count + column)] +=
+                                    basis_row[(usize)row] * basis_row[(usize)column];
+                        }
+                    }
+                }
+            }
+            for (s64 row = 0; row < lane_count; row += 1) {
+                for (s64 column = row + 1; column < lane_count; column += 1) {
+                    gram[(usize)(row * lane_count + column)] =
+                            gram[(usize)(column * lane_count + row)];
+                }
+            }
+
+            if (solve_symmetric_in_place(gram, right_hand_side, lane_count,
+                                         (f64)ridge_regularization)) {
+                for (s64 lane = 0; lane < lane_count; lane += 1) {
+                    u_data[source_node * lane_count + lane] = (f32)right_hand_side[(usize)lane];
+                }
+            }
+        }
+
+        // ── V rows ───────────────────────────────────────────────────────────────
+        for (s64 target_node = 0; target_node < node_count; target_node += 1) {
+            const vector<s64> &ordinals = incoming_edges[(usize)target_node];
+            if (ordinals.empty()) continue;
+
+            fill(gram.begin(), gram.end(), 0.0);
+            fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
+
+            for (s64 ordinal : ordinals) {
+                const s64 source_node = edge_source[(usize)ordinal];
+                for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                    const f32 *coefficient_values = coefficient_row(matrix_index);
+                    for (s64 lane = 0; lane < lane_count; lane += 1) {
+                        basis_row[(usize)lane] = (f64)coefficient_values[lane] *
+                                                 (f64)u_data[source_node * lane_count + lane];
+                    }
+                    const f64 target =
+                            (f64)normalised_targets[(usize)matrix_index][(usize)ordinal];
+                    for (s64 row = 0; row < lane_count; row += 1) {
+                        right_hand_side[(usize)row] += basis_row[(usize)row] * target;
+                        for (s64 column = 0; column <= row; column += 1) {
+                            gram[(usize)(row * lane_count + column)] +=
+                                    basis_row[(usize)row] * basis_row[(usize)column];
+                        }
+                    }
+                }
+            }
+            for (s64 row = 0; row < lane_count; row += 1) {
+                for (s64 column = row + 1; column < lane_count; column += 1) {
+                    gram[(usize)(row * lane_count + column)] =
+                            gram[(usize)(column * lane_count + row)];
+                }
+            }
+
+            if (solve_symmetric_in_place(gram, right_hand_side, lane_count,
+                                         (f64)ridge_regularization)) {
+                for (s64 lane = 0; lane < lane_count; lane += 1) {
+                    v_data[target_node * lane_count + lane] = (f32)right_hand_side[(usize)lane];
+                }
+            }
+        }
+
+        // ── coefficient rows ─────────────────────────────────────────────────────
+        // One per matrix, over every edge. This is what lets the matrices differ while
+        // sharing a basis: U and V hold the structure, Ck holds each quantity's scaling
+        // of it.
+        for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+            fill(gram.begin(), gram.end(), 0.0);
+            fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
+
+            for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+                const s64 source_node = edge_source[(usize)ordinal];
+                const s64 target_node = edge_target[(usize)ordinal];
+                for (s64 lane = 0; lane < lane_count; lane += 1) {
+                    basis_row[(usize)lane] = (f64)u_data[source_node * lane_count + lane] *
+                                             (f64)v_data[target_node * lane_count + lane];
+                }
+                const f64 target = (f64)normalised_targets[(usize)matrix_index][(usize)ordinal];
+                for (s64 row = 0; row < lane_count; row += 1) {
+                    right_hand_side[(usize)row] += basis_row[(usize)row] * target;
+                    for (s64 column = 0; column <= row; column += 1) {
+                        gram[(usize)(row * lane_count + column)] +=
+                                basis_row[(usize)row] * basis_row[(usize)column];
+                    }
+                }
+            }
+            for (s64 row = 0; row < lane_count; row += 1) {
+                for (s64 column = row + 1; column < lane_count; column += 1) {
+                    gram[(usize)(row * lane_count + column)] =
+                            gram[(usize)(column * lane_count + row)];
+                }
+            }
+
+            if (solve_symmetric_in_place(gram, right_hand_side, lane_count,
+                                         (f64)ridge_regularization)) {
+                f32 *coefficient_values = coefficient_row(matrix_index);
+                for (s64 lane = 0; lane < lane_count; lane += 1) {
+                    coefficient_values[lane] = (f32)right_hand_side[(usize)lane];
+                }
+            }
+        }
+    }
+
+    // Undo the normalisation. Ck scales the reconstruction linearly, so putting each
+    // matrix's own scale back here lands it on the magnitude its targets actually had --
+    // while the fit above got to treat every matrix as equally important.
+    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+        f32 *coefficient_values = coefficient_row(matrix_index);
+        for (s64 lane = 0; lane < lane_count; lane += 1) {
+            coefficient_values[lane] =
+                    (f32)((f64)coefficient_values[lane] * matrix_scale[(usize)matrix_index]);
+        }
+    }
+
+    using_constant_weight = false;
+}
+
+void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
+    if (total_edge_count == 0) return;
+
+    // Fit to what the matrices currently READ -- reconstruction plus correction. Absorbing
+    // the corrections into the basis is the point, so they are the target, not the noise.
+    const Vector<Vector<f32>> targets = targets_from_current_values();
+    fit_basis_to_targets(targets, sweep_count, ridge_regularization);
+
+    // Whatever the re-optimised basis still misses stays corrected; the rest is now in
+    // U/V and needs no entry.
+    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+        store_residual_corrections(matrix_index, targets[(usize)matrix_index]);
+    }
+
+    log::logger().debug("refit: {} sweeps, Sk now holds {} weight and {} delay corrections",
+                        sweep_count, sparse_delta_entry_count[(usize)DEFAULT_MATRIX_INDEX],
+                        sparse_delta_entry_count[(usize)DELAY_MATRIX_INDEX]);
 }
 
 f32 WeightMatrix::measure_worst_relative_weight_error(const Vector<f32> &weight) const {
@@ -565,9 +1182,13 @@ f32 WeightMatrix::measure_worst_relative_weight_error(const Vector<f32> &weight)
             if (run_index >= run_count) break;
 
             const f32 declared = weight[(usize)run_index];
-            const f32 reconstructed = reconstruct_entry((s32)source_node,
-                                                        neighbor_buffer[(usize)slot],
-                                                        weight_coefficients);
+            // Basis PLUS correction: what the engine actually reads. Measuring the basis
+            // alone would report an error the corrections have already fixed, and hide the
+            // one they have not.
+            const f32 reconstructed =
+                    reconstruct_entry((s32)source_node, neighbor_buffer[(usize)slot],
+                                      weight_coefficients) +
+                    sparse_delta_for(DEFAULT_MATRIX_INDEX, (s32)source_node, ordinal);
             // Relative to the declared magnitude, because synaptic weights span many
             // orders of magnitude and an absolute error means nothing across them. A
             // declared zero is compared absolutely, since nothing is relative to zero.
@@ -819,51 +1440,6 @@ void WeightMatrix::update(
     }
 
     using_constant_weight = false;
-}
-
-void WeightMatrix::fold_edge_deltas(f32 learning_rate, f32 l2_regularization, s32 iterations) {
-    if (plasticity_delta_capacity <= 0) return;
-
-    s32 *staged_count = plasticity_delta_count.get_contents_as<s32>();
-    const s64 pending = min<s64>((s64)*staged_count, plasticity_delta_capacity);
-    if (pending <= 0) {
-        *staged_count = 0;
-        return;
-    }
-
-    if ((s64)*staged_count > plasticity_delta_capacity) {
-        // Deltas past capacity were never written, so they are lost rather than corrupt --
-        // the fix is a shorter fold interval, and saying so is what makes that visible.
-        log::logger().warn("fold_edge_deltas: {} deltas were dropped this interval "
-                           "(capacity {}); fold more often",
-                           (s64)*staged_count - plasticity_delta_capacity,
-                           plasticity_delta_capacity);
-    }
-
-    const s64 *staged_ordinals = plasticity_edge_ordinals.get_contents_as<s64>();
-    const f32 *staged_values = plasticity_delta_values.get_contents_as<f32>();
-
-    vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
-    for (s64 index = 0; index < pending; index += 1) {
-        const s64 ordinal = staged_ordinals[index];
-        if (ordinal < 0 || ordinal >= total_edge_count) continue;
-
-        // Recover the edge's endpoints from its ordinal: the source is the row whose
-        // offset range contains it, the target its slot in that row's walk.
-        const auto row = upper_bound(edge_row_offset_host.begin(), edge_row_offset_host.end(), ordinal);
-        const s64 source_node = (s64)(row - edge_row_offset_host.begin()) - 1;
-        const s64 slot = ordinal - edge_row_offset_host[(usize)source_node];
-
-        const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
-                                                max_neighbor_count);
-        if (slot >= degree) continue;
-
-        update((s32)source_node, neighbor_buffer[(usize)slot], staged_values[index],
-               learning_rate, l2_regularization, iterations);
-    }
-
-    *staged_count = 0;
-    log::logger().debug("fold_edge_deltas: folded {} deltas into the basis", pending);
 }
 
 ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
