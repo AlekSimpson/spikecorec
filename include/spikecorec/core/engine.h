@@ -141,6 +141,30 @@ namespace spikecorec {
 
         bool alive = false;
 
+        // ── plasticity (opt-in) ───────────────────────────────────────────────────
+        bool hebbian_plasticity_enabled = false;
+
+        // How many staged deltas are folded into U/V at once, and how often. Capacity is a
+        // fixed budget rather than one slot per edge -- an interval that overflows it loses
+        // the excess and logs, which says "fold more often" rather than growing without
+        // bound.
+        static constexpr s64 DEFAULT_PLASTICITY_DELTA_CAPACITY = 1 << 16;
+        s64 plasticity_fold_every_n_ticks = 64;
+        f32 plasticity_learning_rate = 0.01f;
+        f32 plasticity_l2_regularization = 1e-6f;
+        s32 plasticity_iterations = 1;
+
+        // Homeostatic scaling, run after each fold. Plain Hebbian only ever strengthens, so
+        // without this the weights run away: a potentiated edge fires its target more, which
+        // potentiates it further. Rescaling the basis back to the magnitude the model
+        // declared keeps the total synaptic drive fixed while letting edges move relative to
+        // each other, which is the part the rule is actually for.
+        //
+        // Captured at construction from the model's own weights, so it is the document's
+        // scale being preserved rather than an invented one. Set to a negative value to
+        // disable and let the weights grow.
+        f32 plasticity_target_root_mean_square = -1.0f;
+
         SpikeEngine() = delete;
         SpikeEngine(const SpikeEngine &) = delete;
         SpikeEngine &operator=(const SpikeEngine &) = delete;
@@ -152,7 +176,15 @@ namespace spikecorec {
         // from the model's connections, and compiles the generated tick kernel. Throws
         // naming the offending ComponentType if the model uses anything Phase 1 does not
         // simulate, rather than loading something it would run incorrectly.
-        explicit SpikeEngine(const String &lems_input_file);
+        // enable_hebbian_plasticity switches on the engine's built-in Hebbian rule, which
+        // nudges U/V toward a stronger reconstruction for edges whose endpoints fired
+        // close together. Off by default: it changes what the simulation computes, and no
+        // NeuroML document asks for it.
+        //
+        // Off costs nothing rather than costing a branch -- the codegen emits no
+        // plasticity block at all, and the delta buffers are never allocated.
+        explicit SpikeEngine(const String &lems_input_file,
+                             bool enable_hebbian_plasticity = false);
 
         // The same, with the network's connectivity supplied in code instead of in the
         // document. The model still declares the cells, the synapse, the stimulus and the
@@ -167,7 +199,8 @@ namespace spikecorec {
                     const vector<vector<s32>> &adjacency,
                     const String &synapse_component_id,
                     f64 connection_weight = 1.0,
-                    f64 connection_delay_seconds = 0.0);
+                    f64 connection_delay_seconds = 0.0,
+                    bool enable_hebbian_plasticity = false);
 
         ~SpikeEngine();
 

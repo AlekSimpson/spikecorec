@@ -1021,6 +1021,33 @@ String read_device_include(const String &file_name) {
     return "\n" + contents.str() + "\n";
 }
 
+// Emitted only when plasticity is on, so a kernel that never stages a delta does not carry
+// the function that computes one.
+const char *KERNEL_PREAMBLE_PLASTICITY = R"METAL(
+// The engine's built-in Hebbian rule: strengthen an edge whose endpoints both fired
+// recently, in proportion to how close together. Both spike times are already resident --
+// the propagate thread owns the source and has just resolved the target -- so this costs
+// arithmetic rather than memory traffic.
+//
+// A negative last_spiked means the endpoint has never fired, which is not the same as
+// having fired long ago: it yields no delta at all rather than an enormous one.
+inline float spikecorec_hebbian_delta(
+    long tick, long source_last_spiked, long target_last_spiked, float step_dt
+) {
+    if (source_last_spiked < 0 || target_last_spiked < 0) return 0.0f;
+
+    const float source_age = (float)(tick - source_last_spiked) * step_dt;
+    const float target_age = (float)(tick - target_last_spiked) * step_dt;
+
+    // Nothing outside the coincidence window contributes, which is what keeps the staging
+    // buffer holding pairs that actually fired together rather than every edge every tick.
+    const float coincidence_window = 0.020f; // 20 ms
+    if (source_age > coincidence_window || target_age > coincidence_window) return 0.0f;
+
+    return exp(-(source_age + target_age) / coincidence_window);
+}
+)METAL";
+
 const char *KERNEL_SIGNATURE = R"METAL(
 kernel void master_step(
     constant long        &tick                      [[ buffer(0)  ]],
@@ -1050,7 +1077,17 @@ kernel void master_step(
     const device long    *edge_row_offset           [[ buffer(24) ]],
     device   float       *synapse_arrivals          [[ buffer(25) ]],
     device   float       *synapse_state             [[ buffer(26) ]],
-    uint thread_id [[ thread_position_in_grid ]]
+)METAL";
+
+// Bound only when plasticity is on. A kernel that never stages a delta does not declare
+// the buffers to stage it into.
+const char *KERNEL_SIGNATURE_PLASTICITY = R"METAL(    device   long        *plasticity_edge_ordinals  [[ buffer(27) ]],
+    device   float       *plasticity_delta_values   [[ buffer(28) ]],
+    device   atomic_int  *plasticity_delta_count    [[ buffer(29) ]],
+    constant int         &plasticity_delta_capacity [[ buffer(30) ]],
+)METAL";
+
+const char *KERNEL_SIGNATURE_CLOSE = R"METAL(    uint thread_id [[ thread_position_in_grid ]]
 ) {
 )METAL";
 
@@ -1147,6 +1184,29 @@ const char *KERNEL_BETWEEN_CELL_AND_PROPAGATE = R"METAL(    }
             arrived = spike_history[arrival_row * neuron_count + neuron_index] != 0;
         }
 
+)METAL";
+
+// Staged, not applied. A rank-1 nudge is an alternating least-squares solve over U[source]
+// and V[target] with threadgroup-scoped reductions; many propagate threads hitting one
+// target's V row cannot run that correctly. Appending is a single atomic increment, and the
+// host folds the batch afterwards.
+const char *KERNEL_PROPAGATE_PLASTICITY = R"METAL(
+        const float hebbian_delta = spikecorec_hebbian_delta(
+            tick, last_spiked[neuron_index], last_spiked[target], step_dt);
+
+        if (hebbian_delta != 0.0f) {
+            const int staged_index =
+                atomic_fetch_add_explicit(plasticity_delta_count, 1, memory_order_relaxed);
+            // Past capacity the delta is dropped rather than written out of bounds. The
+            // host reads the count, sees the overflow and says to fold more often.
+            if (staged_index < plasticity_delta_capacity) {
+                plasticity_edge_ordinals[staged_index] = edge_ordinal;
+                plasticity_delta_values[staged_index] = hebbian_delta;
+            }
+        }
+)METAL";
+
+const char *KERNEL_PROPAGATE_AFTER_PLASTICITY = R"METAL(
         // Nothing arrived means nothing to do for this edge. There is no per-edge state to
         // decay any more -- the target's accumulator does that once, for every edge at
         // once -- so a quiet edge costs one branch instead of a load and a store.
@@ -1339,7 +1399,8 @@ void collect_projection_runs(
     }
 }
 
-String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLayout &layout) {
+String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLayout &layout,
+                              bool enable_hebbian_plasticity) {
     if (parse_result.populations.empty()) {
         throw runtime_error(
                 "dynamics_codegen: the model declares no populations, so there is nothing "
@@ -1409,6 +1470,7 @@ String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLa
            << "\n";
 
     source << KERNEL_PREAMBLE << "\n";
+    if (enable_hebbian_plasticity) source << KERNEL_PREAMBLE_PLASTICITY << "\n";
 
     // ── the generated bodies ─────────────────────────────────────────────────────
     ostringstream cell_bodies;
@@ -1433,12 +1495,16 @@ String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLa
                                                 parse_result, (s64)index);
     }
 
-    source << KERNEL_SIGNATURE
+    source << KERNEL_SIGNATURE;
+    if (enable_hebbian_plasticity) source << KERNEL_SIGNATURE_PLASTICITY;
+    source << KERNEL_SIGNATURE_CLOSE
            << KERNEL_PROLOGUE
            << synapse_integration.str()
            << KERNEL_AFTER_SYNAPSE_INTEGRATION
            << cell_bodies.str()
-           << KERNEL_BETWEEN_CELL_AND_PROPAGATE
+           << KERNEL_BETWEEN_CELL_AND_PROPAGATE;
+    if (enable_hebbian_plasticity) source << KERNEL_PROPAGATE_PLASTICITY;
+    source << KERNEL_PROPAGATE_AFTER_PLASTICITY
            << synapse_bodies.str()
            << KERNEL_EPILOGUE;
 

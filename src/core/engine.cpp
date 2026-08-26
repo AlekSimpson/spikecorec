@@ -46,15 +46,17 @@ f64 starting_value_for(const Vector<DynamicsInstruction> &dynamics,
 
 // ── construction ──────────────────────────────────────────────────────────────────
 
-SpikeEngine::SpikeEngine(const String &lems_input_file)
-    : SpikeEngine(lems_input_file, {}, "", 1.0, 0.0) {}
+SpikeEngine::SpikeEngine(const String &lems_input_file, bool enable_hebbian_plasticity)
+    : SpikeEngine(lems_input_file, {}, "", 1.0, 0.0, enable_hebbian_plasticity) {}
 
 SpikeEngine::SpikeEngine(const String &lems_input_file,
                          const vector<vector<s32>> &adjacency,
                          const String &synapse_component_id,
                          f64 connection_weight,
-                         f64 connection_delay_seconds)
-    : logger(log::make_logger()) {
+                         f64 connection_delay_seconds,
+                         bool enable_hebbian_plasticity)
+    : logger(log::make_logger())
+    , hebbian_plasticity_enabled(enable_hebbian_plasticity) {
 
     // The backend is a member, constructed with this engine: there is no process-global
     // context to initialize and nothing to check before allocating.
@@ -96,7 +98,8 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     build_weight_matrix();
     collect_stimulus();
 
-    const String master_kernel_source = generate_master_kernel(network_details, layout);
+    const String master_kernel_source =
+            generate_master_kernel(network_details, layout, hebbian_plasticity_enabled);
     logger->debug("SpikeEngine: generated master kernel, {} bytes", master_kernel_source.size());
 
     Optional<EngineFunction> compiled = gpu.create_function("master_step", master_kernel_source);
@@ -284,9 +287,11 @@ void SpikeEngine::build_weight_matrix() {
     // rank -1 means "derive it from what the projections below actually contain" rather
     // than a constant someone guessed; capacity 0 leaves plasticity off and allocates
     // nothing for it.
+    // A zero delta capacity is what turns plasticity off end to end: no buffers here, and
+    // no emitted block in the kernel.
     weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
-                           /*plasticity_delta_capacity=*/0);
+                           hebbian_plasticity_enabled ? DEFAULT_PLASTICITY_DELTA_CAPACITY : 0);
 
     // The same run coalescing the codegen bakes into the kernel, from the same function --
     // the two must agree on the ordering exactly, or edges get the wrong synapse.
@@ -306,6 +311,12 @@ void SpikeEngine::build_weight_matrix() {
 
     weights.declare_projections(first_edge_ordinal, edge_count, synapse_prototype_narrow,
                                 weight, delay_ticks);
+
+    // The scale plasticity is held to, taken from the model's own weights before anything
+    // has moved them. Only meaningful when plasticity is on, and only when there are edges.
+    if (hebbian_plasticity_enabled && weights.total_edge_count > 0) {
+        plasticity_target_root_mean_square = weights.neighbor_weight_stats().root_mean_square;
+    }
 
     logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, {} projection runs, "
                   "rank {}, worst weight error {:.3e}",
@@ -618,11 +629,36 @@ void SpikeEngine::step_simulation(s64 tick) {
         resolve_edge_plane(synapse_state),                       // 26
     };
 
+    // Bound only when the kernel declares them, which it does only when plasticity is on.
+    const s32 plasticity_capacity_argument = (s32)weights.plasticity_delta_capacity;
+    if (hebbian_plasticity_enabled) {
+        parameters.push_back(resolve_edge_plane(weights.plasticity_edge_ordinals)); // 27
+        parameters.push_back(resolve_edge_plane(weights.plasticity_delta_values));  // 28
+        parameters.push_back(resolve_edge_plane(weights.plasticity_delta_count));   // 29
+        parameters.push_back(inline_scalar_argument(plasticity_capacity_argument)); // 30
+    }
+
     // job_count is the neuron count, not a block count: run_function dispatches TOTAL
     // threads and works out the groups itself.
     if (!gpu.run_function(kernel_function, parameters, total_neuron_count)) {
         log::throw_runtime_error(*logger,
                 "SpikeEngine: tick " + to_string(tick) + " failed on the GPU");
+    }
+
+    // Folding on an interval rather than every tick: a fold is a dispatch per staged delta,
+    // and batching is the whole reason the kernel stages them instead of applying them.
+    if (hebbian_plasticity_enabled &&
+        plasticity_fold_every_n_ticks > 0 &&
+        (tick + 1) % plasticity_fold_every_n_ticks == 0) {
+        weights.fold_edge_deltas(plasticity_learning_rate, plasticity_l2_regularization,
+                                 plasticity_iterations);
+
+        // Hebbian only strengthens, so the weights run away without this -- a potentiated
+        // edge drives its target harder, which potentiates it further.
+        if (plasticity_target_root_mean_square >= 0.0f) {
+            weights.scale_neighbor_weights_to_root_mean_square(
+                    plasticity_target_root_mean_square);
+        }
     }
 
     record_tick(tick);

@@ -114,6 +114,11 @@ bool find_spike_threshold_condition(const CellTypeSpecification &cell_type,
 // synapse type whose state does not superpose, a regime-scoped cell -- naming the
 // ComponentType. A model that cannot be simulated correctly must fail to load rather than
 // produce a plausible-looking recording of the wrong thing.
-String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLayout &layout);
+// enable_hebbian_plasticity adds the delta-staging block to the propagate walk and the two
+// buffers it writes to the signature. Defaulted off, and "off" means the block is not
+// emitted at all rather than emitted behind a runtime test -- a per-edge, per-tick branch
+// is not free, and a model that never asked for plasticity should not pay for it.
+String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLayout &layout,
+                              bool enable_hebbian_plasticity = false);
 
 } // namespace spikecorec::nml
