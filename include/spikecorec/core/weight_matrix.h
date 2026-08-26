@@ -70,7 +70,14 @@ namespace spikecorec {
         // already far tighter than the biology it stands for -- but a fit that has drifted
         // past the warning line is worth knowing about before it becomes a wrong answer.
         static constexpr f32 WEIGHT_FIT_WARNING_TOLERANCE = 1.0e-4f;
-        static constexpr f32 WEIGHT_FIT_MAXIMUM_TOLERANCE = 1.0e-2f;
+
+        // What the general fit spends when the exact construction is unavailable. Not the
+        // rank an arbitrary field would need for an exact fit -- spending that on every
+        // model gives up the compression this exists for. The residual goes to Sk, and if
+        // a model wants more fidelity the rank is a constructor argument.
+        static constexpr s64 DEFAULT_FIT_RANK_BUDGET = 32;
+        static constexpr s32 DEFAULT_FIT_SWEEP_COUNT = 6;
+        static constexpr f32 DEFAULT_FIT_RIDGE = 1.0e-4f;
 
         K2Tree k2tree;
 
@@ -93,18 +100,43 @@ namespace spikecorec {
         // because the backend hands out one chunk per partition -> allocate round.
         EnginePointer neighbor_weight_scratch;
 
-        // ── plasticity (opt-in; all three are empty when disabled) ────────────────
-        // Per-edge weight deltas awaiting the next fold into U/V. Parallel arrays rather
-        // than an array of pairs: the fold reads ordinals and values as separate typed
-        // buffers, and a record layout would make each a strided load.
+        // ── the sparse delta matrix (Sk) ─────────────────────────────────────────
+        // The basis is a LOSSY projection: rank buys fidelity, and what the rank does not
+        // capture lands here. Every read adds this correction back, so a read is accurate
+        // even while the basis is only approximate -- and when it accumulates enough
+        // entries, refit() re-optimises U/V to represent the corrected values better and
+        // empties it. That loop is what lets rank be a storage dial rather than a promise.
         //
-        // Capacity is a fixed budget, never one slot per edge. A producer that finds the
-        // store full triggers a fold instead of growing it, so this stays independent of
-        // edge count -- which is the whole point.
-        EnginePointer plasticity_edge_ordinals;   // s64[plasticity_delta_capacity]
-        EnginePointer plasticity_delta_values;    // f32[plasticity_delta_capacity]
-        EnginePointer plasticity_delta_count;     // s32[1], bumped atomically on device
-        s64 plasticity_delta_capacity = 0;
+        // Genuinely sparse: CSR over source rows, holding only the edges that need a
+        // correction. Edge ordinals are already grouped by source row, so the row slice of
+        // an edge is contiguous and a lookup is a binary search inside it -- cheap enough
+        // for the propagate walk to do per edge.
+        //
+        //   row_start[m * (node_count + 1) + n] .. [.. + n + 1]  is node n's slice for matrix m
+        //   entry_edge_ordinal[slice]                            sorted ascending within the slice
+        //   entry_delta[slice]                                   the correction to add
+        EnginePointer sparse_delta_row_start;      // s32[MATRIX_COUNT * (node_count + 1)]
+        EnginePointer sparse_delta_edge_ordinal;   // s64[MATRIX_COUNT * sparse_delta_capacity]
+        EnginePointer sparse_delta_value;          // f32[MATRIX_COUNT * sparse_delta_capacity]
+
+        // Updates arrive out of order and possibly from many device threads at once, so
+        // they queue here and are merged into the CSR above on an interval. That batching
+        // is deliberate: the merge is what the CSR's sortedness costs, and paying it per
+        // update would defeat the point.
+        EnginePointer pending_delta_edge_ordinal;  // s64[sparse_delta_capacity]
+        EnginePointer pending_delta_value;         // f32[sparse_delta_capacity]
+        EnginePointer pending_delta_count;         // s32[1], bumped atomically on device
+
+        // How many corrections each matrix currently holds. Bounded: past capacity the
+        // largest residuals are kept and the rest are accepted as error, which is the
+        // accuracy-for-storage trade stated plainly rather than an overflow.
+        s64 sparse_delta_capacity = 0;
+        Vector<s64> sparse_delta_entry_count = Vector<s64>((usize)MATRIX_COUNT, 0);
+
+        // Refit when the corrections outgrow this fraction of the edge set -- the basis has
+        // drifted far enough from the values that re-optimising it is worth the cost. The
+        // primary trigger; a caller that wants a schedule instead can drive refit() itself.
+        f32 refit_occupancy_threshold_fraction = 0.25f;
 
         // ── projection runs (structure of arrays, parallel) ───────────────────────
         // Which synapse prototype each edge uses, as runs over the canonical edge
@@ -164,7 +196,7 @@ namespace spikecorec {
         // rank:               -1 derives it from the declarations (see derive_rank)
         // max_neighbor_count: -1 derives it from the longest row
         // weight_seed:        seeds the basis before any fit; -1 uses hardware entropy
-        // plasticity_delta_capacity: 0 disables plasticity entirely, allocating nothing
+        // sparse_delta_capacity: 0 disables plasticity entirely, allocating nothing
         WeightMatrix(
             EngineBackend &backend,
             const vector<vector<s32>> &network,
@@ -172,7 +204,7 @@ namespace spikecorec {
             bool check_indexing = true,
             s64 max_neighbor_count = -1,
             s64 weight_seed = -1,
-            s64 plasticity_delta_capacity = 0
+            s64 sparse_delta_capacity = 0
         );
 
         ~WeightMatrix();
@@ -218,15 +250,32 @@ namespace spikecorec {
 
         [[nodiscard]] WeightStats neighbor_weight_stats() const;
 
-        // ── plasticity ───────────────────────────────────────────────────────────
-        // Applies one edge's delta straight into U/V as a rank-1 nudge. The host-side
-        // entry point; the simulation path stages deltas and folds them in batches.
+        // ── updates ──────────────────────────────────────────────────────────────
+        // Queues a correction for one edge. It does not touch U/V: the delta lands in the
+        // pending buffer, gets merged into Sk, and is folded into the basis by the next
+        // refit. Reads see it from the moment it is merged.
+        void accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 target_node, f32 delta);
+
+        // Merges whatever the device staged this interval into the CSR. Cheap, and the
+        // point at which recent updates become visible to reads.
+        void compact_pending_deltas();
+
+        // Re-optimises U/V and every Ck against the values Sk currently corrects to, then
+        // empties Sk. Expensive, which is why it is triggered rather than continuous --
+        // the corrections are what it fits to, so it wants a batch of them.
+        void refit(s32 sweep_count = 4, f32 ridge_regularization = 1e-3f);
+
+        // True once the corrections have outgrown refit_occupancy_threshold_fraction of
+        // the edge set.
+        [[nodiscard]] bool is_refit_due() const;
+
+        // Fraction of the edge set currently carrying a correction, across every matrix.
+        [[nodiscard]] f32 sparse_delta_occupancy_fraction() const;
+
+        // Applies one edge's delta straight into U/V as a rank-1 nudge, bypassing Sk.
+        // A direct-manipulation entry point for tooling, not the simulation path.
         void update(s32 source_node, s32 target_node, f32 delta,
                     f32 learning_rate, f32 l2_regularization, s32 iterations);
-
-        // Applies every delta staged in the plasticity buffers and clears the count. No-op
-        // when plasticity is disabled or nothing has been staged.
-        void fold_edge_deltas(f32 learning_rate, f32 l2_regularization, s32 iterations);
 
         // Rescales U/V so the reconstructed weights reach a target RMS. Worth running
         // after a fold: many small rank-1 nudges can drift the basis in scale.
@@ -267,22 +316,61 @@ namespace spikecorec {
         // fall back to the host path rather than to fail.
         [[nodiscard]] bool ensure_function(EngineFunction &function, const String &name) const;
 
+        // Kept so a resize can reproduce the same starting basis instead of drifting on
+        // re-allocation, and so a run stays reproducible across one.
+        unsigned basis_seed = 0;
+
+        // Fills U/V with independent N(0,1) and both coefficient rows with 1.0.
+        void seed_basis(unsigned seed);
+
         void build_edge_row_offset();
 
         // Runs one partition -> allocate round for every buffer this matrix owns, at the
         // current rank. Called at construction and again by resize_basis.
         void allocate_storage();
 
-        // Σ_k U[i][k] * Ck[k] * V[j][k], the one place a stored value is ever produced.
+        // Σ_k U[i][k] * Ck[k] * V[j][k] -- the basis's own answer, BEFORE the sparse
+        // correction. Only the read paths that then add Sk should call this.
         [[nodiscard]] f32 reconstruct_entry(s32 source_node, s32 target_node,
                                             const f32 *coefficient_values) const;
+
+        // The correction Sk holds for one edge of one matrix, or zero when it holds none.
+        // Binary search inside the source row's slice.
+        [[nodiscard]] f32 sparse_delta_for(s64 matrix_index, s32 source_node, s64 edge_ordinal) const;
+
+        // Rebuilds one matrix's CSR from a full list of (edge_ordinal, delta) pairs, keeping
+        // the largest by magnitude when there are more than capacity. Keeping the largest is
+        // what makes truncation a bounded accuracy loss rather than an arbitrary one.
+        void rebuild_sparse_delta(s64 matrix_index, Vector<Pair<s64, f32>> &corrections);
 
         [[nodiscard]] f32 *coefficient_row(s64 matrix_index) const;
 
         // Builds U/V and both coefficient rows directly from the projection structure.
-        // Exact for population-to-population projections -- see the implementation for the
-        // argument. Returns the rank it used.
-        s64 fit_basis_from_projections(const Vector<f32> &weight, const Vector<s32> &delay_ticks);
+        // Exact for population-to-population projections, and free -- but only available
+        // when the runs fit in the lane budget. Returns true when it was used.
+        bool fit_basis_from_projections(const Vector<f32> &weight, const Vector<s32> &delay_ticks);
+
+        // Alternating least squares over the EDGE SUPPORT only, for a basis shared by every
+        // matrix with one coefficient row each. This is the general path: a projection onto
+        // a linear subspace that approximates the targets, with whatever it misses left for
+        // Sk to correct. targets_per_matrix[m][edge_ordinal] is what matrix m should read.
+        void fit_basis_to_targets(const Vector<Vector<f32>> &targets_per_matrix,
+                                  s32 sweep_count, f32 ridge_regularization);
+
+        // Per-edge target values implied by the projection runs, one row per matrix.
+        [[nodiscard]] Vector<Vector<f32>> targets_from_projections(
+                const Vector<f32> &weight, const Vector<s32> &delay_ticks) const;
+
+        // What every matrix currently reads, corrections included. This is what refit fits
+        // to: the basis is re-optimised to represent the values Sk is currently correcting
+        // it toward, which is how the corrections get absorbed.
+        [[nodiscard]] Vector<Vector<f32>> targets_from_current_values() const;
+
+        // Compares the basis against the per-edge targets and hands the difference to Sk.
+        // Returns how many corrections were kept. Indexed by edge ordinal so the initial
+        // fit and refit can both use it.
+        s64 store_residual_corrections(s64 matrix_index,
+                                       const Vector<f32> &targets_by_edge_ordinal);
 
         // Worst relative error over every edge, against the declared per-projection values.
         [[nodiscard]] f32 measure_worst_relative_weight_error(const Vector<f32> &weight) const;

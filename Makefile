@@ -28,7 +28,14 @@ TEST_DIR   := tests
 EX_DIR     := examples
 
 # Compiler flags
-CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -I$(INC_DIR)
+# -MMD -MP emits a .d file beside every .o listing the headers that object depends on,
+# which the include at the bottom of this file then feeds back to make.
+#
+# Without it, editing a header rebuilds nothing: every .o still looks newer than its .cpp.
+# That is not a stale-comment problem -- change a struct's layout and half the archive is
+# compiled against the old one, which links cleanly and then crashes at a vectorised load
+# somewhere unrelated. Cheap insurance against a very expensive afternoon.
+CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -MMD -MP -I$(INC_DIR)
 NVCCFLAGS  := -std=c++17 -O2 -I$(INC_DIR) --expt-relaxed-constexpr
 ARFLAGS    := rcs
 
@@ -321,3 +328,9 @@ compdb:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# ── Header dependencies ──────────────────────────────────────
+# One .d per .o, written by -MMD -MP above. `-include` rather than `include` so a clean
+# tree (where none exist yet) is not an error.
+DEPENDENCY_FILES := $(CORE_OBJS:.o=.d) $(NML_OBJS:.o=.d) $(METAL_OBJS:.o=.d) $(CUDA_OBJS:.o=.d)
+-include $(DEPENDENCY_FILES)

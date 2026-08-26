@@ -990,6 +990,32 @@ inline float spikecorec_reconstruct_edge(
     return dot_product;
 }
 
+// The correction the sparse delta holds for one edge, or zero. The basis is a lossy
+// projection and this is what the rank did not capture, so a read that skipped it would
+// disagree with the host's -- silently, and only for the edges that needed correcting.
+//
+// CSR over source rows: the row's slice is contiguous and sorted by ordinal, so this is a
+// binary search over a handful of entries rather than a scan.
+inline float spikecorec_sparse_delta(
+    const device int *row_start, const device long *entry_ordinal,
+    const device float *entry_value, int node_count, int matrix_index,
+    int source_node, long edge_ordinal
+) {
+    const int row_base = matrix_index * (node_count + 1);
+    int low = row_start[row_base + source_node];
+    int high = row_start[row_base + source_node + 1];
+
+    while (low < high) {
+        const int middle = low + (high - low) / 2;
+        if (entry_ordinal[middle] < edge_ordinal) low = middle + 1;
+        else high = middle;
+    }
+    if (low < row_start[row_base + source_node + 1] && entry_ordinal[low] == edge_ordinal) {
+        return entry_value[low];
+    }
+    return 0.0f;
+}
+
 // Which synapse prototype an edge uses, from the run table baked in below. Runs are
 // sorted and contiguous over the edge ordering, so this is the last run starting at or
 // below the ordinal. Prototype index deliberately does not come from the basis: it picks
@@ -1085,14 +1111,17 @@ kernel void master_step(
     const device long    *edge_row_offset           [[ buffer(24) ]],
     device   float       *synapse_arrivals          [[ buffer(25) ]],
     device   float       *synapse_state             [[ buffer(26) ]],
+    const device int     *sparse_delta_row_start    [[ buffer(27) ]],
+    const device long    *sparse_delta_edge_ordinal [[ buffer(28) ]],
+    const device float   *sparse_delta_value        [[ buffer(29) ]],
 )METAL";
 
 // Bound only when plasticity is on. A kernel that never stages a delta does not declare
 // the buffers to stage it into.
-const char *KERNEL_SIGNATURE_PLASTICITY = R"METAL(    device   long        *plasticity_edge_ordinals  [[ buffer(27) ]],
-    device   float       *plasticity_delta_values   [[ buffer(28) ]],
-    device   atomic_int  *plasticity_delta_count    [[ buffer(29) ]],
-    constant int         &plasticity_delta_capacity [[ buffer(30) ]],
+const char *KERNEL_SIGNATURE_PLASTICITY = R"METAL(    device   long        *pending_delta_edge_ordinal [[ buffer(30) ]],
+    device   float       *pending_delta_value        [[ buffer(31) ]],
+    device   atomic_int  *pending_delta_count        [[ buffer(32) ]],
+    constant int         &pending_delta_capacity     [[ buffer(33) ]],
 )METAL";
 
 const char *KERNEL_SIGNATURE_CLOSE = R"METAL(    uint thread_id [[ thread_position_in_grid ]]
@@ -1175,13 +1204,24 @@ const char *KERNEL_BETWEEN_CELL_AND_PROPAGATE = R"METAL(    }
         const long edge_ordinal = edge_row_offset[neuron_index] + slot;
         if (edge_ordinal >= edge_row_offset[neuron_index + 1]) break;
 
-        const float edge_weight = spikecorec_reconstruct_edge(
-            U, V, weight_coefficients, rank_float4_stride, neuron_index, target);
+        // Basis plus correction, both halves, exactly as the host computes it. Skipping the
+        // correction would disagree with get() only on the edges that needed one, which is
+        // the hardest kind of disagreement to notice.
+        const float edge_weight =
+            spikecorec_reconstruct_edge(U, V, weight_coefficients, rank_float4_stride,
+                                        neuron_index, target) +
+            spikecorec_sparse_delta(sparse_delta_row_start, sparse_delta_edge_ordinal,
+                                    sparse_delta_value, neuron_count, 0,
+                                    neuron_index, edge_ordinal);
 
         // Whole ticks, so rounding absorbs the reconstruction's error where the same error
         // in a weight would not be -- and one tick is the engine's own minimum latency.
-        int delay_ticks = (int)round(spikecorec_reconstruct_edge(
-            U, V, delay_coefficients, rank_float4_stride, neuron_index, target));
+        int delay_ticks = (int)round(
+            spikecorec_reconstruct_edge(U, V, delay_coefficients, rank_float4_stride,
+                                        neuron_index, target) +
+            spikecorec_sparse_delta(sparse_delta_row_start, sparse_delta_edge_ordinal,
+                                    sparse_delta_value, neuron_count, 1,
+                                    neuron_index, edge_ordinal));
         if (delay_ticks < 1) delay_ticks = 1;
 
         // Did this neuron spike exactly delay_ticks ago? The history ring is what makes

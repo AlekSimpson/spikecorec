@@ -208,19 +208,64 @@ TEST(WeightMatrix, nothing_is_sized_by_the_padded_neighbour_count) {
               (u64)(matrix.node_count + 1) * sizeof(s64));
 }
 
-// Plasticity off must cost nothing, not cost a branch.
-TEST(WeightMatrix, plasticity_buffers_are_absent_unless_asked_for) {
+// The correction layer is bounded by capacity, never by edge count. A matrix given no
+// capacity simply carries no corrections -- the basis is then the whole answer, accuracy
+// hit included.
+TEST(WeightMatrix, the_correction_layer_is_bounded_by_capacity) {
     WeightMatrix without(test_backend(), small_network());
-    EXPECT_EQ(without.plasticity_delta_capacity, 0);
-    EXPECT_TRUE(without.plasticity_edge_ordinals.is_empty());
-    EXPECT_TRUE(without.plasticity_delta_values.is_empty());
-    EXPECT_TRUE(without.plasticity_delta_count.is_empty());
+    EXPECT_EQ(without.sparse_delta_capacity, 0);
+    EXPECT_TRUE(without.sparse_delta_edge_ordinal.is_empty());
 
     WeightMatrix with(test_backend(), small_network(), -1, true, -1, 7, /*capacity=*/128);
-    EXPECT_EQ(with.plasticity_delta_capacity, 128);
-    EXPECT_FALSE(with.plasticity_edge_ordinals.is_empty());
-    EXPECT_FALSE(with.plasticity_delta_values.is_empty());
-    EXPECT_FALSE(with.plasticity_delta_count.is_empty());
+    EXPECT_EQ(with.sparse_delta_capacity, 128);
+    EXPECT_FALSE(with.sparse_delta_row_start.is_empty());
+    EXPECT_FALSE(with.sparse_delta_edge_ordinal.is_empty());
+
+    // Never sized by the edge count, however many edges there are.
+    EXPECT_EQ(with.sparse_delta_edge_ordinal.total_bytes,
+              (u64)WeightMatrix::MATRIX_COUNT * 128 * sizeof(s64));
+}
+
+// An update queues rather than moving U/V, and becomes visible to reads once merged. This
+// is the whole read-path contract: basis plus correction, never one or the other.
+TEST(WeightMatrix, a_queued_correction_changes_what_a_read_returns) {
+    WeightMatrix matrix(test_backend(), small_network(), -1, true, -1, 7, /*capacity=*/128);
+    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
+
+    ASSERT_FLOAT_EQ(matrix.get(0, 1), 0.25f);
+
+    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 0.5f);
+    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.75f);
+
+    // Only that edge moves. A correction is per-edge, and one that leaked into its
+    // neighbours would be the CSR row bounds being wrong.
+    EXPECT_FLOAT_EQ(matrix.get(0, 2), 1.75f);
+    EXPECT_FLOAT_EQ(matrix.get(1, 2), 0.001f);
+
+    // Corrections on the same edge accumulate rather than replacing.
+    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, -0.25f);
+    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.5f);
+}
+
+// refit re-optimises the basis toward the values the corrections point at, then drops the
+// corrections it has absorbed. The values a read returns must survive that unchanged --
+// that is the entire point of the loop.
+TEST(WeightMatrix, refit_absorbs_corrections_without_changing_what_reads_return) {
+    WeightMatrix matrix(test_backend(), small_network(), -1, true, -1, 7, /*capacity=*/128);
+    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
+
+    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 0.5f);
+    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 1, 2, 0.1f);
+
+    const f32 before_0_1 = matrix.get(0, 1);
+    const f32 before_0_2 = matrix.get(0, 2);
+    const f32 before_1_2 = matrix.get(1, 2);
+
+    matrix.refit();
+
+    EXPECT_NEAR(matrix.get(0, 1), before_0_1, 1e-3f);
+    EXPECT_NEAR(matrix.get(0, 2), before_0_2, 1e-3f);
+    EXPECT_NEAR(matrix.get(1, 2), before_1_2, 1e-3f);
 }
 
 // ── whole-network reads ───────────────────────────────────────────────────────────
