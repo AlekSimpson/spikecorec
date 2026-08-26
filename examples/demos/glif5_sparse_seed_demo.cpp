@@ -75,6 +75,5 @@ int main() {
     std::printf("  cells that fired anyway   %lld\n",
                 (long long)(result.participation * (f64)result.neuron_count));
 
-    release_gpu_resources();
     return 0;
 }

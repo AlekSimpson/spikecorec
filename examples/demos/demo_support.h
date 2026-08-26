@@ -111,9 +111,11 @@ inline void report_demo(const String &demo_name, const String &description,
 }
 
 // Called at the top of every demo's main().
+// The GPU backend is a member of each SpikeEngine now, constructed and released with it,
+// so there is no process-wide context to bring up here -- only the output directory the
+// demo is about to write into.
 inline void begin_demo() {
     std::filesystem::create_directories(demo_directory());
-    initialize_gpu_context();
 }
 
 } // namespace spikecorec::demos

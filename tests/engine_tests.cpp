@@ -753,25 +753,38 @@ TEST(SpikeEngine, connection_weights_and_delays_survive_the_weight_matrix_exactl
 
     SpikeEngine engine(lems_path);
 
-    // Exactly, not approximately: the default matrix's coefficient vector is pinned to
-    // zero, so an edge's weight is the stored value rather than a low-rank reconstruction
-    // near it. A weight that came back as 0.2497 would still look plausible in a plot.
+    // Each of these connections has its own (weight, delay) pair, so each is its own
+    // projection run and gets its own latent lane -- which the shared basis then
+    // reproduces exactly. A weight that came back as 0.2497 would still look plausible
+    // in a plot, so this asserts equality rather than closeness.
     EXPECT_FLOAT_EQ(engine.weights.get(0, 1), 0.25f);
     EXPECT_FLOAT_EQ(engine.weights.get(0, 2), 1.75f);
     EXPECT_FLOAT_EQ(engine.weights.get(1, 3), 0.001f);
 
+    // The engine's own measurement of the same thing, which is what decides whether a
+    // model loads at all. Exact here, and it has to be: the three runs have distinct
+    // targets, so no lane is nonzero at both endpoints of another run's edge.
+    EXPECT_FLOAT_EQ(engine.weights.measured_weight_fit_error, 0.0f);
+
+    // Delay round-trips exactly rather than to a tolerance. One tick out indexes the
+    // wrong row of the spike-history ring, which is a different simulation rather than a
+    // rounder one.
     EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 1), 10);
     EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 2), 20);
     EXPECT_EQ(engine.weights.get_edge_delay_ticks(1, 3), 30);
 
-    // Plane 0 of the per-edge family carries each edge's synapse prototype, and there is
-    // only one prototype in this model.
-    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, 0, 1), 0.0f);
-    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(0, 1, 3), 0.0f);
+    // The synapse prototype comes from the projection run table rather than the basis:
+    // it picks a switch case in the kernel, and control flow must not ride on a
+    // reconstruction. One prototype in this model, so every edge reports it.
+    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(0, 1), 0);
+    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(0, 2), 0);
+    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(1, 3), 0);
 
-    // alphaCurrentSynapse's OnStart sets both state variables to zero.
-    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(1, 0, 1), 0.0f);
-    EXPECT_FLOAT_EQ(engine.weights.get_edge_variable(2, 0, 1), 0.0f);
+    // A pair that is not an edge has no ordinal and therefore no prototype.
+    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(3, 0), -1);
+
+    // Synapse state is deliberately absent from the edge store: it aggregates into one
+    // accumulator per (target, prototype), so there is nothing per-edge left to read.
 }
 
 TEST(SpikeEngine, declared_output_files_are_written_with_the_shape_the_model_asked_for) {
