@@ -4,229 +4,542 @@
 
 #ifdef SPIKECOREC_CUDA
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <nvrtc.h>
-#include <stdexcept>
-#include <string>
 #elif defined(SPIKECOREC_METAL)
 #include <Metal/Metal.hpp>
 #include <dlfcn.h>
-#include <stdexcept>
 #endif
+
+#include <algorithm>
+#include <stdexcept>
+#include <string>
 
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/log.h"
 #include "spikecorec/core/types.h"
 
 using namespace std;
-using namespace spikecorec::log;
 
-namespace spikecorec::backend {
+namespace spikecorec {
 
-/// mac code
+namespace {
+
+// The aligned start of the next range in a chunk. Every partition is pushed to at least
+// PARTITION_ALIGNMENT so a `constant` kernel binding and a float4 read are both legal at
+// its offset, whatever the datatype asks for.
+u64 aligned_partition_offset(u64 cursor, u64 alignment) {
+    return (cursor + alignment - 1) & ~(alignment - 1);
+}
+
+} // namespace
+
+// ── Metal ─────────────────────────────────────────────────────────────────────────
+
+#ifdef SPIKECOREC_METAL
+
+namespace {
+
+// default.metallib is built by the Makefile and placed alongside the build artifacts. A
+// command line tool has no app bundle for newDefaultLibrary() to search, so locate the
+// metallib next to the loaded binary (via dladdr) and load it explicitly.
+MTL::Library *load_default_metal_library(MTL::Device *device) {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void *>(&load_default_metal_library), &info) && info.dli_fname) {
+        String binary_path(info.dli_fname);
+        const usize last_slash = binary_path.find_last_of('/');
+        const String directory = (last_slash == String::npos) ? "." : binary_path.substr(0, last_slash);
+        const String metallib_path = directory + "/default.metallib";
+
+        NS::String *path_string = NS::String::string(metallib_path.c_str(), NS::UTF8StringEncoding);
+        NS::URL *url = NS::URL::fileURLWithPath(path_string);
+        NS::Error *error = nullptr;
+        if (MTL::Library *library = device->newLibrary(url, &error)) return library;
+    }
+    return device->newDefaultLibrary();
+}
+
+String describe_metal_error(NS::Error *error) {
+    return error ? String(error->localizedDescription()->utf8String()) : String("unknown error");
+}
+
+} // namespace
+
+MetalBackend::MetalBackend(s64 threads_per_block_argument) {
+    // Assigned rather than initialized in the member-init list: threads_per_block belongs
+    // to AbstractBackend, and a derived constructor cannot name a base's member there.
+    threads_per_block = threads_per_block_argument;
+
+    device = MTL::CreateSystemDefaultDevice();
+    if (device == nullptr) {
+        log::throw_runtime_error(log::logger(),
+                "MetalBackend: no Metal device is available on this system");
+    }
+    queue = device->newCommandQueue();
+    default_library = load_default_metal_library(device);
+
+    log::logger().debug("MetalBackend: device ready, threads_per_block={}", threads_per_block);
+}
+
+MetalBackend::~MetalBackend() {
+    deallocate_all();
+    if (default_library != nullptr) default_library->release();
+    if (queue != nullptr) queue->release();
+    if (device != nullptr) device->release();
+}
 
 MetalBackend &MetalBackend::partition(
     u64 bytes, EngineDatatype datatype, Vector<EnginePointer> &partitions
 ) {
+    // A finished allocate() means this call opens a FRESH chunk rather than trying to
+    // extend a slab that already exists. That is what makes the pattern reusable:
+    // SpikeEngine, WeightMatrix and K2Tree each run their own partition -> allocate round
+    // against the same backend, and each gets its own slab.
     if (memory_has_been_allocated) {
-        logger().warn(
-            "Partitioning data when memory has already been allocated.");
-        return this;
+        memory_has_been_allocated = false;
+        last_offset = 0;
+        max_bytes = 0;
     }
 
-    EnginePointer new_partition;
-    new_partition.base_pointer = base_memory_pointer->get_contents();
-    new_partition.offset = (partitions.empty())
-        ? 0
-        : partitions.back().offset + partitions.back().total_bytes;
-    new_partition.total_bytes = bytes;
-    new_partition.alignment = type_alignments[datatype];
-    partitions.push_back(new_partition);
-    max_bytes += bytes;
-    return this;
-    
+    // A zero-byte request is legal -- a cell type with no parameters, a graph with no
+    // edges, a disabled optional buffer -- and yields an empty handle rather than a range
+    // nothing may be written to.
+    if (bytes == 0) {
+        partitions.push_back(EnginePointer{});
+        return *this;
+    }
+
+    const u64 alignment = std::max<u64>(type_alignments[datatype], PARTITION_ALIGNMENT);
+    const u64 aligned_offset = aligned_partition_offset((u64)last_offset, alignment);
+
+    // base_pointer stays null until allocate() runs: the slab does not exist yet, and
+    // reading it here is what made every handle point at uninitialized memory.
+    partitions.push_back(EnginePointer{nullptr, (s64)aligned_offset, bytes, alignment, false});
+
+    last_offset = (s64)(aligned_offset + bytes);
+    max_bytes = (u64)last_offset;
+    return *this;
 }
 
-void *MetalBackend::allocate() {
-    if (memory_has_been_allocated) return nullptr;
+EnginePointer MetalBackend::allocate(Vector<EnginePointer> &partitions) {
+    if (memory_has_been_allocated) return base_pointer;
 
     memory_has_been_allocated = true;
-    base_memory_pointer = device->newBuffer(
-        max_bytes, 
-        MTL::ResourceStorageModeShared
-    );
+    if (max_bytes == 0) {
+        base_pointer = EnginePointer{};
+        return base_pointer;
+    }
 
-    return EnginePointer{base_memory_pointer->get_contents(), 0, max_bytes, 8};
+    MTL::Buffer *slab = device->newBuffer(max_bytes, MTL::ResourceStorageModeShared);
+
+    // newBuffer returns null when the device cannot satisfy the request, and every caller
+    // writes through get_contents() immediately -- an unchecked null surfaces as a
+    // segfault inside a memset rather than as an allocation failure. Exhaustion is the
+    // expected failure mode at the network sizes this engine targets.
+    if (slab == nullptr) {
+        log::throw_runtime_error(log::logger(),
+                "MetalBackend::allocate: the GPU could not allocate " + to_string(max_bytes) +
+                " bytes (" + to_string(max_bytes / (1024 * 1024)) + " MiB) — out of device memory");
+    }
+    slabs.push_back(slab);
+
+    // Only handles from THIS chunk are still null, so a caller reusing one vector across
+    // chunks does not get its earlier handles re-aimed at the new slab.
+    for (EnginePointer &partition_handle : partitions) {
+        if (partition_handle.base_pointer != nullptr || partition_handle.total_bytes == 0) continue;
+        partition_handle.base_pointer = slab;
+    }
+
+    log::logger().debug("MetalBackend::allocate: slab of {} bytes, {} chunks live",
+                        max_bytes, slabs.size());
+
+    base_pointer = EnginePointer{slab, 0, max_bytes, PARTITION_ALIGNMENT, false};
+    return base_pointer;
+}
+
+void MetalBackend::deallocate_slab(const EnginePointer &slab) {
+    if (slab.base_pointer == nullptr || slab.inline_scalar) return;
+
+    MTL::Buffer *buffer = static_cast<MTL::Buffer *>(slab.base_pointer);
+    const auto entry = std::find(slabs.begin(), slabs.end(), buffer);
+    if (entry == slabs.end()) return;
+
+    slabs.erase(entry);
+    buffer->release();
 }
 
 void MetalBackend::deallocate_all() {
-    if (base_memory_pointer != nullptr) {
-        base_memory_pointer->release();
-    }
+    for (MTL::Buffer *slab : slabs) slab->release();
+    slabs.clear();
+    base_pointer = EnginePointer{};
     memory_has_been_allocated = false;
+    last_offset = 0;
+    max_bytes = 0;
 }
 
-EngineFunction MetalBackend::create_function(
+Optional<EngineFunction> MetalBackend::create_function(
     const String &name, const String &source_code
 ) {
-    auto swift_string = [](const String &text) {
-        return NS::String::string(text, NS::UTF8StringEncoding);
-    };
+    log::logger().debug("create_function: name={} source_bytes={}", name, source_code.size());
 
     NS::Error *error = nullptr;
-
     MTL::Library *library = device->newLibrary(
-            swift_string(source_code), nullptr, &error);
+            NS::String::string(source_code.c_str(), NS::UTF8StringEncoding), nullptr, &error);
+    if (library == nullptr) {
+        log::logger().critical("create_function: newLibrary failed: {}", describe_metal_error(error));
+        return std::nullopt;
+    }
 
-    MTL::Function *function = library->newFunction(swift_string(name));
-    return EngineFunction{function};
+    MTL::Function *function = library->newFunction(
+            NS::String::string(name.c_str(), NS::UTF8StringEncoding));
+    library->release();
+    if (function == nullptr) {
+        log::logger().critical("create_function: '{}' not found in the compiled library", name);
+        return std::nullopt;
+    }
+
+    error = nullptr;
+    MTL::ComputePipelineState *pipeline = device->newComputePipelineState(function, &error);
+    function->release();
+    if (pipeline == nullptr) {
+        log::logger().critical("create_function: newComputePipelineState failed: {}",
+                               describe_metal_error(error));
+        return std::nullopt;
+    }
+
+    return EngineFunction{pipeline};
+}
+
+Optional<EngineFunction> MetalBackend::load_precompiled_function(const String &name) {
+    if (default_library == nullptr) {
+        log::logger().critical("load_precompiled_function: no default.metallib was loaded");
+        return std::nullopt;
+    }
+
+    MTL::Function *function = default_library->newFunction(
+            NS::String::string(name.c_str(), NS::UTF8StringEncoding));
+    if (function == nullptr) {
+        log::logger().critical("load_precompiled_function: '{}' not found in default.metallib", name);
+        return std::nullopt;
+    }
+
+    NS::Error *error = nullptr;
+    MTL::ComputePipelineState *pipeline = device->newComputePipelineState(function, &error);
+    function->release();
+    if (pipeline == nullptr) {
+        log::logger().critical("load_precompiled_function: newComputePipelineState failed: {}",
+                               describe_metal_error(error));
+        return std::nullopt;
+    }
+
+    return EngineFunction{pipeline};
+}
+
+void MetalBackend::release_function(EngineFunction &function) {
+    if (function.pipeline_state == nullptr) return;
+    function.pipeline_state->release();
+    function.pipeline_state = nullptr;
 }
 
 bool MetalBackend::run_function(
-    MTL::Function *function, Vector<EnginePointer> &parameters, s64 job_count
+    EngineFunction &function, Vector<EnginePointer> &parameters, s64 job_count
 ) {
-    NS::Error* error = nullptr;
-
-    MTL::CommandQueue *queue = device->newCommandQueue();
-    MTL::CommandBuffer *command_buffer = queue->commandBuffer();
-    MTL::ComputeCommandEncoder *encoder = command_buffer->computeCommandEncoder();
-
-    MTL::ComputePipelineState *pipeline =
-        device->newComputePipelineState(function, &error);
-    
-    encoder->setComputePipelineState(pipeline);
-
-    s64 index = 0;
-    for (EnginePointer parameter: parameters) {
-        encoder->setBuffer(parameter.base_pointer, parameter.offset, index);
-        index++;
-    }
-
-    encoder->dispatchThreads(MTL::Size(element_count, 1, 1),
-                             MTL::Size(threads_per_group, 1, 1));
-    encoder->endEncoding();
-    
-    command_buffer->commit();
-    command_buffer->waitUntilCompleted();
-
-    if (error == nullptr) {
-        // TODO: do error logging here and stuff
+    if (function.pipeline_state == nullptr) {
+        log::logger().critical("run_function: the function has no pipeline state");
         return false;
     }
 
+    MTL::CommandBuffer *command_buffer = queue->commandBuffer();
+    MTL::ComputeCommandEncoder *encoder = command_buffer->computeCommandEncoder();
+    encoder->setComputePipelineState(function.pipeline_state);
+
+    for (usize index = 0; index < parameters.size(); index += 1) {
+        const EnginePointer &parameter = parameters[index];
+
+        if (parameter.inline_scalar) {
+            // `constant T &x [[buffer(N)]]` accepts inline constant data as readily as a
+            // buffer binding, which is what lets a scalar travel as an EnginePointer.
+            encoder->setBytes(parameter.base_pointer, parameter.total_bytes, index);
+        } else {
+            encoder->setBuffer(static_cast<MTL::Buffer *>(parameter.base_pointer),
+                               (NS::UInteger)parameter.offset, index);
+        }
+    }
+
+    // dispatchThreads takes TOTAL threads, not threadgroups -- job_count is the element
+    // count, and Metal handles the non-multiple tail itself.
+    const s64 thread_count = std::max<s64>(job_count, 1);
+    const s64 group_width = std::min<s64>(threads_per_block, thread_count);
+    encoder->dispatchThreads(MTL::Size::Make((NS::UInteger)thread_count, 1, 1),
+                             MTL::Size::Make((NS::UInteger)group_width, 1, 1));
+    encoder->endEncoding();
+    encoder->release();
+
+    command_buffer->commit();
+    command_buffer->waitUntilCompleted();
+
+    if (command_buffer->status() == MTL::CommandBufferStatusError) {
+        const String description = describe_metal_error(command_buffer->error());
+        log::logger().critical("run_function: command buffer failed: {} (job_count={}, parameters={})",
+                               description, job_count, parameters.size());
+        command_buffer->release();
+        return false;
+    }
+
+    log::logger().trace("run_function: dispatched {} threads in groups of {}, {} parameters",
+                        thread_count, group_width, parameters.size());
+    command_buffer->release();
     return true;
 }
 
-/// cuda code
+#endif // SPIKECOREC_METAL
+
+// ── CUDA ──────────────────────────────────────────────────────────────────────────
+
+#ifdef SPIKECOREC_CUDA
+
+namespace {
+
+String describe_cuda_driver_error(CUresult result) {
+    const char *error_name = nullptr;
+    const char *error_string = nullptr;
+    cuGetErrorName(result, &error_name);
+    cuGetErrorString(result, &error_string);
+    return String(error_name ? error_name : "unknown") + " (" +
+           String(error_string ? error_string : "unknown") + ")";
+}
+
+} // namespace
+
+CudaBackend::CudaBackend(s64 threads_per_block_argument) {
+    threads_per_block = threads_per_block_argument;
+
+    cuInit(0); // once per process, flags must be 0
+    cuDeviceGet(&cuda_gpu_device, 0); // 0 = device ordinal
+    cuDevicePrimaryCtxRetain(&cuda_context, cuda_gpu_device);
+    cuCtxSetCurrent(cuda_context);
+
+    log::logger().debug("CudaBackend: context ready, threads_per_block={}", threads_per_block);
+}
+
+CudaBackend::~CudaBackend() {
+    deallocate_all();
+    cuDevicePrimaryCtxRelease(cuda_gpu_device);
+}
 
 CudaBackend &CudaBackend::partition(
     u64 bytes, EngineDatatype datatype, Vector<EnginePointer> &partitions
 ) {
+    // See MetalBackend::partition -- same contract, same reset-on-fresh-chunk rule.
     if (memory_has_been_allocated) {
-        logger().warn(
-            "Partitioning data when memory has already been allocated.");
-        return this;
+        memory_has_been_allocated = false;
+        last_offset = 0;
+        max_bytes = 0;
     }
 
-    EnginePointer new_partition;
-    new_partition.offset = (partitions.empty())
-        ? 0
-        : partitions.back().offset + partitions.back().total_bytes;
-    new_partitions.total_bytes = bytes;
-    new_partitions.alignment = type_alignments[datatype];
-    new_partitions.base_pointer = base_memory_pointer;
+    if (bytes == 0) {
+        partitions.push_back(EnginePointer{});
+        return *this;
+    }
 
-    return this;
+    const u64 alignment = std::max<u64>(type_alignments[datatype], PARTITION_ALIGNMENT);
+    const u64 aligned_offset = aligned_partition_offset((u64)last_offset, alignment);
+
+    partitions.push_back(EnginePointer{nullptr, (s64)aligned_offset, bytes, alignment, false});
+
+    last_offset = (s64)(aligned_offset + bytes);
+    max_bytes = (u64)last_offset;
+    return *this;
 }
 
-EnginePointer CudaBackend::allocate() {
-    if (memory_has_been_allocated) return nullptr;
+EnginePointer CudaBackend::allocate(Vector<EnginePointer> &partitions) {
+    if (memory_has_been_allocated) return base_pointer;
 
     memory_has_been_allocated = true;
-    cudaMallocManaged(&base_memory_pointer, max_bytes);
-    return EnginePointer{base_memory_pointer, 0, max_bytes, 8};
+    if (max_bytes == 0) {
+        base_pointer = EnginePointer{};
+        return base_pointer;
+    }
+
+    void *slab = nullptr;
+    const cudaError_t allocation_result = cudaMallocManaged(&slab, max_bytes);
+    if (allocation_result != cudaSuccess || slab == nullptr) {
+        log::throw_runtime_error(log::logger(),
+                "CudaBackend::allocate: cudaMallocManaged failed for " + to_string(max_bytes) +
+                " bytes: " + cudaGetErrorString(allocation_result));
+    }
+    slabs.push_back(slab);
+
+    for (EnginePointer &partition_handle : partitions) {
+        if (partition_handle.base_pointer != nullptr || partition_handle.total_bytes == 0) continue;
+        partition_handle.base_pointer = slab;
+    }
+
+    log::logger().debug("CudaBackend::allocate: slab of {} bytes, {} chunks live",
+                        max_bytes, slabs.size());
+
+    base_pointer = EnginePointer{slab, 0, max_bytes, PARTITION_ALIGNMENT, false};
+    return base_pointer;
+}
+
+void CudaBackend::deallocate_slab(const EnginePointer &slab) {
+    if (slab.base_pointer == nullptr || slab.inline_scalar) return;
+
+    const auto entry = std::find(slabs.begin(), slabs.end(), slab.base_pointer);
+    if (entry == slabs.end()) return;
+
+    slabs.erase(entry);
+    cudaFree(slab.base_pointer);
 }
 
 void CudaBackend::deallocate_all() {
-    if (base_memory_pointer != nullptr) {
-        cudaFree(base_memory_pointer);
-    }
+    for (void *slab : slabs) cudaFree(slab);
+    slabs.clear();
+    base_pointer = EnginePointer{};
     memory_has_been_allocated = false;
+    last_offset = 0;
+    max_bytes = 0;
 }
 
-EngineFunction CudaBackend::create_function(
+Optional<EngineFunction> CudaBackend::create_function(
     const String &name, const String &source_code
 ) {
-    nvrtcProgram program;
-    nvrtcCreateProgram(&program, source_code, combine(name, ".cu"), 0, nullptr, nullptr);
-    
+    log::logger().debug("create_function: name={} source_bytes={}", name, source_code.size());
+
+    const String program_name = name + ".cu";
+
+    nvrtcProgram program{};
+    nvrtcCreateProgram(&program, source_code.c_str(), program_name.c_str(), 0, nullptr, nullptr);
+
     // TODO: const char *options[] = { "--gpu-architecture=compute_87" };   // Orin
-    const char *options[] = {};
-    nvrtcResult compile_result = nvrtcCompileProgram(program, 1, options);
-    
-    size_t log_size;
-    nvrtcGetProgramLogSize(program, &log_size);
-    if (log_size > 1) {
-        Vector<char> log(log_size);
-        nvrtcGetProgramLog(program, log.data());
-        logger().error("{}", log.data());
+    // Zero options, and an option COUNT of zero to match -- claiming one against an empty
+    // array is undefined behaviour.
+    const nvrtcResult compile_result = nvrtcCompileProgram(program, 0, nullptr);
+
+    size_t compile_log_size = 0;
+    nvrtcGetProgramLogSize(program, &compile_log_size);
+    if (compile_log_size > 1) {
+        Vector<char> compile_log(compile_log_size);
+        nvrtcGetProgramLog(program, compile_log.data());
+        log::logger().error("create_function: nvrtc log: {}", compile_log.data());
     }
-    if (compile_result != NVRTC_SUCCESS) { 
-        return EngineFunction{};
+    if (compile_result != NVRTC_SUCCESS) {
+        log::logger().critical("create_function: nvrtcCompileProgram failed: {}",
+                               nvrtcGetErrorString(compile_result));
+        nvrtcDestroyProgram(&program);
+        return std::nullopt;
     }
-    
-    size_t parallel_thread_executor_size;
+
+    size_t parallel_thread_executor_size = 0;
     nvrtcGetPTXSize(program, &parallel_thread_executor_size);
-    Vector<u8> parallel_thread_executor(parallel_thread_executor_size);
+    Vector<char> parallel_thread_executor(parallel_thread_executor_size);
     nvrtcGetPTX(program, parallel_thread_executor.data());
     nvrtcDestroyProgram(&program);
-    
-    CUmodule module;
-    cuModuleLoadData(&module, parallel_thread_executor.data());
-    
-    CUfunction kernel;
-    cuModuleGetFunction(&kernel, module, name);
 
-    return EngineFunction{kernel};
+    EngineFunction function{};
+
+    const CUresult module_result =
+            cuModuleLoadData(&function.cuda_module, parallel_thread_executor.data());
+    if (module_result != CUDA_SUCCESS) {
+        log::logger().critical("create_function: cuModuleLoadData failed: {}",
+                               describe_cuda_driver_error(module_result));
+        return std::nullopt;
+    }
+
+    const CUresult function_result =
+            cuModuleGetFunction(&function.cuda_function, function.cuda_module, name.c_str());
+    if (function_result != CUDA_SUCCESS) {
+        log::logger().critical("create_function: '{}' not found in the compiled module: {}",
+                               name, describe_cuda_driver_error(function_result));
+        cuModuleUnload(function.cuda_module);
+        return std::nullopt;
+    }
+
+    return function;
+}
+
+Optional<EngineFunction> CudaBackend::load_precompiled_function(const String &name) {
+    // CUDA compiles its kernels at build time into the static library rather than into a
+    // loadable module, so there is nothing to look up by name here. The CUDA counterparts
+    // of the precompiled Metal shaders are called directly.
+    log::logger().critical("load_precompiled_function: '{}' -- the CUDA backend has no "
+                           "runtime-loadable precompiled module", name);
+    return std::nullopt;
+}
+
+void CudaBackend::release_function(EngineFunction &function) {
+    if (function.cuda_module == nullptr) return;
+    cuModuleUnload(function.cuda_module);
+    function.cuda_module = nullptr;
+    function.cuda_function = nullptr;
+}
+
+void CudaBackend::advise_read_mostly(const EnginePointer &range, u64 byte_count) {
+    if (range.is_empty() || byte_count == 0) return;
+    cudaMemAdvise(range.get_contents(), byte_count, cudaMemAdviseSetReadMostly, 0);
+}
+
+void CudaBackend::prefetch_to_gpu(const EnginePointer &range, u64 byte_count) {
+    if (range.is_empty() || byte_count == 0) return;
+    cudaMemPrefetchAsync(range.get_contents(), byte_count, 0);
+}
+
+void CudaBackend::prefetch_to_cpu(const EnginePointer &range, u64 byte_count) {
+    if (range.is_empty() || byte_count == 0) return;
+    cudaMemPrefetchAsync(range.get_contents(), byte_count, cudaCpuDeviceId);
 }
 
 bool CudaBackend::run_function(
-    CUfuntion &function, Vector<EnginePointer> &parameters, s32 job_count
+    EngineFunction &function, Vector<EnginePointer> &parameters, s64 job_count
 ) {
-    s64 block_count = (job_count + threads_per_block - 1) / threads_per_block;
+    const s64 block_count = (job_count + threads_per_block - 1) / threads_per_block;
 
-    void **parameter_pointers = new void*[parameters.size()];
-    void **parameters_ = new void*[parameters.size() + 1];
-    size_t index = 0;
-    for (EnginePointer parameter: parameters) {
-        u8 *base = static_cast<u8 *>(parameter.base_pointer);
-        parameter_pointers[index] = base + parameter.offset;
-        parameters[index] = &parameter_pointers[index];
-        index++;
+    // cuLaunchKernel takes pointers TO each argument's value. For a slab range the value
+    // is the device address, so it needs a stable cell to point at; for an inline scalar
+    // the caller's own storage already is that cell.
+    Vector<void *> argument_values(parameters.size(), nullptr);
+    Vector<void *> argument_pointers(parameters.size(), nullptr);
+
+    for (usize index = 0; index < parameters.size(); index += 1) {
+        const EnginePointer &parameter = parameters[index];
+        if (parameter.inline_scalar) {
+            argument_pointers[index] = parameter.base_pointer;
+        } else {
+            argument_values[index] = parameter.get_contents();
+            argument_pointers[index] = &argument_values[index];
+        }
     }
 
-    parameters_[parameters.size()] = &job_count;
-    
-    constexpr s32 USE_DYNAMIC_SHARED_MEMORY = 0;
-    CUresult launch_result = cuLaunchKernel(
-        function,
-        block_count, 1, 1,         // grid
-        threads_per_block, 1, 1,   // block
-        USE_DYNAMIC_SHARED_MEMORY, // dynamic shared memory
+    constexpr u32 USE_DYNAMIC_SHARED_MEMORY = 0;
+    const CUresult launch_result = cuLaunchKernel(
+        function.cuda_function,
+        (u32)block_count, 1, 1,       // grid
+        (u32)threads_per_block, 1, 1, // block
+        USE_DYNAMIC_SHARED_MEMORY,
         nullptr,
-        parameters_, nullptr
+        argument_pointers.data(), nullptr
     );
-    
-    cudaError_t execution_result = cudaDeviceSynchronize();
 
-    delete[] parameter_pointers;
-    delete[] parameters_;
+    if (launch_result != CUDA_SUCCESS) {
+        log::logger().critical("run_function: cuLaunchKernel failed: {} "
+                               "-- grid={} block={} job_count={} parameters={}",
+                               describe_cuda_driver_error(launch_result),
+                               block_count, threads_per_block, job_count, parameters.size());
+        return false;
+    }
 
-    // TODO: add logging around the launch result for both error and success scenarios
-    // return launch_result;
+    const cudaError_t execution_result = cudaDeviceSynchronize();
+    if (execution_result != cudaSuccess) {
+        log::logger().critical("run_function: cudaDeviceSynchronize failed after launch: {}",
+                               cudaGetErrorString(execution_result));
+        return false;
+    }
 
+    log::logger().trace("run_function: launched grid={} block={} job_count={} parameters={}",
+                        block_count, threads_per_block, job_count, parameters.size());
     return true;
 }
 
-
+#endif // SPIKECOREC_CUDA
 
 } // namespace spikecorec

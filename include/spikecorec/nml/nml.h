@@ -479,7 +479,7 @@ struct NML_ParseResult {
 // Projection of neurons' outgoing edges into the plain source -> targets form WeightMatrix
 // consumes. Derived on demand rather than stored, so there is one edge list to keep
 // correct rather than two that can disagree.
-Vector<Vector<s64>> build_adjacency_list(const NML_ParseResult &parse_result);
+Vector<Vector<s32>> build_adjacency_list(const NML_ParseResult &parse_result);
 
 struct NML_Parser {
     UnorderedMap<String, ComponentType> declared_component_types;

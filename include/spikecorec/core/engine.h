@@ -21,7 +21,10 @@ using namespace spikecorec::nml;
 
 namespace spikecorec {
 
-    // constexpr s64 NEVER_SPIKED_TICK = -((s64)1 << 32);
+    // last_spiked holds this for a neuron that has never fired. Negative rather than a
+    // large negative magic number: the refractory gate branches on the sign, so "never
+    // fired" is a state rather than "fired so long ago the arithmetic works out".
+    constexpr s64 NEVER_SPIKED_TICK = -1;
 
     // One spike, as the model asked for it to be recorded.
     struct RecordedSpike {
@@ -53,10 +56,37 @@ namespace spikecorec {
         // latency exactly one tick rather than one-or-two depending on thread order.
         EnginePointer network_inputs;     // [2][total_neuron_count]
 
+        // ── aggregated synapse state ──────────────────────────────────────────────
+        // Per-edge synapse state does not exist. Every Phase-1 synapse has linear state
+        // dynamics, per-prototype parameters, and a current linear in that state, with
+        // `weight` its only per-edge quantity and entering the arrival increment linearly.
+        // So the sum of a target's incoming synapse states obeys the same equation each
+        // term does, and one accumulator per (target, prototype) reproduces the per-edge
+        // computation exactly rather than approximately.
+        //
+        // That is worth roughly 400 MB per state variable at a million neurons -- and it
+        // is faster besides: an edge now touches memory only when a spike actually
+        // arrives, instead of loading and storing its state on every tick.
+        //
+        // Arrivals are double-buffered by tick parity for the same reason network_inputs
+        // is: scatters land in the next row while the target drains the current one.
+        EnginePointer synapse_arrivals;   // [2][prototype_count][total_neuron_count]
+        EnginePointer synapse_state;      // [prototype_count][state_count][total_neuron_count]
+
+        // Bound wherever the kernel declares a per-edge buffer the model has no plane for.
+        // A model with no connections registers none of them, and there is no way to bind
+        // "nothing" to a `device float *` a kernel declares. One float is enough: the
+        // kernel never reads it, because a neuron with no adjacency row leaves the
+        // propagate walk before its first load.
+        EnginePointer empty_edge_plane;
+
+        // The whole-chunk handle for everything above, released at shutdown.
+        EnginePointer model_slab;
+
         // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
         // asking whether the source spiked `delay` ticks ago, so every spike in flight is
         // remembered, not just the most recent one.
-        // GpuPointer<void> spike_history;
+        EnginePointer spike_history;
         EnginePointer last_spiked;        // [total_neuron_count]
 
         // Host-side stimulus, applied before each dispatch.
@@ -97,8 +127,8 @@ namespace spikecorec {
         // model's own OutputFiles because LEMS has no way to ask for "every neuron, every
         // Nth tick", and pretending one of its elements meant that would be inventing
         // semantics the format does not have.
-        // std::unique_ptr<SimulationRecorder> membrane_video_recorder;
-        // s64 membrane_video_frame_stride = 1;
+        std::unique_ptr<SimulationRecorder> membrane_video_recorder;
+        s64 membrane_video_frame_stride = 1;
         // Where each neuron's `v` sits in cell_state, precomputed so a frame is a gather
         // rather than a per-neuron name lookup.
         Vector<s64> membrane_offset_per_neuron;
@@ -166,7 +196,15 @@ namespace spikecorec {
         void shutdown();
 
     private:
+        // Carves every model buffer out of one slab. Runs after the layout is known,
+        // because that is what sizes them.
         void allocate_model_buffers();
+
+        // Zeroes and seeds what allocate_model_buffers only reserved. Separate because a
+        // slab is uninitialized memory and every one of these is read before it is
+        // written on the first tick.
+        void initialize_model_buffers();
+
         void initialize_cell_state();
         void build_weight_matrix();
         void collect_stimulus();
@@ -181,7 +219,9 @@ namespace spikecorec {
 
         void apply_stimulus(s64 tick);
 
-        void *resolve_edge_plane(s64 matrix_index);
+        // `plane`, or empty_edge_plane when the model has no such buffer.
+        [[nodiscard]] EnginePointer resolve_edge_plane(const EnginePointer &plane) const;
+
 
         // The current one event of a spike train injects when the model names no
         // amplitude: enough charge, in a single tick, to carry this neuron from where it

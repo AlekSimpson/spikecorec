@@ -56,8 +56,8 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
                          f64 connection_delay_seconds)
     : logger(log::make_logger()) {
 
-    if (!gpu_context_is_initialized()) initialize_gpu_context();
-
+    // The backend is a member, constructed with this engine: there is no process-global
+    // context to initialize and nothing to check before allocating.
     NML_Parser parser;
     if (!parser.validate_against_schema(lems_input_file)) {
         log::throw_runtime_error(*logger,
@@ -90,18 +90,22 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
                 "(parsed " + to_string(network_details.step_dt) + " s)");
     }
 
-    block_count = (s32)((total_neuron_count + thread_count_per_block - 1) /
-                        thread_count_per_block);
-
     allocate_model_buffers();
+    initialize_model_buffers();
     initialize_cell_state();
     build_weight_matrix();
     collect_stimulus();
 
-    String master_kernel_source = generate_master_kernel(network_details, layout);
-    logger->debug("SpikeEngine: generated master kernel, bytes: {}\n",
-                  master_kernel_source.size());
-    kernel_function = gpu.create_function("master_step", master_kernel_source);
+    const String master_kernel_source = generate_master_kernel(network_details, layout);
+    logger->debug("SpikeEngine: generated master kernel, {} bytes", master_kernel_source.size());
+
+    Optional<EngineFunction> compiled = gpu.create_function("master_step", master_kernel_source);
+    if (!compiled.has_value()) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: the generated master kernel failed to compile — see the log above "
+                "for the compiler's own diagnostic");
+    }
+    kernel_function = *compiled;
 
     spike_counts_per_neuron.assign((usize)total_neuron_count, 0);
 
@@ -123,36 +127,96 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
 }
 
 void SpikeEngine::allocate_model_buffers() {
-    const u64 gpu_bytes =
-            aligned_byte_count(sizeof(f32), layout.cell_state_length) +
-            aligned_byte_count(sizeof(f32), layout.cell_parameter_length) +
-            aligned_byte_count(sizeof(f32), layout.synapse_parameter_length) +
-            aligned_byte_count(sizeof(f32), 2 * total_neuron_count) +
-            aligned_byte_count(sizeof(u8), layout.spike_history_length * total_neuron_count) +
-            aligned_byte_count(sizeof(s64), total_neuron_count) +
-            aligned_byte_count(sizeof(f32), 1);
+    const s64 prototype_count = (s64)network_details.synapse_prototypes.size();
+    const s64 synapse_state_count = layout.widest_synapse_state_count;
 
-    allocator = EngineAllocator(0, gpu_bytes);
+    Vector<EnginePointer> data_partitions;
+    gpu.partition(sizeof(f32) * layout.cell_state_length, EngineDatatype::FLOAT32, data_partitions)
+       .partition(sizeof(f32) * layout.cell_parameter_length, EngineDatatype::FLOAT32, data_partitions)
+       .partition(sizeof(f32) * layout.synapse_parameter_length, EngineDatatype::FLOAT32, data_partitions)
+       .partition(sizeof(f32) * 2 * total_neuron_count, EngineDatatype::FLOAT32, data_partitions)
+       .partition(sizeof(u8) * layout.spike_history_length * total_neuron_count,
+                  EngineDatatype::UNSIGNED8, data_partitions)
+       .partition(sizeof(s64) * total_neuron_count, EngineDatatype::SIGNED64, data_partitions)
+       // One accumulator per (tick parity, prototype, neuron) and one state per
+       // (prototype, state variable, neuron) -- both independent of edge count, which is
+       // the whole point of aggregating.
+       .partition(sizeof(f32) * 2 * prototype_count * total_neuron_count,
+                  EngineDatatype::FLOAT32, data_partitions)
+       .partition(sizeof(f32) * prototype_count * synapse_state_count * total_neuron_count,
+                  EngineDatatype::FLOAT32, data_partitions)
+       .partition(sizeof(f32), EngineDatatype::FLOAT32, data_partitions);
 
-    cell_state         = allocator.allocate_gpu(sizeof(f32), layout.cell_state_length);
-    cell_parameters    = allocator.allocate_gpu(sizeof(f32), layout.cell_parameter_length);
-    synapse_parameters = allocator.allocate_gpu(sizeof(f32), layout.synapse_parameter_length);
-    network_inputs     = allocator.allocate_gpu(sizeof(f32), 2 * total_neuron_count);
-    spike_history      = allocator.allocate_gpu(
-            sizeof(u8), layout.spike_history_length * total_neuron_count);
-    last_spiked        = allocator.allocate_gpu(sizeof(s64), total_neuron_count);
-    edge_placeholder   = allocator.allocate_gpu(sizeof(f32), 1);
+    model_slab = gpu.allocate(data_partitions);
 
-    // The arena does not clear its slab, and every one of these is read before it is
-    // written on the first tick.
+    // EnginePointer is a non-owning value: copying one produces a second name for the same
+    // range, and the slab is what owns the storage. There is nothing to move.
+    cell_state         = data_partitions[0];
+    cell_parameters    = data_partitions[1];
+    synapse_parameters = data_partitions[2];
+    network_inputs     = data_partitions[3];
+    spike_history      = data_partitions[4];
+    last_spiked        = data_partitions[5];
+    synapse_arrivals   = data_partitions[6];
+    synapse_state      = data_partitions[7];
+    empty_edge_plane   = data_partitions[8];
+
+    logger->debug("SpikeEngine: model slab {} bytes — cell_state {}, cell_parameters {}, "
+                  "synapse_parameters {}, network_inputs {}, spike_history {}, "
+                  "synapse_arrivals {}, synapse_state {}",
+                  model_slab.total_bytes, layout.cell_state_length, layout.cell_parameter_length,
+                  layout.synapse_parameter_length, 2 * total_neuron_count,
+                  layout.spike_history_length * total_neuron_count,
+                  2 * prototype_count * total_neuron_count,
+                  prototype_count * synapse_state_count * total_neuron_count);
+}
+
+void SpikeEngine::initialize_model_buffers() {
+    const s64 prototype_count = (s64)network_details.synapse_prototypes.size();
+    const s64 synapse_state_count = layout.widest_synapse_state_count;
+
+    // The slab is uninitialized memory and every one of these is read before it is written
+    // on the first tick.
     memset(network_inputs.get_contents(), 0, (usize)(2 * total_neuron_count) * sizeof(f32));
     memset(spike_history.get_contents(), 0,
            (usize)(layout.spike_history_length * total_neuron_count) * sizeof(u8));
-    // Far enough in the past that (tick - last_spiked) * dt is large for any run length.
-    // Zero would not do: a refractory gate reads it as "fired on tick 0", so every cell in
-    // the model would start the run held and the ones that are never driven would stay
-    // held forever.
-    s64 *last_spiked_data = static_cast<s64 *>(last_spiked.get_contents());
+    if (!synapse_arrivals.is_empty()) {
+        memset(synapse_arrivals.get_contents(), 0,
+               (usize)(2 * prototype_count * total_neuron_count) * sizeof(f32));
+    }
+    if (!empty_edge_plane.is_empty()) {
+        memset(empty_edge_plane.get_contents(), 0, sizeof(f32));
+    }
+
+    // Each synapse type's state variables start at the value its OnStart gives them, which
+    // for the aggregate is that starting value times zero incoming spikes -- i.e. the
+    // starting value itself only when the type declares a non-zero one.
+    if (!synapse_state.is_empty()) {
+        f32 *synapse_state_data = synapse_state.get_contents_as<f32>();
+        for (s64 prototype_index = 0; prototype_index < prototype_count; prototype_index += 1) {
+            const ComponentPrototype &prototype =
+                    network_details.synapse_prototypes[(usize)prototype_index];
+            const SynapseTypeSpecification &synapse_type =
+                    network_details.synapse_types[(usize)prototype.type_index];
+
+            for (s64 slot = 0; slot < synapse_state_count; slot += 1) {
+                const f64 initial = (slot < (s64)synapse_type.state_variable_names.size())
+                        ? starting_value_for(synapse_type.dynamics,
+                                             synapse_type.state_variable_names[(usize)slot],
+                                             synapse_type.parameter_names,
+                                             prototype.starting_parameters, synapse_type.name)
+                        : 0.0;
+                f32 *row = synapse_state_data +
+                           (prototype_index * synapse_state_count + slot) * total_neuron_count;
+                std::fill(row, row + total_neuron_count, (f32)initial);
+            }
+        }
+    }
+
+    // Negative means "has never fired" -- see the refractory gate in dynamics_codegen. A
+    // zero would read as "fired on tick 0", holding every cell in the model refractory from
+    // the start and the undriven ones forever.
+    s64 *last_spiked_data = last_spiked.get_contents_as<s64>();
     std::fill(last_spiked_data, last_spiked_data + total_neuron_count, NEVER_SPIKED_TICK);
 
     // Parameter rows, one per prototype, in the column order the type declared.
@@ -176,11 +240,6 @@ void SpikeEngine::allocate_model_buffers() {
         }
     }
 
-    logger->debug("SpikeEngine: arena {} bytes — cell_state {}, cell_parameters {}, "
-                  "synapse_parameters {}, network_inputs {}, spike_history {}",
-                  gpu_bytes, layout.cell_state_length, layout.cell_parameter_length,
-                  layout.synapse_parameter_length, 2 * total_neuron_count,
-                  layout.spike_history_length * total_neuron_count);
 }
 
 // Runs each cell type's OnStart once per neuron. This is not a formality: iafCell's
@@ -214,66 +273,44 @@ void SpikeEngine::initialize_cell_state() {
     }
 }
 
-// Everything per-edge goes into the WeightMatrix: the connection weight, the delay, the
-// edge's synapse prototype, and that synapse's state variables. The k^2-tree is what says
-// which (source, target) pairs exist, so only real edges are ever addressed, and each
-// matrix's Ck is pinned to zero so the stored value is the value — a weight of 5e-10 reads
-// back as 5e-10 rather than as whatever the shared basis reconstructs near it.
+// Every per-edge quantity lives in the WeightMatrix, and none of it as a per-edge value:
+// the k^2-tree says which (source, target) pairs exist, and a shared low-rank basis says
+// what each edge's weight and delay are. The synapse prototype is a run table, and per-edge
+// synapse STATE does not exist at all -- it aggregates into synapse_state, one accumulator
+// per (target, prototype).
 void SpikeEngine::build_weight_matrix() {
-    const Vector<Vector<s64>> adjacency = build_adjacency_list(network_details);
+    const Vector<Vector<s32>> network = build_adjacency_list(network_details);
 
-    Vector<vector<s32>> network((usize)total_neuron_count);
-    for (usize source = 0; source < adjacency.size(); source += 1) {
-        network[source].reserve(adjacency[source].size());
-        for (s64 target : adjacency[source]) network[source].push_back((s32)target);
+    // rank -1 means "derive it from what the projections below actually contain" rather
+    // than a constant someone guessed; capacity 0 leaves plasticity off and allocates
+    // nothing for it.
+    weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
+                           /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
+                           /*plasticity_delta_capacity=*/0);
+
+    // The same run coalescing the codegen bakes into the kernel, from the same function --
+    // the two must agree on the ordering exactly, or edges get the wrong synapse.
+    Vector<s64> first_edge_ordinal;
+    Vector<s64> edge_count;
+    Vector<s64> synapse_prototype;
+    Vector<f32> weight;
+    Vector<s32> delay_ticks;
+    collect_projection_runs(network_details, first_edge_ordinal, edge_count,
+                            synapse_prototype, weight, delay_ticks);
+
+    Vector<s32> synapse_prototype_narrow;
+    synapse_prototype_narrow.reserve(synapse_prototype.size());
+    for (s64 prototype_index : synapse_prototype) {
+        synapse_prototype_narrow.push_back((s32)prototype_index);
     }
 
-    weights = WeightMatrix(network, /*rank=*/1, /*check_indexing=*/true,
-                           /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed);
-    weights.configure_per_edge_variable_count(layout.per_edge_variable_count);
+    weights.declare_projections(first_edge_ordinal, edge_count, synapse_prototype_narrow,
+                                weight, delay_ticks);
 
-    for (usize source = 0; source < network_details.neurons.size(); source += 1) {
-        for (const NetworkEdge &edge : network_details.neurons[source].outgoing_edges) {
-            const s32 source_node = (s32)source;
-            const s32 target_node = (s32)edge.target_neuron_index;
-
-            weights.set_edge_weight(source_node, target_node, (f32)edge.weight);
-
-            // The engine's synaptic latency is one tick, so a connection that names no
-            // delay still arrives a tick later rather than instantaneously.
-            weights.set_edge_delay_ticks(source_node, target_node,
-                                          (s32)std::max<s64>(1, edge.delay_tick_count));
-
-            if (edge.synapse_prototype_index < 0) {
-                log::throw_runtime_error(*logger,
-                        "SpikeEngine: the connection " + to_string(source) + " -> " +
-                        to_string(edge.target_neuron_index) +
-                        " names no synapse, so there is nothing to carry its current");
-            }
-            weights.set_edge_variable(0, source_node, target_node,
-                                       (f32)edge.synapse_prototype_index);
-
-            const ComponentPrototype &prototype =
-                    network_details.synapse_prototypes[(usize)edge.synapse_prototype_index];
-            const SynapseTypeSpecification &synapse_type =
-                    network_details.synapse_types[(usize)prototype.type_index];
-
-            for (usize slot = 0; slot < synapse_type.state_variable_names.size(); slot += 1) {
-                const f64 initial = starting_value_for(
-                        synapse_type.dynamics, synapse_type.state_variable_names[slot],
-                        synapse_type.parameter_names, prototype.starting_parameters,
-                        synapse_type.name);
-
-                weights.set_edge_variable((s64)slot + 1, source_node, target_node,
-                                           (f32)initial);
-            }
-        }
-    }
-
-    logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, "
-                  "max_neighbor_count {}, {} per-edge variables",
-                  weights.node_count, weights.total_edge_count,
-                  weights.max_neighbor_count, layout.per_edge_variable_count);
+    logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, {} projection runs, "
+                  "rank {}, worst weight error {:.3e}",
+                  weights.node_count, weights.total_edge_count, first_edge_ordinal.size(),
+                  weights.rank, weights.measured_weight_fit_error);
 }
 
 // A spike is a binary event; what it is worth in current depends entirely on the cell it
@@ -502,8 +539,6 @@ SpikeEngine::~SpikeEngine() {
     if (alive) shutdown();
 }
 
-// ── running ───────────────────────────────────────────────────────────────────────
-
 // Host-side stimulus lands in the row this tick's kernel is about to drain, so injected
 // current reaches the cell on the tick the model asked for rather than the one after.
 void SpikeEngine::apply_stimulus(s64 tick) {
@@ -534,77 +569,61 @@ void SpikeEngine::apply_stimulus(s64 tick) {
     }
 }
 
-// The Sk plane of one matrix in the weight family, or the placeholder when that matrix was
-// never registered. `matrix_index` is checked rather than trusted: delay_matrix_index is
-// -1 until the first connection sets a delay, and indexing sparse_delta_buffers with it is
-// an out-of-bounds read that returns a plausible-looking pointer instead of crashing where
-// the mistake is.
-void *SpikeEngine::resolve_edge_plane(s64 matrix_index) {
-    if (matrix_index < 0) return edge_placeholder.get_contents();
-    if (matrix_index >= (s64)weights.sparse_delta_buffers.size()) {
-        return edge_placeholder.get_contents();
-    }
-
-    GpuPointer<f32> &plane = weights.sparse_delta_buffers[(usize)matrix_index];
-    if (plane.pointer == nullptr) return edge_placeholder.get_contents();
-
-    return (void *)plane.get_contents();
+// One buffer the kernel declares, or the placeholder when the model has no such plane. A
+// network with no connections allocates none of them, and there is no way to bind
+// "nothing" to a buffer slot a kernel names.
+EnginePointer SpikeEngine::resolve_edge_plane(const EnginePointer &plane) const {
+    return plane.is_empty() ? empty_edge_plane : plane;
 }
 
 void SpikeEngine::step_simulation(s64 tick) {
     apply_stimulus(tick);
 
+    // Scalars live on the stack for the duration of the dispatch and reach the kernel as
+    // inline constant data: an EnginePointer with inline_scalar set means "these bytes",
+    // not "this range of a slab", and run_function is what tells the two apart.
     const s32 neuron_count_argument = (s32)total_neuron_count;
     const s32 spike_history_length_argument = (s32)layout.spike_history_length;
-    const s32 max_neighbor_count_argument = (s32)weights.max_neighbor_count;
-
-    void *cell_state_pointer         = cell_state.get_contents();
-    void *cell_parameters_pointer    = cell_parameters.get_contents();
-    void *synapse_parameters_pointer = synapse_parameters.get_contents();
-    void *network_inputs_pointer     = network_inputs.get_contents();
-    void *spike_history_pointer      = spike_history.get_contents();
-    void *last_spiked_pointer        = last_spiked.get_contents();
+    const s32 rank_float4_stride_argument = (s32)weights.rank_float4_stride;
 
     const K2Tree &tree = weights.k2tree;
-    void *internal_words_pointer   = (void *)tree.internal_node_words.get_contents();
-    void *leaf_words_pointer       = (void *)tree.leaf_node_words.get_contents();
-    void *superblock_table_pointer = (void *)tree.rank_superblock_table.get_contents();
-    void *subblock_table_pointer   = (void *)tree.rank_subblock_table.get_contents();
 
-    // A model with no connections registers no delay matrix and allocates no per-edge
-    // planes, so these are absent rather than empty. The kernel never reads them -- there
-    // is no adjacency row to walk -- but every argument still has to be a real registered
-    // address, because metal_dispatch binds a pointer it cannot resolve as raw bytes.
-    void *edge_weights_pointer = resolve_edge_plane(WeightMatrix::DEFAULT_MATRIX_INDEX);
-    void *edge_delays_pointer = resolve_edge_plane(weights.delay_matrix_index);
-    void *edge_variables_pointer = weights.per_edge_variable_values.pointer != nullptr
-            ? (void *)weights.per_edge_variable_values.get_contents()
-            : edge_placeholder.get_contents();
-
-    const void *arguments[] = {
-        &tick, &step_dt, &neuron_count_argument, &spike_history_length_argument,
-        &max_neighbor_count_argument,
-        &cell_state_pointer, &cell_parameters_pointer, &synapse_parameters_pointer,
-        &network_inputs_pointer, &spike_history_pointer, &last_spiked_pointer,
-        &internal_words_pointer, &leaf_words_pointer,
-        &superblock_table_pointer, &subblock_table_pointer,
-        &tree.branching_factor, &tree.superblock_size_words, &tree.padded_node_count,
-        &tree.tree_height, &tree.internal_bit_count,
-        &edge_weights_pointer, &edge_delays_pointer, &edge_variables_pointer,
-    };
-    const usize argument_sizes[] = {
-        sizeof(s64), sizeof(f32), sizeof(s32), sizeof(s32), sizeof(s32),
-        sizeof(void *), sizeof(void *), sizeof(void *),
-        sizeof(void *), sizeof(void *), sizeof(void *),
-        sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
-        sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32), sizeof(s32),
-        sizeof(void *), sizeof(void *), sizeof(void *),
+    Vector<EnginePointer> parameters = {
+        inline_scalar_argument(tick),                            // 0
+        inline_scalar_argument(step_dt),                         // 1
+        inline_scalar_argument(neuron_count_argument),           // 2
+        inline_scalar_argument(spike_history_length_argument),   // 3
+        inline_scalar_argument(rank_float4_stride_argument),     // 4
+        cell_state,                                              // 5
+        resolve_edge_plane(cell_parameters),                     // 6
+        resolve_edge_plane(synapse_parameters),                  // 7
+        network_inputs,                                          // 8
+        spike_history,                                           // 9
+        last_spiked,                                             // 10
+        resolve_edge_plane(tree.internal_node_words),            // 11
+        resolve_edge_plane(tree.leaf_node_words),                // 12
+        resolve_edge_plane(tree.rank_superblock_table),          // 13
+        resolve_edge_plane(tree.rank_subblock_table),            // 14
+        inline_scalar_argument(tree.branching_factor),           // 15
+        inline_scalar_argument(tree.superblock_size_words),      // 16
+        inline_scalar_argument(tree.padded_node_count),          // 17
+        inline_scalar_argument(tree.tree_height),                // 18
+        inline_scalar_argument(tree.internal_bit_count),         // 19
+        resolve_edge_plane(weights.U_matrix),                    // 20
+        resolve_edge_plane(weights.V_matrix),                    // 21
+        resolve_edge_plane(weights.coefficient_range(WeightMatrix::DEFAULT_MATRIX_INDEX)), // 22
+        resolve_edge_plane(weights.coefficient_range(WeightMatrix::DELAY_MATRIX_INDEX)),   // 23
+        resolve_edge_plane(weights.edge_row_offset),             // 24
+        resolve_edge_plane(synapse_arrivals),                    // 25
+        resolve_edge_plane(synapse_state),                       // 26
     };
 
-    metal_dispatch(master_kernel, LaunchConfig{(u32)block_count, (u32)thread_count_per_block},
-                   arguments, argument_sizes,
-                   (u32)(sizeof(arguments) / sizeof(arguments[0])));
-    synchronize_gpu_work();
+    // job_count is the neuron count, not a block count: run_function dispatches TOTAL
+    // threads and works out the groups itself.
+    if (!gpu.run_function(kernel_function, parameters, total_neuron_count)) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: tick " + to_string(tick) + " failed on the GPU");
+    }
 
     record_tick(tick);
 }
@@ -826,10 +845,15 @@ void SpikeEngine::shutdown() {
 
     logger->info("SpikeEngine: shutting down");
 
-    release_kernel(master_kernel);
-    // Move-assigning an empty one releases this matrix's GPU buffers, which has to happen
-    // before the arena and the GPU context go.
+    gpu.release_function(kernel_function);
+
+    // Move-assigning an empty one releases this matrix's slab, which has to happen while
+    // the backend that owns it is still alive.
     weights = WeightMatrix();
+
+    // The model slab goes the same way. Everything else the backend holds is released by
+    // its own destructor, which runs after this.
+    gpu.deallocate_slab(model_slab);
 
     alive = false;
 }
