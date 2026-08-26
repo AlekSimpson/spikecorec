@@ -82,7 +82,12 @@ SRCS = [
     "src/core/recording.cpp",
     "src/core/topologies.cpp",
     "src/core/types.cpp",
+    "src/core/units.cpp",
     "src/core/weight_matrix.cpp",
+    # engine.cpp calls into the NML front-end and the kernel codegen, so both have to be
+    # in the extension or it fails to link. Their absence here predates the backend rework.
+    "src/nml/dynamics_codegen.cpp",
+    "src/nml/nml.cpp",
 ]
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
 EXTRA_LINK_ARGS = []
@@ -114,7 +119,15 @@ for _macro, _package in (
 if BACKEND == "cuda":
     CUDA_PATH = os.environ.get("CUDA_PATH", "/usr/local/cuda")
     INC.append(f"{CUDA_PATH}/include")
-    SRCS.append("src/cuda/kernels.cu")       # compiled with nvcc by CudaBuildExt
+    # src/cuda/kernels.cu was deleted in the backend rework and has no replacement yet.
+    # The CUDA backend also cannot run a generated kernel at all — dynamics_codegen emits
+    # Metal only — so a CUDA extension would link short of the gpu_* wrappers and, if it
+    # linked, would report successful ticks having run no dynamics. Fail here instead.
+    raise RuntimeError(
+        "The CUDA backend is not currently buildable: src/cuda/kernels.cu was removed in "
+        "the backend rework, and dynamics_codegen emits Metal only. Build with "
+        "SPIKECOREC_BACKEND=metal."
+    )
     # backend.cpp uses the driver API (cuInit/cuCtxCreate/cuModuleLoadData) and
     # NVRTC in addition to the runtime API, so link -lcuda and -lnvrtc too. The
     # driver stub satisfies the link; the real libcuda loads at runtime.

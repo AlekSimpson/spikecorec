@@ -1,0 +1,26 @@
+<Lems>
+    <!--
+      Drives two_cell_synapse.nml. Records the target's membrane trace and every cell's
+      spikes, so a run can be checked both for "did the synapse deliver anything at all"
+      and for "did it deliver the right amount".
+    -->
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Synapses.xml"/>
+    <Include file="Inputs.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="two_cell_synapse.nml"/>
+
+    <Simulation id="sim1" length="200ms" step="0.05ms" target="twoCellNetwork">
+        <OutputFile id="membrane" fileName="two_cell_synapse_membrane.dat">
+            <OutputColumn id="target_v" quantity="targetPopulation[0]/v"/>
+        </OutputFile>
+        <EventOutputFile id="spikes" fileName="two_cell_synapse_spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="sourcePopulation[0]" eventPort="spike"/>
+            <EventSelection id="1" select="sourcePopulation[1]" eventPort="spike"/>
+            <EventSelection id="2" select="targetPopulation[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+
+    <Target component="sim1"/>
+</Lems>

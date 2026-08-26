@@ -194,6 +194,9 @@ $(BUILD_DIR)/nml/%.o: $(SRC_DIR)/nml/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ── CUDA objects (.cu) ───────────────────────────────────────
+# src/cuda/ is currently empty, so CUDA_SRCS expands to nothing and this rule matches
+# nothing. Kept rather than deleted: it is the rule the tree needs again the moment the
+# CUDA kernels come back, and a pattern rule with no matching source costs nothing.
 $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
@@ -255,11 +258,12 @@ test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
 # ── Examples ─────────────────────────────────────────────────
 examples: examples-$(BACKEND)
 
+# The examples are backend-agnostic C++ and build against whichever library is present.
+# This target used to name examples/cuda_example.cpp, which has never existed in the tree.
 examples-cuda: check-cuda $(CUDA_LIB)
-	$(NVCC) $(NVCCFLAGS) $(EX_DIR)/cuda_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda \
-	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/cuda_example
+	@echo "[spikecorec] the CUDA backend cannot yet run a generated kernel"
+	@echo "             (dynamics_codegen emits Metal only) — examples are Metal-only."
+	@false
 
 # Every .cpp directly in examples/ is an example; the headers beside them are shared
 # model generators, not programs of their own.

@@ -294,41 +294,63 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
     };
 }
 
-static K2Tree make_k2tree_from_arrays(TreeArrays &arrays, s32 node_count, s32 branching_factor, s32 superblock_size) {
-    // Every k^2-tree entry point funnels its allocations through here, so this is the one
-    // place that can catch a missing initialize_gpu_context() before it becomes a crash.
-    // Without a context the Metal allocator hands back a null buffer, and the memcpy just
-    // below then faults inside _platform_memmove with no diagnostic whatsoever, for a graph
-    // of any size — an error message costs one branch per tree construction.
-    if (!gpu_context_is_initialized()) {
-        throw_runtime_error(logger(),
-            "K2Tree: the GPU context is not initialized — call "
-            "spikecorec::initialize_gpu_context() before building a k^2-tree (its bit arrays "
-            "and rank tables are allocated in GPU-visible memory)");
+// Carves one slab holding the four bit arrays plus adjacent_batch's staging, copies the
+// host-built arrays into it, and hands the ranges to the constructor. Every k^2-tree entry
+// point funnels through here, so this is the single place a tree's storage is decided.
+static K2Tree make_k2tree_from_arrays(
+    EngineBackend &backend, TreeArrays &arrays,
+    s32 node_count, s32 branching_factor, s32 superblock_size
+) {
+    const usize internal_node_words_length = arrays.internal_node_words.size();
+    const usize leaf_node_words_length = arrays.leaf_node_words.size();
+    const usize rank_superblock_length = arrays.rank_superblock_table.size();
+    const usize rank_subblock_length = arrays.rank_subblock_table.size();
+
+    spikecorec::Vector<EnginePointer> partitions;
+    backend
+        .partition(internal_node_words_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
+        .partition(leaf_node_words_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
+        .partition(rank_superblock_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
+        .partition(rank_subblock_length * sizeof(u16), EngineDatatype::UNSIGNED16, partitions)
+        // adjacent_batch's staging, sized once here rather than per call: the backend
+        // hands out one chunk per partition -> allocate round, so there is no transient
+        // allocation to reach for. Larger batches are chunked against this cap.
+        .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), EngineDatatype::SIGNED32, partitions)
+        .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), EngineDatatype::SIGNED32, partitions)
+        .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(u8), EngineDatatype::UNSIGNED8, partitions);
+
+    const EnginePointer owning_slab = backend.allocate(partitions);
+
+    // A zero-length array is legal -- the empty adjacency has no bits at all -- and
+    // partition() hands back an empty handle for it, so guard each copy on its length
+    // rather than assuming get_contents() is non-null.
+    if (internal_node_words_length > 0) {
+        memcpy(partitions[0].get_contents(), arrays.internal_node_words.data(),
+               internal_node_words_length * sizeof(u32));
+    }
+    if (leaf_node_words_length > 0) {
+        memcpy(partitions[1].get_contents(), arrays.leaf_node_words.data(),
+               leaf_node_words_length * sizeof(u32));
+    }
+    if (rank_superblock_length > 0) {
+        memcpy(partitions[2].get_contents(), arrays.rank_superblock_table.data(),
+               rank_superblock_length * sizeof(u32));
+    }
+    if (rank_subblock_length > 0) {
+        memcpy(partitions[3].get_contents(), arrays.rank_subblock_table.data(),
+               rank_subblock_length * sizeof(u16));
     }
 
-    usize internal_node_words_length = arrays.internal_node_words.size();
-    usize leaf_node_words_length = arrays.leaf_node_words.size();
-    usize rank_superblock_length = arrays.rank_superblock_table.size();
-    usize rank_subblock_length = arrays.rank_subblock_table.size();
-
-    GpuPointer<u32> internal_node_gpu_pointer = allocate<u32>(internal_node_words_length * sizeof(u32));
-    GpuPointer<u32> leaf_node_gpu_pointer = allocate<u32>(leaf_node_words_length * sizeof(u32));
-    GpuPointer<u32> rank_superblock_gpu_pointer = allocate<u32>(rank_superblock_length * sizeof(u32));
-    GpuPointer<u16> rank_subblock_gpu_pointer = allocate<u16>(rank_subblock_length * sizeof(u16));
-
-    memcpy(internal_node_gpu_pointer.get_contents(), arrays.internal_node_words.data(),
-           internal_node_words_length * sizeof(u32));
-    memcpy(leaf_node_gpu_pointer.get_contents(), arrays.leaf_node_words.data(), leaf_node_words_length * sizeof(u32));
-    memcpy(rank_superblock_gpu_pointer.get_contents(), arrays.rank_superblock_table.data(),
-           rank_superblock_length * sizeof(u32));
-    memcpy(rank_subblock_gpu_pointer.get_contents(), arrays.rank_subblock_table.data(), rank_subblock_length * sizeof(u16));
-
-    return {
-        std::move(internal_node_gpu_pointer),
-        std::move(leaf_node_gpu_pointer),
-        std::move(rank_superblock_gpu_pointer),
-        std::move(rank_subblock_gpu_pointer),
+    return K2Tree{
+        backend,
+        owning_slab,
+        partitions[0],
+        partitions[1],
+        partitions[2],
+        partitions[3],
+        partitions[4],
+        partitions[5],
+        partitions[6],
         internal_node_words_length,
         leaf_node_words_length,
         rank_superblock_length,
@@ -345,10 +367,17 @@ static K2Tree make_k2tree_from_arrays(TreeArrays &arrays, s32 node_count, s32 br
 // ── constructor / destructor ──────────────────────────────────────────────────
 
 K2Tree::K2Tree(
-    GpuPointer<u32> internal_node_words,
-    GpuPointer<u32> leaf_node_words,
-    GpuPointer<u32> rank_superblock_table,
-    GpuPointer<u16> rank_subblock_table,
+    EngineBackend &backend,
+    EnginePointer owning_slab,
+
+    EnginePointer internal_node_words,
+    EnginePointer leaf_node_words,
+    EnginePointer rank_superblock_table,
+    EnginePointer rank_subblock_table,
+
+    EnginePointer query_source_staging,
+    EnginePointer query_target_staging,
+    EnginePointer query_output_staging,
 
     usize internal_node_words_length,
     usize leaf_node_words_length,
@@ -368,36 +397,105 @@ K2Tree::K2Tree(
       , padded_node_count(padded_node_count)
       , tree_height(tree_height)
       , internal_bit_count(internal_bit_count)
-      , internal_node_words(std::move(internal_node_words))
-      , leaf_node_words(std::move(leaf_node_words))
-      , rank_superblock_table(std::move(rank_superblock_table))
-      , rank_subblock_table(std::move(rank_subblock_table))
+      , internal_node_words(internal_node_words)
+      , leaf_node_words(leaf_node_words)
+      , rank_superblock_table(rank_superblock_table)
+      , rank_subblock_table(rank_subblock_table)
+      , query_source_staging(query_source_staging)
+      , query_target_staging(query_target_staging)
+      , query_output_staging(query_output_staging)
+      , owning_backend(&backend)
+      , owning_slab(owning_slab)
       , internal_node_words_length(internal_node_words_length)
       , leaf_node_words_length(leaf_node_words_length)
       , rank_superblock_length(rank_superblock_length)
       , rank_subblock_length(rank_subblock_length) {
 
-    advise_read_mostly(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
-    advise_read_mostly(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
-    advise_read_mostly(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
-    advise_read_mostly(this->rank_subblock_table, this->rank_subblock_length * sizeof(u16));
+    // Written once at construction and read on every walk thereafter, which is exactly
+    // the case for per-device read-only replicas rather than migration.
+    backend.advise_read_mostly(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
+    backend.advise_read_mostly(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
+    backend.advise_read_mostly(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
+    backend.advise_read_mostly(this->rank_subblock_table, this->rank_subblock_length * sizeof(u16));
 
-    prefetch_to_gpu(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
-    prefetch_to_gpu(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
-    prefetch_to_gpu(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
-    prefetch_to_gpu(this->rank_subblock_table, this->rank_subblock_length * sizeof(u16));
+    backend.prefetch_to_gpu(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
+    backend.prefetch_to_gpu(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
+    backend.prefetch_to_gpu(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
+    backend.prefetch_to_gpu(this->rank_subblock_table, this->rank_subblock_length * sizeof(u16));
+}
+
+K2Tree::K2Tree(K2Tree &&other) noexcept
+    : branching_factor(other.branching_factor)
+      , superblock_size_words(other.superblock_size_words)
+      , node_count(other.node_count)
+      , padded_node_count(other.padded_node_count)
+      , tree_height(other.tree_height)
+      , internal_bit_count(other.internal_bit_count)
+      , internal_node_words(other.internal_node_words)
+      , leaf_node_words(other.leaf_node_words)
+      , rank_superblock_table(other.rank_superblock_table)
+      , rank_subblock_table(other.rank_subblock_table)
+      , query_source_staging(other.query_source_staging)
+      , query_target_staging(other.query_target_staging)
+      , query_output_staging(other.query_output_staging)
+      , owning_backend(other.owning_backend)
+      , owning_slab(other.owning_slab)
+      , internal_node_words_length(other.internal_node_words_length)
+      , leaf_node_words_length(other.leaf_node_words_length)
+      , rank_superblock_length(other.rank_superblock_length)
+      , rank_subblock_length(other.rank_subblock_length) {
+
+    // The whole reason this is not defaulted: the source must forget the slab, or both
+    // objects release it. Everything else above is a plain value copy.
+    other.owning_backend = nullptr;
+    other.owning_slab = EnginePointer{};
+    other.tree_height = 0;
+    other.node_count = 0;
+}
+
+K2Tree &K2Tree::operator=(K2Tree &&other) noexcept {
+    if (this == &other) return *this;
+
+    // Release what this object already holds before taking over the incoming slab.
+    if (owning_backend != nullptr) owning_backend->deallocate_slab(owning_slab);
+
+    branching_factor = other.branching_factor;
+    superblock_size_words = other.superblock_size_words;
+    node_count = other.node_count;
+    padded_node_count = other.padded_node_count;
+    tree_height = other.tree_height;
+    internal_bit_count = other.internal_bit_count;
+    internal_node_words = other.internal_node_words;
+    leaf_node_words = other.leaf_node_words;
+    rank_superblock_table = other.rank_superblock_table;
+    rank_subblock_table = other.rank_subblock_table;
+    query_source_staging = other.query_source_staging;
+    query_target_staging = other.query_target_staging;
+    query_output_staging = other.query_output_staging;
+    owning_backend = other.owning_backend;
+    owning_slab = other.owning_slab;
+    internal_node_words_length = other.internal_node_words_length;
+    leaf_node_words_length = other.leaf_node_words_length;
+    rank_superblock_length = other.rank_superblock_length;
+    rank_subblock_length = other.rank_subblock_length;
+
+    other.owning_backend = nullptr;
+    other.owning_slab = EnginePointer{};
+    other.tree_height = 0;
+    other.node_count = 0;
+    return *this;
 }
 
 K2Tree::~K2Tree() {
-    deallocate(std::move(internal_node_words));
-    deallocate(std::move(leaf_node_words));
-    deallocate(std::move(rank_superblock_table));
-    deallocate(std::move(rank_subblock_table));
+    // The four bit arrays and the query staging are all sub-ranges of one slab, and no
+    // sub-range owns anything -- releasing the slab is what frees them.
+    if (owning_backend != nullptr) owning_backend->deallocate_slab(owning_slab);
 }
 
 // ── factory methods ───────────────────────────────────────────────────────────
 
 optional<K2Tree> K2Tree::from_adjacency_list(
+    EngineBackend &backend,
     const vector<vector<s32> > &adjacency_list,
     s32 node_count,
     s32 branching_factor,
@@ -422,10 +520,11 @@ optional<K2Tree> K2Tree::from_adjacency_list(
     logger().debug("K2Tree::from_adjacency_list: edge_count={} tree_height={} padded_node_count={} "
                    "internal_bit_count={}", edges.size(), arrays.tree_height, arrays.padded_node_count,
                    arrays.internal_bit_count);
-    return make_k2tree_from_arrays(arrays, effective_node_count, branching_factor, superblock_size);
+    return make_k2tree_from_arrays(backend, arrays, effective_node_count, branching_factor, superblock_size);
 }
 
 optional<K2Tree> K2Tree::from_edges(
+    EngineBackend &backend,
     const s32 *source_indices,
     const s32 *target_indices,
     s32 edge_count,
@@ -449,14 +548,14 @@ optional<K2Tree> K2Tree::from_edges(
     auto arrays = build_tree_arrays(edges, node_count, branching_factor, superblock_size);
     logger().debug("K2Tree::from_edges: tree_height={} padded_node_count={} internal_bit_count={}",
                    arrays.tree_height, arrays.padded_node_count, arrays.internal_bit_count);
-    return make_k2tree_from_arrays(arrays, node_count, branching_factor, superblock_size);
+    return make_k2tree_from_arrays(backend, arrays, node_count, branching_factor, superblock_size);
 }
 
 // ── serialization ─────────────────────────────────────────────────────────────
 
 static constexpr u32 SAVE_MAGIC = 0x4B325452; // "K2TR"
 
-K2Tree K2Tree::load(const char *path) {
+K2Tree K2Tree::load(EngineBackend &backend, const char *path) {
     logger().debug("K2Tree::load: path={}", path);
     ifstream file(path, ios::binary);
 
@@ -477,29 +576,51 @@ K2Tree K2Tree::load(const char *path) {
     file.read(reinterpret_cast<char *>(&rank_superblock_length), sizeof(usize));
     file.read(reinterpret_cast<char *>(&rank_subblock_length), sizeof(usize));
 
-    GpuPointer<u32> internal_node_gpu_pointer = allocate<u32>(internal_node_words_length * sizeof(u32));
-    GpuPointer<u32> leaf_node_gpu_pointer = allocate<u32>(leaf_node_words_length * sizeof(u32));
-    GpuPointer<u32> rank_superblock_gpu_pointer = allocate<u32>(rank_superblock_length * sizeof(u32));
-    GpuPointer<u16> rank_subblock_gpu_pointer = allocate<u16>(rank_subblock_length * sizeof(u16));
+    // Same chunk layout as make_k2tree_from_arrays: the four arrays plus adjacent_batch's
+    // staging, so a loaded tree is indistinguishable from a built one.
+    spikecorec::Vector<EnginePointer> partitions;
+    backend
+        .partition(internal_node_words_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
+        .partition(leaf_node_words_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
+        .partition(rank_superblock_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
+        .partition(rank_subblock_length * sizeof(u16), EngineDatatype::UNSIGNED16, partitions)
+        .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), EngineDatatype::SIGNED32, partitions)
+        .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), EngineDatatype::SIGNED32, partitions)
+        .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(u8), EngineDatatype::UNSIGNED8, partitions);
 
-    file.read(reinterpret_cast<char *>(internal_node_gpu_pointer.get_contents()),
-              (streamsize) (internal_node_words_length * sizeof(u32)));
-    file.read(reinterpret_cast<char *>(leaf_node_gpu_pointer.get_contents()),
-              (streamsize) (leaf_node_words_length * sizeof(u32)));
-    file.read(reinterpret_cast<char *>(rank_superblock_gpu_pointer.get_contents()),
-              (streamsize) (rank_superblock_length * sizeof(u32)));
-    file.read(reinterpret_cast<char *>(rank_subblock_gpu_pointer.get_contents()),
-              (streamsize) (rank_subblock_length * sizeof(u16)));
+    const EnginePointer owning_slab = backend.allocate(partitions);
+
+    if (internal_node_words_length > 0) {
+        file.read(reinterpret_cast<char *>(partitions[0].get_contents()),
+                  (streamsize) (internal_node_words_length * sizeof(u32)));
+    }
+    if (leaf_node_words_length > 0) {
+        file.read(reinterpret_cast<char *>(partitions[1].get_contents()),
+                  (streamsize) (leaf_node_words_length * sizeof(u32)));
+    }
+    if (rank_superblock_length > 0) {
+        file.read(reinterpret_cast<char *>(partitions[2].get_contents()),
+                  (streamsize) (rank_superblock_length * sizeof(u32)));
+    }
+    if (rank_subblock_length > 0) {
+        file.read(reinterpret_cast<char *>(partitions[3].get_contents()),
+                  (streamsize) (rank_subblock_length * sizeof(u16)));
+    }
 
     logger().debug("K2Tree::load: path={} magic={:#x} node_count={} branching_factor={} tree_height={} "
                    "padded_node_count={} internal_bit_count={}",
                    path, magic, node_count, branching_factor, tree_height, padded_node_count, internal_bit_count);
 
-    return {
-        std::move(internal_node_gpu_pointer),
-        std::move(leaf_node_gpu_pointer),
-        std::move(rank_superblock_gpu_pointer),
-        std::move(rank_subblock_gpu_pointer),
+    return K2Tree{
+        backend,
+        owning_slab,
+        partitions[0],
+        partitions[1],
+        partitions[2],
+        partitions[3],
+        partitions[4],
+        partitions[5],
+        partitions[6],
         internal_node_words_length,
         leaf_node_words_length,
         rank_superblock_length,
@@ -531,10 +652,10 @@ void K2Tree::save(const char *path) const {
     file.write(reinterpret_cast<const char *>(&rank_superblock_length), sizeof(usize));
     file.write(reinterpret_cast<const char *>(&rank_subblock_length), sizeof(usize));
 
-    const u32 *internal_node_data = internal_node_words.get_contents();
-    const u32 *leaf_node_data = leaf_node_words.get_contents();
-    const u32 *rank_superblock_data = rank_superblock_table.get_contents();
-    const u16 *rank_subblock_data = rank_subblock_table.get_contents();
+    const u32 *internal_node_data = internal_node_words.get_contents_as<u32>();
+    const u32 *leaf_node_data = leaf_node_words.get_contents_as<u32>();
+    const u32 *rank_superblock_data = rank_superblock_table.get_contents_as<u32>();
+    const u16 *rank_subblock_data = rank_subblock_table.get_contents_as<u16>();
 
     file.write(reinterpret_cast<const char *>(internal_node_data),
                (streamsize) (internal_node_words_length * sizeof(u32)));
@@ -551,10 +672,10 @@ s32 K2Tree::adjacent(s32 source_node, s32 target_node) const {
         target_node < 0 || target_node >= node_count) return 0;
     if (tree_height == 0) return 0;
 
-    const u32 *internal_words = internal_node_words.get_contents();
-    const u32 *leaf_words = leaf_node_words.get_contents();
-    const u32 *superblock_data = rank_superblock_table.get_contents();
-    const u16 *subblock_data = rank_subblock_table.get_contents();
+    const u32 *internal_words = internal_node_words.get_contents_as<u32>();
+    const u32 *leaf_words = leaf_node_words.get_contents_as<u32>();
+    const u32 *superblock_data = rank_superblock_table.get_contents_as<u32>();
+    const u16 *subblock_data = rank_subblock_table.get_contents_as<u16>();
 
     s32 branching_factor_squared = branching_factor * branching_factor;
 
@@ -599,10 +720,10 @@ s64 K2Tree::get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_c
     if (max_neighbor_count <= 0) return 0;
     if (node_index < 0 || node_index >= node_count || tree_height == 0) return 0;
 
-    const u32 *internal_words = internal_node_words.get_contents();
-    const u32 *leaf_words = leaf_node_words.get_contents();
-    const u32 *superblock_data = rank_superblock_table.get_contents();
-    const u16 *subblock_data = rank_subblock_table.get_contents();
+    const u32 *internal_words = internal_node_words.get_contents_as<u32>();
+    const u32 *leaf_words = leaf_node_words.get_contents_as<u32>();
+    const u32 *superblock_data = rank_superblock_table.get_contents_as<u32>();
+    const u16 *subblock_data = rank_subblock_table.get_contents_as<u16>();
 
     s64 neighbors_found = 0;
     collect_row_neighbors(
@@ -618,10 +739,10 @@ s64 K2Tree::get_predecessors(s32 node_index, s32 *output_buffer, s64 max_neighbo
     if (max_neighbor_count <= 0) return 0;
     if (node_index < 0 || node_index >= node_count || tree_height == 0) return 0;
 
-    const u32 *internal_words = internal_node_words.get_contents();
-    const u32 *leaf_words = leaf_node_words.get_contents();
-    const u32 *superblock_data = rank_superblock_table.get_contents();
-    const u16 *subblock_data = rank_subblock_table.get_contents();
+    const u32 *internal_words = internal_node_words.get_contents_as<u32>();
+    const u32 *leaf_words = leaf_node_words.get_contents_as<u32>();
+    const u32 *superblock_data = rank_superblock_table.get_contents_as<u32>();
+    const u16 *subblock_data = rank_subblock_table.get_contents_as<u16>();
 
     s64 predecessors_found = 0;
     collect_column_predecessors(
@@ -640,41 +761,79 @@ void K2Tree::adjacent_batch(
     s32 query_count
 ) const {
     if (query_count <= 0) return;
+    if (owning_backend == nullptr) {
+        // The empty adjacency has no slab and therefore no staging. It also has no edges,
+        // so every query answers 0.
+        memset(output_buffer, 0, (usize)query_count * sizeof(uint8_t));
+        return;
+    }
 
-    // note: source_indices/target_indices/output_buffer are caller-owned host memory
-    // (mirrors the plain s32 node indices of the single-query `adjacent`) — not GPU-visible —
-    // so queries are staged into unified-memory scratch buffers, the kernel writes
-    // results into a scratch output buffer, and we copy the results back once done.
-    GpuPointer<s32> device_source = allocate<s32>((usize)query_count * sizeof(s32));
-    GpuPointer<s32> device_target = allocate<s32>((usize)query_count * sizeof(s32));
-    GpuPointer<uint8_t> device_output = allocate<uint8_t>((usize)query_count * sizeof(uint8_t));
+    // source_indices/target_indices/output_buffer are caller-owned host memory (mirroring
+    // the plain s32 node indices of the single-query `adjacent`), not GPU-visible, so
+    // queries are staged into this tree's own staging ranges and the results copied back.
+    //
+    // The staging is sized once at construction (ADJACENT_BATCH_QUERY_CAP), because the
+    // backend hands out one chunk per partition -> allocate round and there is no
+    // transient allocation available. A larger batch is answered in chunks rather than
+    // refused -- the cap bounds memory, not the query.
+    s32 *staged_sources = query_source_staging.get_contents_as<s32>();
+    s32 *staged_targets = query_target_staging.get_contents_as<s32>();
+    uint8_t *staged_output = query_output_staging.get_contents_as<uint8_t>();
 
-    memcpy(device_source.get_contents(), source_indices, (usize)query_count * sizeof(s32));
-    memcpy(device_target.get_contents(), target_indices, (usize)query_count * sizeof(s32));
+    // Built once, on the first batch. A build without default.metallib beside the binary
+    // gets nullopt here and answers on the host instead of failing.
+    bool dispatch_is_available = false;
+#ifdef SPIKECOREC_METAL
+    dispatch_is_available = adjacent_batch_function.pipeline_state != nullptr;
+#endif
+    if (!dispatch_is_available) {
+        Optional<EngineFunction> loaded =
+                owning_backend->load_precompiled_function("k2tree_adjacent_batch_kernel");
+        if (loaded.has_value()) {
+            adjacent_batch_function = *loaded;
+            dispatch_is_available = true;
+        }
+    }
 
-    gpu_k2tree_adjacent_batch(
-        internal_node_words.get_contents(),
-        leaf_node_words.get_contents(),
-        rank_superblock_table.get_contents(),
-        rank_subblock_table.get_contents(),
-        branching_factor,
-        superblock_size_words,
-        node_count,
-        padded_node_count,
-        tree_height,
-        internal_bit_count,
-        device_source.get_contents(),
-        device_target.get_contents(),
-        device_output.get_contents(),
-        query_count
-    );
-    synchronize_gpu_work();
+    for (s32 first_query = 0; first_query < query_count; first_query += (s32)ADJACENT_BATCH_QUERY_CAP) {
+        const s32 chunk_size =
+                std::min<s32>((s32)ADJACENT_BATCH_QUERY_CAP, query_count - first_query);
 
-    memcpy(output_buffer, device_output.get_contents(), (usize)query_count * sizeof(uint8_t));
+        memcpy(staged_sources, source_indices + first_query, (usize)chunk_size * sizeof(s32));
+        memcpy(staged_targets, target_indices + first_query, (usize)chunk_size * sizeof(s32));
 
-    deallocate(std::move(device_source));
-    deallocate(std::move(device_target));
-    deallocate(std::move(device_output));
+        bool answered_on_device = false;
+        if (dispatch_is_available) {
+            const s32 chunk_size_argument = chunk_size;
+            spikecorec::Vector<EnginePointer> parameters = {
+                internal_node_words,                            // 0
+                leaf_node_words,                                // 1
+                rank_superblock_table,                          // 2
+                rank_subblock_table,                            // 3
+                inline_scalar_argument(branching_factor),       // 4
+                inline_scalar_argument(superblock_size_words),  // 5
+                inline_scalar_argument(node_count),             // 6
+                inline_scalar_argument(padded_node_count),      // 7
+                inline_scalar_argument(tree_height),            // 8
+                inline_scalar_argument(internal_bit_count),     // 9
+                query_source_staging,                           // 10
+                query_target_staging,                           // 11
+                query_output_staging,                           // 12
+                inline_scalar_argument(chunk_size_argument),    // 13
+            };
+            answered_on_device = owning_backend->run_function(adjacent_batch_function,
+                                                              parameters, chunk_size);
+        }
+
+        if (!answered_on_device) {
+            for (s32 query_index = 0; query_index < chunk_size; query_index += 1) {
+                staged_output[query_index] = (uint8_t)adjacent(staged_sources[query_index],
+                                                               staged_targets[query_index]);
+            }
+        }
+
+        memcpy(output_buffer + first_query, staged_output, (usize)chunk_size * sizeof(uint8_t));
+    }
 }
 
 s32 K2Tree::trace(s32 source_node, s32 target_node) const {
@@ -692,10 +851,10 @@ s32 K2Tree::trace(s32 source_node, s32 target_node) const {
         return 0;
     }
 
-    const u32 *internal_words = internal_node_words.get_contents();
-    const u32 *leaf_words = leaf_node_words.get_contents();
-    const u32 *superblock_data = rank_superblock_table.get_contents();
-    const u16 *subblock_data = rank_subblock_table.get_contents();
+    const u32 *internal_words = internal_node_words.get_contents_as<u32>();
+    const u32 *leaf_words = leaf_node_words.get_contents_as<u32>();
+    const u32 *superblock_data = rank_superblock_table.get_contents_as<u32>();
+    const u16 *subblock_data = rank_subblock_table.get_contents_as<u16>();
 
     s32 branching_factor_squared = branching_factor * branching_factor;
 

@@ -1,0 +1,80 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.neuroml.org/schema/neuroml2 https://raw.github.com/NeuroML/NeuroML2/development/Schemas/NeuroML2/NeuroML_v2.3.xsd"
+         id="TwoCellSynapse">
+
+    <!--
+      The smallest model that exercises a synapse: two driven sources feeding one target
+      through one projection, so the target's input is a sum over more than one edge.
+
+      Sized to be checkable by hand. Both source cells are the same iafCell driven above
+      rheobase, so they fire at a known rate:
+
+        tau  = C / leakConductance = 100 pF / 5 nS = 20 ms
+        rheobase                   = 5 nS * 15 mV  = 75 pA
+
+      The target sits at 60 pA, BELOW rheobase, so it cannot fire on its own drive alone.
+      Anything it does is the synapse's doing, which is what makes this fixture worth
+      having: a bug that drops synaptic input shows up as a silent target rather than as a
+      slightly wrong number.
+
+      The two connections carry different weights on purpose. Aggregating a target's
+      incoming synapses into one accumulator is exact only because the arrival increment is
+      linear in the edge's weight; equal weights would not tell a correct implementation
+      apart from one that ignored weight entirely.
+    -->
+
+    <iafCell id="sourceCell"
+             leakConductance="5 nS"
+             leakReversal="-65 mV"
+             thresh="-50 mV"
+             reset="-70 mV"
+             C="100 pF"/>
+
+    <iafCell id="targetCell"
+             leakConductance="5 nS"
+             leakReversal="-65 mV"
+             thresh="-50 mV"
+             reset="-70 mV"
+             C="100 pF"/>
+
+    <!--
+      Current-based, so Phase 1 can simulate it, and linear in its own state, so a
+      target's incoming edges sum exactly into one accumulator:
+
+        i    = I
+        dI/dt = (e*J - I) / tau
+        dJ/dt = -J / tau
+        on arrival: J = J + weight * ibase
+    -->
+    <alphaCurrentSynapse id="excitatorySynapse" tau="2 ms" ibase="40 pA"/>
+
+    <pulseGenerator id="sourceDrive" delay="0 ms" duration="200 ms" amplitude="90 pA"/>
+    <pulseGenerator id="subThresholdDrive" delay="0 ms" duration="200 ms" amplitude="60 pA"/>
+
+    <network id="twoCellNetwork">
+        <population id="sourcePopulation" component="sourceCell" size="2"/>
+        <population id="targetPopulation" component="targetCell" size="1"/>
+
+        <projection id="excitatoryProjection"
+                    presynapticPopulation="sourcePopulation"
+                    postsynapticPopulation="targetPopulation"
+                    synapse="excitatorySynapse">
+            <connectionWD id="0"
+                          preCellId="../sourcePopulation[0]"
+                          postCellId="../targetPopulation[0]"
+                          weight="1.0"
+                          delay="1 ms"/>
+            <connectionWD id="1"
+                          preCellId="../sourcePopulation[1]"
+                          postCellId="../targetPopulation[0]"
+                          weight="0.5"
+                          delay="1 ms"/>
+        </projection>
+
+        <explicitInput target="sourcePopulation[0]" input="sourceDrive"/>
+        <explicitInput target="sourcePopulation[1]" input="sourceDrive"/>
+        <explicitInput target="targetPopulation[0]" input="subThresholdDrive"/>
+    </network>
+
+</neuroml>

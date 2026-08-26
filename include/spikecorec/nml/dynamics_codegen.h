@@ -75,6 +75,25 @@ struct ModelLayout {
 
 ModelLayout compute_model_layout(const NML_ParseResult &parse_result);
 
+// Coalesces the model's connections into runs over the canonical edge ordering: a maximal
+// stretch of consecutive edges sharing a (prototype, weight, delay) triple. A NeuroML
+// projection names one synapse, one weight and one delay for all of its connections, so a
+// document with one projection produces one run however many connections it declares.
+//
+// Shared by the engine, which hands the runs to WeightMatrix, and by the codegen, which
+// bakes the prototype lookup into the kernel. One implementation because the two must agree
+// on the ordering exactly -- a disagreement would silently give edges the wrong synapse.
+//
+// The ordering matches WeightMatrix's, which numbers edges by walking each source node's
+// row through the k^2-tree: neurons in index order, and within a neuron its outgoing_edges
+// in declaration order, which is the order build_adjacency_list fed the tree.
+void collect_projection_runs(const NML_ParseResult &parse_result,
+                             Vector<s64> &first_edge_ordinal,
+                             Vector<s64> &edge_count,
+                             Vector<s64> &synapse_prototype,
+                             Vector<f32> &weight,
+                             Vector<s32> &delay_ticks);
+
 // The comparison a cell spikes on, taken from the OnCondition that carries its EventOut:
 // `v .gt. thresh` yields ("v", "thresh"). Both come back as names — the caller decides
 // whether each is a parameter, a state variable or a literal, because that differs by

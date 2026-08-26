@@ -1741,15 +1741,15 @@ NML_ParseResult NML_Parser::export_model_details_to_engine(NML_Node *lems_root) 
     return return_value;
 }
 
-Vector<Vector<s64>> build_adjacency_list(const NML_ParseResult &parse_result) {
-    Vector<Vector<s64>> adjacency(parse_result.neurons.size());
+Vector<Vector<s32>> build_adjacency_list(const NML_ParseResult &parse_result) {
+    Vector<Vector<s32>> adjacency(parse_result.neurons.size());
 
     for (usize source = 0; source < parse_result.neurons.size(); source += 1) {
         const Vector<NetworkEdge> &edges = parse_result.neurons[source].outgoing_edges;
         adjacency[source].reserve(edges.size());
 
         for (const NetworkEdge &edge : edges) {
-            adjacency[source].push_back(edge.target_neuron_index);
+            adjacency[source].push_back((s32)edge.target_neuron_index);
         }
     }
 

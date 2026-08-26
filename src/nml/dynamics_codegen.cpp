@@ -740,6 +740,77 @@ String generate_cell_body(const CellTypeSpecification &cell_type,
     return source.str();
 }
 
+// Splits an OnEvent StateAssignment of the form `s = s + <increment>` and returns the
+// increment. Aggregation depends on exactly this shape: the sum of a target's incoming
+// synapse states can only obey the same equation each term does if an arrival ADDS to the
+// state rather than transforming it. `s = s * 2` would not aggregate, and neither would
+// `s = weight` -- both are rejected rather than quietly summed wrongly.
+Optional<String> extract_additive_increment(const String &expression, const String &state_name) {
+    Vector<String> terms;
+    s64 depth = 0;
+    usize term_start = 0;
+    for (usize index = 0; index < expression.size(); index += 1) {
+        const char character = expression[index];
+        if (character == '(') depth += 1;
+        if (character == ')') depth -= 1;
+        if (character == '+' && depth == 0) {
+            terms.push_back(expression.substr(term_start, index - term_start));
+            term_start = index + 1;
+        }
+    }
+    terms.push_back(expression.substr(term_start));
+
+    auto trimmed = [](const String &text) {
+        const usize first = text.find_first_not_of(" \t\n");
+        if (first == String::npos) return String();
+        const usize last = text.find_last_not_of(" \t\n");
+        return text.substr(first, last - first + 1);
+    };
+
+    Vector<String> increment_terms;
+    bool found_state_term = false;
+    for (const String &term : terms) {
+        if (!found_state_term && trimmed(term) == state_name) {
+            found_state_term = true;
+            continue;
+        }
+        increment_terms.push_back(term);
+    }
+
+    if (!found_state_term || increment_terms.empty()) return std::nullopt;
+
+    String increment = increment_terms[0];
+    for (usize index = 1; index < increment_terms.size(); index += 1) {
+        increment += "+" + increment_terms[index];
+    }
+    return increment;
+}
+
+// Which state variable an arrival adds to. Exactly one may receive arrivals: the target's
+// accumulator carries one incoming quantity per prototype, and two receiving variables
+// would need the scatter to say which -- doubling the per-tick atomic traffic for a case
+// no Phase-1 synapse has.
+s64 find_arrival_state_slot(const SynapseTypeSpecification &synapse_type) {
+    s64 arrival_slot = -1;
+    for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Arrival) continue;
+        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+
+        for (usize candidate = 0; candidate < synapse_type.state_variable_names.size();
+             candidate += 1) {
+            if (synapse_type.state_variable_names[candidate] != instruction.target) continue;
+            if (arrival_slot >= 0 && arrival_slot != (s64)candidate) {
+                throw runtime_error(
+                        "dynamics_codegen: '" + synapse_type.name + "' has more than one state "
+                        "variable assigned on arrival, which the aggregated accumulator cannot "
+                        "represent -- it carries one incoming quantity per prototype");
+            }
+            arrival_slot = (s64)candidate;
+        }
+    }
+    return arrival_slot;
+}
+
 String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
                              const NML_ParseResult &parse_result,
                              s64 case_index) {
@@ -764,48 +835,9 @@ String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
 
     source << "                case " << case_index << ": { // " << synapse_type.name << "\n";
 
-    for (usize slot = 0; slot < synapse_type.state_variable_names.size(); slot += 1) {
-        source << indent << "float state_" << slot << " = edge_variables[" << (slot + 1)
-               << " * edge_plane_stride + edge_base]; // "
-               << synapse_type.state_variable_names[slot] << "\n";
-    }
-    source << "\n";
-
-    // The OnEvent handler fires first, so a spike that arrives this tick is part of the
-    // state the derivative step then advances.
-    ostringstream arrival;
-    for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
-        if (instruction.stage != DynamicsStage::Arrival) continue;
-        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
-
-        s64 slot = -1;
-        for (usize candidate = 0; candidate < synapse_type.state_variable_names.size();
-             candidate += 1) {
-            if (synapse_type.state_variable_names[candidate] == instruction.target) {
-                slot = (s64)candidate;
-            }
-        }
-        if (slot < 0) {
-            throw runtime_error(
-                    "dynamics_codegen: '" + synapse_type.name + "' assigns '" +
-                    instruction.target +
-                    "' in an OnEvent, but it is not one of its StateVariables");
-        }
-
-        arrival << indent << "    state_" << slot << " = "
-                << translate_expression(instruction.expression, symbols, synapse_type.name)
-                << ";\n";
-    }
-    if (!arrival.str().empty()) {
-        source << indent << "if (arrived) {\n" << arrival.str() << indent << "}\n";
-    }
-
-    source << emit_integrate_stage(synapse_type.dynamics, symbols,
-                                   synapse_type.state_variable_names, "state_",
-                                   synapse_type.name, indent, "", "");
-
     // The current this synapse delivers is its `i` exposure, which every
-    // baseCurrentBasedSynapse declares as a DerivedVariable.
+    // baseCurrentBasedSynapse declares as a DerivedVariable. Checked here rather than in
+    // the integration below so the error names the type at the first place it is reached.
     bool exposes_current = false;
     for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
         if (instruction.source_tag != NML_DeclarationType::DerivedVariable) continue;
@@ -817,14 +849,91 @@ String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
                 "dynamics_codegen: '" + synapse_type.name +
                 "' exposes no current `i`; a current-based synapse must derive one");
     }
-    source << indent << "synapse_current = derived_i;\n\n";
 
-    for (usize slot = 0; slot < synapse_type.state_variable_names.size(); slot += 1) {
-        source << indent << "edge_variables[" << (slot + 1)
-               << " * edge_plane_stride + edge_base] = state_" << slot << ";\n";
+    // The whole per-edge body is one expression now: what this arrival adds. The state it
+    // adds to lives on the target, one accumulator for every edge of this prototype, and
+    // the decay that used to happen here per edge happens there once.
+    const s64 arrival_slot = find_arrival_state_slot(synapse_type);
+    if (arrival_slot < 0) {
+        source << indent << "arrival_increment = 0.0f; // no OnEvent: arrivals change nothing\n";
+        source << "                } break;\n";
+        return source.str();
+    }
+
+    for (const DynamicsInstruction &instruction : synapse_type.dynamics) {
+        if (instruction.stage != DynamicsStage::Arrival) continue;
+        if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
+        if (instruction.target != synapse_type.state_variable_names[(usize)arrival_slot]) continue;
+
+        const Optional<String> increment =
+                extract_additive_increment(instruction.expression, instruction.target);
+        if (!increment.has_value()) {
+            throw runtime_error(
+                    "dynamics_codegen: '" + synapse_type.name + "' assigns '" +
+                    instruction.target + " = " + instruction.expression +
+                    "' on arrival. Aggregating a target's incoming synapses into one "
+                    "accumulator is exact only when an arrival ADDS to the state, so the "
+                    "assignment has to read '" + instruction.target + " = " +
+                    instruction.target + " + ...'");
+        }
+
+        source << indent << "arrival_increment = "
+               << translate_expression(*increment, symbols, synapse_type.name) << ";\n";
     }
 
     source << "                } break;\n";
+    return source.str();
+}
+
+// The target's side of the same synapse: drain this tick's arrivals into the accumulator,
+// advance it one dt, and add the current it now carries to the neuron's input.
+//
+// This runs once per (neuron, prototype) rather than once per edge, which is what makes it
+// independent of the edge count -- and why a quiet edge costs nothing at all.
+String generate_synapse_integration(
+    const SynapseTypeSpecification &synapse_type,
+    const NML_ParseResult &parse_result,
+    s64 prototype_index,
+    s64 synapse_state_count
+) {
+    const SymbolTable symbols = build_synapse_symbols(synapse_type, parse_result);
+    const String indent = "        ";
+    const s64 arrival_slot = find_arrival_state_slot(synapse_type);
+
+    ostringstream source;
+    source << indent << "{ // prototype " << prototype_index << " -- " << synapse_type.name << "\n";
+    source << indent << "    const int synapse_parameter_base = synapse_prototype_parameter_base["
+           << prototype_index << "];\n";
+
+    for (usize slot = 0; slot < synapse_type.state_variable_names.size(); slot += 1) {
+        source << indent << "    const int state_slot_" << slot << " = ("
+               << (prototype_index * synapse_state_count + (s64)slot)
+               << ") * neuron_count + neuron_index;\n"
+               << indent << "    float state_" << slot << " = synapse_state[state_slot_" << slot
+               << "]; // " << synapse_type.state_variable_names[slot] << "\n";
+    }
+
+    if (arrival_slot >= 0) {
+        source << "\n"
+               << indent << "    // Everything that arrived on any edge of this prototype this\n"
+               << indent << "    // tick, summed by the scatter itself. Cleared as it is drained,\n"
+               << indent << "    // so the row is ready for the parity that comes back to it.\n"
+               << indent << "    const int arrival_index = (current_row * SYNAPSE_PROTOTYPE_COUNT + "
+               << prototype_index << ") * neuron_count + neuron_index;\n"
+               << indent << "    state_" << arrival_slot << " += synapse_arrivals[arrival_index];\n"
+               << indent << "    synapse_arrivals[arrival_index] = 0.0f;\n\n";
+    }
+
+    source << emit_integrate_stage(synapse_type.dynamics, symbols,
+                                   synapse_type.state_variable_names, "state_",
+                                   synapse_type.name, indent + "    ", "", "");
+
+    source << indent << "    network_input += derived_i;\n";
+
+    for (usize slot = 0; slot < synapse_type.state_variable_names.size(); slot += 1) {
+        source << indent << "    synapse_state[state_slot_" << slot << "] = state_" << slot << ";\n";
+    }
+    source << indent << "}\n";
     return source.str();
 }
 
@@ -849,6 +958,43 @@ const char *KERNEL_PREAMBLE = R"METAL(
 
 inline float spikecorec_heaviside(float value) {
     return value >= 0.0f ? 1.0f : 0.0f;
+}
+
+// One edge's stored value, reconstructed from the shared basis. There is no per-edge
+// array to load from: the k^2-tree said this pair is an edge, and U/Ck/V say what it is
+// worth. Ck is folded into the same accumulation position the host uses, so the two agree
+// term for term rather than merely closely.
+inline float spikecorec_reconstruct_edge(
+    const device float4 *U, const device float4 *V, const device float *coefficients,
+    int rank_float4_stride, int source_node, int target_node
+) {
+    const device float4 *u_row = U + (long)source_node * rank_float4_stride;
+    const device float4 *v_row = V + (long)target_node * rank_float4_stride;
+
+    float dot_product = 0.0f;
+    for (int lane = 0; lane < rank_float4_stride; ++lane) {
+        float4 lane_coefficients = float4(
+            coefficients[lane * 4 + 0], coefficients[lane * 4 + 1],
+            coefficients[lane * 4 + 2], coefficients[lane * 4 + 3]
+        );
+        dot_product += dot(u_row[lane], lane_coefficients * v_row[lane]);
+    }
+    return dot_product;
+}
+
+// Which synapse prototype an edge uses, from the run table baked in below. Runs are
+// sorted and contiguous over the edge ordering, so this is the last run starting at or
+// below the ordinal. Prototype index deliberately does not come from the basis: it picks
+// a switch case, and control flow should not ride on a reconstruction.
+inline int spikecorec_edge_prototype(long edge_ordinal) {
+    int low = 0;
+    int high = PROJECTION_RUN_COUNT - 1;
+    while (low < high) {
+        int middle = (low + high + 1) / 2;
+        if ((long)projection_first_edge_ordinal[middle] <= edge_ordinal) low = middle;
+        else high = middle - 1;
+    }
+    return projection_synapse_prototype[low];
 }
 )METAL";
 
@@ -881,7 +1027,7 @@ kernel void master_step(
     constant float       &step_dt                   [[ buffer(1)  ]],
     constant int         &neuron_count              [[ buffer(2)  ]],
     constant int         &spike_history_length      [[ buffer(3)  ]],
-    constant int         &max_neighbor_count        [[ buffer(4)  ]],
+    constant int         &rank_float4_stride        [[ buffer(4)  ]],
     device   float       *cell_state                [[ buffer(5)  ]],
     const device float   *cell_parameters           [[ buffer(6)  ]],
     const device float   *synapse_parameters        [[ buffer(7)  ]],
@@ -897,9 +1043,13 @@ kernel void master_step(
     constant int         &padded_node_count         [[ buffer(17) ]],
     constant int         &tree_height               [[ buffer(18) ]],
     constant int         &internal_bit_count        [[ buffer(19) ]],
-    const device float   *edge_weights              [[ buffer(20) ]],
-    const device float   *edge_delays               [[ buffer(21) ]],
-    device   float       *edge_variables            [[ buffer(22) ]],
+    const device float4  *U                         [[ buffer(20) ]],
+    const device float4  *V                         [[ buffer(21) ]],
+    const device float   *weight_coefficients       [[ buffer(22) ]],
+    const device float   *delay_coefficients        [[ buffer(23) ]],
+    const device long    *edge_row_offset           [[ buffer(24) ]],
+    device   float       *synapse_arrivals          [[ buffer(25) ]],
+    device   float       *synapse_state             [[ buffer(26) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
 )METAL";
@@ -907,8 +1057,6 @@ kernel void master_step(
 const char *KERNEL_PROLOGUE = R"METAL(
     const int neuron_index = (int)thread_id;
     if (neuron_index >= neuron_count) return;
-
-    const int edge_plane_stride = neuron_count * max_neighbor_count;
 
     // ── stage 1 · deliver ────────────────────────────────────────────────────────
     // network_inputs is two rows: this tick's arrivals are read out of one while this
@@ -918,10 +1066,14 @@ const char *KERNEL_PROLOGUE = R"METAL(
     const int current_row = (int)(tick % 2);
     const int next_row    = 1 - current_row;
 
+    // External stimulus only: synaptic input arrives through the per-prototype
+    // accumulators drained just below, which is where the synapse dynamics now live.
     const int input_slot = current_row * neuron_count + neuron_index;
-    const float network_input = network_inputs[input_slot];
+    float network_input = network_inputs[input_slot];
     network_inputs[input_slot] = 0.0f;
+)METAL";
 
+const char *KERNEL_AFTER_SYNAPSE_INTEGRATION = R"METAL(
     // Populations occupy contiguous neuron ranges in document order, so the last one
     // starting at or below this neuron is the one it belongs to.
     int population = 0;
@@ -973,12 +1125,18 @@ const char *KERNEL_BETWEEN_CELL_AND_PROPAGATE = R"METAL(    }
         walk_stack_row_base, walk_stack_col_base, walk_stack_block_size,
         walk_stack_bit_offset, walk_stack_next_col, walk_stack_top
     )) >= 0) {
-        if (slot >= max_neighbor_count) break;
+        // The edge's own number in the canonical ordering: this row's first ordinal plus
+        // its position in the walk. No padding, so the bound is the node's real degree.
+        const long edge_ordinal = edge_row_offset[neuron_index] + slot;
+        if (edge_ordinal >= edge_row_offset[neuron_index + 1]) break;
 
-        const int edge_base = neuron_index * max_neighbor_count + slot;
-        const float edge_weight = edge_weights[edge_base];
+        const float edge_weight = spikecorec_reconstruct_edge(
+            U, V, weight_coefficients, rank_float4_stride, neuron_index, target);
 
-        int delay_ticks = (int)edge_delays[edge_base];
+        // Whole ticks, so rounding absorbs the reconstruction's error where the same error
+        // in a weight would not be -- and one tick is the engine's own minimum latency.
+        int delay_ticks = (int)round(spikecorec_reconstruct_edge(
+            U, V, delay_coefficients, rank_float4_stride, neuron_index, target));
         if (delay_ticks < 1) delay_ticks = 1;
 
         // Did this neuron spike exactly delay_ticks ago? The history ring is what makes
@@ -989,18 +1147,28 @@ const char *KERNEL_BETWEEN_CELL_AND_PROPAGATE = R"METAL(    }
             arrived = spike_history[arrival_row * neuron_count + neuron_index] != 0;
         }
 
-        const int synapse_prototype = (int)edge_variables[edge_base];
+        // Nothing arrived means nothing to do for this edge. There is no per-edge state to
+        // decay any more -- the target's accumulator does that once, for every edge at
+        // once -- so a quiet edge costs one branch instead of a load and a store.
+        if (!arrived) { slot += 1; continue; }
+
+        const int synapse_prototype = spikecorec_edge_prototype(edge_ordinal);
         const int synapse_parameter_base = synapse_prototype_parameter_base[synapse_prototype];
 
-        float synapse_current = 0.0f;
+        float arrival_increment = 0.0f;
         switch (synapse_prototype_type[synapse_prototype]) {
 )METAL";
 
 const char *KERNEL_EPILOGUE = R"METAL(        }
 
-        device atomic_float *arrival_slot =
-            (device atomic_float *)(network_inputs + next_row * neuron_count + target);
-        atomic_fetch_add_explicit(arrival_slot, synapse_current, memory_order_relaxed);
+        // The increment is linear in this edge's weight, so it lands directly in the
+        // target's per-prototype accumulator. Atomic because many sources scatter into one
+        // target; the next row rather than the current one because the target is draining
+        // that one this tick.
+        device atomic_float *arrival_slot = (device atomic_float *)(
+            synapse_arrivals +
+            (next_row * SYNAPSE_PROTOTYPE_COUNT + synapse_prototype) * neuron_count + target);
+        atomic_fetch_add_explicit(arrival_slot, arrival_increment, memory_order_relaxed);
 
         slot += 1;
     }
@@ -1126,6 +1294,51 @@ ModelLayout compute_model_layout(const NML_ParseResult &parse_result) {
     return layout;
 }
 
+void collect_projection_runs(
+    const NML_ParseResult &parse_result,
+    Vector<s64> &first_edge_ordinal,
+    Vector<s64> &edge_count,
+    Vector<s64> &synapse_prototype,
+    Vector<f32> &weight,
+    Vector<s32> &delay_ticks
+) {
+    s64 ordinal = 0;
+    for (usize source = 0; source < parse_result.neurons.size(); source += 1) {
+        for (const NetworkEdge &edge : parse_result.neurons[source].outgoing_edges) {
+            if (edge.synapse_prototype_index < 0) {
+                throw runtime_error(
+                        "dynamics_codegen: the connection " + to_string(source) + " -> " +
+                        to_string(edge.target_neuron_index) +
+                        " names no synapse, so there is nothing to carry its current");
+            }
+
+            const s64 edge_prototype = edge.synapse_prototype_index;
+            const f32 edge_weight = (f32)edge.weight;
+            // The engine's synaptic latency is one tick, so a connection that names no
+            // delay still arrives a tick later rather than instantaneously.
+            const s32 edge_delay = (s32)max<s64>(1, edge.delay_tick_count);
+
+            const bool extends_current_run =
+                    !first_edge_ordinal.empty() &&
+                    synapse_prototype.back() == edge_prototype &&
+                    weight.back() == edge_weight &&
+                    delay_ticks.back() == edge_delay &&
+                    first_edge_ordinal.back() + edge_count.back() == ordinal;
+
+            if (extends_current_run) {
+                edge_count.back() += 1;
+            } else {
+                first_edge_ordinal.push_back(ordinal);
+                edge_count.push_back(1);
+                synapse_prototype.push_back(edge_prototype);
+                weight.push_back(edge_weight);
+                delay_ticks.push_back(edge_delay);
+            }
+            ordinal += 1;
+        }
+    }
+}
+
 String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLayout &layout) {
     if (parse_result.populations.empty()) {
         throw runtime_error(
@@ -1136,10 +1349,10 @@ String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLa
     ostringstream source;
     source << "#include <metal_stdlib>\n"
            << "using namespace metal;\n"
-           << read_device_include("k2tree_device.metalinc")
-           << KERNEL_PREAMBLE << "\n";
+           << read_device_include("k2tree_device.metalinc");
 
     // ── model tables, baked rather than passed ───────────────────────────────────
+    // Emitted ahead of the preamble because its helpers read them.
     // Populations occupy contiguous neuron ranges and there are a handful of them, so the
     // per-neuron cell type / state base / parameter base every thread needs are derivable
     // from a table small enough to compile into the kernel. That is four per-neuron
@@ -1168,15 +1381,50 @@ String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLa
         synapse_types.push_back(parse_result.synapse_prototypes[index].type_index);
         synapse_parameter_bases.push_back(layout.synapse_prototype_parameter_base[index]);
     }
-    source << emit_integer_table("synapse_prototype_type", synapse_types)
+    source << "constant int SYNAPSE_PROTOTYPE_COUNT = "
+           << parse_result.synapse_prototypes.size() << ";\n"
+           << "constant int SYNAPSE_STATE_COUNT = " << layout.widest_synapse_state_count << ";\n"
+           << emit_integer_table("synapse_prototype_type", synapse_types)
            << emit_integer_table("synapse_prototype_parameter_base", synapse_parameter_bases)
            << "\n";
+
+    // Which prototype each edge uses, as runs over the canonical edge ordering. Baked as a
+    // table rather than passed as a per-edge buffer, because a projection names one synapse
+    // for every connection it declares -- so this is O(projections), not O(edges).
+    Vector<s64> run_first_edge_ordinal, run_edge_count, run_synapse_prototype;
+    Vector<f32> run_weight;
+    Vector<s32> run_delay_ticks;
+    collect_projection_runs(parse_result, run_first_edge_ordinal, run_edge_count,
+                            run_synapse_prototype, run_weight, run_delay_ticks);
+
+    // A zero-length constant array is not legal MSL, and a network with no connections has
+    // no runs -- one neutral entry keeps the lookup well-formed for a walk that never runs.
+    if (run_first_edge_ordinal.empty()) {
+        run_first_edge_ordinal.push_back(0);
+        run_synapse_prototype.push_back(0);
+    }
+    source << "constant int PROJECTION_RUN_COUNT = " << run_first_edge_ordinal.size() << ";\n"
+           << emit_integer_table("projection_first_edge_ordinal", run_first_edge_ordinal)
+           << emit_integer_table("projection_synapse_prototype", run_synapse_prototype)
+           << "\n";
+
+    source << KERNEL_PREAMBLE << "\n";
 
     // ── the generated bodies ─────────────────────────────────────────────────────
     ostringstream cell_bodies;
     for (usize index = 0; index < parse_result.cell_types.size(); index += 1) {
         cell_bodies << generate_cell_body(parse_result.cell_types[index], parse_result,
                                           (s64)index);
+    }
+
+    // One integration block per PROTOTYPE, not per type: two prototypes of the same type
+    // have different parameters and therefore different accumulators.
+    ostringstream synapse_integration;
+    for (usize index = 0; index < parse_result.synapse_prototypes.size(); index += 1) {
+        const ComponentPrototype &prototype = parse_result.synapse_prototypes[index];
+        synapse_integration << generate_synapse_integration(
+                parse_result.synapse_types[(usize)prototype.type_index], parse_result,
+                (s64)index, layout.widest_synapse_state_count);
     }
 
     ostringstream synapse_bodies;
@@ -1187,6 +1435,8 @@ String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLa
 
     source << KERNEL_SIGNATURE
            << KERNEL_PROLOGUE
+           << synapse_integration.str()
+           << KERNEL_AFTER_SYNAPSE_INTEGRATION
            << cell_bodies.str()
            << KERNEL_BETWEEN_CELL_AND_PROPAGATE
            << synapse_bodies.str()
