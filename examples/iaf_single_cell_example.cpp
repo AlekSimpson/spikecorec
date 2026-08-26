@@ -16,7 +16,6 @@ int main(int argument_count, char **arguments) {
             ? arguments[1]
             : "tests/fixtures/nml/LEMS_iaf_single_cell.xml";
 
-    initialize_gpu_context();
 
     SpikeEngine engine(model_path);
     engine.run();
@@ -45,6 +44,5 @@ int main(int argument_count, char **arguments) {
     std::printf("mean firing rate         : %.3f Hz\n", engine.mean_firing_rate_hertz());
     std::printf("final membrane potential : %.6f V\n", engine.read_state_variable(0, "v"));
 
-    release_gpu_resources();
     return 0;
 }

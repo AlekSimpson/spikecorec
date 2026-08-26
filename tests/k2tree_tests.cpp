@@ -24,6 +24,15 @@ using namespace spikecorec;
 
 namespace {
 
+// One backend for the whole file. Every tree carves its own slab out of it and releases
+// that slab when it dies, so sharing one backend across tests is not sharing storage --
+// it only avoids standing up a Metal device per test.
+EngineBackend &test_backend() {
+    static EngineBackend backend;
+    return backend;
+}
+
+
 // A file that only THIS process can see, for the save/load round-trip below.
 //
 // It replaces the hardcoded literal "/tmp/spikecorec_test_k2tree.bin", which named one fixed file
@@ -44,7 +53,7 @@ public:
         // Recreated here rather than only alongside the one-time wipe below, because the
         // destructor takes the root away again as soon as it is empty, and K2Tree::save()
         // opens an ofstream without checking it opened: a missing directory would leave
-        // K2Tree::load() reading a file that was never written.
+        // K2Tree::load(test_backend(), ) reading a file that was never written.
         filesystem::create_directories(files_root());
         path_ = files_root() / file_name;
     }
@@ -101,14 +110,14 @@ vector<vector<s32>> k2_reference_adjacency() {
 TEST(K2Tree, from_adjacency_list_invalid_branching_factor) {
     auto adjacency_list = k2_reference_adjacency();
     const s32 node_count = 0;
-    auto result = K2Tree::from_adjacency_list(adjacency_list, node_count, -1);
+    auto result = K2Tree::from_adjacency_list(test_backend(), adjacency_list, node_count, -1);
     EXPECT_FALSE(result.has_value());
 }
 
 TEST(K2Tree, adjacent_and_neighbors) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;
-    K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
+    K2Tree tree = *K2Tree::from_adjacency_list(test_backend(), adjacency, node_count);
 
     for (s32 source = 0; source < node_count; ++source) {
         unordered_set<s32> row(adjacency[(usize)source].begin(), adjacency[(usize)source].end());
@@ -129,7 +138,7 @@ TEST(K2Tree, adjacent_and_neighbors) {
 TEST(K2Tree, adjacent_and_predecessors) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;
-    K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
+    K2Tree tree = *K2Tree::from_adjacency_list(test_backend(), adjacency, node_count);
 
     // Ground-truth predecessor lists = the TRANSPOSE of the reference adjacency: node u is a
     // predecessor of node v iff the edge u -> v exists in the forward adjacency. Derived from
@@ -153,14 +162,14 @@ TEST(K2Tree, adjacent_and_predecessors) {
 
 TEST(K2Tree, predecessors_bounds_and_degenerate) {
     // Out-of-range / degenerate queries return 0 written, mirroring get_neighbors' own bounds checks.
-    K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
+    K2Tree tree = *K2Tree::from_adjacency_list(test_backend(), k2_reference_adjacency(), 8);
     vector<s32> buffer(8);
     EXPECT_EQ(tree.get_predecessors(-1, buffer.data(), 8), 0);
     EXPECT_EQ(tree.get_predecessors(8, buffer.data(), 8), 0);
     EXPECT_EQ(tree.get_predecessors(0, buffer.data(), 0), 0);
 
     vector<vector<s32>> single_isolated = {{}};
-    K2Tree isolated = *K2Tree::from_adjacency_list(single_isolated, 1);
+    K2Tree isolated = *K2Tree::from_adjacency_list(test_backend(), single_isolated, 1);
     EXPECT_EQ(isolated.get_predecessors(0, buffer.data(), 8), 0);
 
     // max_neighbor_count truncation: node 3 has two predecessors (2 and 7); asking for at most 1
@@ -174,7 +183,7 @@ TEST(K2Tree, predecessors_bounds_and_degenerate) {
 TEST(K2Tree, adjacent_batch) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;
-    K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
+    K2Tree tree = *K2Tree::from_adjacency_list(test_backend(), adjacency, node_count);
 
     vector<s32> source_nodes, target_nodes;
     for (s32 source = 0; source < node_count; ++source)
@@ -196,19 +205,19 @@ TEST(K2Tree, single_node_and_bounds) {
     // validation in build_tree_arrays, which from_adjacency_list/from_edges
     // both funnel through).
     vector<vector<s32>> single_with_self_loop = {{0}};
-    EXPECT_THROW({ K2Tree::from_adjacency_list(single_with_self_loop, 1); }, std::invalid_argument);
+    EXPECT_THROW({ K2Tree::from_adjacency_list(test_backend(), single_with_self_loop, 1); }, std::invalid_argument);
 
     // An isolated single node (no self-loop declared) constructs normally: with
     // no other node to connect to, it collapses to a zero-level tree
     // (tree_height=0) and correctly reports no edge.
     vector<vector<s32>> single_isolated = {{}};
-    K2Tree isolated = *K2Tree::from_adjacency_list(single_isolated, 1);
+    K2Tree isolated = *K2Tree::from_adjacency_list(test_backend(), single_isolated, 1);
     EXPECT_EQ(isolated.tree_height, 0);
     vector<s32> buffer(4);
     EXPECT_EQ(isolated.adjacent(0, 0), 0);
     EXPECT_EQ(isolated.get_neighbors(0, buffer.data(), 4), 0);
 
-    K2Tree tree = *K2Tree::from_adjacency_list(k2_reference_adjacency(), 8);
+    K2Tree tree = *K2Tree::from_adjacency_list(test_backend(), k2_reference_adjacency(), 8);
     EXPECT_EQ(tree.adjacent(-1, 0), 0);
     EXPECT_EQ(tree.adjacent(0, 8), 0);
     EXPECT_EQ(tree.adjacent(8, 0), 0);
@@ -227,24 +236,24 @@ TEST(K2Tree, self_loop_rejected_for_any_node_count) {
         {1, 2}, // node 1: self-loop + normal edge
         {0}
     };
-    EXPECT_THROW({ K2Tree::from_adjacency_list(adjacency_with_self_loop, 3); }, std::invalid_argument);
+    EXPECT_THROW({ K2Tree::from_adjacency_list(test_backend(), adjacency_with_self_loop, 3); }, std::invalid_argument);
 
     vector<s32> source_nodes = {0, 1, 1, 2};
     vector<s32> target_nodes = {1, 1, 2, 0};
     EXPECT_THROW({
-        K2Tree::from_edges(source_nodes.data(), target_nodes.data(), (s32)source_nodes.size(), 3);
+        K2Tree::from_edges(test_backend(), source_nodes.data(), target_nodes.data(), (s32)source_nodes.size(), 3);
     }, std::invalid_argument);
 }
 
 TEST(K2Tree, save_load) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;
-    K2Tree tree = *K2Tree::from_adjacency_list(adjacency, node_count);
+    K2Tree tree = *K2Tree::from_adjacency_list(test_backend(), adjacency, node_count);
 
     const ScopedTemporaryFile temporary_file("save_load.bin");
     const char *path = temporary_file.path();
     tree.save(path);
-    K2Tree loaded = K2Tree::load(path);
+    K2Tree loaded = K2Tree::load(test_backend(), path);
 
     EXPECT_EQ(loaded.node_count, tree.node_count);
     EXPECT_EQ(loaded.tree_height, tree.tree_height);
@@ -263,9 +272,9 @@ TEST(K2Tree, from_edges) {
             target_nodes.push_back(target);
         }
 
-    K2Tree from_edge_list = *K2Tree::from_edges(source_nodes.data(), target_nodes.data(),
+    K2Tree from_edge_list = *K2Tree::from_edges(test_backend(), source_nodes.data(), target_nodes.data(),
                                                 (s32)source_nodes.size(), node_count);
-    K2Tree from_adj = *K2Tree::from_adjacency_list(adjacency, node_count);
+    K2Tree from_adj = *K2Tree::from_adjacency_list(test_backend(), adjacency, node_count);
     for (s32 source = 0; source < node_count; ++source)
         for (s32 target = 0; target < node_count; ++target)
             EXPECT_EQ(from_edge_list.adjacent(source, target), from_adj.adjacent(source, target));
@@ -281,38 +290,12 @@ TEST(K2Tree, from_edges_invalid_branching_factor) {
             target_nodes.push_back(target);
         }
 
-    auto result = K2Tree::from_edges(source_nodes.data(), target_nodes.data(),
+    auto result = K2Tree::from_edges(test_backend(), source_nodes.data(), target_nodes.data(),
                                      (s32)source_nodes.size(), node_count, 10);
     EXPECT_FALSE(result.has_value());
 
-    result = K2Tree::from_edges(source_nodes.data(), target_nodes.data(),
+    result = K2Tree::from_edges(test_backend(), source_nodes.data(), target_nodes.data(),
                                 (s32)source_nodes.size(), node_count, -1);
     EXPECT_FALSE(result.has_value());
 }
 
-// A k^2-tree's bit arrays and rank tables live in GPU-visible memory, so building one
-// without initialize_gpu_context() used to hand back a null buffer and fault inside
-// _platform_memmove, for a graph of any size and with no diagnostic at all. Deliberately
-// last in this file: the test main initializes the context once, so observing the
-// un-initialized path means taking it back down, and nothing GPU-resident may be alive
-// across the gap -- a GpuPointer held over it would name a released buffer.
-TEST(K2Tree, building_without_a_gpu_context_reports_a_clear_error) {
-    // Restores the context however the test exits, including through a failed assertion:
-    // every later test allocates.
-    struct GpuContextRestorer {
-        ~GpuContextRestorer() { initialize_gpu_context(); }
-    };
-
-    auto adjacency = k2_reference_adjacency(); // host memory, built before the gap
-    release_gpu_resources();
-    GpuContextRestorer restorer;
-
-    ASSERT_FALSE(gpu_context_is_initialized());
-    try {
-        auto tree = K2Tree::from_adjacency_list(adjacency, 8);
-        ADD_FAILURE() << "building a k^2-tree with no GPU context must not be silent";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(string(error.what()).find("initialize_gpu_context"), string::npos)
-            << "the error must name the call the caller is missing: " << error.what();
-    }
-}

@@ -1035,7 +1035,7 @@ TEST(Export, adjacency_projection_matches_the_stored_edges) {
 
     // The plain source -> targets form WeightMatrix consumes is derived, not stored, so
     // there is only one edge list that can be wrong.
-    Vector<Vector<s64>> adjacency = build_adjacency_list(result);
+    Vector<Vector<s32>> adjacency = build_adjacency_list(result);
 
     ASSERT_EQ(adjacency.size(), result.neurons.size());
     for (usize source = 0; source < result.neurons.size(); source += 1) {
@@ -1047,8 +1047,8 @@ TEST(Export, adjacency_projection_matches_the_stored_edges) {
         }
     }
 
-    EXPECT_EQ(adjacency[0], (Vector<s64>{4}));
-    EXPECT_EQ(adjacency[2], (Vector<s64>{3}));
+    EXPECT_EQ(adjacency[0], (Vector<s32>{4}));
+    EXPECT_EQ(adjacency[2], (Vector<s32>{3}));
     EXPECT_TRUE(adjacency[1].empty());
 }
 

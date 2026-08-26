@@ -15,7 +15,6 @@ int main(int argument_count, char **arguments) {
     const std::string model_path = argument_count > 1
             ? arguments[1] : "tests/fixtures/nml/LEMS_glif_family.xml";
 
-    initialize_gpu_context();
 
     SpikeEngine engine(model_path);
     engine.run();
@@ -47,6 +46,5 @@ int main(int argument_count, char **arguments) {
     std::printf("\nmean firing rate across all five: %.2f Hz\n",
                 engine.mean_firing_rate_hertz());
 
-    release_gpu_resources();
     return 0;
 }

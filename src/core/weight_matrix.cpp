@@ -939,6 +939,13 @@ void WeightMatrix::save(const char *filepath) const {
     const s64 coefficient_bytes = MATRIX_COUNT * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
     file.write(reinterpret_cast<const char *>(coefficients.get_contents()), (streamsize)coefficient_bytes);
 
+    // The delay fast path is state, not derived: a matrix whose delays all agree answers
+    // from constant_delay_ticks and never reconstructs. Restoring the basis without these
+    // gives back a matrix that reports the default one tick for every edge.
+    const u8 constant_delay_flag = using_constant_delay_ticks ? 1 : 0;
+    file.write(reinterpret_cast<const char *>(&constant_delay_flag), sizeof(u8));
+    file.write(reinterpret_cast<const char *>(&constant_delay_ticks), sizeof(s32));
+
     log::logger().debug("WeightMatrix::save: {} node_count={} rank={}", filepath, node_count, rank);
 }
 
@@ -969,6 +976,11 @@ void WeightMatrix::load_from_disk(const char *filepath) {
 
     const s64 coefficient_bytes = MATRIX_COUNT * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
     file.read(reinterpret_cast<char *>(coefficients.get_contents()), (streamsize)coefficient_bytes);
+
+    u8 constant_delay_flag = 0;
+    file.read(reinterpret_cast<char *>(&constant_delay_flag), sizeof(u8));
+    file.read(reinterpret_cast<char *>(&constant_delay_ticks), sizeof(s32));
+    using_constant_delay_ticks = constant_delay_flag != 0;
 
     using_constant_weight = false;
     log::logger().debug("WeightMatrix::load_from_disk: {} node_count={} rank={} magic={:#x}",

@@ -35,6 +35,5 @@ int main() {
                 result, parameters.simulation_seconds,
                 /*render_max_frames=*/96, /*render_frames_per_second=*/12);
 
-    release_gpu_resources();
     return 0;
 }

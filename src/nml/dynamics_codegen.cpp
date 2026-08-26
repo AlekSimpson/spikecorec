@@ -811,23 +811,31 @@ s64 find_arrival_state_slot(const SynapseTypeSpecification &synapse_type) {
     return arrival_slot;
 }
 
-String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
-                             const NML_ParseResult &parse_result,
-                             s64 case_index) {
+// Everything about a synapse type this codegen cannot represent. Called once up front so
+// the diagnostic does not depend on which emitter happens to reach the type first.
+void reject_unsupported_synapse_type(const SynapseTypeSpecification &synapse_type) {
     if (synapse_type.is_conductance_based) {
         throw runtime_error(
                 "dynamics_codegen: '" + synapse_type.name +
                 "' is conductance-based; Phase 1 simulates current-based synapses only");
     }
     if (synapse_type.requires_per_edge_state) {
-        // Every synapse here is already per-edge; the flag means the type composes a
-        // plasticity or block mechanism, whose child dynamics are not lowered yet.
+        // The flag means the type composes a plasticity or block mechanism, whose child
+        // dynamics are not lowered. Such a synapse is also not aggregable: its current
+        // stops being linear in the state it shares with every other edge into the target.
         throw runtime_error(
                 "dynamics_codegen: '" + synapse_type.name +
-                "' composes a plasticity or block mechanism; that is Phase 2 (ticket #66)");
+                "' composes a plasticity or block mechanism, whose current is not linear in "
+                "the state a target's incoming edges share, so it cannot be aggregated");
     }
     reject_unsupported_constructs(synapse_type.name, synapse_type.dynamics,
                                   RefractoryPattern{});
+}
+
+String generate_synapse_body(const SynapseTypeSpecification &synapse_type,
+                             const NML_ParseResult &parse_result,
+                             s64 case_index) {
+    reject_unsupported_synapse_type(synapse_type);
 
     const SymbolTable symbols = build_synapse_symbols(synapse_type, parse_result);
     const String indent = "                    ";
@@ -1405,6 +1413,14 @@ String generate_master_kernel(const NML_ParseResult &parse_result, const ModelLa
         throw runtime_error(
                 "dynamics_codegen: the model declares no populations, so there is nothing "
                 "to generate a kernel for");
+    }
+
+    // Reject what this cannot simulate BEFORE emitting anything. Both synapse emitters
+    // read the same type, and whichever runs first decides which diagnostic the caller
+    // sees -- so the rejection belongs here rather than inside either of them, where it
+    // would name the wrong reason the moment the emission order changed.
+    for (const SynapseTypeSpecification &synapse_type : parse_result.synapse_types) {
+        reject_unsupported_synapse_type(synapse_type);
     }
 
     ostringstream source;
