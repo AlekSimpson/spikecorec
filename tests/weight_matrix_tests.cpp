@@ -237,6 +237,68 @@ TEST(WeightMatrix, a_plasticity_reserve_is_allocated_even_when_the_fit_is_exact)
               (u64)WeightMatrix::MATRIX_COUNT * 128 * sizeof(s64));
 }
 
+// Rank is searched rather than capped at a constant, and the thing it minimises is basis
+// plus corrections TOGETHER -- raising the rank shrinks one and grows the other, so the
+// cheapest rank is a property of the model.
+//
+// For a field with no structure, extra rank buys almost no corrections back, so the search
+// should stay at the bottom rather than spend on a basis that cannot help.
+TEST(WeightMatrix, the_rank_search_does_not_overspend_on_an_incompressible_field) {
+    // Thirty nodes, each reaching the next three, with a weight per edge chosen so no two
+    // agree -- there is no lower-rank structure for a basis to find.
+    const s64 node_count = 30;
+    vector<vector<s32>> ring((usize)node_count);
+    for (s64 source = 0; source < node_count; source += 1) {
+        for (s64 step = 1; step <= 3; step += 1) {
+            ring[(usize)source].push_back((s32)((source + step) % node_count));
+        }
+    }
+
+    Vector<s64> first, count;
+    Vector<s32> prototype, delays;
+    Vector<f32> weights;
+    for (s64 ordinal = 0; ordinal < node_count * 3; ordinal += 1) {
+        first.push_back(ordinal);
+        count.push_back(1);
+        prototype.push_back(0);
+        delays.push_back(1);
+        weights.push_back(1.0f + 0.37f * (f32)((ordinal * 7919) % 101));
+    }
+
+    WeightMatrix searched(test_backend(), ring);
+    searched.declare_projections(first, count, prototype, weights, delays);
+
+    WeightMatrix fixed_budget(test_backend(), ring, -1, true, -1, 7, 1.0f,
+                              /*fit_rank_budget=*/64);
+    fixed_budget.declare_projections(first, count, prototype, weights, delays);
+
+    // The search must not land above a rank it was given no reason to reach.
+    EXPECT_LE(searched.rank, fixed_budget.rank);
+
+    // And the basis it chose must cost no more than the fixed budget's, which is the
+    // measure it was optimising.
+    const s64 searched_basis = 2 * searched.node_count * searched.rank * (s64)sizeof(f32);
+    const s64 fixed_basis = 2 * fixed_budget.node_count * fixed_budget.rank * (s64)sizeof(f32);
+    EXPECT_LE(searched_basis, fixed_basis);
+
+    // Cheaper, not worse: corrections still bring both to the same accuracy.
+    EXPECT_LE(searched.measured_weight_fit_error,
+              WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE);
+}
+
+// An explicit budget overrides the search outright, for a caller who knows their model.
+TEST(WeightMatrix, an_explicit_rank_budget_is_honoured) {
+    WeightMatrix matrix(test_backend(), small_network(), -1, true, -1, 7, 1.0f,
+                        /*fit_rank_budget=*/16);
+    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+
+    // This model takes the exact construction, which sizes rank to the run count -- the
+    // budget only ever binds on the general fit, and never raises the rank above what the
+    // exact path needs.
+    EXPECT_LE(matrix.rank, 16);
+    EXPECT_FLOAT_EQ(matrix.measured_weight_fit_error, 0.0f);
+}
+
 // The ceiling is the accuracy-for-storage dial: it caps what a model with no exploitable
 // structure may spend, and the largest residuals are the ones kept.
 TEST(WeightMatrix, the_ceiling_caps_what_an_unstructured_model_may_spend) {

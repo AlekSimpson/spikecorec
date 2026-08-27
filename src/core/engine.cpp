@@ -289,7 +289,7 @@ void SpikeEngine::build_weight_matrix() {
     // nothing for it.
     weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
-                           correction_ceiling_fraction);
+                           correction_ceiling_fraction, weight_fit_rank_budget);
 
     // Room for updates to queue into, on top of whatever the fit turns out to need. Zero
     // when nothing writes updates, so a model with no plasticity and an exact fit

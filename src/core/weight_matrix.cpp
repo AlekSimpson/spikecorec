@@ -120,13 +120,15 @@ WeightMatrix::WeightMatrix(
     bool check_indexing,
     s64 max_neighbor_count,
     s64 weight_seed,
-    f32 correction_ceiling_fraction
+    f32 correction_ceiling_fraction,
+    s64 fit_rank_budget
 )
     : k2tree(*K2Tree::from_adjacency_list(backend, validate_network(network), (s32)network.size()))
     // No corrections until something has measured that they are needed. A model whose
     // structure the basis captures never allocates any.
     , sparse_delta_capacity(0)
     , correction_ceiling_fraction(max(correction_ceiling_fraction, 0.0f))
+    , fit_rank_budget(fit_rank_budget)
     , owning_backend(&backend)
     , node_count((s64)network.size())
     , check_indexing(check_indexing)
@@ -818,19 +820,17 @@ void WeightMatrix::declare_projections(
     // construction is exact and free, so take it. Otherwise fit -- a projection onto a
     // linear subspace, approximate by design, with the residual left for Sk.
     if (!fit_basis_from_projections(weight, delay_ticks)) {
-        // Rank from the dimension count: MATRIX_COUNT * total_edge_count constraints against
-        // 2 * node_count * rank parameters. That is the rank at which an ARBITRARY field
-        // becomes representable, so it is a ceiling -- capped again by what the kernel can
-        // index, and by a default budget, because spending the ceiling on every model would
-        // give up the compression this exists for.
-        const s64 dimension_count_rank =
-                (MATRIX_COUNT * total_edge_count) / max<s64>(2 * node_count, 1) + 1;
-        const s64 budget_rank = min<s64>(dimension_count_rank, DEFAULT_FIT_RANK_BUDGET);
-        resize_basis(min<s64>(budget_rank, MAX_RANK_FLOAT4_STRIDE * LANE_GROUP));
+        if (fit_rank_budget > 0) {
+            resize_basis(min<s64>(fit_rank_budget, MAX_RANK_FLOAT4_STRIDE * LANE_GROUP));
+            fit_basis_to_targets(targets, DEFAULT_FIT_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
+        } else {
+            // No rank named, so find the one that costs the fewest bytes for this model
+            // rather than assume a constant fits every model's structure.
+            search_for_best_fit_rank(targets);
+        }
 
-        log::logger().debug("declare_projections: {} runs exceed the lane budget; fitting at "
+        log::logger().debug("declare_projections: {} runs exceed the lane budget; fitted at "
                             "rank {} instead of one lane per run", run_count, rank);
-        fit_basis_to_targets(targets, DEFAULT_FIT_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
     }
 
     // Measure what the fit actually missed, then allocate exactly that much -- rather than
@@ -1268,6 +1268,67 @@ void WeightMatrix::fit_basis_to_targets(
     }
 
     using_constant_weight = false;
+}
+
+// Fits at each candidate rank and keeps the one whose basis and corrections cost the fewest
+// bytes together. That sum is the thing worth minimising: raising the rank shrinks the
+// corrections and grows the basis, so there is a floor somewhere between, and where it
+// falls depends on the model rather than on a constant.
+//
+// Candidates climb geometrically to the rank at which an arbitrary field becomes exactly
+// representable -- past that, extra rank buys nothing any correction could not buy cheaper.
+// The search fits shortened; only the winner is fitted properly.
+s64 WeightMatrix::search_for_best_fit_rank(const Vector<Vector<f32>> &targets_per_matrix) {
+    const s64 hard_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
+    const s64 exact_fit_rank =
+            (MATRIX_COUNT * total_edge_count) / max<s64>(2 * node_count, 1) + 1;
+    const s64 highest_candidate = min(round_up_to_lane_group(exact_fit_rank), hard_limit);
+
+    const s64 ceiling_entries = (s64)(correction_ceiling_fraction * (f32)total_edge_count);
+    const s64 correction_entry_bytes = (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32)));
+
+    s64 best_rank = LANE_GROUP;
+    s64 best_total_bytes = numeric_limits<s64>::max();
+    s64 best_corrections = numeric_limits<s64>::max();
+    bool any_candidate_fits_the_ceiling = false;
+
+    s64 candidate = LANE_GROUP;
+    for (s64 attempt = 0; attempt < RANK_SEARCH_MAX_CANDIDATES && candidate <= highest_candidate;
+         attempt += 1) {
+        resize_basis(candidate);
+        fit_basis_to_targets(targets_per_matrix, RANK_SEARCH_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
+
+        const s64 corrections_needed = count_edges_needing_correction(targets_per_matrix);
+        const s64 total_bytes = 2 * node_count * rank * (s64)sizeof(f32) +
+                                min(corrections_needed, ceiling_entries) * correction_entry_bytes;
+        const bool fits_the_ceiling = corrections_needed <= ceiling_entries;
+
+        // A candidate that stays inside the ceiling always beats one that does not, however
+        // few bytes the second uses -- exceeding it means accepting error, and cheapness is
+        // only worth comparing among candidates that are equally correct.
+        const bool better =
+                fits_the_ceiling
+                    ? (!any_candidate_fits_the_ceiling || total_bytes < best_total_bytes)
+                    : (!any_candidate_fits_the_ceiling && corrections_needed < best_corrections);
+
+        if (better) {
+            best_rank = rank;
+            best_total_bytes = total_bytes;
+            best_corrections = corrections_needed;
+            any_candidate_fits_the_ceiling = fits_the_ceiling;
+        }
+
+        log::logger().debug("rank search: rank {} needs {} corrections, {} bytes total",
+                            rank, corrections_needed, total_bytes);
+        candidate *= 2;
+    }
+
+    resize_basis(best_rank);
+    fit_basis_to_targets(targets_per_matrix, DEFAULT_FIT_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
+
+    log::logger().debug("rank search: chose rank {} ({} bytes, {} corrections)",
+                        best_rank, best_total_bytes, best_corrections);
+    return best_rank;
 }
 
 void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {

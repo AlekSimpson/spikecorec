@@ -155,6 +155,13 @@ namespace spikecorec {
         // in memory rather than in silently wrong weights. Lower it to cap what such a
         // model may spend; a well-structured model needs none of it either way.
         f32 correction_ceiling_fraction = 1.0f;
+
+        // The largest rank the weight matrix's general fit may spend, or -1 to search for
+        // the rank whose basis and corrections cost the fewest bytes together. Searching is
+        // the default because the cheapest rank is a property of the model: an
+        // incompressible field gains nothing from extra rank and wants the smallest, while
+        // a structured one is worth spending on.
+        s64 weight_fit_rank_budget = -1;
         s64 plasticity_fold_every_n_ticks = 64;
         f32 plasticity_learning_rate = 0.01f;
         f32 plasticity_l2_regularization = 1e-6f;
