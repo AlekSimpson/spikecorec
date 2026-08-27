@@ -71,13 +71,14 @@ namespace spikecorec {
         // past the warning line is worth knowing about before it becomes a wrong answer.
         static constexpr f32 WEIGHT_FIT_WARNING_TOLERANCE = 1.0e-4f;
 
-        // What the general fit spends when the exact construction is unavailable. Not the
-        // rank an arbitrary field would need for an exact fit -- spending that on every
-        // model gives up the compression this exists for. The residual goes to Sk, and if
-        // a model wants more fidelity the rank is a constructor argument.
-        static constexpr s64 DEFAULT_FIT_RANK_BUDGET = 32;
         static constexpr s32 DEFAULT_FIT_SWEEP_COUNT = 6;
         static constexpr f32 DEFAULT_FIT_RIDGE = 1.0e-4f;
+
+        // Rank is searched, not capped at a number someone picked. The search is cheap
+        // because it uses a shortened fit -- enough to rank the candidates against each
+        // other, with the winner then fitted properly.
+        static constexpr s32 RANK_SEARCH_SWEEP_COUNT = 2;
+        static constexpr s64 RANK_SEARCH_MAX_CANDIDATES = 5;
 
         K2Tree k2tree;
 
@@ -147,6 +148,18 @@ namespace spikecorec {
         // something is going to write updates -- an exactly-fitted model with no plasticity
         // has nothing to queue and allocates nothing.
         s64 plasticity_reserve_entries = 0;
+
+        // The largest rank the general fit may spend, or -1 to search for the rank that
+        // minimises basis + corrections together.
+        //
+        // A fixed cap is the wrong shape for this. The rank at which an arbitrary field
+        // becomes exactly representable is edges/(2*nodes) per matrix, and at scale that
+        // costs MORE than storing every value raw -- a million nodes at degree 100 wants
+        // rank 101, which is 808 MB of basis against 800 MB of raw. Exact is not the
+        // target now that corrections exist; cheapest-for-the-accuracy is, and the two
+        // costs trade against each other, so the minimum is found by measuring rather than
+        // by picking a number.
+        s64 fit_rank_budget = -1;
 
         // Refit when the corrections outgrow this fraction of the edge set -- the basis has
         // drifted far enough from the values that re-optimising it is worth the cost. The
@@ -220,7 +233,8 @@ namespace spikecorec {
             bool check_indexing = true,
             s64 max_neighbor_count = -1,
             s64 weight_seed = -1,
-            f32 correction_ceiling_fraction = 1.0f
+            f32 correction_ceiling_fraction = 1.0f,
+            s64 fit_rank_budget = -1
         );
 
         ~WeightMatrix();
@@ -355,6 +369,10 @@ namespace spikecorec {
         // Distinct from resize_basis, which re-seeds -- doing that here would discard the
         // fit whose residuals decided the capacity in the first place.
         void resize_correction_capacity(s64 new_capacity);
+
+        // Fits at each candidate rank and returns the one whose basis and corrections cost
+        // the fewest bytes together. Leaves the basis fitted at the winner.
+        s64 search_for_best_fit_rank(const Vector<Vector<f32>> &targets_per_matrix);
 
         // Σ_k U[i][k] * Ck[k] * V[j][k] -- the basis's own answer, BEFORE the sparse
         // correction. Only the read paths that then add Sk should call this.
