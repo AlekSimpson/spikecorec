@@ -43,14 +43,29 @@ s64 round_up_to_lane_group(s64 value) {
 //
 // Absolute for a delay, and generous: it is rounded to a whole tick on read, so a basis
 // landing within half a tick already reads back correctly and an entry would buy nothing.
-f32 negligible_residual_for(s64 matrix_index, f32 target_value) {
+f32 negligible_residual_for(s64 matrix_index, f32 target_value, f32 field_scale) {
     if (matrix_index == WeightMatrix::DELAY_MATRIX_INDEX) return 0.4f;
 
-    // A declared zero has nothing to be relative to, so it gets the tolerance outright.
-    const f32 magnitude = fabsf(target_value);
-    return (magnitude > 0.0f)
-        ? WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE * magnitude
-        : WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE;
+    // Relative to the value OR to the field it sits in, whichever is more forgiving.
+    //
+    // Relative to the value alone is unusable wherever a field passes through zero: a
+    // weight of 1e-8 in a field of order 1 would demand its residual be under 1e-12, which
+    // f32 cannot deliver, so every such edge is reported as needing a correction forever.
+    // That is not a small error being flagged -- it is a large field's rounding noise
+    // measured against a value that happens to be tiny.
+    const f32 relative_to_value = WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE * fabsf(target_value);
+    const f32 relative_to_field = WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE * fabsf(field_scale);
+    return max(max(relative_to_value, relative_to_field), WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE);
+}
+
+// Root mean square of one matrix's targets -- the scale the field lives at, which is what
+// a residual near zero has to be judged against.
+f32 field_scale_of(const Vector<f32> &targets) {
+    if (targets.empty()) return 1.0f;
+    f64 sum_of_squares = 0.0;
+    for (f32 value : targets) sum_of_squares += (f64)value * (f64)value;
+    const f64 root_mean_square = sqrt(sum_of_squares / (f64)targets.size());
+    return (root_mean_square > 0.0) ? (f32)root_mean_square : 1.0f;
 }
 
 bool solve_symmetric_in_place(vector<f64> &gram, vector<f64> &right_hand_side, s64 dimension,
@@ -567,9 +582,12 @@ s64 WeightMatrix::count_edges_needing_correction(
 
     for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
         const f32 *coefficient_values = coefficient_row(matrix_index);
-        // Delay only has to land within half a tick, since rounding absorbs the rest --
-        // the same slack store_residual_corrections applies, so the two agree on what
-        // "needs correcting" means.
+
+        // The scale the field lives at, which is what a residual on a near-zero value has
+        // to be judged against. store_residual_corrections computes the same thing the
+        // same way, so the two agree on what "needs correcting" means -- a disagreement
+        // there would size the capacity for one answer and then store the other.
+        const f32 field_scale = field_scale_of(targets_per_matrix[(usize)matrix_index]);
 
         s64 matrix_need = 0;
         for (s64 source_node = 0; source_node < node_count; source_node += 1) {
@@ -583,7 +601,8 @@ s64 WeightMatrix::count_edges_needing_correction(
                                           coefficient_values);
                 if (fabsf(residual) >
                     negligible_residual_for(matrix_index,
-                                            targets_per_matrix[(usize)matrix_index][(usize)ordinal])) {
+                                            targets_per_matrix[(usize)matrix_index][(usize)ordinal],
+                                            field_scale)) {
                     matrix_need += 1;
                 }
             }
@@ -913,6 +932,7 @@ s64 WeightMatrix::store_residual_corrections(
     if ((s64)targets_by_edge_ordinal.size() < total_edge_count) return 0;
 
     const f32 *coefficient_values = coefficient_row(matrix_index);
+    const f32 field_scale = field_scale_of(targets_by_edge_ordinal);
 
     vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
     Vector<Pair<s64, f32>> corrections;
@@ -927,7 +947,8 @@ s64 WeightMatrix::store_residual_corrections(
                                                         coefficient_values);
             const f32 residual = targets_by_edge_ordinal[(usize)ordinal] - reconstructed;
             if (fabsf(residual) >
-                negligible_residual_for(matrix_index, targets_by_edge_ordinal[(usize)ordinal])) {
+                negligible_residual_for(matrix_index, targets_by_edge_ordinal[(usize)ordinal],
+                                        field_scale)) {
                 corrections.push_back({ordinal, residual});
             }
         }
@@ -1142,6 +1163,7 @@ void WeightMatrix::fit_basis_to_targets(
             for (s64 ordinal = first; ordinal < last; ordinal += 1) {
                 const s64 target_node = edge_target[(usize)ordinal];
                 for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                    if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
                     const f32 *coefficient_values = coefficient_row(matrix_index);
                     for (s64 lane = 0; lane < lane_count; lane += 1) {
                         basis_row[(usize)lane] = (f64)coefficient_values[lane] *
@@ -1184,6 +1206,7 @@ void WeightMatrix::fit_basis_to_targets(
             for (s64 ordinal : ordinals) {
                 const s64 source_node = edge_source[(usize)ordinal];
                 for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                    if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
                     const f32 *coefficient_values = coefficient_row(matrix_index);
                     for (s64 lane = 0; lane < lane_count; lane += 1) {
                         basis_row[(usize)lane] = (f64)coefficient_values[lane] *
@@ -1220,6 +1243,10 @@ void WeightMatrix::fit_basis_to_targets(
         // sharing a basis: U and V hold the structure, Ck holds each quantity's scaling
         // of it.
         for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+            // A uniform delay is answered by constant_delay_ticks and never reconstructed,
+            // so making the shared basis fit it spends lanes on a field nothing reads --
+            // and, worse, pulls U and V away from the weights, which are read.
+            if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
             fill(gram.begin(), gram.end(), 0.0);
             fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
 
@@ -1355,6 +1382,18 @@ f32 WeightMatrix::measure_worst_relative_weight_error(const Vector<f32> &weight)
     if (run_count == 0 || total_edge_count == 0) return 0.0f;
 
     const f32 *weight_coefficients = coefficient_row(DEFAULT_MATRIX_INDEX);
+
+    // The scale the weights live at, so a residual on a near-zero one is judged against
+    // the field rather than against itself.
+    Vector<f32> declared_by_edge;
+    declared_by_edge.reserve((usize)max<s64>(total_edge_count, 0));
+    for (s64 index = 0; index < (s64)weight.size(); index += 1) {
+        for (s64 repeat = 0; repeat < projection_edge_count[(usize)index]; repeat += 1) {
+            declared_by_edge.push_back(weight[(usize)index]);
+        }
+    }
+    const f32 field_scale = field_scale_of(declared_by_edge);
+
     vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
 
     f32 worst_relative_error = 0.0f;
@@ -1379,12 +1418,14 @@ f32 WeightMatrix::measure_worst_relative_weight_error(const Vector<f32> &weight)
                     reconstruct_entry((s32)source_node, neighbor_buffer[(usize)slot],
                                       weight_coefficients) +
                     sparse_delta_for(DEFAULT_MATRIX_INDEX, (s32)source_node, ordinal);
-            // Relative to the declared magnitude, because synaptic weights span many
-            // orders of magnitude and an absolute error means nothing across them. A
-            // declared zero is compared absolutely, since nothing is relative to zero.
-            const f32 scale = fabsf(declared);
-            const f32 error = (scale > 0.0f) ? fabsf(reconstructed - declared) / scale
-                                             : fabsf(reconstructed - declared);
+            // Relative to the declared value OR to the field it sits in, whichever is
+            // larger. Weights span orders of magnitude, so an absolute error means nothing
+            // across them -- but relative to the value alone is worse than useless
+            // wherever a field passes through zero: an absolute error of 6e-4 on a weight
+            // of 1e-6 reads as 630x, which says the fit is broken when the fit is fine and
+            // the denominator is the problem.
+            const f32 scale = max(fabsf(declared), field_scale);
+            const f32 error = fabsf(reconstructed - declared) / max(scale, numeric_limits<f32>::min());
             worst_relative_error = max(worst_relative_error, error);
         }
     }
