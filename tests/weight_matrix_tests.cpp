@@ -208,28 +208,61 @@ TEST(WeightMatrix, nothing_is_sized_by_the_padded_neighbour_count) {
               (u64)(matrix.node_count + 1) * sizeof(s64));
 }
 
-// The correction layer is bounded by capacity, never by edge count. A matrix given no
-// capacity simply carries no corrections -- the basis is then the whole answer, accuracy
-// hit included.
-TEST(WeightMatrix, the_correction_layer_is_bounded_by_capacity) {
-    WeightMatrix without(test_backend(), small_network());
-    EXPECT_EQ(without.sparse_delta_capacity, 0);
-    EXPECT_TRUE(without.sparse_delta_edge_ordinal.is_empty());
+// Capacity is measured, not guessed. A model the basis reproduces needs no corrections and
+// must allocate none -- that is the whole point of sizing after the fit rather than before
+// it, and the case a fixed fraction used to charge for.
+TEST(WeightMatrix, a_reproducible_model_allocates_no_correction_layer) {
+    WeightMatrix matrix(test_backend(), small_network());
+    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
 
-    WeightMatrix with(test_backend(), small_network(), -1, true, -1, 7, /*capacity=*/128);
-    EXPECT_EQ(with.sparse_delta_capacity, 128);
-    EXPECT_FALSE(with.sparse_delta_row_start.is_empty());
-    EXPECT_FALSE(with.sparse_delta_edge_ordinal.is_empty());
+    EXPECT_FLOAT_EQ(matrix.measured_weight_fit_error, 0.0f);
+    EXPECT_EQ(matrix.sparse_delta_capacity, 0);
+    EXPECT_TRUE(matrix.sparse_delta_edge_ordinal.is_empty());
+    EXPECT_TRUE(matrix.sparse_delta_value.is_empty());
+    EXPECT_FLOAT_EQ(matrix.sparse_delta_occupancy_fraction(), 0.0f);
+}
 
-    // Never sized by the edge count, however many edges there are.
-    EXPECT_EQ(with.sparse_delta_edge_ordinal.total_bytes,
+// A reserve is what a model with nothing to correct still needs when something is going to
+// write updates -- otherwise there is nowhere to queue them.
+TEST(WeightMatrix, a_plasticity_reserve_is_allocated_even_when_the_fit_is_exact) {
+    WeightMatrix matrix(test_backend(), small_network());
+    matrix.plasticity_reserve_entries = 128;
+    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
+
+    EXPECT_EQ(matrix.sparse_delta_capacity, 128);
+    EXPECT_FALSE(matrix.sparse_delta_edge_ordinal.is_empty());
+
+    // Sized by the reserve, never by the edge count.
+    EXPECT_EQ(matrix.sparse_delta_edge_ordinal.total_bytes,
               (u64)WeightMatrix::MATRIX_COUNT * 128 * sizeof(s64));
+}
+
+// The ceiling is the accuracy-for-storage dial: it caps what a model with no exploitable
+// structure may spend, and the largest residuals are the ones kept.
+TEST(WeightMatrix, the_ceiling_caps_what_an_unstructured_model_may_spend) {
+    // Weights chosen so no two edges share a value and the runs cannot coalesce.
+    WeightMatrix unbounded(test_backend(), small_network(), -1, true, -1, 7,
+                           /*correction_ceiling_fraction=*/1.0f);
+    declare_one_run_per_edge(unbounded, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+
+    WeightMatrix bounded(test_backend(), small_network(), -1, true, -1, 7,
+                         /*correction_ceiling_fraction=*/0.0f);
+    declare_one_run_per_edge(bounded, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+
+    // A ceiling of zero forbids corrections outright, so the basis is the whole answer.
+    EXPECT_EQ(bounded.sparse_delta_capacity, 0);
+
+    // Both reproduce this model regardless, because the exact construction covers it --
+    // which is the point: the ceiling only ever binds on a model that needs corrections.
+    EXPECT_FLOAT_EQ(unbounded.measured_weight_fit_error, 0.0f);
+    EXPECT_FLOAT_EQ(bounded.measured_weight_fit_error, 0.0f);
 }
 
 // An update queues rather than moving U/V, and becomes visible to reads once merged. This
 // is the whole read-path contract: basis plus correction, never one or the other.
 TEST(WeightMatrix, a_queued_correction_changes_what_a_read_returns) {
-    WeightMatrix matrix(test_backend(), small_network(), -1, true, -1, 7, /*capacity=*/128);
+    WeightMatrix matrix(test_backend(), small_network());
+    matrix.plasticity_reserve_entries = 128;
     declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
 
     ASSERT_FLOAT_EQ(matrix.get(0, 1), 0.25f);
@@ -251,7 +284,8 @@ TEST(WeightMatrix, a_queued_correction_changes_what_a_read_returns) {
 // corrections it has absorbed. The values a read returns must survive that unchanged --
 // that is the entire point of the loop.
 TEST(WeightMatrix, refit_absorbs_corrections_without_changing_what_reads_return) {
-    WeightMatrix matrix(test_backend(), small_network(), -1, true, -1, 7, /*capacity=*/128);
+    WeightMatrix matrix(test_backend(), small_network());
+    matrix.plasticity_reserve_entries = 128;
     declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
 
     matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 0.5f);

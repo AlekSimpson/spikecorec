@@ -127,11 +127,26 @@ namespace spikecorec {
         EnginePointer pending_delta_value;         // f32[sparse_delta_capacity]
         EnginePointer pending_delta_count;         // s32[1], bumped atomically on device
 
-        // How many corrections each matrix currently holds. Bounded: past capacity the
-        // largest residuals are kept and the rest are accepted as error, which is the
-        // accuracy-for-storage trade stated plainly rather than an overflow.
+        // How many corrections each matrix can hold, and how many it does. Capacity is not
+        // guessed: declare_projections fits the basis, measures how many edges the fit
+        // actually misses, and sizes this to that. A model whose structure the basis
+        // captures allocates nothing here -- which is the common case, and the one a fixed
+        // fraction used to charge for anyway.
         s64 sparse_delta_capacity = 0;
         Vector<s64> sparse_delta_entry_count = Vector<s64>((usize)MATRIX_COUNT, 0);
+
+        // The most of the edge set corrections may occupy. This is the accuracy-for-storage
+        // dial, and the only reason it is not simply "as many as needed": a field with no
+        // structure to exploit needs one per edge, and corrections cost more per edge than
+        // the values would. At 1.0 every model is reproduced exactly and an incompressible
+        // one pays for it visibly; lower it to cap what that model may spend, and the
+        // largest residuals are the ones kept.
+        f32 correction_ceiling_fraction = 1.0f;
+
+        // Room reserved on top of the fit's needs, for updates to queue into. Zero unless
+        // something is going to write updates -- an exactly-fitted model with no plasticity
+        // has nothing to queue and allocates nothing.
+        s64 plasticity_reserve_entries = 0;
 
         // Refit when the corrections outgrow this fraction of the edge set -- the basis has
         // drifted far enough from the values that re-optimising it is worth the cost. The
@@ -196,7 +211,8 @@ namespace spikecorec {
         // rank:               -1 derives it from the declarations (see derive_rank)
         // max_neighbor_count: -1 derives it from the longest row
         // weight_seed:        seeds the basis before any fit; -1 uses hardware entropy
-        // sparse_delta_capacity: 0 disables plasticity entirely, allocating nothing
+        // correction_ceiling_fraction: the most of the edge set corrections may occupy;
+        //                     1.0 reproduces every model exactly.
         WeightMatrix(
             EngineBackend &backend,
             const vector<vector<s32>> &network,
@@ -204,7 +220,7 @@ namespace spikecorec {
             bool check_indexing = true,
             s64 max_neighbor_count = -1,
             s64 weight_seed = -1,
-            s64 sparse_delta_capacity = 0
+            f32 correction_ceiling_fraction = 1.0f
         );
 
         ~WeightMatrix();
@@ -326,8 +342,19 @@ namespace spikecorec {
         void build_edge_row_offset();
 
         // Runs one partition -> allocate round for every buffer this matrix owns, at the
-        // current rank. Called at construction and again by resize_basis.
+        // current rank and correction capacity. Called at construction and on every resize.
         void allocate_storage();
+
+        // How many edges the fitted basis fails to reproduce -- the model's structural
+        // complexity, measured rather than assumed. A network of uniform projections
+        // answers zero; one with a value per edge answers with the edge count.
+        [[nodiscard]] s64 count_edges_needing_correction(
+                const Vector<Vector<f32>> &targets_per_matrix) const;
+
+        // Re-partitions at a new correction capacity, carrying the fitted basis across.
+        // Distinct from resize_basis, which re-seeds -- doing that here would discard the
+        // fit whose residuals decided the capacity in the first place.
+        void resize_correction_capacity(s64 new_capacity);
 
         // Σ_k U[i][k] * Ck[k] * V[j][k] -- the basis's own answer, BEFORE the sparse
         // correction. Only the read paths that then add Sk should call this.

@@ -287,16 +287,15 @@ void SpikeEngine::build_weight_matrix() {
     // rank -1 means "derive it from what the projections below actually contain" rather
     // than a constant someone guessed; capacity 0 leaves plasticity off and allocates
     // nothing for it.
-    // The correction layer is not a plasticity feature -- it is what makes an approximate
-    // basis read accurately, so it is sized for every model. A fraction of the edge set
-    // rather than all of it: refit is supposed to keep it well under this, and a capacity
-    // large enough to correct every edge would cost more than storing every edge.
-    const s64 sparse_delta_capacity =
-            max<s64>(1024, layout.total_edge_count / 4);
-
     weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
-                           sparse_delta_capacity);
+                           correction_ceiling_fraction);
+
+    // Room for updates to queue into, on top of whatever the fit turns out to need. Zero
+    // when nothing writes updates, so a model with no plasticity and an exact fit
+    // allocates no correction layer at all.
+    weights.plasticity_reserve_entries =
+            hebbian_plasticity_enabled ? DEFAULT_PLASTICITY_DELTA_CAPACITY : 0;
 
     // The same run coalescing the codegen bakes into the kernel, from the same function --
     // the two must agree on the ordering exactly, or edges get the wrong synapse.

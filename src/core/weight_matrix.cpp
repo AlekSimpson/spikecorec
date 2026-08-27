@@ -34,6 +34,25 @@ s64 round_up_to_lane_group(s64 value) {
 //
 // Returns false when even the ridged system is not decomposable, in which case the caller
 // leaves that row alone rather than writing a NaN into the basis.
+// How far a reconstruction may sit from its target before it is worth an Sk entry.
+//
+// Relative for a weight, because weights span orders of magnitude and an absolute figure
+// means nothing across them -- and because a least-squares fit leaves a tiny residual on
+// essentially EVERY edge. Counting those would say a well-fitted model needs a correction
+// per edge, which is the opposite of what the measurement is for.
+//
+// Absolute for a delay, and generous: it is rounded to a whole tick on read, so a basis
+// landing within half a tick already reads back correctly and an entry would buy nothing.
+f32 negligible_residual_for(s64 matrix_index, f32 target_value) {
+    if (matrix_index == WeightMatrix::DELAY_MATRIX_INDEX) return 0.4f;
+
+    // A declared zero has nothing to be relative to, so it gets the tolerance outright.
+    const f32 magnitude = fabsf(target_value);
+    return (magnitude > 0.0f)
+        ? WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE * magnitude
+        : WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE;
+}
+
 bool solve_symmetric_in_place(vector<f64> &gram, vector<f64> &right_hand_side, s64 dimension,
                               f64 ridge_regularization) {
     for (s64 index = 0; index < dimension; index += 1) {
@@ -101,10 +120,13 @@ WeightMatrix::WeightMatrix(
     bool check_indexing,
     s64 max_neighbor_count,
     s64 weight_seed,
-    s64 sparse_delta_capacity
+    f32 correction_ceiling_fraction
 )
     : k2tree(*K2Tree::from_adjacency_list(backend, validate_network(network), (s32)network.size()))
-    , sparse_delta_capacity(max<s64>(sparse_delta_capacity, 0))
+    // No corrections until something has measured that they are needed. A model whose
+    // structure the basis captures never allocates any.
+    , sparse_delta_capacity(0)
+    , correction_ceiling_fraction(max(correction_ceiling_fraction, 0.0f))
     , owning_backend(&backend)
     , node_count((s64)network.size())
     , check_indexing(check_indexing)
@@ -135,9 +157,9 @@ WeightMatrix::WeightMatrix(
     seed_basis(basis_seed);
 
     log::logger().debug("WeightMatrix constructed: node_count={} edges={} rank={} "
-                        "max_neighbor_count={} plasticity_capacity={}",
+                        "max_neighbor_count={} correction_ceiling={}",
                         node_count, total_edge_count, this->rank,
-                        this->max_neighbor_count, this->sparse_delta_capacity);
+                        this->max_neighbor_count, this->correction_ceiling_fraction);
 }
 
 // Walks every row once to number the edges. This is also where total_edge_count comes
@@ -521,6 +543,73 @@ s32 WeightMatrix::get_edge_synapse_prototype(s32 source_node, s32 target_node) c
 
 // ── the sparse delta matrix ───────────────────────────────────────────────────────
 
+// How many edges the fitted basis fails to reproduce. This is the model's structural
+// complexity measured rather than assumed: a network of uniform projections answers zero,
+// because the exact construction reproduces every edge; one with an independently chosen
+// value per edge answers with the edge count, because there is nothing to exploit.
+//
+// Taking the worst matrix rather than the sum: capacity is per matrix, so the one that
+// needs the most is the one that decides.
+s64 WeightMatrix::count_edges_needing_correction(
+    const Vector<Vector<f32>> &targets_per_matrix
+) const {
+    if (total_edge_count == 0) return 0;
+
+    vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
+    s64 worst_matrix_need = 0;
+
+    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+        const f32 *coefficient_values = coefficient_row(matrix_index);
+        // Delay only has to land within half a tick, since rounding absorbs the rest --
+        // the same slack store_residual_corrections applies, so the two agree on what
+        // "needs correcting" means.
+
+        s64 matrix_need = 0;
+        for (s64 source_node = 0; source_node < node_count; source_node += 1) {
+            const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
+                                                    max_neighbor_count);
+            for (s64 slot = 0; slot < degree; slot += 1) {
+                const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
+                const f32 residual =
+                        targets_per_matrix[(usize)matrix_index][(usize)ordinal] -
+                        reconstruct_entry((s32)source_node, neighbor_buffer[(usize)slot],
+                                          coefficient_values);
+                if (fabsf(residual) >
+                    negligible_residual_for(matrix_index,
+                                            targets_per_matrix[(usize)matrix_index][(usize)ordinal])) {
+                    matrix_need += 1;
+                }
+            }
+        }
+        worst_matrix_need = max(worst_matrix_need, matrix_need);
+    }
+    return worst_matrix_need;
+}
+
+// Re-partitions at a new correction capacity, carrying the fitted basis across. Distinct
+// from resize_basis, which re-seeds: doing that here would throw away the very fit whose
+// residuals decided this capacity.
+void WeightMatrix::resize_correction_capacity(s64 new_capacity) {
+    if (new_capacity == sparse_delta_capacity) return;
+
+    const s64 lane_count = rank_float4_stride * LANE_GROUP;
+    vector<f32> saved_u(U_matrix.get_contents_as<f32>(),
+                        U_matrix.get_contents_as<f32>() + node_count * lane_count);
+    vector<f32> saved_v(V_matrix.get_contents_as<f32>(),
+                        V_matrix.get_contents_as<f32>() + node_count * lane_count);
+    vector<f32> saved_coefficients(coefficients.get_contents_as<f32>(),
+                                   coefficients.get_contents_as<f32>() + MATRIX_COUNT * lane_count);
+
+    owning_backend->deallocate_slab(owning_slab);
+    sparse_delta_capacity = new_capacity;
+    allocate_storage();
+
+    memcpy(U_matrix.get_contents(), saved_u.data(), saved_u.size() * sizeof(f32));
+    memcpy(V_matrix.get_contents(), saved_v.data(), saved_v.size() * sizeof(f32));
+    memcpy(coefficients.get_contents(), saved_coefficients.data(),
+           saved_coefficients.size() * sizeof(f32));
+}
+
 // Rebuilds one matrix's CSR from a full correction list. When there are more corrections
 // than capacity the largest by magnitude are kept: truncating by size makes the residual
 // error bounded by the smallest kept correction, where truncating arbitrarily would leave
@@ -739,6 +828,18 @@ void WeightMatrix::declare_projections(
         fit_basis_to_targets(targets, DEFAULT_FIT_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
     }
 
+    // Measure what the fit actually missed, then allocate exactly that much -- rather than
+    // guessing a fraction up front and charging every model for it. A network of uniform
+    // projections needs nothing here and gets nothing; one with no structure to exploit
+    // asks for an entry per edge, and the ceiling is what decides whether it may have them.
+    const s64 edges_needing_correction = count_edges_needing_correction(targets);
+    const s64 ceiling_entries =
+            (s64)(correction_ceiling_fraction * (f32)total_edge_count);
+    const s64 chosen_capacity =
+            max<s64>(min(edges_needing_correction, ceiling_entries), plasticity_reserve_entries);
+
+    resize_correction_capacity(chosen_capacity);
+
     // Whatever the basis did not capture goes into Sk, which is what turns an approximate
     // projection into an accurate read. An exact fit leaves it empty; an approximate one
     // leaves corrections behind, and refit() folds them back in once there are enough.
@@ -752,6 +853,18 @@ void WeightMatrix::declare_projections(
 
     measured_weight_fit_error = measure_worst_relative_weight_error(weight);
 
+    if (edges_needing_correction > ceiling_entries) {
+        // The model wanted more corrections than the ceiling allows, so the largest
+        // residuals were kept and the rest are accepted as error. Said plainly, because it
+        // is the one case where a number the caller chose is what limits the accuracy.
+        log::logger().warn("WeightMatrix: the fit misses {} of {} edges but the correction "
+                           "ceiling allows {}; the largest {} residuals were kept and the "
+                           "rest are error. Raise correction_ceiling_fraction (now {:.2f}) "
+                           "or the rank to close the gap.",
+                           edges_needing_correction, total_edge_count, ceiling_entries,
+                           ceiling_entries, correction_ceiling_fraction);
+    }
+
     if (measured_weight_fit_error > WEIGHT_FIT_WARNING_TOLERANCE) {
         // Reported, not refused. The basis is a lossy projection by design and the residual
         // is the accepted price of the storage -- what matters is that the number is visible
@@ -762,13 +875,20 @@ void WeightMatrix::declare_projections(
                            measured_weight_fit_error, WEIGHT_FIT_WARNING_TOLERANCE);
     }
 
-    log::logger().info("WeightMatrix: {} projections over {} edges at rank {} -- basis {} bytes, "
-                       "{} weight and {} delay corrections held ({:.1f}% of edges), worst "
-                       "weight error {:.3e}",
+    // The structure report: how much of this model the basis captured, and what the rest
+    // cost. Worth reading -- nothing refuses to run on account of these numbers.
+    const s64 basis_bytes = 2 * node_count * rank * (s64)sizeof(f32);
+    const s64 correction_bytes =
+            sparse_delta_capacity * (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32)));
+    log::logger().info("WeightMatrix: {} projections over {} edges at rank {} -- the basis "
+                       "reproduces {} of them, {} need correcting. Holding {} weight and {} "
+                       "delay corrections; {} bytes basis + {} bytes corrections against {} "
+                       "for one float per edge. Worst weight error {:.3e}.",
                        run_count, total_edge_count, rank,
-                       2 * node_count * rank * (s64)sizeof(f32),
+                       total_edge_count - edges_needing_correction, edges_needing_correction,
                        weight_corrections, delay_corrections,
-                       100.0 * sparse_delta_occupancy_fraction(), measured_weight_fit_error);
+                       basis_bytes, correction_bytes,
+                       total_edge_count * (s64)sizeof(f32), measured_weight_fit_error);
 }
 
 // Walks the edge set, compares the basis against the targets, and hands whatever differs
@@ -785,8 +905,6 @@ s64 WeightMatrix::store_residual_corrections(
     if ((s64)targets_by_edge_ordinal.size() < total_edge_count) return 0;
 
     const f32 *coefficient_values = coefficient_row(matrix_index);
-    const f32 negligible_residual =
-            (matrix_index == DELAY_MATRIX_INDEX) ? 0.4f : 0.0f;
 
     vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
     Vector<Pair<s64, f32>> corrections;
@@ -800,7 +918,10 @@ s64 WeightMatrix::store_residual_corrections(
                                                         neighbor_buffer[(usize)slot],
                                                         coefficient_values);
             const f32 residual = targets_by_edge_ordinal[(usize)ordinal] - reconstructed;
-            if (fabsf(residual) > negligible_residual) corrections.push_back({ordinal, residual});
+            if (fabsf(residual) >
+                negligible_residual_for(matrix_index, targets_by_edge_ordinal[(usize)ordinal])) {
+                corrections.push_back({ordinal, residual});
+            }
         }
     }
 

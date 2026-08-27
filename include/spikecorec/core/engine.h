@@ -149,6 +149,12 @@ namespace spikecorec {
         // the excess and logs, which says "fold more often" rather than growing without
         // bound.
         static constexpr s64 DEFAULT_PLASTICITY_DELTA_CAPACITY = 1 << 16;
+
+        // How much of the edge set the weight matrix's corrections may occupy. At 1.0 every
+        // model is reproduced exactly, and one with no exploitable structure pays for that
+        // in memory rather than in silently wrong weights. Lower it to cap what such a
+        // model may spend; a well-structured model needs none of it either way.
+        f32 correction_ceiling_fraction = 1.0f;
         s64 plasticity_fold_every_n_ticks = 64;
         f32 plasticity_learning_rate = 0.01f;
         f32 plasticity_l2_regularization = 1e-6f;
