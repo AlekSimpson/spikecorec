@@ -148,6 +148,24 @@ elif BACKEND == "metal":
     ]
     DEFINE_MACROS.append(("SPIKECOREC_METAL", None))
 
+# ── Compile-time paths ───────────────────────────────────────
+# The engine reads two directories out of the source tree at runtime, and both reach it
+# as compile-time defines rather than as a search: the NeuroML standard library, without
+# which every document resolves to zero known ComponentTypes and so to zero neurons, and
+# src/metal, whose k2tree_device.metalinc is prepended to every generated kernel.
+#
+# The Makefile passes both, and an extension built without them is not obviously broken:
+# it imports and constructs cleanly, then reports that the model declares no neurons,
+# which reads as a bad document rather than as a missing define.
+_source_root = os.path.abspath(os.path.dirname(__file__))
+DEFINE_MACROS.append(
+    ("SPIKECOREC_NML_STD_LIB_DIR",
+     '"' + os.path.join(_source_root, "third_party", "neuroml2", "std_lib") + '"'))
+if BACKEND == "metal":
+    DEFINE_MACROS.append(
+        ("SPIKECOREC_METAL_DEVICE_DIR",
+         '"' + os.path.join(_source_root, "src", "metal") + '"'))
+
 # ── Extension ────────────────────────────────────────────────
 ext = Extension(
     name="spikecorec._spikecorec",
