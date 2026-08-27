@@ -202,9 +202,14 @@ void WeightMatrix::allocate_storage() {
                    EngineDatatype::SIGNED64, partitions)
         .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(f32),
                    EngineDatatype::FLOAT32, partitions)
-        .partition((u64)sparse_delta_capacity * sizeof(s64), EngineDatatype::SIGNED64, partitions)
-        .partition((u64)sparse_delta_capacity * sizeof(f32), EngineDatatype::FLOAT32, partitions)
-        .partition(sparse_delta_capacity > 0 ? sizeof(s32) : 0, EngineDatatype::SIGNED32, partitions);
+        // The update queue is sized by the RESERVE, not by the correction capacity. Only
+        // something writing updates queues anything, so a model that merely needs
+        // corrections -- the whole unstructured case -- allocates no queue at all. Sizing
+        // it by capacity charged that model for a buffer it could never use.
+        .partition((u64)plasticity_reserve_entries * sizeof(s64), EngineDatatype::SIGNED64, partitions)
+        .partition((u64)plasticity_reserve_entries * sizeof(f32), EngineDatatype::FLOAT32, partitions)
+        .partition(plasticity_reserve_entries > 0 ? sizeof(s32) : 0,
+                   EngineDatatype::SIGNED32, partitions);
 
     owning_slab = owning_backend->allocate(partitions);
 
@@ -228,7 +233,7 @@ void WeightMatrix::allocate_storage() {
                (usize)MATRIX_COUNT * ((usize)node_count + 1) * sizeof(s32));
     }
     sparse_delta_entry_count.assign((usize)MATRIX_COUNT, 0);
-    if (sparse_delta_capacity > 0) {
+    if (plasticity_reserve_entries > 0) {
         *pending_delta_count.get_contents_as<s32>() = 0;
     }
 
@@ -878,8 +883,11 @@ void WeightMatrix::declare_projections(
     // The structure report: how much of this model the basis captured, and what the rest
     // cost. Worth reading -- nothing refuses to run on account of these numbers.
     const s64 basis_bytes = 2 * node_count * rank * (s64)sizeof(f32);
+    // Everything the correction layer costs, queue included -- reporting only the CSR
+    // would understate what was actually allocated.
     const s64 correction_bytes =
-            sparse_delta_capacity * (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32)));
+            sparse_delta_capacity * (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32))) +
+            plasticity_reserve_entries * (s64)(sizeof(s64) + sizeof(f32));
     log::logger().info("WeightMatrix: {} projections over {} edges at rank {} -- the basis "
                        "reproduces {} of them, {} need correcting. Holding {} weight and {} "
                        "delay corrections; {} bytes basis + {} bytes corrections against {} "
