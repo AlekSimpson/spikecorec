@@ -23,8 +23,6 @@ using namespace std;
 
 namespace spikecorec {
 
-namespace {
-
 // The aligned start of the next range in a chunk. Every partition is pushed to at least
 // PARTITION_ALIGNMENT so a `constant` kernel binding and a float4 read are both legal at
 // its offset, whatever the datatype asks for.
@@ -32,13 +30,8 @@ u64 aligned_partition_offset(u64 cursor, u64 alignment) {
     return (cursor + alignment - 1) & ~(alignment - 1);
 }
 
-} // namespace
-
-// ── Metal ─────────────────────────────────────────────────────────────────────────
 
 #ifdef SPIKECOREC_METAL
-
-namespace {
 
 // default.metallib is built by the Makefile and placed alongside the build artifacts. A
 // command line tool has no app bundle for newDefaultLibrary() to search, so locate the
@@ -60,15 +53,15 @@ MTL::Library *load_default_metal_library(MTL::Device *device) {
 }
 
 String describe_metal_error(NS::Error *error) {
-    return error ? String(error->localizedDescription()->utf8String()) : String("unknown error");
+    return error
+        ? String(error->localizedDescription()->utf8String()) 
+        : String("unknown error");
 }
 
-} // namespace
-
-MetalBackend::MetalBackend(s64 threads_per_block_argument) {
+MetalBackend::MetalBackend(s64 threads_per_block_) {
     // Assigned rather than initialized in the member-init list: threads_per_block belongs
     // to AbstractBackend, and a derived constructor cannot name a base's member there.
-    threads_per_block = threads_per_block_argument;
+    threads_per_block = threads_per_block_;
 
     device = MTL::CreateSystemDefaultDevice();
     if (device == nullptr) {
@@ -91,19 +84,12 @@ MetalBackend::~MetalBackend() {
 MetalBackend &MetalBackend::partition(
     u64 bytes, EngineDatatype datatype, Vector<EnginePointer> &partitions
 ) {
-    // A finished allocate() means this call opens a FRESH chunk rather than trying to
-    // extend a slab that already exists. That is what makes the pattern reusable:
-    // SpikeEngine, WeightMatrix and K2Tree each run their own partition -> allocate round
-    // against the same backend, and each gets its own slab.
     if (memory_has_been_allocated) {
         memory_has_been_allocated = false;
         last_offset = 0;
         max_bytes = 0;
     }
 
-    // A zero-byte request is legal -- a cell type with no parameters, a graph with no
-    // edges, a disabled optional buffer -- and yields an empty handle rather than a range
-    // nothing may be written to.
     if (bytes == 0) {
         partitions.push_back(EnginePointer{});
         return *this;
@@ -112,9 +98,14 @@ MetalBackend &MetalBackend::partition(
     const u64 alignment = std::max<u64>(type_alignments[datatype], PARTITION_ALIGNMENT);
     const u64 aligned_offset = aligned_partition_offset((u64)last_offset, alignment);
 
-    // base_pointer stays null until allocate() runs: the slab does not exist yet, and
-    // reading it here is what made every handle point at uninitialized memory.
-    partitions.push_back(EnginePointer{nullptr, (s64)aligned_offset, bytes, alignment, false});
+    // base_pointer stays null until allocate() runs
+    partitions.push_back(EnginePointer{
+        nullptr, 
+        (s64)aligned_offset, 
+        bytes, 
+        alignment, 
+        false
+    });
 
     last_offset = (s64)(aligned_offset + bytes);
     max_bytes = (u64)last_offset;
@@ -126,28 +117,26 @@ EnginePointer MetalBackend::allocate(Vector<EnginePointer> &partitions) {
 
     memory_has_been_allocated = true;
     if (max_bytes == 0) {
+        // nothing was allocated, return nullptr
         base_pointer = EnginePointer{};
         return base_pointer;
     }
 
     MTL::Buffer *slab = device->newBuffer(max_bytes, MTL::ResourceStorageModeShared);
-
-    // newBuffer returns null when the device cannot satisfy the request, and every caller
-    // writes through get_contents() immediately -- an unchecked null surfaces as a
-    // segfault inside a memset rather than as an allocation failure. Exhaustion is the
-    // expected failure mode at the network sizes this engine targets.
     if (slab == nullptr) {
+        // its possible that newBuffer returns null when something is wrong with the device
         log::throw_runtime_error(log::logger(),
                 "MetalBackend::allocate: the GPU could not allocate " + to_string(max_bytes) +
                 " bytes (" + to_string(max_bytes / (1024 * 1024)) + " MiB) — out of device memory");
     }
+
     slabs.push_back(slab);
 
     // Only handles from THIS chunk are still null, so a caller reusing one vector across
     // chunks does not get its earlier handles re-aimed at the new slab.
-    for (EnginePointer &partition_handle : partitions) {
-        if (partition_handle.base_pointer != nullptr || partition_handle.total_bytes == 0) continue;
-        partition_handle.base_pointer = slab;
+    for (EnginePointer &partition: partitions) {
+        if (partition.base_pointer != nullptr || partition.total_bytes == 0) continue;
+        partition.base_pointer = slab;
     }
 
     log::logger().debug("MetalBackend::allocate: slab of {} bytes, {} chunks live",
@@ -182,9 +171,21 @@ Optional<EngineFunction> MetalBackend::create_function(
 ) {
     log::logger().debug("create_function: name={} source_bytes={}", name, source_code.size());
 
+    // The language version is stated rather than inherited. Passing null options lets the
+    // runtime compiler pick a default that varies by process -- the same generated source
+    // compiled from a C++ host and failed from a Python one with "unknown type name
+    // 'atomic_float'", because atomic_float is Metal 3 and the default landed below it.
+    // The generated kernel needs Metal 3 for its atomic float scatter, so it asks.
+    MTL::CompileOptions *options = MTL::CompileOptions::alloc()->init();
+    options->setLanguageVersion(MTL::LanguageVersion3_0);
+
     NS::Error *error = nullptr;
     MTL::Library *library = device->newLibrary(
-            NS::String::string(source_code.c_str(), NS::UTF8StringEncoding), nullptr, &error);
+        NS::String::string(source_code.c_str(), NS::UTF8StringEncoding),
+        options,
+        &error
+    );
+    options->release();
     if (library == nullptr) {
         log::logger().critical("create_function: newLibrary failed: {}", describe_metal_error(error));
         return std::nullopt;
@@ -294,22 +295,19 @@ bool MetalBackend::run_function(
 
 #endif // SPIKECOREC_METAL
 
-// ── CUDA ──────────────────────────────────────────────────────────────────────────
-
 #ifdef SPIKECOREC_CUDA
-
-namespace {
 
 String describe_cuda_driver_error(CUresult result) {
     const char *error_name = nullptr;
     const char *error_string = nullptr;
     cuGetErrorName(result, &error_name);
-    cuGetErrorString(result, &error_string);
-    return String(error_name ? error_name : "unknown") + " (" +
-           String(error_string ? error_string : "unknown") + ")";
-}
+    error_name = error_name != nullptr ? error_name : "unknown";
 
-} // namespace
+    cuGetErrorString(result, &error_string);
+    error_string = error_string != nullptr ? error_string : "unknown";
+
+    return String(error_name) + " (" + String(error_string) + ")";
+}
 
 CudaBackend::CudaBackend(s64 threads_per_block_argument) {
     threads_per_block = threads_per_block_argument;
@@ -330,7 +328,6 @@ CudaBackend::~CudaBackend() {
 CudaBackend &CudaBackend::partition(
     u64 bytes, EngineDatatype datatype, Vector<EnginePointer> &partitions
 ) {
-    // See MetalBackend::partition -- same contract, same reset-on-fresh-chunk rule.
     if (memory_has_been_allocated) {
         memory_has_been_allocated = false;
         last_offset = 0;
