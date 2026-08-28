@@ -978,11 +978,47 @@ bool WeightMatrix::fit_basis_from_projections(
 ) {
     const s64 run_count = (s64)projection_first_edge_ordinal.size();
 
-    // Only available while every run can have its own lane. Past that the construction has
-    // no exactness left to offer and the general fit is the honest path.
-    if (round_up_to_lane_group(run_count) > MAX_RANK_FLOAT4_STRIDE * LANE_GROUP) return false;
+    // A lane per distinct (weight, delay) pair, not per run. Runs split wherever anything
+    // about a projection changes -- including its synapse prototype, which the run table
+    // stores separately and the basis never represents. A network whose cells each draw
+    // their own synapse has a run boundary at nearly every cell while carrying one weight
+    // and one delay throughout, and giving each of those runs a lane would fit a constant
+    // field at rank 188 and spend 728 KB on a basis where 39 KB of raw floats would do.
+    //
+    // Merging is safe because every edge leaving a source shares that source's run, so a
+    // source occupies exactly one lane however many runs map onto it -- which is the
+    // property the indicator construction rests on.
+    Vector<s64> lane_of_run((usize)max<s64>(run_count, 0), 0);
+    Vector<f32> lane_weight;
+    Vector<s32> lane_delay;
 
-    resize_basis(run_count);
+    for (s64 run_index = 0; run_index < run_count; run_index += 1) {
+        const f32 this_weight = weight[(usize)run_index];
+        const s32 this_delay = max<s32>(delay_ticks[(usize)run_index], 1);
+
+        s64 found = -1;
+        for (usize lane = 0; lane < lane_weight.size(); lane += 1) {
+            if (lane_weight[lane] != this_weight || lane_delay[lane] != this_delay) continue;
+            found = (s64)lane;
+            break;
+        }
+        if (found < 0) {
+            found = (s64)lane_weight.size();
+            lane_weight.push_back(this_weight);
+            lane_delay.push_back(this_delay);
+        }
+        lane_of_run[(usize)run_index] = found;
+    }
+
+    const s64 distinct_count = (s64)lane_weight.size();
+
+    // Only available while every distinct value can have its own lane. Past that the
+    // construction has no exactness left to offer and the general fit is the honest path.
+    if (round_up_to_lane_group(distinct_count) > MAX_RANK_FLOAT4_STRIDE * LANE_GROUP) {
+        return false;
+    }
+
+    resize_basis(distinct_count);
 
     const s64 lane_count = rank_float4_stride * LANE_GROUP;
     f32 *u_data = U_matrix.get_contents_as<f32>();
@@ -994,10 +1030,11 @@ bool WeightMatrix::fit_basis_from_projections(
     f32 *weight_coefficients = coefficient_row(DEFAULT_MATRIX_INDEX);
     f32 *delay_coefficients = coefficient_row(DELAY_MATRIX_INDEX);
     for (s64 lane_index = 0; lane_index < lane_count; lane_index += 1) {
-        const bool lane_is_a_run = lane_index < run_count;
-        weight_coefficients[lane_index] = lane_is_a_run ? weight[(usize)lane_index] : 0.0f;
+        const bool lane_carries_a_value = lane_index < distinct_count;
+        weight_coefficients[lane_index] =
+                lane_carries_a_value ? lane_weight[(usize)lane_index] : 0.0f;
         delay_coefficients[lane_index] =
-                lane_is_a_run ? (f32)max<s32>(delay_ticks[(usize)lane_index], 1) : 0.0f;
+                lane_carries_a_value ? (f32)lane_delay[(usize)lane_index] : 0.0f;
     }
 
     // One pass over every edge, marking the endpoints of the run it belongs to.
@@ -1016,13 +1053,18 @@ bool WeightMatrix::fit_basis_from_projections(
             }
             if (run_index >= run_count) break;
 
-            u_data[source_node * lane_count + run_index] = 1.0f;
-            v_data[neighbor_buffer[(usize)slot] * lane_count + run_index] = 1.0f;
+            const s64 lane = lane_of_run[(usize)run_index];
+            u_data[source_node * lane_count + lane] = 1.0f;
+            v_data[neighbor_buffer[(usize)slot] * lane_count + lane] = 1.0f;
         }
     }
 
+    log::logger().debug("fit_basis_from_projections: {} runs carry {} distinct "
+                        "(weight, delay) pairs, so the basis is rank {}",
+                        run_count, distinct_count, rank);
+
     using_constant_weight = false;
-    using_constant_delay_ticks = using_constant_delay_ticks && run_count <= 1;
+    using_constant_delay_ticks = using_constant_delay_ticks && distinct_count <= 1;
     return true;
 }
 

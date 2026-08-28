@@ -171,8 +171,33 @@ PYBIND11_MODULE(_spikecorec, m) {
              py::arg("enable_hebbian_plasticity") = false,
              "The same, with connectivity supplied in code instead of in the document -- "
              "which is how a network too large to write as <connection> elements is built.")
+        .def(py::init<const String &, const std::vector<std::vector<s32>> &,
+                      const std::vector<String> &, const std::vector<f64> &,
+                      f64, f64, bool>(),
+             py::arg("lems_input_file"), py::arg("adjacency"),
+             py::arg("synapse_component_ids"),
+             py::arg("synapse_proportions") = std::vector<f64>{},
+             py::arg("connection_weight") = 1.0,
+             py::arg("connection_delay_seconds") = 0.0,
+             py::arg("enable_hebbian_plasticity") = false,
+             "The same, with several synapses to draw from. Each neuron is assigned one of "
+             "synapse_component_ids at random and every edge leaving it uses that one, so "
+             "a list naming an excitatory and an inhibitory synapse produces a population "
+             "of excitatory and inhibitory cells. synapse_proportions gives each id its "
+             "share of the population and is normalised ([0.8, 0.2] is the usual cortical "
+             "ratio); empty means an equal share each. Read synapse_choice_per_neuron "
+             "afterwards to find which cells drew which.")
 
         .def_readonly("total_neuron_count", &SpikeEngine::total_neuron_count)
+        .def_property_readonly("synapse_choice_per_neuron",
+            [](const SpikeEngine &engine) {
+                // Which entry of synapse_component_ids each neuron drew. Empty unless the
+                // engine was built from a list.
+                return py::array_t<s32>((py::ssize_t)engine.synapse_choice_per_neuron.size(),
+                                        engine.synapse_choice_per_neuron.data());
+            },
+            "Index into synapse_component_ids for each neuron, or empty when the engine "
+            "was not built from a list of synapses.")
         .def_readonly("lifetime", &SpikeEngine::lifetime)
         .def_readonly("step_dt", &SpikeEngine::step_dt)
         .def_readonly("alive", &SpikeEngine::alive)

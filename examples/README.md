@@ -96,7 +96,7 @@ Each run writes three things per network into the output directory:
 ### Rendering a video
 
 ```bash
-python3 examples/render_membrane_video.py build/glif3_network_membrane.spire --duration 2.0
+python3 examples/demo_glif1_torus.py    # runs, records and renders in one go
 ```
 
 Writes `build/glif3_network_membrane.mp4`: the population as a grid coloured by membrane

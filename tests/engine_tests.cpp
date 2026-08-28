@@ -10,6 +10,9 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <random>
+#include <set>
 #include <sstream>
 
 #include <gtest/gtest.h>
@@ -18,7 +21,6 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/topologies.h"
 #include "spikecorec/nml/dynamics_codegen.h"
-#include "../examples/demos/network_model.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -1484,6 +1486,148 @@ NetworkActivity measure_activity(const SpikeEngine &engine, f64 step_seconds,
 
 } // namespace
 
+
+// ── balanced GLIF network fixture ─────────────────────────────────────────────────
+//
+// The model these tests run used to be built by a header in examples/demos, which a test
+// has no business including -- and which is gone. It lives here now, where its only
+// consumer is.
+//
+// It is also much smaller than it was, because the connections are no longer in the
+// document. The engine's list-of-synapses constructor draws one synapse per cell and
+// wires the topology from code, so what the file has to say is just the cells, the two
+// synapses and the drive. That is the same thing the four Python demos do.
+namespace {
+
+String glif_cell_type_name_for(s32 glif_index) {
+    return "GLIF" + to_string(glif_index) + "Cell";
+}
+
+// C = 100 pF and gL = 10 nS give a 10 ms membrane time constant and a rheobase of
+// gL * (vth - EL) = 200 pA. GLIF4 and GLIF5 declare no vth: their threshold is a state
+// variable that starts at thetaInf.
+String glif_cell_attributes_for(s32 glif_index) {
+    const String shared = R"( C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms")";
+    switch (glif_index) {
+        case 1: return shared + R"( vth="-50mV")";
+        case 2: return shared + R"( vth="-50mV" resetScale="0.3")";
+        case 3: return shared + R"( vth="-50mV" tauAsc1="100ms" tauAsc2="10ms")"
+                                R"( ascAdd1="-60pA" ascAdd2="-120pA")";
+        case 4: return shared + R"( thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="3mV")";
+        case 5: return shared + R"( thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="3mV")"
+                                R"( tauAsc1="100ms" tauAsc2="10ms")"
+                                R"( ascAdd1="-60pA" ascAdd2="-120pA")";
+        default:
+            throw runtime_error("glif_cell_attributes_for: index must be 1..5");
+    }
+}
+
+struct GlifNetworkParameters {
+    s32 glif_index = 1;
+    s64 side_length = 22;              // 484 cells
+    s32 fanout = 20;                   // 9,680 edges
+    // Balanced so the network is alive rather than inhibition-dominated: at 11 pA
+    // against -50 pA a cell's ~16 excitatory inputs are outweighed by its ~4
+    // inhibitory ones, and a fifth of the population never fires at all.
+    f64 excitatory_ibase_amperes = 16e-12;
+    f64 inhibitory_ibase_amperes = -35e-12;
+    f64 synapse_tau_seconds = 5e-3;
+    f64 background_current_amperes = 190e-12;   // below the 200 pA rheobase
+    f64 seed_extra_current_amperes = 45e-12;    // takes a seeded cell above it
+    f64 seed_fraction = 0.2;
+    f64 connection_delay_seconds = 2e-3;
+    f64 simulation_seconds = 2.0;
+    f64 step_seconds = 1e-4;
+    u64 seed = 20260813;
+
+    [[nodiscard]] s64 total_count() const { return side_length * side_length; }
+};
+
+// Writes <directory>/<name>.nml and its LEMS document; returns the LEMS path.
+String write_glif_network_model(const String &name,
+                                const GlifNetworkParameters &parameters,
+                                const String &directory) {
+    const String model_path = directory + "/" + name + ".nml";
+    const String lems_path = directory + "/LEMS_" + name + ".xml";
+    const String cell_type = glif_cell_type_name_for(parameters.glif_index);
+    const s64 total_count = parameters.total_count();
+
+    // A fifth of the population is driven over rheobase and fires on its own; the rest
+    // sit under it and fire only on synaptic input. Deterministic from the seed, so the
+    // same cells are driven on every run.
+    const s64 seeded_count = (s64)(parameters.seed_fraction * (f64)total_count);
+    Set<s64> seeded;
+    mt19937_64 generator(parameters.seed);
+    uniform_int_distribution<s64> anywhere(0, total_count - 1);
+    while ((s64)seeded.size() < seeded_count) seeded.insert(anywhere(generator));
+
+    ofstream model(model_path);
+    model << setprecision(12);
+    model << "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"" << name
+          << "\">\n\n"
+          << "  <include href=\""
+          << filesystem::absolute("tests/fixtures/nml/glif_cell_types.nml").string()
+          << "\"/>\n\n";
+
+    model << "  <" << cell_type << " id=\"networkCell\""
+          << glif_cell_attributes_for(parameters.glif_index) << "/>\n\n";
+
+    model << "  <alphaCurrentSynapse id=\"excitatorySynapse\" tau=\""
+          << parameters.synapse_tau_seconds << " s\" ibase=\""
+          << parameters.excitatory_ibase_amperes << " A\"/>\n";
+    model << "  <alphaCurrentSynapse id=\"inhibitorySynapse\" tau=\""
+          << parameters.synapse_tau_seconds << " s\" ibase=\""
+          << parameters.inhibitory_ibase_amperes << " A\"/>\n\n";
+
+    model << "  <pulseGenerator id=\"background\" delay=\"0 s\" duration=\""
+          << parameters.simulation_seconds << " s\" amplitude=\""
+          << parameters.background_current_amperes << " A\"/>\n";
+    model << "  <pulseGenerator id=\"seedDrive\" delay=\"0 s\" duration=\""
+          << parameters.simulation_seconds << " s\" amplitude=\""
+          << (parameters.background_current_amperes +
+              parameters.seed_extra_current_amperes) << " A\"/>\n\n";
+
+    model << "  <network id=\"network\">\n";
+    model << "    <population id=\"population\" component=\"networkCell\" size=\""
+          << total_count << "\"/>\n\n";
+    for (s64 index = 0; index < total_count; index += 1) {
+        model << "    <explicitInput target=\"population[" << index << "]\" input=\""
+              << (seeded.count(index) ? "seedDrive" : "background") << "\"/>\n";
+    }
+    model << "  </network>\n</neuroml>\n";
+    model.close();
+
+    ofstream lems(lems_path);
+    lems << setprecision(12);
+    lems << "<Lems>\n"
+            "    <Include file=\"Cells.xml\"/>\n"
+            "    <Include file=\"Synapses.xml\"/>\n"
+            "    <Include file=\"Inputs.xml\"/>\n"
+            "    <Include file=\"Networks.xml\"/>\n"
+            "    <Include file=\"Simulation.xml\"/>\n"
+            "    <Include file=\"" << name << ".nml\"/>\n\n"
+            "    <Simulation id=\"sim1\" length=\"" << parameters.simulation_seconds
+         << "s\" step=\"" << parameters.step_seconds << "s\" target=\"network\"/>\n\n"
+            "    <Target component=\"sim1\"/>\n</Lems>\n";
+    return lems_path;
+}
+
+// The engine, wired from the topology with a 4:1 excitatory:inhibitory draw.
+unique_ptr<SpikeEngine> make_glif_network(const String &name,
+                                          const GlifNetworkParameters &parameters,
+                                          const String &directory) {
+    const String lems_path = write_glif_network_model(name, parameters, directory);
+    const vector<vector<s32>> topology = random_fixed_outdegree(
+            parameters.side_length, parameters.fanout, (s64)parameters.seed);
+
+    return make_unique<SpikeEngine>(
+            lems_path, topology,
+            vector<String>{"excitatorySynapse", "inhibitorySynapse"},
+            vector<f64>{0.8, 0.2}, 1.0, parameters.connection_delay_seconds);
+}
+
+} // namespace
+
 // One recurrent network per GLIF type, each asserted to be alive on the same terms: a
 // population rate in a sensible band, nearly every neuron participating, activity that is
 // asynchronous rather than one repeating volley, and a network still firing at the end of
@@ -1497,15 +1641,16 @@ TEST_P(GlifNetworkAliveness, sustains_asynchronous_recurrent_activity) {
     const s32 glif_index = GetParam();
     ModelDirectory directory("glif" + to_string(glif_index) + "_network");
 
-    demos::NetworkDemoParameters parameters;
+    GlifNetworkParameters parameters;
     parameters.glif_index = glif_index;
 
-    const String lems_path = demos::write_network_model(
+    unique_ptr<SpikeEngine> owned = make_glif_network(
             "glif" + to_string(glif_index) + "_network", parameters, directory.path());
+    SpikeEngine &engine = *owned;
 
-    SpikeEngine engine(lems_path);
-    EXPECT_EQ(engine.total_neuron_count, 500);
-    EXPECT_EQ(engine.layout.total_edge_count, 10000);
+    EXPECT_EQ(engine.total_neuron_count, parameters.total_count());
+    EXPECT_EQ(engine.layout.total_edge_count,
+              parameters.total_count() * parameters.fanout);
 
     engine.run();
 
@@ -1576,17 +1721,17 @@ TEST(SpikeEngine, adapting_glif_networks_settle_below_non_adapting_ones) {
     for (s32 glif_index : {1, 3, 5}) {
         ModelDirectory directory("glif_rate_" + to_string(glif_index));
 
-        demos::NetworkDemoParameters parameters;
+        GlifNetworkParameters parameters;
         parameters.glif_index = glif_index;
         // Half the run of the aliveness tests: the rate separation is fully developed
-        // within a second (23 Hz against 5 Hz), and three networks at full length is two
-        // minutes of suite time for a comparison that is already clear.
+        // within a second, and three networks at full length is minutes of suite time for
+        // a comparison that is already clear.
         parameters.simulation_seconds = 1.0;
 
-        SpikeEngine engine(demos::write_network_model(
-                "glif" + to_string(glif_index) + "_rate", parameters, directory.path()));
-        engine.run();
-        rate_by_type[(usize)glif_index] = engine.mean_firing_rate_hertz();
+        unique_ptr<SpikeEngine> engine = make_glif_network(
+                "glif" + to_string(glif_index) + "_rate", parameters, directory.path());
+        engine->run();
+        rate_by_type[(usize)glif_index] = engine->mean_firing_rate_hertz();
     }
 
     // GLIF3's after-spike currents suppress firing; GLIF5 adds an adapting threshold on
