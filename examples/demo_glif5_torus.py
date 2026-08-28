@@ -12,14 +12,8 @@ def glif5_torus_demo():
 
     model = Path(__file__).resolve().parent / "models" / "LEMS_glif5_torus.xml"
 
-    # Every cell reaches its four neighbours, with the sheet's edges wrapped so no cell
-    # sits on a boundary. The document declares no connections at all; this is the whole
-    # of the network's wiring.
     topology = spc.square_torus(side_length)
 
-    # Two synapses to draw from. The engine gives each cell one of them and every edge
-    # leaving that cell carries it, so the draw is what decides which cells are
-    # excitatory and which inhibitory. 4:1 is the usual cortical ratio.
     engine = spc.SpikeEngine(str(model), topology,
                              ["excitatorySynapse", "inhibitorySynapse"],
                              synapse_proportions=[0.8, 0.2],
@@ -45,9 +39,6 @@ def glif5_torus_demo():
     print("neurons that fired : %.0f %%"
           % (100.0 * engine.fraction_of_neurons_that_spiked()))
 
-    # GLIF5 adapts: firing raises a cell's own threshold and injects a hyperpolarising
-    # current, so the rate falls over the first few spikes. Comparing the first and last
-    # interval of the busiest cell is the cheapest way to see that in a number.
     spike_times, spike_neurons = engine.spike_times
     busiest = max(range(engine.total_neuron_count), key=lambda index: spike_counts[index])
     own_times = [time for time, neuron in zip(spike_times, spike_neurons)
@@ -63,8 +54,6 @@ def glif5_torus_demo():
         return next(index for index in range(engine.total_neuron_count)
                     if choice[index] == wanted_choice and spike_counts[index] > 0)
 
-    # One cell of each kind for the trace panel, picked from the cells that actually
-    # fired so neither trace is a flat line.
     excitatory_cell = first_active_cell(0)
     inhibitory_cell = first_active_cell(1)
     print("tracing            : excitatory cell %d, inhibitory cell %d"

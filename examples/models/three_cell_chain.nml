@@ -1,28 +1,5 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ThreeCellChain">
 
-    <!--
-      Three excitatory cells in a line, A to B to C. The chain is supplied from Python as
-      the adjacency list [[1], [2], []]; this document says only what the cells and the
-      synapse are, and how A is driven.
-
-      A receives a train of 10 pulses. A spikeArray names no amplitude, so the engine
-      gives each event the charge that carries its target from rest to threshold in one
-      tick, derived from that cell's own C, vth and EL rather than guessed.
-
-      The synapse is deliberately strong. An arrival delivers a charge of e * ibase * tau,
-      but the 10 ms membrane leaks while the 5 ms current is still arriving, so the peak
-      is only about a third of what that charge is worth instantly. At 600 pA that is
-      roughly 28 mV against the 20 mV from rest to threshold, so one spike reliably fires
-      the next cell and the chain conducts every time. At 350 pA it does not conduct at
-      all, which is the margin this value is chosen to clear.
-
-      Conduction from A to C takes about 13 ms, which is worth understanding: only 2 ms
-      of it is the 1 ms wire delay on each edge. The rest is the synapse. An alpha current
-      peaks a full tau after the spike that caused it, so the target needs several
-      milliseconds to charge before it crosses threshold. The delay parameter sets when a
-      spike arrives, not when it has an effect.
-    -->
-
     <include href="glif_cell_types.nml"/>
 
     <GLIF1Cell id="chainCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV"

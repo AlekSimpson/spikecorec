@@ -1,27 +1,5 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif1Torus">
 
-    <!--
-      A 5x5 sheet of GLIF1 cells wired as a torus. The wiring is supplied from Python,
-      not declared here: this document says only what the cells and the synapses are, and
-      how they are driven.
-
-      Two synapses are on offer and the engine assigns one per cell, which is what makes
-      a cell excitatory or inhibitory. All of a cell's outgoing edges carry its own
-      synapse, so a cell is one thing or the other rather than a mixture.
-
-      GLIF1 with C = 100 pF and gL = 10 nS has a 10 ms membrane time constant and a
-      rheobase of gL * (vth EL) = 200 pA. The 5 seeded cells are driven over it and fire
-      on their own; every other cell settles at EL + I/gL = -54 mV, 4 mV under threshold,
-      and fires only when spikes arrive along its edges.
-
-      An arrival delivers a charge of e * ibase * tau, but the membrane leaks while that
-      current is still arriving, so the peak is about a third of the 8.1 mV that charge
-      would be worth instantly: roughly 2.8 mV excitatory against a 4 mV gap. Two
-      arrivals inside tau fire a background cell and one does not, which is what stops
-      the first wave saturating the sheet. Inhibition is four times as strong, so with a
-      4:1 excitatory:inhibitory split the two roughly cancel.
-    -->
-
     <include href="glif_cell_types.nml"/>
 
     <GLIF1Cell id="sheetCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV"

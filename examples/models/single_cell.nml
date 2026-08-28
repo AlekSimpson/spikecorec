@@ -1,23 +1,5 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="SingleCell">
 
-    <!--
-      One GLIF1 cell under a current step, chosen so the whole trajectory is checkable
-      by hand:
-
-        membrane time constant = C / gL = 100 pF / 10 nS = 10 ms
-        rheobase current       = gL * (vth EL) = 10 nS * 20 mV = 200 pA
-
-      The 500 pA drive is 2.5x rheobase, so the cell charges toward EL + I/gL = -20 mV,
-      crosses the -50 mV threshold, resets to -70 mV, and repeats. Its interspike
-      interval is the 5 ms refractory period plus
-
-        tau * ln((I/gL (vreset EL)) / (I/gL (vth EL)))
-          = 10 ms * ln(50 / 30) = 5.1 ms
-
-      which is 10.1 ms in all, so the cell fires at very close to 100 Hz. The engine
-      reports 50 spikes in 500 ms.
-    -->
-
     <include href="glif_cell_types.nml"/>
 
     <GLIF1Cell id="singleCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV"

@@ -1,23 +1,5 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif5Torus">
 
-    <!--
-      A 10x10 sheet of GLIF5 cells wired as a torus. As with the GLIF1 sheet the wiring
-      comes from Python, and the engine assigns each cell one of the two synapses on
-      offer, making it excitatory or inhibitory.
-
-      GLIF5 is the whole family at once: a leaky integrate-and-fire cell with a moving
-      threshold (tauTheta, thetaSpikeAdd) and two after-spike currents (tauAsc1/2,
-      ascAdd1/2). Both make it adapt. Firing raises the cell's own threshold by 3 mV and
-      injects a hyperpolarising current, so a cell under steady drive slows over its
-      first few spikes rather than settling at one rate. Against the GLIF1 sheet, which
-      does not adapt at all, that is the thing to watch: the same drive produces a
-      falling rate here and a flat one there.
-
-      Because the threshold moves, thetaInf rather than vth says where it starts. The 10
-      seeded cells sit well over the 200 pA rheobase so they keep firing as they adapt;
-      the rest sit 4 mV under threshold and fire only on synaptic input.
-    -->
-
     <include href="glif_cell_types.nml"/>
 
     <GLIF5Cell id="sheetCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
