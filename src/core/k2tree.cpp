@@ -35,9 +35,6 @@ static pair<s32, s32> compute_tree_parameters(s32 node_count, s32 branching_fact
     return {tree_height, padded_size};
 }
 
-// Packs (level, block_row, block_column) into a single 64-bit key for child_masks.
-// 8 bits for level / 28 bits each for block_row and block_column comfortably covers
-// node counts into the hundreds of millions, far beyond the stated 1M-neuron scale.
 static u64 pack_child_mask_key(s32 level, s32 block_row, s32 block_column) {
     return (u64(u32(level)) << 56) | (u64(u32(block_row)) << 28) | u64(u32(block_column));
 }
@@ -58,11 +55,6 @@ static s32 rank1_exclusive(const u32 *internal_node_words, const u32 *superblock
     return (s32) (superblock_base + subblock_base + partial_word_popcount);
 }
 
-// Recursive row-walk: collects up to max_neighbor_count neighbor indices of the row
-// belonging to `source_node` into output_buffer, descending only into subtrees that
-// intersect that row and have at least one bit set. Mirrors K2Tree::adjacent's bit-position
-// bookkeeping, but explores every column branch at each level instead of following a fixed
-// target column.
 static void collect_row_neighbors(
     const u32 *internal_words, const u32 *leaf_words,
     const u32 *superblock_data, const u16 *subblock_data,
@@ -109,12 +101,6 @@ static void collect_row_neighbors(
     }
 }
 
-// Recursive column-walk: the exact mirror of collect_row_neighbors, collecting up to
-// max_neighbor_count PREDECESSOR indices of `target_node`'s column into output_buffer (every
-// source node with an edge into it). Descends only into subtrees that intersect that column
-// and have at least one bit set. Same bit-position bookkeeping as collect_row_neighbors, but
-// fixes the column offset (derived from the query node) at each level and explores every ROW
-// branch, instead of fixing the row and exploring every column branch.
 static void collect_column_predecessors(
     const u32 *internal_words, const u32 *leaf_words,
     const u32 *superblock_data, const u16 *subblock_data,
@@ -183,13 +169,6 @@ struct TreeArrays {
 
 static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 node_count, s32 branching_factor,
                                     s32 superblock_size) {
-    // Self-loops (i==j) are not supported and must never be silently accepted or
-    // silently dropped -- checked here, unconditionally over every edge, before any
-    // other branch (including the tree_height==0 early-return just below, which
-    // would otherwise skip this entirely for node_count<=1). This is the single
-    // point both K2Tree::from_adjacency_list and K2Tree::from_edges funnel through,
-    // so it's the one place that can catch a self-loop from either entry point, and
-    // it is what makes WeightMatrix reject one too.
     for (auto [source_node, target_node]: edges) {
         if (source_node == target_node) {
             throw_invalid_argument(logger(),
@@ -294,9 +273,6 @@ static TreeArrays build_tree_arrays(const vector<pair<s32, s32> > &edges, s32 no
     };
 }
 
-// Carves one slab holding the four bit arrays plus adjacent_batch's staging, copies the
-// host-built arrays into it, and hands the ranges to the constructor. Every k^2-tree entry
-// point funnels through here, so this is the single place a tree's storage is decided.
 static K2Tree make_k2tree_from_arrays(
     EngineBackend &backend, TreeArrays &arrays,
     s32 node_count, s32 branching_factor, s32 superblock_size
@@ -312,18 +288,12 @@ static K2Tree make_k2tree_from_arrays(
         .partition(leaf_node_words_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
         .partition(rank_superblock_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
         .partition(rank_subblock_length * sizeof(u16), EngineDatatype::UNSIGNED16, partitions)
-        // adjacent_batch's staging, sized once here rather than per call: the backend
-        // hands out one chunk per partition -> allocate round, so there is no transient
-        // allocation to reach for. Larger batches are chunked against this cap.
         .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), EngineDatatype::SIGNED32, partitions)
         .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), EngineDatatype::SIGNED32, partitions)
         .partition(K2Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(u8), EngineDatatype::UNSIGNED8, partitions);
 
     const EnginePointer owning_slab = backend.allocate(partitions);
 
-    // A zero-length array is legal -- the empty adjacency has no bits at all -- and
-    // partition() hands back an empty handle for it, so guard each copy on its length
-    // rather than assuming get_contents() is non-null.
     if (internal_node_words_length > 0) {
         memcpy(partitions[0].get_contents(), arrays.internal_node_words.data(),
                internal_node_words_length * sizeof(u32));
@@ -363,8 +333,6 @@ static K2Tree make_k2tree_from_arrays(
         arrays.internal_bit_count
     };
 }
-
-// ── constructor / destructor ──────────────────────────────────────────────────
 
 K2Tree::K2Tree(
     EngineBackend &backend,
@@ -411,8 +379,6 @@ K2Tree::K2Tree(
       , rank_superblock_length(rank_superblock_length)
       , rank_subblock_length(rank_subblock_length) {
 
-    // Written once at construction and read on every walk thereafter, which is exactly
-    // the case for per-device read-only replicas rather than migration.
     backend.advise_read_mostly(this->internal_node_words, this->internal_node_words_length * sizeof(u32));
     backend.advise_read_mostly(this->leaf_node_words, this->leaf_node_words_length * sizeof(u32));
     backend.advise_read_mostly(this->rank_superblock_table, this->rank_superblock_length * sizeof(u32));
@@ -445,8 +411,6 @@ K2Tree::K2Tree(K2Tree &&other) noexcept
       , rank_superblock_length(other.rank_superblock_length)
       , rank_subblock_length(other.rank_subblock_length) {
 
-    // The whole reason this is not defaulted: the source must forget the slab, or both
-    // objects release it. Everything else above is a plain value copy.
     other.owning_backend = nullptr;
     other.owning_slab = EnginePointer{};
     other.tree_height = 0;
@@ -456,7 +420,6 @@ K2Tree::K2Tree(K2Tree &&other) noexcept
 K2Tree &K2Tree::operator=(K2Tree &&other) noexcept {
     if (this == &other) return *this;
 
-    // Release what this object already holds before taking over the incoming slab.
     if (owning_backend != nullptr) owning_backend->deallocate_slab(owning_slab);
 
     branching_factor = other.branching_factor;
@@ -487,8 +450,6 @@ K2Tree &K2Tree::operator=(K2Tree &&other) noexcept {
 }
 
 K2Tree::~K2Tree() {
-    // The four bit arrays and the query staging are all sub-ranges of one slab, and no
-    // sub-range owns anything -- releasing the slab is what frees them.
     if (owning_backend != nullptr) owning_backend->deallocate_slab(owning_slab);
 }
 
@@ -551,8 +512,6 @@ optional<K2Tree> K2Tree::from_edges(
     return make_k2tree_from_arrays(backend, arrays, node_count, branching_factor, superblock_size);
 }
 
-// ── serialization ─────────────────────────────────────────────────────────────
-
 static constexpr u32 SAVE_MAGIC = 0x4B325452; // "K2TR"
 
 K2Tree K2Tree::load(EngineBackend &backend, const char *path) {
@@ -576,8 +535,6 @@ K2Tree K2Tree::load(EngineBackend &backend, const char *path) {
     file.read(reinterpret_cast<char *>(&rank_superblock_length), sizeof(usize));
     file.read(reinterpret_cast<char *>(&rank_subblock_length), sizeof(usize));
 
-    // Same chunk layout as make_k2tree_from_arrays: the four arrays plus adjacent_batch's
-    // staging, so a loaded tree is indistinguishable from a built one.
     spikecorec::Vector<EnginePointer> partitions;
     backend
         .partition(internal_node_words_length * sizeof(u32), EngineDatatype::UNSIGNED32, partitions)
@@ -762,26 +719,14 @@ void K2Tree::adjacent_batch(
 ) const {
     if (query_count <= 0) return;
     if (owning_backend == nullptr) {
-        // The empty adjacency has no slab and therefore no staging. It also has no edges,
-        // so every query answers 0.
         memset(output_buffer, 0, (usize)query_count * sizeof(uint8_t));
         return;
     }
 
-    // source_indices/target_indices/output_buffer are caller-owned host memory (mirroring
-    // the plain s32 node indices of the single-query `adjacent`), not GPU-visible, so
-    // queries are staged into this tree's own staging ranges and the results copied back.
-    //
-    // The staging is sized once at construction (ADJACENT_BATCH_QUERY_CAP), because the
-    // backend hands out one chunk per partition -> allocate round and there is no
-    // transient allocation available. A larger batch is answered in chunks rather than
-    // refused -- the cap bounds memory, not the query.
     s32 *staged_sources = query_source_staging.get_contents_as<s32>();
     s32 *staged_targets = query_target_staging.get_contents_as<s32>();
     uint8_t *staged_output = query_output_staging.get_contents_as<uint8_t>();
 
-    // Built once, on the first batch. A build without default.metallib beside the binary
-    // gets nullopt here and answers on the host instead of failing.
     bool dispatch_is_available = false;
 #ifdef SPIKECOREC_METAL
     dispatch_is_available = adjacent_batch_function.pipeline_state != nullptr;

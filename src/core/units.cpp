@@ -50,8 +50,6 @@ f64 tick_to_seconds(s64 tick, f64 total_seconds, s64 total_ticks) {
     );
 }
 
-// Covers the suffixes the NeuroML standard library actually uses. Everything the engine
-// sees is SI, so conversion happens at parse time and never downstream.
 f64 unit_suffix_scale(const String &suffix) {
     static const UnorderedMap<String, f64> scales = {
         {"", 1.0}, {"none", 1.0},

@@ -23,9 +23,6 @@ using namespace std;
 
 namespace spikecorec {
 
-// The aligned start of the next range in a chunk. Every partition is pushed to at least
-// PARTITION_ALIGNMENT so a `constant` kernel binding and a float4 read are both legal at
-// its offset, whatever the datatype asks for.
 u64 aligned_partition_offset(u64 cursor, u64 alignment) {
     return (cursor + alignment - 1) & ~(alignment - 1);
 }
@@ -33,9 +30,6 @@ u64 aligned_partition_offset(u64 cursor, u64 alignment) {
 
 #ifdef SPIKECOREC_METAL
 
-// default.metallib is built by the Makefile and placed alongside the build artifacts. A
-// command line tool has no app bundle for newDefaultLibrary() to search, so locate the
-// metallib next to the loaded binary (via dladdr) and load it explicitly.
 MTL::Library *load_default_metal_library(MTL::Device *device) {
     Dl_info info{};
     if (dladdr(reinterpret_cast<const void *>(&load_default_metal_library), &info) && info.dli_fname) {
@@ -59,8 +53,6 @@ String describe_metal_error(NS::Error *error) {
 }
 
 MetalBackend::MetalBackend(s64 threads_per_block_) {
-    // Assigned rather than initialized in the member-init list: threads_per_block belongs
-    // to AbstractBackend, and a derived constructor cannot name a base's member there.
     threads_per_block = threads_per_block_;
 
     device = MTL::CreateSystemDefaultDevice();
@@ -132,8 +124,6 @@ EnginePointer MetalBackend::allocate(Vector<EnginePointer> &partitions) {
 
     slabs.push_back(slab);
 
-    // Only handles from THIS chunk are still null, so a caller reusing one vector across
-    // chunks does not get its earlier handles re-aimed at the new slab.
     for (EnginePointer &partition: partitions) {
         if (partition.base_pointer != nullptr || partition.total_bytes == 0) continue;
         partition.base_pointer = slab;
@@ -171,11 +161,6 @@ Optional<EngineFunction> MetalBackend::create_function(
 ) {
     log::logger().debug("create_function: name={} source_bytes={}", name, source_code.size());
 
-    // The language version is stated rather than inherited. Passing null options lets the
-    // runtime compiler pick a default that varies by process -- the same generated source
-    // compiled from a C++ host and failed from a Python one with "unknown type name
-    // 'atomic_float'", because atomic_float is Metal 3 and the default landed below it.
-    // The generated kernel needs Metal 3 for its atomic float scatter, so it asks.
     MTL::CompileOptions *options = MTL::CompileOptions::alloc()->init();
     options->setLanguageVersion(MTL::LanguageVersion3_0);
 
@@ -258,8 +243,6 @@ bool MetalBackend::run_function(
         const EnginePointer &parameter = parameters[index];
 
         if (parameter.inline_scalar) {
-            // `constant T &x [[buffer(N)]]` accepts inline constant data as readily as a
-            // buffer binding, which is what lets a scalar travel as an EnginePointer.
             encoder->setBytes(parameter.base_pointer, parameter.total_bytes, index);
         } else {
             encoder->setBuffer(static_cast<MTL::Buffer *>(parameter.base_pointer),
@@ -267,8 +250,6 @@ bool MetalBackend::run_function(
         }
     }
 
-    // dispatchThreads takes TOTAL threads, not threadgroups -- job_count is the element
-    // count, and Metal handles the non-multiple tail itself.
     const s64 thread_count = std::max<s64>(job_count, 1);
     const s64 group_width = std::min<s64>(threads_per_block, thread_count);
     encoder->dispatchThreads(MTL::Size::Make((NS::UInteger)thread_count, 1, 1),
@@ -409,8 +390,6 @@ Optional<EngineFunction> CudaBackend::create_function(
     nvrtcCreateProgram(&program, source_code.c_str(), program_name.c_str(), 0, nullptr, nullptr);
 
     // TODO: const char *options[] = { "--gpu-architecture=compute_87" };   // Orin
-    // Zero options, and an option COUNT of zero to match -- claiming one against an empty
-    // array is undefined behaviour.
     const nvrtcResult compile_result = nvrtcCompileProgram(program, 0, nullptr);
 
     size_t compile_log_size = 0;

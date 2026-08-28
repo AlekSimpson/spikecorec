@@ -24,7 +24,6 @@ using namespace spikecorec::nml;
 
 namespace {
 
-// The starting value of `variable_name` for a type, folded from its OnStart.
 f64 starting_value_for(const Vector<DynamicsInstruction> &dynamics,
                        const String &variable_name,
                        const Vector<String> &parameter_names,
@@ -39,13 +38,10 @@ f64 starting_value_for(const Vector<DynamicsInstruction> &dynamics,
                                       parameter_values, owner_name);
     }
 
-    // LEMS leaves a StateVariable with no OnStart at zero.
     return 0.0;
 }
 
 } // namespace
-
-// ── construction ──────────────────────────────────────────────────────────────────
 
 SpikeEngine::SpikeEngine(const String &lems_input_file, bool enable_hebbian_plasticity)
     : SpikeEngine(lems_input_file, {}, "", 1.0, 0.0, enable_hebbian_plasticity) {}
@@ -72,8 +68,6 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     : logger(log::make_logger())
     , hebbian_plasticity_enabled(enable_hebbian_plasticity) {
 
-    // The backend is a member, constructed with this engine: there is no process-global
-    // context to initialize and nothing to check before allocating.
     NML_Parser parser;
     if (!parser.validate_against_schema(lems_input_file)) {
         log::throw_runtime_error(*logger,
@@ -155,9 +149,6 @@ void SpikeEngine::allocate_model_buffers() {
        .partition(sizeof(u8) * layout.spike_history_length * total_neuron_count,
                   EngineDatatype::UNSIGNED8, data_partitions)
        .partition(sizeof(s64) * total_neuron_count, EngineDatatype::SIGNED64, data_partitions)
-       // One accumulator per (tick parity, prototype, neuron) and one state per
-       // (prototype, state variable, neuron) -- both independent of edge count, which is
-       // the whole point of aggregating.
        .partition(sizeof(f32) * 2 * prototype_count * total_neuron_count,
                   EngineDatatype::FLOAT32, data_partitions)
        .partition(sizeof(f32) * prototype_count * synapse_state_count * total_neuron_count,
@@ -166,8 +157,6 @@ void SpikeEngine::allocate_model_buffers() {
 
     model_slab = gpu.allocate(data_partitions);
 
-    // EnginePointer is a non-owning value: copying one produces a second name for the same
-    // range, and the slab is what owns the storage. There is nothing to move.
     cell_state         = data_partitions[0];
     cell_parameters    = data_partitions[1];
     synapse_parameters = data_partitions[2];
@@ -192,8 +181,6 @@ void SpikeEngine::initialize_model_buffers() {
     const s64 prototype_count = (s64)network_details.synapse_prototypes.size();
     const s64 synapse_state_count = layout.widest_synapse_state_count;
 
-    // The slab is uninitialized memory and every one of these is read before it is written
-    // on the first tick.
     memset(network_inputs.get_contents(), 0, (usize)(2 * total_neuron_count) * sizeof(f32));
     memset(spike_history.get_contents(), 0,
            (usize)(layout.spike_history_length * total_neuron_count) * sizeof(u8));
@@ -205,9 +192,7 @@ void SpikeEngine::initialize_model_buffers() {
         memset(empty_edge_plane.get_contents(), 0, sizeof(f32));
     }
 
-    // Each synapse type's state variables start at the value its OnStart gives them, which
-    // for the aggregate is that starting value times zero incoming spikes -- i.e. the
-    // starting value itself only when the type declares a non-zero one.
+    // Each synapse type's state variables start at the value its OnStart gives them
     if (!synapse_state.is_empty()) {
         f32 *synapse_state_data = synapse_state.get_contents_as<f32>();
         for (s64 prototype_index = 0; prototype_index < prototype_count; prototype_index += 1) {
@@ -230,13 +215,11 @@ void SpikeEngine::initialize_model_buffers() {
         }
     }
 
-    // Negative means "has never fired" -- see the refractory gate in dynamics_codegen. A
-    // zero would read as "fired on tick 0", holding every cell in the model refractory from
-    // the start and the undriven ones forever.
+    // negative means has never fired
     s64 *last_spiked_data = last_spiked.get_contents_as<s64>();
     std::fill(last_spiked_data, last_spiked_data + total_neuron_count, NEVER_SPIKED_TICK);
 
-    // Parameter rows, one per prototype, in the column order the type declared.
+    // parameter rows, one per prototype, in the column order the type declared.
     f32 *cell_parameter_data = static_cast<f32 *>(cell_parameters.get_contents());
     for (usize index = 0; index < network_details.cell_prototypes.size(); index += 1) {
         const ComponentPrototype &prototype = network_details.cell_prototypes[index];
@@ -259,10 +242,6 @@ void SpikeEngine::initialize_model_buffers() {
 
 }
 
-// Runs each cell type's OnStart once per neuron. This is not a formality: iafCell's
-// OnStart is `v = leakReversal`, and a cell left at 0 V when its threshold is -50 mV is
-// already over threshold on tick 0 — the whole network fires once and then sits at reset
-// forever, which looks exactly like a working simulation of a dead network.
 void SpikeEngine::initialize_cell_state() {
     f32 *cell_state_data = static_cast<f32 *>(cell_state.get_contents());
 
@@ -290,35 +269,28 @@ void SpikeEngine::initialize_cell_state() {
     }
 }
 
-// Every per-edge quantity lives in the WeightMatrix, and none of it as a per-edge value:
-// the k^2-tree says which (source, target) pairs exist, and a shared low-rank basis says
-// what each edge's weight and delay are. The synapse prototype is a run table, and per-edge
-// synapse STATE does not exist at all -- it aggregates into synapse_state, one accumulator
-// per (target, prototype).
 void SpikeEngine::build_weight_matrix() {
     const Vector<Vector<s32>> network = build_adjacency_list(network_details);
 
-    // rank -1 means "derive it from what the projections below actually contain" rather
-    // than a constant someone guessed; capacity 0 leaves plasticity off and allocates
-    // nothing for it.
+    // rank -1 means "derive it from what the projections below actually contain"
     weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
                            correction_ceiling_fraction, weight_fit_rank_budget);
 
-    // Room for updates to queue into, on top of whatever the fit turns out to need. Zero
+    // room for updates to queue into, on top of whatever the fit turns out to need. Zero
     // when nothing writes updates, so a model with no plasticity and an exact fit
     // allocates no correction layer at all.
-    weights.plasticity_reserve_entries =
-            hebbian_plasticity_enabled ? DEFAULT_PLASTICITY_DELTA_CAPACITY : 0;
+    weights.plasticity_reserve_entries = hebbian_plasticity_enabled 
+        ? DEFAULT_PLASTICITY_DELTA_CAPACITY 
+        : 0;
 
-    // The same run coalescing the codegen bakes into the kernel, from the same function --
-    // the two must agree on the ordering exactly, or edges get the wrong synapse.
-    Vector<s64> first_edge_ordinal;
+    // The same run coalescing the codegen bakes into the kernel
+    Vector<s64> edge_ordinal;
     Vector<s64> edge_count;
     Vector<s64> synapse_prototype;
     Vector<f32> weight;
     Vector<s32> delay_ticks;
-    collect_projection_runs(network_details, first_edge_ordinal, edge_count,
+    collect_projection_runs(network_details, edge_ordinal, edge_count,
                             synapse_prototype, weight, delay_ticks);
 
     Vector<s32> synapse_prototype_narrow;
@@ -327,34 +299,20 @@ void SpikeEngine::build_weight_matrix() {
         synapse_prototype_narrow.push_back((s32)prototype_index);
     }
 
-    weights.declare_projections(first_edge_ordinal, edge_count, synapse_prototype_narrow,
+    weights.declare_projections(edge_ordinal, edge_count, synapse_prototype_narrow,
                                 weight, delay_ticks);
 
-    // The scale plasticity is held to, taken from the model's own weights before anything
-    // has moved them. Only meaningful when plasticity is on, and only when there are edges.
     if (hebbian_plasticity_enabled && weights.total_edge_count > 0) {
         plasticity_target_root_mean_square = weights.neighbor_weight_stats().root_mean_square;
     }
 
     logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, {} projection runs, "
                   "rank {}, worst weight error {:.3e}",
-                  weights.node_count, weights.total_edge_count, first_edge_ordinal.size(),
+                  weights.node_count, weights.total_edge_count, edge_ordinal.size(),
                   weights.rank, weights.measured_weight_fit_error);
 }
 
-// A spike is a binary event; what it is worth in current depends entirely on the cell it
-// lands on. When the model declines to say, the sensible reading of "a spike arrived" is
-// "enough to make this cell fire", which is C * (threshold - resting) / dt: the charge that
-// moves the membrane the whole way in one tick.
-//
-// Every term comes from the target's own declarations rather than from guessed names. The
-// capacitance is the parameter whose DIMENSION is capacitance, whatever the model calls it.
-// The threshold and the resting value come from the cell's own spike condition and its
-// OnStart -- so GLIF1, which tests the parameter `vth`, and GLIF4, which tests the state
-// variable `theta`, both resolve without either being special-cased.
 f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
-    // Strictly above threshold, because the comparison that fires a cell is a strict one:
-    // landing exactly on it does not spike.
     constexpr f64 THRESHOLD_OVERSHOOT = 1.05;
 
     for (usize index = 0; index < network_details.populations.size(); index += 1) {
@@ -390,10 +348,6 @@ f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
                     "is no threshold to aim at. Give the input an amplitude");
         }
 
-        // The swing to cover is measured from the lowest the membrane goes, not from where
-        // it starts. A cell that has just fired sits at its reset value, which for every
-        // iaf and GLIF cell is below the leak reversal -- sizing the event from the
-        // starting potential makes the first spike fire and the ones after it fall short.
         f64 membrane_floor = starting_value_for(cell_type.dynamics, membrane_name,
                                                 cell_type.parameter_names,
                                                 prototype.starting_parameters,
@@ -404,9 +358,6 @@ f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
             if (instruction.source_tag != NML_DeclarationType::StateAssignment) continue;
             if (instruction.target != membrane_name) continue;
 
-            // Only a reset that folds to a value counts. GLIF2 resets to
-            // `vreset + resetScale*(v - vth)`, which depends on the overshoot and cannot be
-            // known here; its plain vreset floor is covered by the OnStart value instead.
             try {
                 membrane_floor = std::min(
                         membrane_floor,
@@ -421,7 +372,6 @@ f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
 
         const f64 resting = membrane_floor;
 
-        // The threshold is a parameter in GLIF1/2/3 and a state variable in GLIF4/5.
         bool threshold_found = false;
         f64 threshold = 0.0;
         for (usize slot = 0; slot < cell_type.parameter_names.size(); slot += 1) {
@@ -500,8 +450,6 @@ void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
 
     const usize choice_count = prototype_index_of_choice.size();
 
-    // Shares of the population, normalised. An empty list means an equal share each, and
-    // a list of the wrong length is a mistake worth naming rather than padding over.
     Vector<f64> cumulative_share(choice_count, 0.0);
     if (synapse_proportions.empty()) {
         for (usize index = 0; index < choice_count; index += 1) {
@@ -537,17 +485,12 @@ void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
         }
     }
 
-    // Seeded from the document rather than from the clock: a model that fixes its seed
-    // gets the same cells excitatory on every run, which is what makes a demo's numbers
-    // reproducible. simulation_seed is not assigned until after this runs, so the parse
-    // result is read directly.
     const u64 assignment_seed = network_details.random_seed.has_value()
                                         ? *network_details.random_seed
                                         : 0x5CC0DEu;
     std::mt19937_64 generator(assignment_seed);
     std::uniform_real_distribution<f64> uniform(0.0, 1.0);
 
-    // At least one tick: the engine's synaptic latency has no zero-delay path.
     const s64 delay_ticks = std::max<s64>(
             1, (s64)std::llround(connection_delay_seconds / network_details.step_dt));
 
@@ -628,11 +571,6 @@ void SpikeEngine::collect_stimulus() {
 
             if (target.event_ticks.empty()) continue;
 
-            // A spike train injects a current for one tick at each event time. A model
-            // that names an amplitude gets that; one that does not -- which is every
-            // standard spike source, since LEMS binds only attributes matching a declared
-            // Parameter -- gets whatever makes its target fire. A spike is a binary event
-            // and its worth in current is a property of the cell receiving it.
             const f64 amplitude = profile.amplitude != 0.0
                     ? profile.amplitude
                     : default_spike_amplitude_for(target.neuron_index);
@@ -653,8 +591,6 @@ SpikeEngine::~SpikeEngine() {
     if (alive) shutdown();
 }
 
-// Host-side stimulus lands in the row this tick's kernel is about to drain, so injected
-// current reaches the cell on the tick the model asked for rather than the one after.
 void SpikeEngine::apply_stimulus(s64 tick) {
     f32 *input_data = static_cast<f32 *>(network_inputs.get_contents());
     const s64 row_base = (tick % 2) * total_neuron_count;
@@ -667,9 +603,6 @@ void SpikeEngine::apply_stimulus(s64 tick) {
                 continuous_injection_amplitudes[index];
     }
 
-    // Event times are sorted, so each train only ever walks forward. The first loop skips
-    // any event the run has already passed, which matters when a model schedules several
-    // events inside one tick or when step() is called out of order by a test.
     for (ScheduledSpikeTrain &train : scheduled_spike_trains) {
         while (train.cursor < train.event_ticks.size() &&
                (s64)train.event_ticks[train.cursor] < tick) {
@@ -683,9 +616,6 @@ void SpikeEngine::apply_stimulus(s64 tick) {
     }
 }
 
-// One buffer the kernel declares, or the placeholder when the model has no such plane. A
-// network with no connections allocates none of them, and there is no way to bind
-// "nothing" to a buffer slot a kernel names.
 EnginePointer SpikeEngine::resolve_edge_plane(const EnginePointer &plane) const {
     return plane.is_empty() ? empty_edge_plane : plane;
 }
@@ -693,9 +623,6 @@ EnginePointer SpikeEngine::resolve_edge_plane(const EnginePointer &plane) const 
 void SpikeEngine::step_simulation(s64 tick) {
     apply_stimulus(tick);
 
-    // Scalars live on the stack for the duration of the dispatch and reach the kernel as
-    // inline constant data: an EnginePointer with inline_scalar set means "these bytes",
-    // not "this range of a slab", and run_function is what tells the two apart.
     const s32 neuron_count_argument = (s32)total_neuron_count;
     const s32 spike_history_length_argument = (s32)layout.spike_history_length;
     const s32 rank_float4_stride_argument = (s32)weights.rank_float4_stride;
@@ -735,7 +662,6 @@ void SpikeEngine::step_simulation(s64 tick) {
         resolve_edge_plane(weights.sparse_delta_value),          // 29
     };
 
-    // Bound only when the kernel declares them, which it does only when plasticity is on.
     const s32 plasticity_capacity_argument = (s32)weights.sparse_delta_capacity;
     if (hebbian_plasticity_enabled) {
         parameters.push_back(resolve_edge_plane(weights.pending_delta_edge_ordinal)); // 30
@@ -744,30 +670,21 @@ void SpikeEngine::step_simulation(s64 tick) {
         parameters.push_back(inline_scalar_argument(plasticity_capacity_argument));   // 33
     }
 
-    // job_count is the neuron count, not a block count: run_function dispatches TOTAL
-    // threads and works out the groups itself.
     if (!gpu.run_function(kernel_function, parameters, total_neuron_count)) {
         log::throw_runtime_error(*logger,
                 "SpikeEngine: tick " + to_string(tick) + " failed on the GPU");
     }
 
-    // Folding on an interval rather than every tick: a fold is a dispatch per staged delta,
-    // and batching is the whole reason the kernel stages them instead of applying them.
     if (hebbian_plasticity_enabled &&
         plasticity_fold_every_n_ticks > 0 &&
         (tick + 1) % plasticity_fold_every_n_ticks == 0) {
-        // Merge what the device staged into the correction layer, which is where reads
-        // pick it up. Cheap, and the point at which recent updates become visible.
+
         weights.compact_pending_deltas();
 
-        // Re-optimise the basis only once the corrections have grown enough to be worth
-        // it. That is the expensive half, and batching it is the whole reason updates
-        // queue rather than moving U and V directly.
+        // re optimise the basis
         if (weights.is_refit_due()) {
             weights.refit();
 
-            // Hebbian only strengthens, so the weights run away without this -- a
-            // potentiated edge drives its target harder, which potentiates it further.
             if (plasticity_target_root_mean_square >= 0.0f) {
                 weights.scale_neighbor_weights_to_root_mean_square(
                         plasticity_target_root_mean_square);
@@ -820,8 +737,6 @@ void SpikeEngine::record_tick(s64 tick) {
     }
 }
 
-// ── readback ──────────────────────────────────────────────────────────────────────
-
 f32 SpikeEngine::read_state_variable(s64 neuron_index, const String &variable_name) const {
     for (usize index = 0; index < network_details.populations.size(); index += 1) {
         const PopulationLayout &population = network_details.populations[index];
@@ -870,8 +785,6 @@ f64 SpikeEngine::fraction_of_neurons_that_spiked() const {
     return (f64)spiking_neurons / (f64)total_neuron_count;
 }
 
-// ── membrane video ────────────────────────────────────────────────────────────────
-
 void SpikeEngine::record_membrane_video(const String &path, s64 frame_stride) {
     if (frame_stride < 1) {
         log::throw_runtime_error(*logger,
@@ -879,8 +792,6 @@ void SpikeEngine::record_membrane_video(const String &path, s64 frame_stride) {
                 to_string(frame_stride) + ")");
     }
 
-    // Where each neuron's `v` lives, resolved once. Every GLIF and iaf cell exposes it;
-    // a cell type that does not is an error rather than a silently flat row in the video.
     membrane_offset_per_neuron.assign((usize)total_neuron_count, -1);
 
     for (usize index = 0; index < network_details.populations.size(); index += 1) {
@@ -927,8 +838,6 @@ void SpikeEngine::write_spike_file(const String &path) const {
     logger->info("write_spike_file: wrote {} spikes to {}", recorded_spikes.size(), path);
 }
 
-// ── recording output ──────────────────────────────────────────────────────────────
-
 void SpikeEngine::write_recordings() {
     if (membrane_video_recorder) {
         membrane_video_recorder->finish();
@@ -948,8 +857,6 @@ void SpikeEngine::write_recordings() {
         }
 
         if (format == OutputFileFormat::SPIKE_EVENTS) {
-            // The NeuroML event-file convention: one "time id" line per spike, ordered by
-            // time, restricted to the neurons the EventSelections named.
             Set<s64> selected;
             for (const RecordingSelection &selection : profile.selections) {
                 if (selection.neuron_index >= 0) selected.insert(selection.neuron_index);
@@ -967,8 +874,6 @@ void SpikeEngine::write_recordings() {
             continue;
         }
 
-        // The NML column-matrix convention: first column time, one further column per
-        // OutputColumn, in the order the file declared them.
         Vector<usize> columns;
         for (const RecordingSelection &selection : profile.selections) {
             for (usize index = 0; index < traced_selections.size(); index += 1) {
@@ -1001,8 +906,6 @@ void SpikeEngine::shutdown() {
     // the backend that owns it is still alive.
     weights = WeightMatrix();
 
-    // The model slab goes the same way. Everything else the backend holds is released by
-    // its own destructor, which runs after this.
     gpu.deallocate_slab(model_slab);
 
     alive = false;

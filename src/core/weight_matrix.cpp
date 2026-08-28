@@ -27,39 +27,14 @@ s64 round_up_to_lane_group(s64 value) {
     return ((max<s64>(value, 1) + group - 1) / group) * group;
 }
 
-// Solves (gram + ridge*I) x = right_hand_side in place, by Cholesky. The system is small --
-// one per node, of dimension rank -- and symmetric positive definite once the ridge term is
-// added, which is the whole reason the ridge is there rather than for regularisation alone:
-// a node whose edges do not span the rank leaves the Gram matrix singular.
-//
-// Returns false when even the ridged system is not decomposable, in which case the caller
-// leaves that row alone rather than writing a NaN into the basis.
-// How far a reconstruction may sit from its target before it is worth an Sk entry.
-//
-// Relative for a weight, because weights span orders of magnitude and an absolute figure
-// means nothing across them -- and because a least-squares fit leaves a tiny residual on
-// essentially EVERY edge. Counting those would say a well-fitted model needs a correction
-// per edge, which is the opposite of what the measurement is for.
-//
-// Absolute for a delay, and generous: it is rounded to a whole tick on read, so a basis
-// landing within half a tick already reads back correctly and an entry would buy nothing.
 f32 negligible_residual_for(s64 matrix_index, f32 target_value, f32 field_scale) {
     if (matrix_index == WeightMatrix::DELAY_MATRIX_INDEX) return 0.4f;
 
-    // Relative to the value OR to the field it sits in, whichever is more forgiving.
-    //
-    // Relative to the value alone is unusable wherever a field passes through zero: a
-    // weight of 1e-8 in a field of order 1 would demand its residual be under 1e-12, which
-    // f32 cannot deliver, so every such edge is reported as needing a correction forever.
-    // That is not a small error being flagged -- it is a large field's rounding noise
-    // measured against a value that happens to be tiny.
     const f32 relative_to_value = WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE * fabsf(target_value);
     const f32 relative_to_field = WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE * fabsf(field_scale);
     return max(max(relative_to_value, relative_to_field), WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE);
 }
 
-// Root mean square of one matrix's targets -- the scale the field lives at, which is what
-// a residual near zero has to be judged against.
 f32 field_scale_of(const Vector<f32> &targets) {
     if (targets.empty()) return 1.0f;
     f64 sum_of_squares = 0.0;
@@ -92,7 +67,6 @@ bool solve_symmetric_in_place(vector<f64> &gram, vector<f64> &right_hand_side, s
         }
     }
 
-    // Forward substitution, then back substitution.
     for (s64 row = 0; row < dimension; row += 1) {
         f64 sum = right_hand_side[(usize)row];
         for (s64 index = 0; index < row; index += 1) {
@@ -126,8 +100,6 @@ const vector<vector<s32>> &WeightMatrix::validate_network(const vector<vector<s3
     return network;
 }
 
-// ── construction ──────────────────────────────────────────────────────────────────
-
 WeightMatrix::WeightMatrix(
     EngineBackend &backend,
     const vector<vector<s32>> &network,
@@ -139,8 +111,6 @@ WeightMatrix::WeightMatrix(
     s64 fit_rank_budget
 )
     : k2tree(*K2Tree::from_adjacency_list(backend, validate_network(network), (s32)network.size()))
-    // No corrections until something has measured that they are needed. A model whose
-    // structure the basis captures never allocates any.
     , sparse_delta_capacity(0)
     , correction_ceiling_fraction(max(correction_ceiling_fraction, 0.0f))
     , fit_rank_budget(fit_rank_budget)
@@ -155,9 +125,6 @@ WeightMatrix::WeightMatrix(
         this->max_neighbor_count = longest_row;
     }
 
-    // Provisional until declare_projections derives the real one. A caller that names a
-    // rank outright gets it; -1 means "decide from the declarations", and four lanes is
-    // the smallest basis that can hold anything at all.
     this->rank = (rank > 0) ? round_up_to_lane_group(rank) : LANE_GROUP;
     rank_float4_stride = this->rank / LANE_GROUP;
 
@@ -179,9 +146,6 @@ WeightMatrix::WeightMatrix(
                         this->max_neighbor_count, this->correction_ceiling_fraction);
 }
 
-// Walks every row once to number the edges. This is also where total_edge_count comes
-// from, so the two can never disagree: an edge has an ordinal exactly when the walk found
-// it, which keeps both consistent with an explicitly-truncating max_neighbor_count.
 void WeightMatrix::build_edge_row_offset() {
     edge_row_offset_host.assign((usize)node_count + 1, 0);
 
@@ -206,23 +170,13 @@ void WeightMatrix::allocate_storage() {
         .partition(matrix_byte_size, EngineDatatype::FLOAT32X4, partitions)                  // V
         .partition((u64)MATRIX_COUNT * lane_count * sizeof(f32), EngineDatatype::FLOAT32, partitions)
         .partition((u64)(node_count + 1) * sizeof(s64), EngineDatatype::SIGNED64, partitions)
-        // Sized by edges, not node_count * max_neighbor_count: a padded scratch here would
-        // reintroduce exactly the allocation this class exists to avoid, and it would be
-        // resident for the object's whole life.
         .partition((u64)total_edge_count * sizeof(f32), EngineDatatype::FLOAT32, partitions)
-        // The sparse correction layer. Row starts always exist -- an empty CSR is all
-        // zeros, which is a valid "no corrections anywhere" rather than an absent buffer
-        // the read path has to test for.
         .partition((u64)MATRIX_COUNT * (u64)(node_count + 1) * sizeof(s32),
                    EngineDatatype::SIGNED32, partitions)
         .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(s64),
                    EngineDatatype::SIGNED64, partitions)
         .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(f32),
                    EngineDatatype::FLOAT32, partitions)
-        // The update queue is sized by the RESERVE, not by the correction capacity. Only
-        // something writing updates queues anything, so a model that merely needs
-        // corrections -- the whole unstructured case -- allocates no queue at all. Sizing
-        // it by capacity charged that model for a buffer it could never use.
         .partition((u64)plasticity_reserve_entries * sizeof(s64), EngineDatatype::SIGNED64, partitions)
         .partition((u64)plasticity_reserve_entries * sizeof(f32), EngineDatatype::FLOAT32, partitions)
         .partition(plasticity_reserve_entries > 0 ? sizeof(s32) : 0,
@@ -259,9 +213,6 @@ void WeightMatrix::allocate_storage() {
     owning_backend->prefetch_to_gpu(V_matrix, matrix_byte_size);
 }
 
-// Releases the current chunk and runs a fresh partition round at the new rank. Used when
-// declare_projections derives a rank the constructor could not know, and when a loaded
-// file disagrees with the in-memory shape.
 void WeightMatrix::resize_basis(s64 new_rank) {
     const s64 rounded_rank = round_up_to_lane_group(new_rank);
     if (rounded_rank == rank) return;
@@ -277,15 +228,9 @@ void WeightMatrix::resize_basis(s64 new_rank) {
     rank_float4_stride = rank / LANE_GROUP;
     allocate_storage();
 
-    // A fresh slab is uninitialised memory, and alternating least squares started from
-    // whatever was there converges to nothing -- it was reading the previous allocation's
-    // bytes as a starting basis. Seed it the same way the constructor does.
     seed_basis(basis_seed);
 }
 
-// Independent N(0,1) in every lane. Not a fit: it is the starting point one becomes, and
-// what a matrix used as a random reservoir keeps. The seed is held so a resize reproduces
-// the same starting basis rather than drifting on re-allocation.
 void WeightMatrix::seed_basis(unsigned seed) {
     mt19937 random_engine(seed);
     normal_distribution<f32> normal_distribution_unit(0.0f, 1.0f);
@@ -304,8 +249,6 @@ void WeightMatrix::seed_basis(unsigned seed) {
                                  normal_distribution_unit(random_engine)};
     }
 
-    // Both coefficient rows start neutral, so an unfitted basis reconstructs the plain
-    // dot(U, V) it always did.
     const s64 lane_count = rank_float4_stride * LANE_GROUP;
     f32 *coefficient_data = coefficients.get_contents_as<f32>();
     for (s64 lane_index = 0; lane_index < MATRIX_COUNT * lane_count; lane_index += 1) {
@@ -345,8 +288,6 @@ WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
     , measured_weight_fit_error(other.measured_weight_fit_error)
     , edge_row_offset_host(std::move(other.edge_row_offset_host))
 {
-    // The only reason this is not defaulted: the source must forget the slab, or both
-    // objects release it.
     other.owning_backend = nullptr;
     other.owning_slab = EnginePointer{};
     other.node_count = 0;
@@ -401,8 +342,6 @@ WeightMatrix::~WeightMatrix() {
     if (owning_backend != nullptr) owning_backend->deallocate_slab(owning_slab);
 }
 
-// ── indexing ──────────────────────────────────────────────────────────────────────
-
 bool WeightMatrix::check_index_inbounds(s32 node_index) const {
     return check_indexing && node_index >= 0 && node_index < node_count;
 }
@@ -443,8 +382,6 @@ optional<s64> WeightMatrix::edge_ordinal(s32 source_node, s32 target_node) const
     }
     return nullopt;
 }
-
-// ── reconstruction ────────────────────────────────────────────────────────────────
 
 f32 *WeightMatrix::coefficient_row(s64 matrix_index) const {
     return coefficients.get_contents_as<f32>() + matrix_index * rank_float4_stride * LANE_GROUP;
@@ -490,8 +427,6 @@ f32 WeightMatrix::reconstruct_entry(
     return dot_product;
 }
 
-// The correction Sk holds for one edge, or zero. Binary search inside the source row's
-// slice, which is what the CSR layout buys: rows are contiguous and short.
 f32 WeightMatrix::sparse_delta_for(s64 matrix_index, s32 source_node, s64 edge_ordinal) const {
     if (sparse_delta_entry_count[(usize)matrix_index] == 0) return 0.0f;
     if (sparse_delta_row_start.is_empty()) return 0.0f;
@@ -516,8 +451,6 @@ f32 WeightMatrix::sparse_delta_for(s64 matrix_index, s32 source_node, s64 edge_o
     return 0.0f;
 }
 
-// Basis plus correction. The basis is a lossy projection and Sk is what the rank did not
-// capture, so neither half is the value on its own -- every read path goes through here.
 f32 WeightMatrix::get_for_matrix(s32 source_node, s32 target_node, s64 matrix_index) const {
     validate_matrix_index(matrix_index);
     if (!check_index_inbounds(source_node, target_node)) return 0.0f;
@@ -539,9 +472,6 @@ s32 WeightMatrix::get_edge_delay_ticks(s32 source_node, s32 target_node) const {
     if (using_constant_delay_ticks) return constant_delay_ticks;
     if (!check_index_inbounds(source_node, target_node)) return constant_delay_ticks;
 
-    // A delay is a whole number of ticks, so rounding absorbs fit error the way it cannot
-    // for a weight: the basis only has to land within half a tick. That slack is why the
-    // delay matrix usually needs no corrections at all even when the weights do.
     const f32 corrected = get_for_matrix(source_node, target_node, DELAY_MATRIX_INDEX);
     return max<s32>((s32)lroundf(corrected), 1);
 }
@@ -550,8 +480,6 @@ s32 WeightMatrix::get_edge_synapse_prototype(s32 source_node, s32 target_node) c
     const optional<s64> ordinal = edge_ordinal(source_node, target_node);
     if (!ordinal.has_value()) return -1;
 
-    // Runs are sorted and contiguous over the edge ordering, so the run containing an
-    // ordinal is the last one starting at or below it.
     const auto entry = upper_bound(projection_first_edge_ordinal.begin(),
                                    projection_first_edge_ordinal.end(), *ordinal);
     if (entry == projection_first_edge_ordinal.begin()) return -1;
@@ -563,15 +491,6 @@ s32 WeightMatrix::get_edge_synapse_prototype(s32 source_node, s32 target_node) c
     return projection_synapse_prototype[run_index];
 }
 
-// ── the sparse delta matrix ───────────────────────────────────────────────────────
-
-// How many edges the fitted basis fails to reproduce. This is the model's structural
-// complexity measured rather than assumed: a network of uniform projections answers zero,
-// because the exact construction reproduces every edge; one with an independently chosen
-// value per edge answers with the edge count, because there is nothing to exploit.
-//
-// Taking the worst matrix rather than the sum: capacity is per matrix, so the one that
-// needs the most is the one that decides.
 s64 WeightMatrix::count_edges_needing_correction(
     const Vector<Vector<f32>> &targets_per_matrix
 ) const {
@@ -583,10 +502,6 @@ s64 WeightMatrix::count_edges_needing_correction(
     for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
         const f32 *coefficient_values = coefficient_row(matrix_index);
 
-        // The scale the field lives at, which is what a residual on a near-zero value has
-        // to be judged against. store_residual_corrections computes the same thing the
-        // same way, so the two agree on what "needs correcting" means -- a disagreement
-        // there would size the capacity for one answer and then store the other.
         const f32 field_scale = field_scale_of(targets_per_matrix[(usize)matrix_index]);
 
         s64 matrix_need = 0;
@@ -612,9 +527,6 @@ s64 WeightMatrix::count_edges_needing_correction(
     return worst_matrix_need;
 }
 
-// Re-partitions at a new correction capacity, carrying the fitted basis across. Distinct
-// from resize_basis, which re-seeds: doing that here would throw away the very fit whose
-// residuals decided this capacity.
 void WeightMatrix::resize_correction_capacity(s64 new_capacity) {
     if (new_capacity == sparse_delta_capacity) return;
 
@@ -636,10 +548,6 @@ void WeightMatrix::resize_correction_capacity(s64 new_capacity) {
            saved_coefficients.size() * sizeof(f32));
 }
 
-// Rebuilds one matrix's CSR from a full correction list. When there are more corrections
-// than capacity the largest by magnitude are kept: truncating by size makes the residual
-// error bounded by the smallest kept correction, where truncating arbitrarily would leave
-// the worst edges wrong.
 void WeightMatrix::rebuild_sparse_delta(s64 matrix_index, Vector<Pair<s64, f32>> &corrections) {
     validate_matrix_index(matrix_index);
     if (sparse_delta_capacity <= 0 || sparse_delta_row_start.is_empty()) return;
@@ -653,8 +561,6 @@ void WeightMatrix::rebuild_sparse_delta(s64 matrix_index, Vector<Pair<s64, f32>>
         corrections.resize((usize)sparse_delta_capacity);
     }
 
-    // The CSR wants entries ascending by ordinal, and ordinals are already grouped by
-    // source row -- so one sort puts both the rows and their contents in order.
     sort(corrections.begin(), corrections.end(),
          [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
              return left.first < right.first;
@@ -672,8 +578,6 @@ void WeightMatrix::rebuild_sparse_delta(s64 matrix_index, Vector<Pair<s64, f32>>
         entry_value[index] = corrections[index].second;
     }
 
-    // Row starts from the prefix sum of how many corrections fall in each row. An edge's
-    // row is the one whose edge_row_offset range contains its ordinal.
     s64 correction_index = 0;
     for (s64 node_index = 0; node_index <= node_count; node_index += 1) {
         const s64 row_first_ordinal = edge_row_offset_host[(usize)node_index];
@@ -700,8 +604,6 @@ void WeightMatrix::accumulate_edge_delta(
             to_string(target_node) + ") is not an edge, so it has nothing to correct");
     }
 
-    // Read, add, rebuild. Correct and simple; the device path queues into the pending
-    // buffer instead precisely because doing this per update is what batching avoids.
     Vector<Pair<s64, f32>> corrections;
     const s64 existing_count = sparse_delta_entry_count[(usize)matrix_index];
     const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
@@ -721,9 +623,6 @@ void WeightMatrix::accumulate_edge_delta(
     rebuild_sparse_delta(matrix_index, corrections);
 }
 
-// Merges what the device staged this interval into the CSR. Until this runs, those updates
-// are queued but not yet visible to a read -- which is the batching latency the design
-// accepts in exchange for not sorting on every update.
 void WeightMatrix::compact_pending_deltas() {
     if (sparse_delta_capacity <= 0 || pending_delta_count.is_empty()) return;
 
@@ -743,7 +642,6 @@ void WeightMatrix::compact_pending_deltas() {
     const s64 *staged_ordinal = pending_delta_edge_ordinal.get_contents_as<s64>();
     const f32 *staged_value = pending_delta_value.get_contents_as<f32>();
 
-    // Corrections go to the weight matrix: an update changes what an edge is worth.
     Vector<Pair<s64, f32>> corrections;
     const s64 existing_count = sparse_delta_entry_count[(usize)DEFAULT_MATRIX_INDEX];
     const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
@@ -757,8 +655,6 @@ void WeightMatrix::compact_pending_deltas() {
         corrections.push_back({staged_ordinal[index], staged_value[index]});
     }
 
-    // Sum duplicates rather than letting the later one win: two arrivals on one edge in an
-    // interval are two updates, not a correction and a replacement.
     sort(corrections.begin(), corrections.end(),
          [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
              return left.first < right.first;
@@ -792,8 +688,6 @@ bool WeightMatrix::is_refit_due() const {
     return sparse_delta_occupancy_fraction() >= refit_occupancy_threshold_fraction;
 }
 
-// ── declaring the network's values ────────────────────────────────────────────────
-
 void WeightMatrix::declare_projections(
     const Vector<s64> &first_edge_ordinal,
     const Vector<s64> &edge_count,
@@ -818,15 +712,11 @@ void WeightMatrix::declare_projections(
         return;
     }
 
-    // One run means one value for the whole network, which needs no basis at all.
     bool every_delay_matches = true;
     for (usize run_index = 1; run_index < run_count; run_index += 1) {
         if (delay_ticks[run_index] != delay_ticks[0]) every_delay_matches = false;
     }
-    // Decided here rather than inside either fit, because it is a property of what was
-    // declared. Leaving it set when the delays vary makes get_edge_delay_ticks answer the
-    // constant for every edge and ignore the basis entirely -- silently, and only for
-    // models whose delays are not uniform.
+
     if (every_delay_matches) {
         set_constant_delay_ticks(max<s32>(delay_ticks[0], 1));
     } else {
@@ -835,16 +725,11 @@ void WeightMatrix::declare_projections(
 
     const Vector<Vector<f32>> targets = targets_from_projections(weight, delay_ticks);
 
-    // Two ways to get a basis. When the runs fit in the lane budget the indicator
-    // construction is exact and free, so take it. Otherwise fit -- a projection onto a
-    // linear subspace, approximate by design, with the residual left for Sk.
     if (!fit_basis_from_projections(weight, delay_ticks)) {
         if (fit_rank_budget > 0) {
             resize_basis(min<s64>(fit_rank_budget, MAX_RANK_FLOAT4_STRIDE * LANE_GROUP));
             fit_basis_to_targets(targets, DEFAULT_FIT_SWEEP_COUNT, DEFAULT_FIT_RIDGE);
         } else {
-            // No rank named, so find the one that costs the fewest bytes for this model
-            // rather than assume a constant fits every model's structure.
             search_for_best_fit_rank(targets);
         }
 
@@ -852,10 +737,6 @@ void WeightMatrix::declare_projections(
                             "rank {} instead of one lane per run", run_count, rank);
     }
 
-    // Measure what the fit actually missed, then allocate exactly that much -- rather than
-    // guessing a fraction up front and charging every model for it. A network of uniform
-    // projections needs nothing here and gets nothing; one with no structure to exploit
-    // asks for an entry per edge, and the ceiling is what decides whether it may have them.
     const s64 edges_needing_correction = count_edges_needing_correction(targets);
     const s64 ceiling_entries =
             (s64)(correction_ceiling_fraction * (f32)total_edge_count);
@@ -864,9 +745,6 @@ void WeightMatrix::declare_projections(
 
     resize_correction_capacity(chosen_capacity);
 
-    // Whatever the basis did not capture goes into Sk, which is what turns an approximate
-    // projection into an accurate read. An exact fit leaves it empty; an approximate one
-    // leaves corrections behind, and refit() folds them back in once there are enough.
     const s64 weight_corrections =
             store_residual_corrections(DEFAULT_MATRIX_INDEX, targets[(usize)DEFAULT_MATRIX_INDEX]);
     const s64 delay_corrections =
@@ -878,9 +756,6 @@ void WeightMatrix::declare_projections(
     measured_weight_fit_error = measure_worst_relative_weight_error(weight);
 
     if (edges_needing_correction > ceiling_entries) {
-        // The model wanted more corrections than the ceiling allows, so the largest
-        // residuals were kept and the rest are accepted as error. Said plainly, because it
-        // is the one case where a number the caller chose is what limits the accuracy.
         log::logger().warn("WeightMatrix: the fit misses {} of {} edges but the correction "
                            "ceiling allows {}; the largest {} residuals were kept and the "
                            "rest are error. Raise correction_ceiling_fraction (now {:.2f}) "
@@ -890,20 +765,14 @@ void WeightMatrix::declare_projections(
     }
 
     if (measured_weight_fit_error > WEIGHT_FIT_WARNING_TOLERANCE) {
-        // Reported, not refused. The basis is a lossy projection by design and the residual
-        // is the accepted price of the storage -- what matters is that the number is visible
-        // rather than that it is zero.
         log::logger().warn("WeightMatrix: after corrections the worst declared weight is still "
                            "off by {:.3e} relative, past the {:.0e} line. Raise the rank or "
                            "the correction capacity if that matters for this model.",
                            measured_weight_fit_error, WEIGHT_FIT_WARNING_TOLERANCE);
     }
 
-    // The structure report: how much of this model the basis captured, and what the rest
-    // cost. Worth reading -- nothing refuses to run on account of these numbers.
     const s64 basis_bytes = 2 * node_count * rank * (s64)sizeof(f32);
-    // Everything the correction layer costs, queue included -- reporting only the CSR
-    // would understate what was actually allocated.
+
     const s64 correction_bytes =
             sparse_delta_capacity * (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32))) +
             plasticity_reserve_entries * (s64)(sizeof(s64) + sizeof(f32));
@@ -918,13 +787,6 @@ void WeightMatrix::declare_projections(
                        total_edge_count * (s64)sizeof(f32), measured_weight_fit_error);
 }
 
-// Walks the edge set, compares the basis against the targets, and hands whatever differs
-// to Sk. An edge the basis already reproduces needs no entry, which is what keeps Sk empty
-// for a projection-structured network rather than merely small.
-//
-// Delay gets half a tick of slack, because rounding absorbs anything smaller: a basis that
-// lands within 0.4 of the right integer already reads back correctly, and an entry for it
-// would be storage bought for nothing.
 s64 WeightMatrix::store_residual_corrections(
     s64 matrix_index, const Vector<f32> &targets_by_edge_ordinal
 ) {
@@ -958,36 +820,11 @@ s64 WeightMatrix::store_residual_corrections(
     return sparse_delta_entry_count[(usize)matrix_index];
 }
 
-// Builds U, V and both coefficient rows straight from the projection structure rather than
-// fitting numerically, and is EXACT for a network wired out of population-to-population
-// projections -- which is what NeuroML's <projection presynapticPopulation=
-// postsynapticPopulation=> gives.
-//
-// The construction: give run k its own latent lane. U[i][k] is 1 when node i is a source of
-// run k and 0 otherwise; V[j][k] is 1 when node j is a target of run k. Then Ck[k] holds
-// the run's value, and Σ_m U[i][m]·Ck[m]·V[j][m] collapses to exactly Ck[k] for any edge
-// (i, j) in run k.
-//
-// Why the other lanes vanish: lane m is nonzero at U[i] only if i is a source of run m, and
-// nonzero at V[j] only if j is a target of run m. Populations are disjoint, so a node
-// belongs to one source population and one target population -- meaning both can only hold
-// for m == k. Where that disjointness does not hold, the measurement in
-// declare_projections is what catches it.
 bool WeightMatrix::fit_basis_from_projections(
     const Vector<f32> &weight, const Vector<s32> &delay_ticks
 ) {
     const s64 run_count = (s64)projection_first_edge_ordinal.size();
 
-    // A lane per distinct (weight, delay) pair, not per run. Runs split wherever anything
-    // about a projection changes -- including its synapse prototype, which the run table
-    // stores separately and the basis never represents. A network whose cells each draw
-    // their own synapse has a run boundary at nearly every cell while carrying one weight
-    // and one delay throughout, and giving each of those runs a lane would fit a constant
-    // field at rank 188 and spend 728 KB on a basis where 39 KB of raw floats would do.
-    //
-    // Merging is safe because every edge leaving a source shares that source's run, so a
-    // source occupies exactly one lane however many runs map onto it -- which is the
-    // property the indicator construction rests on.
     Vector<s64> lane_of_run((usize)max<s64>(run_count, 0), 0);
     Vector<f32> lane_weight;
     Vector<s32> lane_delay;
@@ -1012,8 +849,6 @@ bool WeightMatrix::fit_basis_from_projections(
 
     const s64 distinct_count = (s64)lane_weight.size();
 
-    // Only available while every distinct value can have its own lane. Past that the
-    // construction has no exactness left to offer and the general fit is the honest path.
     if (round_up_to_lane_group(distinct_count) > MAX_RANK_FLOAT4_STRIDE * LANE_GROUP) {
         return false;
     }
@@ -1037,7 +872,6 @@ bool WeightMatrix::fit_basis_from_projections(
                 lane_carries_a_value ? (f32)lane_delay[(usize)lane_index] : 0.0f;
     }
 
-    // One pass over every edge, marking the endpoints of the run it belongs to.
     vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
     s64 run_index = 0;
     for (s64 source_node = 0; source_node < node_count; source_node += 1) {
@@ -1068,8 +902,6 @@ bool WeightMatrix::fit_basis_from_projections(
     return true;
 }
 
-// ── fitting the basis ─────────────────────────────────────────────────────────────
-
 Vector<Vector<f32>> WeightMatrix::targets_from_projections(
     const Vector<f32> &weight, const Vector<s32> &delay_ticks
 ) const {
@@ -1079,8 +911,6 @@ Vector<Vector<f32>> WeightMatrix::targets_from_projections(
     if (run_count == 0) return targets;
 
     for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
-        // Runs are sorted and contiguous, so the run containing an ordinal is the last one
-        // starting at or below it.
         const auto entry = upper_bound(projection_first_edge_ordinal.begin(),
                                        projection_first_edge_ordinal.end(), ordinal);
         const s64 run_index = max<s64>(entry - projection_first_edge_ordinal.begin() - 1, 0);
@@ -1105,9 +935,6 @@ Vector<Vector<f32>> WeightMatrix::targets_from_current_values() const {
             const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
             const s32 target_node = neighbor_buffer[(usize)slot];
             for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
-                // Reconstruction PLUS correction: the corrected value is what this matrix
-                // currently reads, and re-optimising the basis toward it is exactly how a
-                // correction gets absorbed into the basis and stops needing an entry.
                 targets[(usize)matrix_index][(usize)ordinal] =
                         reconstruct_entry((s32)source_node, target_node,
                                           coefficient_row(matrix_index)) +
@@ -1118,14 +945,6 @@ Vector<Vector<f32>> WeightMatrix::targets_from_current_values() const {
     return targets;
 }
 
-// Alternating least squares over the edge support. Three phases per sweep -- solve every
-// U row, then every V row, then every coefficient row -- each of which is a small dense
-// least-squares problem in `rank` unknowns.
-//
-// The support is what keeps this affordable: a row of U is fitted against that node's own
-// out-edges, not against a whole matrix row, so a sweep costs O(total_edge_count * rank^2)
-// rather than O(node_count^2 * rank^2). At a million nodes that is the difference between
-// a construction step and an impossibility.
 void WeightMatrix::fit_basis_to_targets(
     const Vector<Vector<f32>> &targets_per_matrix, s32 sweep_count, f32 ridge_regularization
 ) {
@@ -1135,15 +954,6 @@ void WeightMatrix::fit_basis_to_targets(
     f32 *u_data = U_matrix.get_contents_as<f32>();
     f32 *v_data = V_matrix.get_contents_as<f32>();
 
-    // Every matrix shares one basis, and least squares minimises ABSOLUTE error -- so a
-    // matrix whose values are numerically larger dominates the objective and the others are
-    // fitted to whatever is left. Delay in ticks runs 10-40 while a weight is order 1, which
-    // is enough for the weight field to be neglected entirely: a constant weight of 1.0,
-    // representable at rank 1, came back with 100% error.
-    //
-    // Normalising each matrix by its own scale makes them contribute comparably. The scale
-    // is folded back into that matrix's coefficient row afterwards, so the reconstruction
-    // still lands on the original magnitude.
     Vector<f64> matrix_scale((usize)MATRIX_COUNT, 1.0);
     for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
         f64 sum_of_squares = 0.0;
@@ -1164,8 +974,6 @@ void WeightMatrix::fit_basis_to_targets(
         }
     }
 
-    // Flat edge list, built once: every phase walks it, and re-walking the k^2-tree per
-    // sweep would dominate the arithmetic it is there to serve.
     vector<s32> edge_source((usize)total_edge_count);
     vector<s32> edge_target((usize)total_edge_count);
     {
@@ -1181,8 +989,6 @@ void WeightMatrix::fit_basis_to_targets(
         }
     }
 
-    // Incoming edges per node, so the V phase can gather its own equations without a
-    // second tree walk per sweep.
     vector<vector<s64>> incoming_edges((usize)node_count);
     for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
         incoming_edges[(usize)edge_target[(usize)ordinal]].push_back(ordinal);
@@ -1193,7 +999,6 @@ void WeightMatrix::fit_basis_to_targets(
     vector<f64> basis_row((usize)lane_count);
 
     for (s32 sweep = 0; sweep < sweep_count; sweep += 1) {
-        // ── U rows ───────────────────────────────────────────────────────────────
         for (s64 source_node = 0; source_node < node_count; source_node += 1) {
             const s64 first = edge_row_offset_host[(usize)source_node];
             const s64 last = edge_row_offset_host[(usize)source_node + 1];
@@ -1237,7 +1042,6 @@ void WeightMatrix::fit_basis_to_targets(
             }
         }
 
-        // ── V rows ───────────────────────────────────────────────────────────────
         for (s64 target_node = 0; target_node < node_count; target_node += 1) {
             const vector<s64> &ordinals = incoming_edges[(usize)target_node];
             if (ordinals.empty()) continue;
@@ -1280,14 +1084,7 @@ void WeightMatrix::fit_basis_to_targets(
             }
         }
 
-        // ── coefficient rows ─────────────────────────────────────────────────────
-        // One per matrix, over every edge. This is what lets the matrices differ while
-        // sharing a basis: U and V hold the structure, Ck holds each quantity's scaling
-        // of it.
         for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
-            // A uniform delay is answered by constant_delay_ticks and never reconstructed,
-            // so making the shared basis fit it spends lanes on a field nothing reads --
-            // and, worse, pulls U and V away from the weights, which are read.
             if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
             fill(gram.begin(), gram.end(), 0.0);
             fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
@@ -1325,9 +1122,6 @@ void WeightMatrix::fit_basis_to_targets(
         }
     }
 
-    // Undo the normalisation. Ck scales the reconstruction linearly, so putting each
-    // matrix's own scale back here lands it on the magnitude its targets actually had --
-    // while the fit above got to treat every matrix as equally important.
     for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
         f32 *coefficient_values = coefficient_row(matrix_index);
         for (s64 lane = 0; lane < lane_count; lane += 1) {
@@ -1339,14 +1133,6 @@ void WeightMatrix::fit_basis_to_targets(
     using_constant_weight = false;
 }
 
-// Fits at each candidate rank and keeps the one whose basis and corrections cost the fewest
-// bytes together. That sum is the thing worth minimising: raising the rank shrinks the
-// corrections and grows the basis, so there is a floor somewhere between, and where it
-// falls depends on the model rather than on a constant.
-//
-// Candidates climb geometrically to the rank at which an arbitrary field becomes exactly
-// representable -- past that, extra rank buys nothing any correction could not buy cheaper.
-// The search fits shortened; only the winner is fitted properly.
 s64 WeightMatrix::search_for_best_fit_rank(const Vector<Vector<f32>> &targets_per_matrix) {
     const s64 hard_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
     const s64 exact_fit_rank =
@@ -1372,9 +1158,6 @@ s64 WeightMatrix::search_for_best_fit_rank(const Vector<Vector<f32>> &targets_pe
                                 min(corrections_needed, ceiling_entries) * correction_entry_bytes;
         const bool fits_the_ceiling = corrections_needed <= ceiling_entries;
 
-        // A candidate that stays inside the ceiling always beats one that does not, however
-        // few bytes the second uses -- exceeding it means accepting error, and cheapness is
-        // only worth comparing among candidates that are equally correct.
         const bool better =
                 fits_the_ceiling
                     ? (!any_candidate_fits_the_ceiling || total_bytes < best_total_bytes)
@@ -1403,13 +1186,9 @@ s64 WeightMatrix::search_for_best_fit_rank(const Vector<Vector<f32>> &targets_pe
 void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     if (total_edge_count == 0) return;
 
-    // Fit to what the matrices currently READ -- reconstruction plus correction. Absorbing
-    // the corrections into the basis is the point, so they are the target, not the noise.
     const Vector<Vector<f32>> targets = targets_from_current_values();
     fit_basis_to_targets(targets, sweep_count, ridge_regularization);
 
-    // Whatever the re-optimised basis still misses stays corrected; the rest is now in
-    // U/V and needs no entry.
     for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
         store_residual_corrections(matrix_index, targets[(usize)matrix_index]);
     }
@@ -1425,8 +1204,6 @@ f32 WeightMatrix::measure_worst_relative_weight_error(const Vector<f32> &weight)
 
     const f32 *weight_coefficients = coefficient_row(DEFAULT_MATRIX_INDEX);
 
-    // The scale the weights live at, so a residual on a near-zero one is judged against
-    // the field rather than against itself.
     Vector<f32> declared_by_edge;
     declared_by_edge.reserve((usize)max<s64>(total_edge_count, 0));
     for (s64 index = 0; index < (s64)weight.size(); index += 1) {
@@ -1453,19 +1230,11 @@ f32 WeightMatrix::measure_worst_relative_weight_error(const Vector<f32> &weight)
             if (run_index >= run_count) break;
 
             const f32 declared = weight[(usize)run_index];
-            // Basis PLUS correction: what the engine actually reads. Measuring the basis
-            // alone would report an error the corrections have already fixed, and hide the
-            // one they have not.
             const f32 reconstructed =
                     reconstruct_entry((s32)source_node, neighbor_buffer[(usize)slot],
                                       weight_coefficients) +
                     sparse_delta_for(DEFAULT_MATRIX_INDEX, (s32)source_node, ordinal);
-            // Relative to the declared value OR to the field it sits in, whichever is
-            // larger. Weights span orders of magnitude, so an absolute error means nothing
-            // across them -- but relative to the value alone is worse than useless
-            // wherever a field passes through zero: an absolute error of 6e-4 on a weight
-            // of 1e-6 reads as 630x, which says the fit is broken when the fit is fine and
-            // the denominator is the problem.
+
             const f32 scale = max(fabsf(declared), field_scale);
             const f32 error = fabsf(reconstructed - declared) / max(scale, numeric_limits<f32>::min());
             worst_relative_error = max(worst_relative_error, error);
@@ -1505,15 +1274,10 @@ s64 WeightMatrix::count_delay_mismatches(const Vector<s32> &delay_ticks) const {
     return mismatch_count;
 }
 
-// ── whole-network reads ───────────────────────────────────────────────────────────
-
 void WeightMatrix::neighbor_weights(f32 *output_weights) const {
     neighbor_weights_for_matrix(output_weights, DEFAULT_MATRIX_INDEX);
 }
 
-// Writes total_edge_count values indexed by edge ordinal -- no padding, no sentinel rows.
-// One GPU thread per real edge; falls back to the host walk when default.metallib is not
-// beside the binary, so a build without the AOT library still answers correctly.
 void WeightMatrix::neighbor_weights_for_matrix(f32 *output_weights, s64 matrix_index) const {
     validate_matrix_index(matrix_index);
     if (total_edge_count == 0) return;
@@ -1598,12 +1362,7 @@ WeightStats WeightMatrix::neighbor_weight_stats() const {
             max_weight};
 }
 
-// ── constant-value shortcuts ──────────────────────────────────────────────────────
-
 void WeightMatrix::set_constant_weight(f32 value) {
-    // Every lane of the group participates in the reconstruction, so the per-lane scale
-    // has to be derived from rank_float4_stride * LANE_GROUP -- deriving it from the
-    // logical rank overshoots whenever the two differ.
     const s64 lane_count = rank_float4_stride * LANE_GROUP;
     const f32 scale = (value != 0.0f) ? sqrtf(fabsf(value) / (f32)lane_count) : 0.0f;
     const f32 v_fill_value = (value >= 0.0f) ? scale : -scale;
@@ -1636,15 +1395,6 @@ void WeightMatrix::set_constant_delay_ticks(s32 ticks) {
     using_constant_delay_ticks = true;
 }
 
-// ── plasticity ────────────────────────────────────────────────────────────────────
-
-// One alternating-least-squares nudge of U[source] and V[target] toward a reconstruction
-// `delta` higher than the current one. Nothing is stored: the delta is absorbed into the
-// basis, which is what keeps per-edge storage at zero.
-//
-// The cost of that, stated plainly: moving U[source] moves every edge out of `source`, and
-// moving V[target] moves every edge into `target`. That is the trade compression makes, and
-// `rank` is the knob that decides how much the neighbours move.
 void WeightMatrix::update(
     s32 source_node, s32 target_node, f32 delta,
     f32 learning_rate, f32 l2_regularization, s32 iterations
@@ -1672,9 +1422,6 @@ void WeightMatrix::update(
             inline_scalar_argument(iterations_argument),
         };
 
-        // One thread per float4 lane, and a job count equal to the lane count so the whole
-        // update lands in a single threadgroup -- the kernel's anchors and its simd_sum
-        // reductions are threadgroup-scoped and only mean anything that way.
         if (owning_backend->run_function(weight_update_function, parameters, rank_float4_stride)) {
             using_constant_weight = false;
             return;
@@ -1729,8 +1476,6 @@ ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
             ? sqrtf(target_root_mean_square / current_root_mean_square)
             : 0.0f;
 
-    // Split evenly between the two factors, so the product scales by scale_factor^2 = the
-    // requested ratio and neither factor grows faster than the other.
     const s64 total_float4_element_count = node_count * rank_float4_stride;
     bool scaled_on_device = false;
 
@@ -1770,8 +1515,6 @@ ScaleResult WeightMatrix::scale_neighbor_weights_to_root_mean_square(
     return {target_root_mean_square, scale_factor, stats_before, stats_after};
 }
 
-// ── serialization ─────────────────────────────────────────────────────────────────
-
 void WeightMatrix::save(const char *filepath) const {
     ofstream file(filepath, ios::binary);
     file.write(reinterpret_cast<const char *>(&WEIGHT_MATRIX_SAVE_MAGIC), sizeof(u32));
@@ -1783,14 +1526,9 @@ void WeightMatrix::save(const char *filepath) const {
     file.write(reinterpret_cast<const char *>(U_matrix.get_contents()), (streamsize)basis_bytes);
     file.write(reinterpret_cast<const char *>(V_matrix.get_contents()), (streamsize)basis_bytes);
 
-    // Both coefficient rows: without them the basis reconstructs nothing meaningful, since
-    // Ck is where the declared values actually live.
     const s64 coefficient_bytes = MATRIX_COUNT * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
     file.write(reinterpret_cast<const char *>(coefficients.get_contents()), (streamsize)coefficient_bytes);
 
-    // The delay fast path is state, not derived: a matrix whose delays all agree answers
-    // from constant_delay_ticks and never reconstructs. Restoring the basis without these
-    // gives back a matrix that reports the default one tick for every edge.
     const u8 constant_delay_flag = using_constant_delay_ticks ? 1 : 0;
     file.write(reinterpret_cast<const char *>(&constant_delay_flag), sizeof(u8));
     file.write(reinterpret_cast<const char *>(&constant_delay_ticks), sizeof(s32));
