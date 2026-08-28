@@ -39,11 +39,6 @@ namespace spikecorec {
             s64 down  = ((row + 1) % side_length) * side_length + column;
             s64 up    = (((row - 1) + side_length) % side_length) * side_length + column;
 
-            // side_length==1 wraps every direction back onto the single cell itself
-            // (right==left==down==up==i); that's not a genuine edge -- self-loops
-            // are not supported -- so it's omitted rather than reported as a
-            // neighbor. For side_length>=2 none of these ever equal i, so this
-            // filtering is a no-op there.
             vector<s32> neighbors;
             for (s64 candidate : {right, left, down, up}) {
                 if (candidate != i) {
