@@ -1,24 +1,5 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="GlifCellTypes">
 
-  <!--
-    The GLIF family (Allen Institute Generalized LIF), as LEMS ComponentTypes. None of
-    these are in the NeuroML standard library, so the model carries its own definitions
-    and the engine compiles them like any other ComponentType.
-
-    What each one adds to the one before:
-      GLIF1  leaky integrate-and-fire with a refractory period
-      GLIF2  + a voltage-dependent reset rule (vreset + resetScale * (v - vth))
-      GLIF3  + two after-spike currents asc1/asc2, decaying and bumped at each spike
-      GLIF4  + an adapting threshold theta that relaxes to thetaInf and jumps on a spike
-      GLIF5  + both after-spike currents and the adapting threshold
-
-    Every one declares the same two regimes: an active "integrating" regime and a
-    "refractory" one it sits in for t_ref after firing. The engine lowers that pair to a
-    comparison against when the cell last fired rather than to a state machine  :  the
-    refractory regime's timer variable, its OnEntry and its Transitions all collapse into
-    that one test. Anything more elaborate than this pair is refused at load.
-  -->
-
   <ComponentType name="GLIF1Cell" extends="baseCell">
     <Parameter name="C" dimension="capacitance"/>
     <Parameter name="gL" dimension="conductance"/>
@@ -26,17 +7,22 @@
     <Parameter name="vth" dimension="voltage"/>
     <Parameter name="vreset" dimension="voltage"/>
     <Parameter name="t_ref" dimension="time"/>
+    
     <Attachments name="synapses" type="basePointCurrent"/>
+
     <EventPort name="spike" direction="out"/>
     <Exposure name="v" dimension="voltage"/>
     <Exposure name="iSyn" dimension="current"/>
+
     <Dynamics>
       <StateVariable name="v" dimension="voltage" exposure="v"/>
       <StateVariable name="refractoryTimeElapsed" dimension="time"/>
       <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+
       <OnStart>
         <StateAssignment variable="v" value="EL"/>
       </OnStart>
+
       <Regime name="integrating" initial="true">
         <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
         <OnCondition test="v .gt. vth">
@@ -45,6 +31,7 @@
           <Transition regime="refractory"/>
         </OnCondition>
       </Regime>
+      
       <Regime name="refractory">
         <OnEntry>
           <StateAssignment variable="refractoryTimeElapsed" value="0"/>
@@ -54,6 +41,7 @@
           <Transition regime="integrating"/>
         </OnCondition>
       </Regime>
+
     </Dynamics>
   </ComponentType>
 
@@ -65,17 +53,22 @@
     <Parameter name="vreset" dimension="voltage"/>
     <Parameter name="resetScale" dimension="none"/>
     <Parameter name="t_ref" dimension="time"/>
+
     <Attachments name="synapses" type="basePointCurrent"/>
+
     <EventPort name="spike" direction="out"/>
     <Exposure name="v" dimension="voltage"/>
     <Exposure name="iSyn" dimension="current"/>
+
     <Dynamics>
       <StateVariable name="v" dimension="voltage" exposure="v"/>
       <StateVariable name="refractoryTimeElapsed" dimension="time"/>
       <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
+
       <OnStart>
         <StateAssignment variable="v" value="EL"/>
       </OnStart>
+
       <Regime name="integrating" initial="true">
         <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
         <OnCondition test="v .gt. vth">
@@ -84,6 +77,7 @@
           <Transition regime="refractory"/>
         </OnCondition>
       </Regime>
+
       <Regime name="refractory">
         <OnEntry>
           <StateAssignment variable="refractoryTimeElapsed" value="0"/>
@@ -93,6 +87,7 @@
           <Transition regime="integrating"/>
         </OnCondition>
       </Regime>
+
     </Dynamics>
   </ComponentType>
 
@@ -107,12 +102,15 @@
     <Parameter name="tauAsc2" dimension="time"/>
     <Parameter name="ascAdd1" dimension="current"/>
     <Parameter name="ascAdd2" dimension="current"/>
+
     <Attachments name="synapses" type="basePointCurrent"/>
+
     <EventPort name="spike" direction="out"/>
     <Exposure name="v" dimension="voltage"/>
     <Exposure name="asc1" dimension="current"/>
     <Exposure name="asc2" dimension="current"/>
     <Exposure name="iSyn" dimension="current"/>
+
     <Dynamics>
       <StateVariable name="v" dimension="voltage" exposure="v"/>
       <StateVariable name="asc1" dimension="current" exposure="asc1"/>
@@ -122,11 +120,13 @@
       <DerivedVariable name="ascSum" dimension="current" value="asc1 + asc2"/>
       <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
       <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
+
       <OnStart>
         <StateAssignment variable="v" value="EL"/>
         <StateAssignment variable="asc1" value="0"/>
         <StateAssignment variable="asc2" value="0"/>
       </OnStart>
+      
       <Regime name="integrating" initial="true">
         <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn + ascSum) / C"/>
         <OnCondition test="v .gt. vth">
@@ -137,6 +137,7 @@
           <Transition regime="refractory"/>
         </OnCondition>
       </Regime>
+
       <Regime name="refractory">
         <OnEntry>
           <StateAssignment variable="refractoryTimeElapsed" value="0"/>
@@ -146,6 +147,7 @@
           <Transition regime="integrating"/>
         </OnCondition>
       </Regime>
+
     </Dynamics>
   </ComponentType>
 
@@ -158,21 +160,26 @@
     <Parameter name="thetaInf" dimension="voltage"/>
     <Parameter name="tauTheta" dimension="time"/>
     <Parameter name="thetaSpikeAdd" dimension="voltage"/>
+    
     <Attachments name="synapses" type="basePointCurrent"/>
+
     <EventPort name="spike" direction="out"/>
     <Exposure name="v" dimension="voltage"/>
     <Exposure name="theta" dimension="voltage"/>
     <Exposure name="iSyn" dimension="current"/>
+
     <Dynamics>
       <StateVariable name="v" dimension="voltage" exposure="v"/>
       <StateVariable name="theta" dimension="voltage" exposure="theta"/>
       <StateVariable name="refractoryTimeElapsed" dimension="time"/>
       <DerivedVariable name="iSyn" dimension="current" exposure="iSyn" select="synapses[*]/i" reduce="add"/>
       <TimeDerivative variable="theta" value="(thetaInf - theta) / tauTheta"/>
+
       <OnStart>
         <StateAssignment variable="v" value="EL"/>
         <StateAssignment variable="theta" value="thetaInf"/>
       </OnStart>
+
       <Regime name="integrating" initial="true">
         <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn) / C"/>
         <OnCondition test="v .gt. theta">
@@ -182,6 +189,7 @@
           <Transition regime="refractory"/>
         </OnCondition>
       </Regime>
+
       <Regime name="refractory">
         <OnEntry>
           <StateAssignment variable="refractoryTimeElapsed" value="0"/>
@@ -191,6 +199,7 @@
           <Transition regime="integrating"/>
         </OnCondition>
       </Regime>
+
     </Dynamics>
   </ComponentType>
 
@@ -207,13 +216,16 @@
     <Parameter name="tauAsc2" dimension="time"/>
     <Parameter name="ascAdd1" dimension="current"/>
     <Parameter name="ascAdd2" dimension="current"/>
+
     <Attachments name="synapses" type="basePointCurrent"/>
+
     <EventPort name="spike" direction="out"/>
     <Exposure name="v" dimension="voltage"/>
     <Exposure name="theta" dimension="voltage"/>
     <Exposure name="asc1" dimension="current"/>
     <Exposure name="asc2" dimension="current"/>
     <Exposure name="iSyn" dimension="current"/>
+
     <Dynamics>
       <StateVariable name="v" dimension="voltage" exposure="v"/>
       <StateVariable name="theta" dimension="voltage" exposure="theta"/>
@@ -225,12 +237,14 @@
       <TimeDerivative variable="theta" value="(thetaInf - theta) / tauTheta"/>
       <TimeDerivative variable="asc1" value="-asc1 / tauAsc1"/>
       <TimeDerivative variable="asc2" value="-asc2 / tauAsc2"/>
+
       <OnStart>
         <StateAssignment variable="v" value="EL"/>
         <StateAssignment variable="theta" value="thetaInf"/>
         <StateAssignment variable="asc1" value="0"/>
         <StateAssignment variable="asc2" value="0"/>
       </OnStart>
+
       <Regime name="integrating" initial="true">
         <TimeDerivative variable="v" value="(gL * (EL - v) + iSyn + ascSum) / C"/>
         <OnCondition test="v .gt. theta">
@@ -242,6 +256,7 @@
           <Transition regime="refractory"/>
         </OnCondition>
       </Regime>
+
       <Regime name="refractory">
         <OnEntry>
           <StateAssignment variable="refractoryTimeElapsed" value="0"/>
@@ -251,6 +266,7 @@
           <Transition regime="integrating"/>
         </OnCondition>
       </Regime>
+      
     </Dynamics>
   </ComponentType>
 
