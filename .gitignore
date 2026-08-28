@@ -9,6 +9,10 @@ logs/
 *.metallib
 
 notebooks/
+# The tutorial's code samples are source and are tracked; the .ipynb built
+# from them is not.
+!examples/notebooks/
+examples/notebooks/*.ipynb
 
 recordings/
 
