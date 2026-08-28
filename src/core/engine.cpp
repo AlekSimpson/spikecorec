@@ -2,6 +2,7 @@
 // Created by Alek Simpson on 5/30/26.
 //
 
+#include <random>
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -55,6 +56,19 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
                          f64 connection_weight,
                          f64 connection_delay_seconds,
                          bool enable_hebbian_plasticity)
+    : SpikeEngine(lems_input_file, adjacency,
+                  synapse_component_id.empty() ? vector<String>{}
+                                               : vector<String>{synapse_component_id},
+                  {}, connection_weight, connection_delay_seconds,
+                  enable_hebbian_plasticity) {}
+
+SpikeEngine::SpikeEngine(const String &lems_input_file,
+                         const vector<vector<s32>> &adjacency,
+                         const vector<String> &synapse_component_ids,
+                         const vector<f64> &synapse_proportions,
+                         f64 connection_weight,
+                         f64 connection_delay_seconds,
+                         bool enable_hebbian_plasticity)
     : logger(log::make_logger())
     , hebbian_plasticity_enabled(enable_hebbian_plasticity) {
 
@@ -70,8 +84,8 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     network_details = parser.parse_lems(lems_input_file);
 
     if (!adjacency.empty()) {
-        apply_topology(adjacency, synapse_component_id, connection_weight,
-                       connection_delay_seconds);
+        apply_topology(adjacency, synapse_component_ids, synapse_proportions,
+                       connection_weight, connection_delay_seconds);
     }
 
     layout = compute_model_layout(network_details);
@@ -442,7 +456,8 @@ f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
 }
 
 void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
-                                 const String &synapse_component_id,
+                                 const vector<String> &synapse_component_ids,
+                                 const vector<f64> &synapse_proportions,
                                  f64 connection_weight,
                                  f64 connection_delay_seconds) {
     const s64 neuron_count = (s64)network_details.neurons.size();
@@ -452,37 +467,114 @@ void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
                 " rows but the model's populations declare " + to_string(neuron_count) +
                 " neurons; one row per neuron is required");
     }
+    if (synapse_component_ids.empty()) {
+        log::throw_runtime_error(*logger,
+                "SpikeEngine: the topology names no synapse, so its edges would carry "
+                "nothing");
+    }
 
     // An instance id may be document-scoped ("net.syn"), so match the trailing name too.
-    s64 prototype_index = -1;
+    Vector<s64> prototype_index_of_choice;
     String available;
-    for (usize index = 0; index < network_details.synapse_prototypes.size(); index += 1) {
-        const String &instance_id = network_details.synapse_prototypes[index].instance_id;
-        available += (available.empty() ? "" : ", ") + instance_id;
+    for (const ComponentPrototype &prototype : network_details.synapse_prototypes) {
+        available += (available.empty() ? "" : ", ") + prototype.instance_id;
+    }
 
-        const usize separator = instance_id.rfind('.');
-        const String leaf = separator == String::npos ? instance_id
-                                                      : instance_id.substr(separator + 1);
-        if (instance_id == synapse_component_id || leaf == synapse_component_id) {
-            prototype_index = (s64)index;
+    for (const String &wanted : synapse_component_ids) {
+        s64 prototype_index = -1;
+        for (usize index = 0; index < network_details.synapse_prototypes.size(); index += 1) {
+            const String &instance_id = network_details.synapse_prototypes[index].instance_id;
+            const usize separator = instance_id.rfind('.');
+            const String leaf = separator == String::npos ? instance_id
+                                                          : instance_id.substr(separator + 1);
+            if (instance_id == wanted || leaf == wanted) prototype_index = (s64)index;
+        }
+        if (prototype_index < 0) {
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: the topology names synapse '" + wanted +
+                    "', which the model does not declare. It declares: " +
+                    (available.empty() ? "no synapses at all" : available));
+        }
+        prototype_index_of_choice.push_back(prototype_index);
+    }
+
+    const usize choice_count = prototype_index_of_choice.size();
+
+    // Shares of the population, normalised. An empty list means an equal share each, and
+    // a list of the wrong length is a mistake worth naming rather than padding over.
+    Vector<f64> cumulative_share(choice_count, 0.0);
+    if (synapse_proportions.empty()) {
+        for (usize index = 0; index < choice_count; index += 1) {
+            cumulative_share[index] = (f64)(index + 1) / (f64)choice_count;
+        }
+    } else {
+        if (synapse_proportions.size() != choice_count) {
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: the topology gives " + to_string(synapse_proportions.size()) +
+                    " proportions for " + to_string(choice_count) + " synapses; there must "
+                    "be one proportion per synapse, or none at all for an equal share each");
+        }
+
+        f64 total_share = 0.0;
+        for (f64 share : synapse_proportions) {
+            if (share < 0.0) {
+                log::throw_runtime_error(*logger,
+                        "SpikeEngine: the topology gives a negative synapse proportion (" +
+                        to_string(share) + ")");
+            }
+            total_share += share;
+        }
+        if (total_share <= 0.0) {
+            log::throw_runtime_error(*logger,
+                    "SpikeEngine: the topology's synapse proportions sum to zero, so no "
+                    "synapse could ever be chosen");
+        }
+
+        f64 running_share = 0.0;
+        for (usize index = 0; index < choice_count; index += 1) {
+            running_share += synapse_proportions[index] / total_share;
+            cumulative_share[index] = running_share;
         }
     }
-    if (prototype_index < 0) {
-        log::throw_runtime_error(*logger,
-                "SpikeEngine: the topology names synapse '" + synapse_component_id +
-                "', which the model does not declare. It declares: " +
-                (available.empty() ? "no synapses at all" : available));
-    }
 
-    const s64 type_index =
-            network_details.synapse_prototypes[(usize)prototype_index].type_index;
+    // Seeded from the document rather than from the clock: a model that fixes its seed
+    // gets the same cells excitatory on every run, which is what makes a demo's numbers
+    // reproducible. simulation_seed is not assigned until after this runs, so the parse
+    // result is read directly.
+    const u64 assignment_seed = network_details.random_seed.has_value()
+                                        ? *network_details.random_seed
+                                        : 0x5CC0DEu;
+    std::mt19937_64 generator(assignment_seed);
+    std::uniform_real_distribution<f64> uniform(0.0, 1.0);
 
     // At least one tick: the engine's synaptic latency has no zero-delay path.
     const s64 delay_ticks = std::max<s64>(
             1, (s64)std::llround(connection_delay_seconds / network_details.step_dt));
 
+    synapse_choice_per_neuron.assign((usize)neuron_count, 0);
+    Vector<s64> edges_per_choice(choice_count, 0);
+    Vector<s64> neurons_per_choice(choice_count, 0);
+
     s64 edge_count = 0;
     for (s64 source = 0; source < neuron_count; source += 1) {
+        // One draw per neuron, not per edge. Everything leaving this cell carries the
+        // same synapse, which is what makes it an excitatory or an inhibitory cell.
+        usize choice = choice_count - 1;
+        if (choice_count > 1) {
+            const f64 draw = uniform(generator);
+            for (usize candidate = 0; candidate < choice_count; candidate += 1) {
+                if (draw >= cumulative_share[candidate]) continue;
+                choice = candidate;
+                break;
+            }
+        }
+        synapse_choice_per_neuron[(usize)source] = (s32)choice;
+        neurons_per_choice[choice] += 1;
+
+        const s64 prototype_index = prototype_index_of_choice[choice];
+        const s64 type_index =
+                network_details.synapse_prototypes[(usize)prototype_index].type_index;
+
         Vector<NetworkEdge> &edges = network_details.neurons[(usize)source].outgoing_edges;
         edges.clear();
         edges.reserve(adjacency[(usize)source].size());
@@ -503,13 +595,20 @@ void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
             edge.delay_tick_count = delay_ticks;
             edges.push_back(edge);
             edge_count += 1;
+            edges_per_choice[choice] += 1;
         }
     }
 
-    logger->info("SpikeEngine: topology applied — {} neurons, {} edges, synapse '{}', "
-                 "weight {}, delay {} ticks",
-                 neuron_count, edge_count, synapse_component_id, connection_weight,
-                 delay_ticks);
+    String assignment;
+    for (usize choice = 0; choice < choice_count; choice += 1) {
+        assignment += (assignment.empty() ? "" : ", ") + synapse_component_ids[choice] +
+                      " on " + to_string(neurons_per_choice[choice]) + " cells (" +
+                      to_string(edges_per_choice[choice]) + " edges)";
+    }
+
+    logger->info("SpikeEngine: topology applied — {} neurons, {} edges, weight {}, "
+                 "delay {} ticks; {}",
+                 neuron_count, edge_count, connection_weight, delay_ticks, assignment);
 }
 
 void SpikeEngine::collect_stimulus() {

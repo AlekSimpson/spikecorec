@@ -215,6 +215,34 @@ namespace spikecorec {
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false);
 
+        // The same, with several synapses to draw from. Each neuron is assigned one of
+        // `synapse_component_ids` at random and every edge leaving it uses that one, so a
+        // list naming an excitatory and an inhibitory synapse produces a population of
+        // excitatory and inhibitory cells.
+        //
+        // Per cell rather than per edge because that is what makes a cell excitatory or
+        // inhibitory at all: drawing separately for each edge would leave every neuron a
+        // mix of both, which is not a thing a neuron is. It is also what Dale's law says,
+        // and it keeps the weight matrix's projection runs proportional to the number of
+        // neurons rather than to the number of edges.
+        //
+        // `synapse_proportions` gives each id its share of the population and is
+        // normalised, so {0.8, 0.2} is the usual cortical ratio. Empty means an equal
+        // share each. The draw is seeded from the document's own random seed, so a model
+        // that fixes its seed gets the same assignment every run.
+        SpikeEngine(const String &lems_input_file,
+                    const vector<vector<s32>> &adjacency,
+                    const vector<String> &synapse_component_ids,
+                    const vector<f64> &synapse_proportions = {},
+                    f64 connection_weight = 1.0,
+                    f64 connection_delay_seconds = 0.0,
+                    bool enable_hebbian_plasticity = false);
+
+        // Which synapse each neuron drew, parallel to the populations' neuron indices.
+        // Empty unless the engine was built from a list. A demo reads this to find an
+        // excitatory cell and an inhibitory one to trace.
+        Vector<s32> synapse_choice_per_neuron;
+
         ~SpikeEngine();
 
         void run();
@@ -259,7 +287,8 @@ namespace spikecorec {
         // carrying one synapse prototype. Runs before the layout is computed, so
         // everything downstream sees an ordinary parse result.
         void apply_topology(const vector<vector<s32>> &adjacency,
-                            const String &synapse_component_id,
+                            const vector<String> &synapse_component_ids,
+                            const vector<f64> &synapse_proportions,
                             f64 connection_weight,
                             f64 connection_delay_seconds);
 

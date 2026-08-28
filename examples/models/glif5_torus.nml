@@ -1,0 +1,138 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif5Torus">
+
+    <!--
+      A 10x10 sheet of GLIF5 cells wired as a torus. As with the GLIF1 sheet the wiring
+      comes from Python, and the engine assigns each cell one of the two synapses on
+      offer, making it excitatory or inhibitory.
+
+      GLIF5 is the whole family at once: a leaky integrate-and-fire cell with a moving
+      threshold (tauTheta, thetaSpikeAdd) and two after-spike currents (tauAsc1/2,
+      ascAdd1/2). Both make it adapt. Firing raises the cell's own threshold by 3 mV and
+      injects a hyperpolarising current, so a cell under steady drive slows over its
+      first few spikes rather than settling at one rate. Against the GLIF1 sheet, which
+      does not adapt at all, that is the thing to watch: the same drive produces a
+      falling rate here and a flat one there.
+
+      Because the threshold moves, thetaInf rather than vth says where it starts. The 10
+      seeded cells sit well over the 200 pA rheobase so they keep firing as they adapt;
+      the rest sit 4 mV under threshold and fire only on synaptic input.
+    -->
+
+    <include href="glif_cell_types.nml"/>
+
+    <GLIF5Cell id="sheetCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
+               thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="3mV"
+               tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-60pA" ascAdd2="-120pA"/>
+
+    <alphaCurrentSynapse id="excitatorySynapse" tau="5ms" ibase="80pA"/>
+    <alphaCurrentSynapse id="inhibitorySynapse" tau="5ms" ibase="-240pA"/>
+
+    <pulseGenerator id="seedDrive" delay="0ms" duration="500ms" amplitude="450pA"/>
+    <pulseGenerator id="backgroundDrive" delay="0ms" duration="500ms" amplitude="175pA"/>
+
+    <network id="sheetNetwork">
+        <population id="sheet" component="sheetCell" size="100"/>
+
+        <explicitInput target="sheet[0]" input="seedDrive"/>
+        <explicitInput target="sheet[1]" input="backgroundDrive"/>
+        <explicitInput target="sheet[2]" input="backgroundDrive"/>
+        <explicitInput target="sheet[3]" input="backgroundDrive"/>
+        <explicitInput target="sheet[4]" input="backgroundDrive"/>
+        <explicitInput target="sheet[5]" input="backgroundDrive"/>
+        <explicitInput target="sheet[6]" input="backgroundDrive"/>
+        <explicitInput target="sheet[7]" input="backgroundDrive"/>
+        <explicitInput target="sheet[8]" input="backgroundDrive"/>
+        <explicitInput target="sheet[9]" input="backgroundDrive"/>
+        <explicitInput target="sheet[10]" input="backgroundDrive"/>
+        <explicitInput target="sheet[11]" input="seedDrive"/>
+        <explicitInput target="sheet[12]" input="backgroundDrive"/>
+        <explicitInput target="sheet[13]" input="backgroundDrive"/>
+        <explicitInput target="sheet[14]" input="backgroundDrive"/>
+        <explicitInput target="sheet[15]" input="backgroundDrive"/>
+        <explicitInput target="sheet[16]" input="backgroundDrive"/>
+        <explicitInput target="sheet[17]" input="backgroundDrive"/>
+        <explicitInput target="sheet[18]" input="backgroundDrive"/>
+        <explicitInput target="sheet[19]" input="backgroundDrive"/>
+        <explicitInput target="sheet[20]" input="backgroundDrive"/>
+        <explicitInput target="sheet[21]" input="backgroundDrive"/>
+        <explicitInput target="sheet[22]" input="seedDrive"/>
+        <explicitInput target="sheet[23]" input="backgroundDrive"/>
+        <explicitInput target="sheet[24]" input="backgroundDrive"/>
+        <explicitInput target="sheet[25]" input="backgroundDrive"/>
+        <explicitInput target="sheet[26]" input="backgroundDrive"/>
+        <explicitInput target="sheet[27]" input="backgroundDrive"/>
+        <explicitInput target="sheet[28]" input="backgroundDrive"/>
+        <explicitInput target="sheet[29]" input="backgroundDrive"/>
+        <explicitInput target="sheet[30]" input="backgroundDrive"/>
+        <explicitInput target="sheet[31]" input="backgroundDrive"/>
+        <explicitInput target="sheet[32]" input="backgroundDrive"/>
+        <explicitInput target="sheet[33]" input="seedDrive"/>
+        <explicitInput target="sheet[34]" input="backgroundDrive"/>
+        <explicitInput target="sheet[35]" input="backgroundDrive"/>
+        <explicitInput target="sheet[36]" input="backgroundDrive"/>
+        <explicitInput target="sheet[37]" input="backgroundDrive"/>
+        <explicitInput target="sheet[38]" input="backgroundDrive"/>
+        <explicitInput target="sheet[39]" input="backgroundDrive"/>
+        <explicitInput target="sheet[40]" input="backgroundDrive"/>
+        <explicitInput target="sheet[41]" input="backgroundDrive"/>
+        <explicitInput target="sheet[42]" input="backgroundDrive"/>
+        <explicitInput target="sheet[43]" input="backgroundDrive"/>
+        <explicitInput target="sheet[44]" input="seedDrive"/>
+        <explicitInput target="sheet[45]" input="backgroundDrive"/>
+        <explicitInput target="sheet[46]" input="backgroundDrive"/>
+        <explicitInput target="sheet[47]" input="backgroundDrive"/>
+        <explicitInput target="sheet[48]" input="backgroundDrive"/>
+        <explicitInput target="sheet[49]" input="backgroundDrive"/>
+        <explicitInput target="sheet[50]" input="backgroundDrive"/>
+        <explicitInput target="sheet[51]" input="backgroundDrive"/>
+        <explicitInput target="sheet[52]" input="backgroundDrive"/>
+        <explicitInput target="sheet[53]" input="backgroundDrive"/>
+        <explicitInput target="sheet[54]" input="backgroundDrive"/>
+        <explicitInput target="sheet[55]" input="seedDrive"/>
+        <explicitInput target="sheet[56]" input="backgroundDrive"/>
+        <explicitInput target="sheet[57]" input="backgroundDrive"/>
+        <explicitInput target="sheet[58]" input="backgroundDrive"/>
+        <explicitInput target="sheet[59]" input="backgroundDrive"/>
+        <explicitInput target="sheet[60]" input="backgroundDrive"/>
+        <explicitInput target="sheet[61]" input="backgroundDrive"/>
+        <explicitInput target="sheet[62]" input="backgroundDrive"/>
+        <explicitInput target="sheet[63]" input="backgroundDrive"/>
+        <explicitInput target="sheet[64]" input="backgroundDrive"/>
+        <explicitInput target="sheet[65]" input="backgroundDrive"/>
+        <explicitInput target="sheet[66]" input="seedDrive"/>
+        <explicitInput target="sheet[67]" input="backgroundDrive"/>
+        <explicitInput target="sheet[68]" input="backgroundDrive"/>
+        <explicitInput target="sheet[69]" input="backgroundDrive"/>
+        <explicitInput target="sheet[70]" input="backgroundDrive"/>
+        <explicitInput target="sheet[71]" input="backgroundDrive"/>
+        <explicitInput target="sheet[72]" input="backgroundDrive"/>
+        <explicitInput target="sheet[73]" input="backgroundDrive"/>
+        <explicitInput target="sheet[74]" input="backgroundDrive"/>
+        <explicitInput target="sheet[75]" input="backgroundDrive"/>
+        <explicitInput target="sheet[76]" input="backgroundDrive"/>
+        <explicitInput target="sheet[77]" input="seedDrive"/>
+        <explicitInput target="sheet[78]" input="backgroundDrive"/>
+        <explicitInput target="sheet[79]" input="backgroundDrive"/>
+        <explicitInput target="sheet[80]" input="backgroundDrive"/>
+        <explicitInput target="sheet[81]" input="backgroundDrive"/>
+        <explicitInput target="sheet[82]" input="backgroundDrive"/>
+        <explicitInput target="sheet[83]" input="backgroundDrive"/>
+        <explicitInput target="sheet[84]" input="backgroundDrive"/>
+        <explicitInput target="sheet[85]" input="backgroundDrive"/>
+        <explicitInput target="sheet[86]" input="backgroundDrive"/>
+        <explicitInput target="sheet[87]" input="backgroundDrive"/>
+        <explicitInput target="sheet[88]" input="seedDrive"/>
+        <explicitInput target="sheet[89]" input="backgroundDrive"/>
+        <explicitInput target="sheet[90]" input="backgroundDrive"/>
+        <explicitInput target="sheet[91]" input="backgroundDrive"/>
+        <explicitInput target="sheet[92]" input="backgroundDrive"/>
+        <explicitInput target="sheet[93]" input="backgroundDrive"/>
+        <explicitInput target="sheet[94]" input="backgroundDrive"/>
+        <explicitInput target="sheet[95]" input="backgroundDrive"/>
+        <explicitInput target="sheet[96]" input="backgroundDrive"/>
+        <explicitInput target="sheet[97]" input="backgroundDrive"/>
+        <explicitInput target="sheet[98]" input="backgroundDrive"/>
+        <explicitInput target="sheet[99]" input="seedDrive"/>
+    </network>
+
+</neuroml>
