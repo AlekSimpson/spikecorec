@@ -71,4 +71,62 @@ f64 unit_suffix_scale(const String &suffix) {
     return entry->second;
 }
 
+s64 tick_count_from_seconds(f64 seconds, f64 step_dt) {
+    if (step_dt <= 0.0) return 0;
+    return static_cast<s64>(std::llround(seconds / step_dt));
+}
+
+// Splits "-60mV" into its numeric magnitude and its unit suffix. Shared by parse_quantity
+// and NML_Parser::resolve_quantity so both scan numbers identically.
+Pair<f64, String> split_quantity(const String &value) {
+    if (value.empty()) return {0.0, ""};
+
+    usize cursor = 0;
+    while (cursor < value.size() && isspace(static_cast<unsigned char>(value[cursor]))) cursor += 1;
+
+    usize number_start = cursor;
+    if (cursor < value.size() && (value[cursor] == '-' || value[cursor] == '+')) cursor += 1;
+    while (cursor < value.size() &&
+           (isdigit(static_cast<unsigned char>(value[cursor])) || value[cursor] == '.')) {
+        cursor += 1;
+    }
+
+    // Exponent, e.g. "1.5e-3mV".
+    if (cursor < value.size() && (value[cursor] == 'e' || value[cursor] == 'E')) {
+        usize exponent_cursor = cursor + 1;
+        if (exponent_cursor < value.size() &&
+            (value[exponent_cursor] == '-' || value[exponent_cursor] == '+')) {
+            exponent_cursor += 1;
+        }
+        if (exponent_cursor < value.size() &&
+            isdigit(static_cast<unsigned char>(value[exponent_cursor]))) {
+            cursor = exponent_cursor;
+            while (cursor < value.size() &&
+                   isdigit(static_cast<unsigned char>(value[cursor]))) cursor += 1;
+        }
+    }
+
+    if (cursor == number_start) return {0.0, ""};
+
+    f64 magnitude = 0.0;
+    try {
+        magnitude = std::stod(value.substr(number_start, cursor - number_start));
+    } catch (const std::exception &) {
+        return {0.0, ""};
+    }
+
+    while (cursor < value.size() && isspace(static_cast<unsigned char>(value[cursor]))) cursor += 1;
+
+    String suffix = value.substr(cursor);
+    while (!suffix.empty() && isspace(static_cast<unsigned char>(suffix.back()))) suffix.pop_back();
+
+    return {magnitude, suffix};
+}
+
+// "-60mV" -> -0.06 against the built-in table only.
+f64 parse_quantity(const String &value) {
+    auto [magnitude, suffix] = split_quantity(value);
+    return magnitude * units::unit_suffix_scale(suffix);
+}
+
 } // namespace spikecorec::units
