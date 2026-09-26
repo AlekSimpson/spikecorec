@@ -37,51 +37,24 @@ namespace spikecorec {
     public:
         log::SharedPointer<log::EngineLogger> logger;
 
+        NML_Context context;
+
         EngineBackend gpu;
 
         WeightMatrix weights;
 
-        NML_ParseResult network_details;
-        ModelLayout layout;
-
         EngineFunction kernel_function;
 
-        // ── model state, carved from the arena ────────────────────────────────────
-        EnginePointer cell_state;         // [layout.cell_state_length]
-        EnginePointer cell_parameters;    // [layout.cell_parameter_length]
-        EnginePointer synapse_parameters; // [layout.synapse_parameter_length]
+        EnginePointer cell_state;
 
         // Two rows, alternating by tick parity: a thread drains its slot in one row while
         // this tick's scatters accumulate into the other. That is what makes the synaptic
         // latency exactly one tick rather than one-or-two depending on thread order.
         EnginePointer network_inputs;     // [2][total_neuron_count]
 
-        // ── aggregated synapse state ──────────────────────────────────────────────
-        // Per-edge synapse state does not exist. Every Phase-1 synapse has linear state
-        // dynamics, per-prototype parameters, and a current linear in that state, with
-        // `weight` its only per-edge quantity and entering the arrival increment linearly.
-        // So the sum of a target's incoming synapse states obeys the same equation each
-        // term does, and one accumulator per (target, prototype) reproduces the per-edge
-        // computation exactly rather than approximately.
-        //
-        // That is worth roughly 400 MB per state variable at a million neurons -- and it
-        // is faster besides: an edge now touches memory only when a spike actually
-        // arrives, instead of loading and storing its state on every tick.
-        //
-        // Arrivals are double-buffered by tick parity for the same reason network_inputs
-        // is: scatters land in the next row while the target drains the current one.
-        EnginePointer synapse_arrivals;   // [2][prototype_count][total_neuron_count]
-        EnginePointer synapse_state;      // [prototype_count][state_count][total_neuron_count]
-
         // Bound wherever the kernel declares a per-edge buffer the model has no plane for.
-        // A model with no connections registers none of them, and there is no way to bind
-        // "nothing" to a `device float *` a kernel declares. One float is enough: the
-        // kernel never reads it, because a neuron with no adjacency row leaves the
-        // propagate walk before its first load.
+        // A model with no connections registers none of them
         EnginePointer empty_edge_plane;
-
-        // The whole-chunk handle for everything above, released at shutdown.
-        EnginePointer model_slab;
 
         // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
         // asking whether the source spiked `delay` ticks ago, so every spike in flight is
@@ -95,14 +68,6 @@ namespace spikecorec {
         Vector<s64> continuous_injection_start_ticks;
         Vector<s64> continuous_injection_end_ticks;
 
-        // A scheduled spike train: one entry per (input profile, target) that carries
-        // event times, plus a cursor into them. Kept sparse rather than expanded into a
-        // dense [target][tick] array, which for a long run is almost all zeros.
-        //
-        // Each event injects `magnitude` for exactly one tick, so it delivers a charge of
-        // magnitude * dt. That is what makes the amplitude a nanoamp-scale number rather
-        // than the picoamps a sustained injector uses: to move a 100 pF membrane by 15 mV
-        // in one 0.1 ms tick takes 15 nA.
         struct ScheduledSpikeTrain {
             s64 neuron_index = -1;
             f32 magnitude = 0.0f;
@@ -111,10 +76,6 @@ namespace spikecorec {
         };
         Vector<ScheduledSpikeTrain> scheduled_spike_trains;
 
-        // ── recording ─────────────────────────────────────────────────────────────
-        // Every neuron's spike count over the run, accumulated tick by tick. Kept
-        // separately from recorded_spikes because the aliveness metrics need every
-        // neuron's count whether or not the model asked for that neuron to be recorded.
         Vector<s64> spike_counts_per_neuron;
         Vector<RecordedSpike> recorded_spikes;
         // Row-major [recorded tick][traced quantity], parallel to traced_selections.
@@ -122,11 +83,6 @@ namespace spikecorec {
         Vector<RecordingSelection> traced_selections;
         Vector<f64> recorded_trace_times;
 
-        // Set up by record_membrane_video(): a .spire recording of every neuron's
-        // membrane potential, which is what the video renderer consumes. Separate from the
-        // model's own OutputFiles because LEMS has no way to ask for "every neuron, every
-        // Nth tick", and pretending one of its elements meant that would be inventing
-        // semantics the format does not have.
         std::unique_ptr<SimulationRecorder> membrane_video_recorder;
         s64 membrane_video_frame_stride = 1;
         // Where each neuron's `v` sits in cell_state, precomputed so a frame is a gather
@@ -136,46 +92,23 @@ namespace spikecorec {
 
         s64 total_neuron_count = 0;
         s64 lifetime = 0;
-        f32 step_dt = 0.0f;
+        f64 step_dt = 0.0f;
         u64 simulation_seed = 0;
 
         bool alive = false;
 
-        // ── plasticity (opt-in) ───────────────────────────────────────────────────
         bool hebbian_plasticity_enabled = false;
 
-        // How many staged deltas are folded into U/V at once, and how often. Capacity is a
-        // fixed budget rather than one slot per edge -- an interval that overflows it loses
-        // the excess and logs, which says "fold more often" rather than growing without
-        // bound.
         static constexpr s64 DEFAULT_PLASTICITY_DELTA_CAPACITY = 1 << 16;
 
-        // How much of the edge set the weight matrix's corrections may occupy. At 1.0 every
-        // model is reproduced exactly, and one with no exploitable structure pays for that
-        // in memory rather than in silently wrong weights. Lower it to cap what such a
-        // model may spend; a well-structured model needs none of it either way.
         f32 correction_ceiling_fraction = 1.0f;
 
-        // The largest rank the weight matrix's general fit may spend, or -1 to search for
-        // the rank whose basis and corrections cost the fewest bytes together. Searching is
-        // the default because the cheapest rank is a property of the model: an
-        // incompressible field gains nothing from extra rank and wants the smallest, while
-        // a structured one is worth spending on.
         s64 weight_fit_rank_budget = -1;
         s64 plasticity_fold_every_n_ticks = 64;
         f32 plasticity_learning_rate = 0.01f;
         f32 plasticity_l2_regularization = 1e-6f;
         s32 plasticity_iterations = 1;
 
-        // Homeostatic scaling, run after each fold. Plain Hebbian only ever strengthens, so
-        // without this the weights run away: a potentiated edge fires its target more, which
-        // potentiates it further. Rescaling the basis back to the magnitude the model
-        // declared keeps the total synaptic drive fixed while letting edges move relative to
-        // each other, which is the part the rule is actually for.
-        //
-        // Captured at construction from the model's own weights, so it is the document's
-        // scale being preserved rather than an invented one. Set to a negative value to
-        // disable and let the weights grow.
         f32 plasticity_target_root_mean_square = -1.0f;
 
         SpikeEngine() = delete;
@@ -184,30 +117,9 @@ namespace spikecorec {
         SpikeEngine(SpikeEngine &&) = delete;
         SpikeEngine &operator=(SpikeEngine &&) = delete;
 
-        // Parses `lems_input_file`, allocates every buffer the model needs, fills them from
-        // the model's starting parameters and OnStart initialisers, builds the weight matrix
-        // from the model's connections, and compiles the generated tick kernel. Throws
-        // naming the offending ComponentType if the model uses anything Phase 1 does not
-        // simulate, rather than loading something it would run incorrectly.
-        // enable_hebbian_plasticity switches on the engine's built-in Hebbian rule, which
-        // nudges U/V toward a stronger reconstruction for edges whose endpoints fired
-        // close together. Off by default: it changes what the simulation computes, and no
-        // NeuroML document asks for it.
-        //
-        // Off costs nothing rather than costing a branch -- the codegen emits no
-        // plasticity block at all, and the delta buffers are never allocated.
         explicit SpikeEngine(const String &lems_input_file,
                              bool enable_hebbian_plasticity = false);
 
-        // The same, with the network's connectivity supplied in code instead of in the
-        // document. The model still declares the cells, the synapse, the stimulus and the
-        // run; `adjacency` says which neuron reaches which, and every edge it describes
-        // uses `synapse_component_id` with the given weight and delay.
-        //
-        // This is how a large network is built: the topology helpers in topologies.h
-        // (square_torus and friends) generate millions of edges in a loop, where writing
-        // them as <connection> elements would mean millions of lines of XML. `adjacency`
-        // must have one row per neuron the model's populations declare.
         SpikeEngine(const String &lems_input_file,
                     const vector<vector<s32>> &adjacency,
                     const String &synapse_component_id,
@@ -215,21 +127,6 @@ namespace spikecorec {
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false);
 
-        // The same, with several synapses to draw from. Each neuron is assigned one of
-        // `synapse_component_ids` at random and every edge leaving it uses that one, so a
-        // list naming an excitatory and an inhibitory synapse produces a population of
-        // excitatory and inhibitory cells.
-        //
-        // Per cell rather than per edge because that is what makes a cell excitatory or
-        // inhibitory at all: drawing separately for each edge would leave every neuron a
-        // mix of both, which is not a thing a neuron is. It is also what Dale's law says,
-        // and it keeps the weight matrix's projection runs proportional to the number of
-        // neurons rather than to the number of edges.
-        //
-        // `synapse_proportions` gives each id its share of the population and is
-        // normalised, so {0.8, 0.2} is the usual cortical ratio. Empty means an equal
-        // share each. The draw is seeded from the document's own random seed, so a model
-        // that fixes its seed gets the same assignment every run.
         SpikeEngine(const String &lems_input_file,
                     const vector<vector<s32>> &adjacency,
                     const vector<String> &synapse_component_ids,
@@ -237,11 +134,6 @@ namespace spikecorec {
                     f64 connection_weight = 1.0,
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false);
-
-        // Which synapse each neuron drew, parallel to the populations' neuron indices.
-        // Empty unless the engine was built from a list. A demo reads this to find an
-        // excitatory cell and an inhibitory one to trace.
-        Vector<s32> synapse_choice_per_neuron;
 
         ~SpikeEngine();
 
@@ -280,8 +172,10 @@ namespace spikecorec {
         void initialize_model_buffers();
 
         void initialize_cell_state();
-        void build_weight_matrix();
+
         void collect_stimulus();
+
+        void log_weight_matrix();
 
         // Replaces whatever connections the document declared with `adjacency`, all
         // carrying one synapse prototype. Runs before the layout is computed, so

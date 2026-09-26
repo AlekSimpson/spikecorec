@@ -16,296 +16,10 @@ namespace {
 
 // ── tokenizer ────────────────────────────────────────────────────────────────────
 
-// NML spells its comparisons and boolean connectives as dotted words; everything else in
-// the expression grammar -- + - * / ( ) , and the function-call form -- is already C.
-const UnorderedMap<String, String> DOTTED_OPERATORS = {
-    {".gt.", ">"},  {".lt.", "<"},   {".geq.", ">="}, {".leq.", "<="},
-    {".eq.", "=="}, {".neq.", "!="}, {".and.", "&&"}, {".or.", "||"},
-};
 
-// LEMS function name -> the name emitted into GPU source. Three of these do not map onto
-// the same-named C function and getting any of them wrong is silent: LEMS `ln` is natural
-// log (C `log`), LEMS `log` is base 10 (C `log10`), and `abs` on a float must be `fabs`
-// rather than the integer `abs`.
-const UnorderedMap<String, String> FUNCTIONS = {
-    {"exp", "exp"},   {"ln", "log"},    {"log", "log10"}, {"sqrt", "sqrt"},
-    {"abs", "fabs"},  {"ceil", "ceil"}, {"floor", "floor"},
-    {"sin", "sin"},   {"cos", "cos"},   {"tan", "tan"},
-    {"sinh", "sinh"}, {"cosh", "cosh"}, {"tanh", "tanh"},
-    {"H", "spikecorec_heaviside"},
-};
 
-// LEMS `random(x)` needs a per-thread RNG stream that reproduces from the simulation seed;
-// that arrives with the on-device generators in Phase 2 (ticket #65/F4). Listing it here
-// rather than leaving it out makes the failure say so instead of "unknown function".
-const Set<String> PHASE_TWO_FUNCTIONS = {"random"};
 
-struct Token {
-    enum class Kind { Number, Identifier, Operator, OpenParen, CloseParen, Comma, End };
 
-    Kind kind = Kind::End;
-    String text;
-};
-
-bool is_identifier_start(char character) {
-    return isalpha(static_cast<unsigned char>(character)) || character == '_';
-}
-
-bool is_identifier_character(char character) {
-    return isalnum(static_cast<unsigned char>(character)) || character == '_';
-}
-
-// A dotted operator and a decimal point both start with '.', so the two are told apart by
-// what follows: ".5" is a number, ".gt." an operator.
-bool starts_dotted_operator(const String &text, usize position) {
-    return position + 1 < text.size() &&
-           isalpha(static_cast<unsigned char>(text[position + 1]));
-}
-
-Vector<Token> tokenize(const String &expression, const String &owner_name) {
-    Vector<Token> tokens;
-    usize position = 0;
-
-    while (position < expression.size()) {
-        const char character = expression[position];
-
-        if (isspace(static_cast<unsigned char>(character))) {
-            position += 1;
-            continue;
-        }
-
-        if (character == '(') { tokens.push_back({Token::Kind::OpenParen, "("});  position += 1; continue; }
-        if (character == ')') { tokens.push_back({Token::Kind::CloseParen, ")"}); position += 1; continue; }
-        if (character == ',') { tokens.push_back({Token::Kind::Comma, ","});      position += 1; continue; }
-
-        if (character == '.' && starts_dotted_operator(expression, position)) {
-            const usize closing_dot = expression.find('.', position + 1);
-            if (closing_dot == String::npos) {
-                throw runtime_error(
-                        "dynamics_codegen: unterminated dotted operator in '" + expression +
-                        "' (" + owner_name + ")");
-            }
-
-            const String spelling = expression.substr(position, closing_dot - position + 1);
-            auto mapped = DOTTED_OPERATORS.find(spelling);
-            if (mapped == DOTTED_OPERATORS.end()) {
-                throw runtime_error(
-                        "dynamics_codegen: unknown operator '" + spelling + "' in '" +
-                        expression + "' (" + owner_name + ")");
-            }
-
-            tokens.push_back({Token::Kind::Operator, mapped->second});
-            position = closing_dot + 1;
-            continue;
-        }
-
-        if (isdigit(static_cast<unsigned char>(character)) || character == '.') {
-            const usize start = position;
-            while (position < expression.size() &&
-                   (isdigit(static_cast<unsigned char>(expression[position])) ||
-                    expression[position] == '.')) {
-                position += 1;
-            }
-            // An exponent, and the sign that may follow it: 2.7e-5 is one token, not three.
-            if (position < expression.size() &&
-                (expression[position] == 'e' || expression[position] == 'E')) {
-                usize lookahead = position + 1;
-                if (lookahead < expression.size() &&
-                    (expression[lookahead] == '+' || expression[lookahead] == '-')) {
-                    lookahead += 1;
-                }
-                if (lookahead < expression.size() &&
-                    isdigit(static_cast<unsigned char>(expression[lookahead]))) {
-                    position = lookahead;
-                    while (position < expression.size() &&
-                           isdigit(static_cast<unsigned char>(expression[position]))) {
-                        position += 1;
-                    }
-                }
-            }
-            tokens.push_back({Token::Kind::Number, expression.substr(start, position - start)});
-            continue;
-        }
-
-        if (is_identifier_start(character)) {
-            const usize start = position;
-            while (position < expression.size() && is_identifier_character(expression[position])) {
-                position += 1;
-            }
-            tokens.push_back({Token::Kind::Identifier, expression.substr(start, position - start)});
-            continue;
-        }
-
-        // Two-character comparisons are also legal LEMS spelling alongside the dotted form.
-        if (position + 1 < expression.size()) {
-            const String pair = expression.substr(position, 2);
-            if (pair == "<=" || pair == ">=" || pair == "==" || pair == "!=" ||
-                pair == "&&" || pair == "||") {
-                tokens.push_back({Token::Kind::Operator, pair});
-                position += 2;
-                continue;
-            }
-        }
-
-        if (String("+-*/^<>").find(character) != String::npos) {
-            tokens.push_back({Token::Kind::Operator, String(1, character)});
-            position += 1;
-            continue;
-        }
-
-        throw runtime_error(
-                "dynamics_codegen: unexpected character '" + String(1, character) + "' in '" +
-                expression + "' (" + owner_name + ")");
-    }
-
-    tokens.push_back({Token::Kind::End, ""});
-    return tokens;
-}
-
-// ── parser ───────────────────────────────────────────────────────────────────────
-//
-// Precedence climbing straight to target text. There is no AST type: the target grammar
-// is the source grammar with different spellings, so every parse function returns the
-// translated substring and the tree only ever exists as the call stack.
-
-s32 binary_precedence(const String &spelling) {
-    if (spelling == "||") return 1;
-    if (spelling == "&&") return 2;
-    if (spelling == "==" || spelling == "!=") return 3;
-    if (spelling == "<" || spelling == ">" || spelling == "<=" || spelling == ">=") return 4;
-    if (spelling == "+" || spelling == "-") return 5;
-    if (spelling == "*" || spelling == "/") return 6;
-    if (spelling == "^") return 7;
-    return -1;
-}
-
-struct Parser {
-    const Vector<Token> &tokens;
-    const SymbolTable &symbols;
-    const String &expression;
-    const String &owner_name;
-    usize position = 0;
-
-    const Token &current() const { return tokens[position]; }
-
-    [[noreturn]] void fail(const String &reason) const {
-        throw runtime_error("dynamics_codegen: " + reason + " in '" + expression + "' (" +
-                            owner_name + ")");
-    }
-
-    String resolve_identifier(const String &name) const {
-        auto bound = symbols.find(name);
-        if (bound == symbols.end()) {
-            throw runtime_error(
-                    "dynamics_codegen: '" + name + "' in '" + expression + "' (" + owner_name +
-                    ") resolves to no parameter, state variable, derived variable, constant "
-                    "or engine quantity");
-        }
-        return bound->second;
-    }
-
-    String parse_primary() {
-        const Token token = current();
-
-        if (token.kind == Token::Kind::Number) {
-            position += 1;
-            // A bare integer in NML source would otherwise become integer division in the
-            // generated C: `1/tau` must not evaluate to 0.
-            const bool already_floating =
-                    token.text.find('.') != String::npos ||
-                    token.text.find('e') != String::npos ||
-                    token.text.find('E') != String::npos;
-            return already_floating ? token.text : token.text + ".0";
-        }
-
-        if (token.kind == Token::Kind::OpenParen) {
-            position += 1;
-            const String inner = parse_binary(0);
-            if (current().kind != Token::Kind::CloseParen) fail("missing ')'");
-            position += 1;
-
-            // No parentheses added back. Everything parse_binary returns is already safe
-            // to use as an operand -- either an atom (a name, a literal, a call) or a
-            // binary expression it parenthesised itself -- so re-wrapping only produces
-            // (((A + B)) * C) where (A + B) * C says the same thing and reads.
-            return inner;
-        }
-
-        if (token.kind == Token::Kind::Operator && (token.text == "-" || token.text == "+")) {
-            position += 1;
-            const String operand = parse_unary();
-            return token.text == "-" ? "(-" + operand + ")" : operand;
-        }
-
-        if (token.kind == Token::Kind::Identifier) {
-            const String name = token.text;
-            position += 1;
-
-            if (current().kind != Token::Kind::OpenParen) return resolve_identifier(name);
-
-            if (PHASE_TWO_FUNCTIONS.count(name) > 0) {
-                throw runtime_error(
-                        "dynamics_codegen: '" + name + "' in '" + expression + "' (" +
-                        owner_name + ") needs the on-device generators from Phase 2 "
-                        "(ticket #65/F4)");
-            }
-
-            auto function = FUNCTIONS.find(name);
-            if (function == FUNCTIONS.end()) {
-                throw runtime_error(
-                        "dynamics_codegen: unknown function '" + name + "' in '" + expression +
-                        "' (" + owner_name + ")");
-            }
-
-            position += 1;
-            Vector<String> arguments;
-            if (current().kind != Token::Kind::CloseParen) {
-                for (;;) {
-                    arguments.push_back(parse_binary(0));
-                    if (current().kind != Token::Kind::Comma) break;
-                    position += 1;
-                }
-            }
-            if (current().kind != Token::Kind::CloseParen) fail("missing ')' after " + name);
-            position += 1;
-
-            String rendered = function->second + "(";
-            for (usize index = 0; index < arguments.size(); index += 1) {
-                if (index > 0) rendered += ", ";
-                rendered += arguments[index];
-            }
-            return rendered + ")";
-        }
-
-        fail("expected a value");
-    }
-
-    String parse_unary() { return parse_primary(); }
-
-    String parse_binary(s32 minimum_precedence) {
-        String left = parse_unary();
-
-        for (;;) {
-            const Token token = current();
-            if (token.kind != Token::Kind::Operator) break;
-
-            const s32 precedence = binary_precedence(token.text);
-            if (precedence < minimum_precedence) break;
-
-            position += 1;
-
-            // `^` is the only right-associative operator, so its right operand is parsed at
-            // the same precedence rather than one above: a^b^c is a^(b^c).
-            const String right =
-                    parse_binary(token.text == "^" ? precedence : precedence + 1);
-
-            left = token.text == "^" ? "pow(" + left + ", " + right + ")"
-                                     : "(" + left + " " + token.text + " " + right + ")";
-        }
-
-        return left;
-    }
-};
 
 // ── instruction grouping ─────────────────────────────────────────────────────────
 
@@ -323,10 +37,11 @@ bool is_path_select(const String &expression) {
 // that runs every tick, and a regime's name is the body that runs only when that regime is
 // the live one.
 Vector<const DynamicsInstruction *> instructions_in_stage(
-        const Vector<DynamicsInstruction> &program,
-        DynamicsStage stage,
-        NML_DeclarationType source_tag,
-        const String &regime_filter) {
+    const Vector<DynamicsInstruction> &program,
+    DynamicsStage stage,
+    NML_DeclarationType source_tag,
+    const String &regime_filter
+) {
     Vector<const DynamicsInstruction *> selected;
     for (const DynamicsInstruction &instruction : program) {
         if (instruction.stage != stage) continue;
@@ -377,7 +92,8 @@ struct RefractoryPattern {
 };
 
 Vector<const DynamicsInstruction *> regime_declarations(
-        const Vector<DynamicsInstruction> &program) {
+    const Vector<DynamicsInstruction> &program
+) {
     Vector<const DynamicsInstruction *> regimes;
     for (const DynamicsInstruction &instruction : program) {
         if (instruction.source_tag != NML_DeclarationType::Regime) continue;
@@ -413,8 +129,10 @@ bool split_refractory_test(const String &test, String &timer_name, String &durat
     return false;
 }
 
-RefractoryPattern detect_refractory_pattern(const String &type_name,
-                                            const Vector<DynamicsInstruction> &program) {
+RefractoryPattern detect_refractory_pattern(
+    const String &type_name,
+    const Vector<DynamicsInstruction> &program
+) {
     const Vector<const DynamicsInstruction *> regimes = regime_declarations(program);
 
     RefractoryPattern pattern;
@@ -474,9 +192,11 @@ RefractoryPattern detect_refractory_pattern(const String &type_name,
     return pattern;
 }
 
-void reject_unsupported_constructs(const String &type_name,
-                                   const Vector<DynamicsInstruction> &program,
-                                   const RefractoryPattern &pattern) {
+void reject_unsupported_constructs(
+    const String &type_name,
+    const Vector<DynamicsInstruction> &program,
+    const RefractoryPattern &pattern
+) {
     for (const DynamicsInstruction &instruction : program) {
         if (!instruction.regime_name.empty() && !pattern.present) {
             throw runtime_error(
@@ -501,14 +221,16 @@ void reject_unsupported_constructs(const String &type_name,
 // sequentially -- alphaCurrentSynapse's dI/dt = (e*J - I)/tau alongside dJ/dt = -J/tau is
 // the standard case, and updating I from an already-advanced J is a silent integration
 // error rather than a compile failure.
-String emit_integrate_stage(const Vector<DynamicsInstruction> &program,
-                            const SymbolTable &symbols,
-                            const Vector<String> &state_variable_names,
-                            const String &state_reference_prefix,
-                            const String &type_name,
-                            const String &indent,
-                            const String &regime_filter,
-                            const String &temporary_suffix) {
+String emit_integrate_stage(
+    const Vector<DynamicsInstruction> &program,
+    const SymbolTable &symbols,
+    const Vector<String> &state_variable_names,
+    const String &state_reference_prefix,
+    const String &type_name,
+    const String &indent,
+    const String &regime_filter,
+    const String &temporary_suffix
+) {
     ostringstream source;
 
     for (const DynamicsInstruction *derived :
@@ -552,14 +274,16 @@ String emit_integrate_stage(const Vector<DynamicsInstruction> &program,
 
 // Everything an OnCondition fires: the StateAssignments it performs and the EventOut that
 // makes the neuron spike. Emitted as one `if` per distinct test.
-String emit_conditional_stages(const Vector<DynamicsInstruction> &program,
-                               const SymbolTable &symbols,
-                               const Vector<String> &state_variable_names,
-                               const String &state_reference_prefix,
-                               const String &type_name,
-                               const String &spike_flag_name,
-                               const String &indent,
-                               const String &regime_filter) {
+String emit_conditional_stages(
+    const Vector<DynamicsInstruction> &program,
+    const SymbolTable &symbols,
+    const Vector<String> &state_variable_names,
+    const String &state_reference_prefix,
+    const String &type_name,
+    const String &spike_flag_name,
+    const String &indent,
+    const String &regime_filter
+) {
     ostringstream source;
 
     for (const String &condition : ordered_conditions(program, regime_filter)) {
@@ -606,7 +330,10 @@ String emit_conditional_stages(const Vector<DynamicsInstruction> &program,
 
 // Constants a document declares at its own scope are usable by name inside any
 // expression, so they are folded straight into the source as literals.
-void bind_global_constants(const NML_ParseResult &parse_result, SymbolTable &symbols) {
+void bind_global_constants(
+   const NML_ParseResult &parse_result, 
+   SymbolTable &symbols
+) {
     for (const auto &[name, value] : parse_result.global_constants) {
         // A type-namespaced constant ("iafCell.foo") is not a bare identifier and can
         // never be written in an expression, so only the plain names are bound.
@@ -619,8 +346,10 @@ void bind_global_constants(const NML_ParseResult &parse_result, SymbolTable &sym
     }
 }
 
-SymbolTable build_cell_symbols(const CellTypeSpecification &cell_type,
-                               const NML_ParseResult &parse_result) {
+SymbolTable build_cell_symbols(
+    const CellTypeSpecification &cell_type,
+    const NML_ParseResult &parse_result
+) {
     SymbolTable symbols;
     bind_global_constants(parse_result, symbols);
 
@@ -647,8 +376,10 @@ SymbolTable build_cell_symbols(const CellTypeSpecification &cell_type,
     return symbols;
 }
 
-SymbolTable build_synapse_symbols(const SynapseTypeSpecification &synapse_type,
-                                  const NML_ParseResult &parse_result) {
+SymbolTable build_synapse_symbols(
+    const SynapseTypeSpecification &synapse_type,
+    const NML_ParseResult &parse_result
+) {
     SymbolTable symbols;
     bind_global_constants(parse_result, symbols);
 
@@ -676,9 +407,11 @@ SymbolTable build_synapse_symbols(const SynapseTypeSpecification &synapse_type,
 
 // ── generated bodies ─────────────────────────────────────────────────────────────
 
-String generate_cell_body(const CellTypeSpecification &cell_type,
-                          const NML_ParseResult &parse_result,
-                          s64 case_index) {
+String generate_cell_body(
+    const CellTypeSpecification &cell_type,
+    const NML_ParseResult &parse_result,
+    s64 case_index
+) {
     const RefractoryPattern refractory =
             detect_refractory_pattern(cell_type.name, cell_type.dynamics);
     reject_unsupported_constructs(cell_type.name, cell_type.dynamics, refractory);
@@ -1036,25 +769,6 @@ inline int spikecorec_edge_prototype(long edge_ordinal) {
 #define SPIKECOREC_METAL_DEVICE_DIR ""
 #endif
 
-// A kernel handed to compile_kernel() is compiled from a bare string with no include path,
-// so device code shared with the precompiled shaders has to be pasted in rather than
-// included. Reading it keeps one copy of the k^2-tree walk instead of a second that can
-// silently drift from the first.
-String read_device_include(const String &file_name) {
-    const String path = String(SPIKECOREC_METAL_DEVICE_DIR) + "/" + file_name;
-
-    ifstream file(path);
-    if (!file) {
-        throw runtime_error(
-                "dynamics_codegen: cannot read device include '" + path +
-                "'; SPIKECOREC_METAL_DEVICE_DIR must point at the source tree's src/metal");
-    }
-
-    ostringstream contents;
-    contents << file.rdbuf();
-    return "\n" + contents.str() + "\n";
-}
-
 // Emitted only when plasticity is on, so a kernel that never stages a delta does not carry
 // the function that computes one.
 const char *KERNEL_PREAMBLE_PLASTICITY = R"METAL(
@@ -1294,16 +1008,20 @@ String translate_expression(const String &expression,
         throw runtime_error("dynamics_codegen: empty expression (" + owner_name + ")");
     }
 
-    const Vector<Token> tokens = tokenize(expression, owner_name);
-    Parser parser{tokens, symbols, expression, owner_name};
+    const Vector<LemsExpressionToken> tokens = tokenize_lems(expression, owner_name);
+    LemsExpressionParser parser{tokens, symbols, expression, owner_name};
 
-    const String translated = parser.parse_binary(0);
-    if (parser.current().kind != Token::Kind::End) {
-        throw runtime_error("dynamics_codegen: trailing '" + parser.current().text + "' in '" +
+    LemsParseNode *translated = parser.parse_binary(0);
+    if (parser.current().kind != LemsExpressionToken::Kind::End) {
+        throw runtime_error("dynamics_codegen: trailing '" + parser.current().lexeme + "' in '" +
                             expression + "' (" + owner_name + ")");
     }
 
-    return translated;
+    // TODO: parse_binary now returns a LemsParseNode tree rather than a finished GPU
+    // source string. Emitting that tree to MSL/CUDA text is the remaining step and is
+    // not implemented here.
+    (void)translated;
+    return String();
 }
 
 f64 evaluate_initial_value(const String &expression,
