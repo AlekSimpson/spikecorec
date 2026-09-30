@@ -132,7 +132,7 @@ endif
 
 # ── Source files ─────────────────────────────────────────────
 CORE_SRCS      := $(wildcard $(SRC_DIR)/core/*.cpp)
-NML_SRCS       := $(wildcard $(SRC_DIR)/nml/*.cpp)
+NML_SRCS       := $(filter-out $(SRC_DIR)/nml/dynamics_codegen.cpp, $(wildcard $(SRC_DIR)/nml/*.cpp))
 CUDA_SRCS      := $(wildcard $(SRC_DIR)/cuda/*.cu)
 METAL_SRCS     := $(wildcard $(SRC_DIR)/metal/*.cpp)
 METAL_SHADERS  := $(wildcard $(SRC_DIR)/metal/*.metal)

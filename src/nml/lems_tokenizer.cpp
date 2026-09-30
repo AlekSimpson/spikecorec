@@ -5,7 +5,6 @@
 
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
-#include "spikecorec/nml/declarations.h"
 #include "spikecorec/nml/node.h"
 
 using namespace spikecorec;

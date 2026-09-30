@@ -1,12 +1,18 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <libxml/xmlschemas.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <filesystem>
+
+#include "spikecorec/core/log.h"
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/recording.h"
 
 #include "spikecorec/nml/parser.h"
-#include "spikecorec/nml/declarations.h"
 #include "spikecorec/nml/node.h"
 #include "spikecorec/nml/components.h"
 #include "spikecorec/nml/dynamics.h"
@@ -14,358 +20,790 @@
 
 using namespace spikecorec;
 using namespace std;
+using namespace std::filesystem;
 
 
 namespace spikecorec::nml {
 
-void NML_Parser::bind_instance_data(
-    NML_Node *instance_node,
-    const ComponentType &component_type,
-    ComponentInstance &instance
-) {
-    Set<NML_DeclarationType> instance_bound_declarations = {
+bool is_document_scope_directive(const String &tag_name) {
+    static const Set<String> directives = {
+        "Include", "include", "ComponentType", "Unit", "Dimension", "Constant", "Target"
+    };
+    return directives.count(tag_name) != 0;
+}
+
+NML_Node *NML_Context::parse_neuroml(const String &filepath) {
+    xmlNodePtr xml_root = get_xml_root(filepath);
+    if (!xml_root) return nullptr;
+
+    NML_Node *root = build_nml_tree(xml_root);
+    xmlFreeDoc(xml_root->doc);
+    return root;
+}
+
+NML_Node *NML_Context::parse_neuroml_file(const String &filepath, Vector<String> &files_to_parse) {
+    std::error_code path_error;
+    path canonical = weakly_canonical(path(filepath), path_error);
+    String canonical_text = path_error ? filepath : canonical.string();
+
+    NML_Node *root = parse_neuroml(filepath);
+    if (!root) return nullptr;
+
+    path containing_directory = path(canonical_text).parent_path();
+
+    for (const NML_Node *child : children_of(root)) {
+        const NML_Tag &tag = child->body;
+
+        if (tag.tag_name != "Include" && tag.tag_name != "include") continue;
+
+        String reference = tag.has_attribute("file")
+                ? tag.get_attribute("file")
+                : tag.get_attribute("href");
+        if (reference.empty()) continue;
+
+        path included = path(reference);
+        if (included.is_relative()) {
+            included = containing_directory / included;
+        }
+
+        if (!exists(included) && !STANDARD_LIBRARY_PATH.empty()) {
+            const path from_standard_library = path(STANDARD_LIBRARY_PATH) / path(reference).filename();
+            if (exists(from_standard_library)) {
+                included = from_standard_library;
+            }
+        }
+
+        files_to_parse.push_back(included.string());
+    }
+
+    return root;
+}
+
+void NML_Context::reset() {
+    component_instances.clear();
+    component_types.clear();
+    for (NML_Node *root : document_roots) delete root;
+    document_roots.clear();
+    document_filepaths.clear();
+    main_document_root = nullptr;
+    model_units.clear();
+    model_constants.clear();
+    target_component_id.clear();
+    simulation = NML_SimulationContext();
+}
+
+void NML_Context::parse(const String &main_filepath) {
+    if (STANDARD_LIBRARY_PATH.empty() || !exists(STANDARD_LIBRARY_PATH)) {
+        log::logger().error("NML standard library path does not exist: {}",
+                            STANDARD_LIBRARY_PATH);
+        return;
+    }
+    reset();
+
+    Vector<String> files_to_parse;
+    for (const auto &entry : directory_iterator(STANDARD_LIBRARY_PATH)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".xml" && entry.path().extension() != ".nml") continue;
+
+        files_to_parse.push_back(entry.path().string());
+    }
+
+    std::sort(files_to_parse.begin(), files_to_parse.end());
+
+    files_to_parse.push_back(main_filepath);
+
+    Set<String> parsed_files;
+
+    std::error_code main_path_error;
+    const path canonical_main = weakly_canonical(path(main_filepath), main_path_error);
+    const String canonical_main_file = main_path_error ? main_filepath : canonical_main.string();
+
+    // Resolved after every document is read: a <Constant> may be written in a <Unit> that
+    // a later file in the queue, such as one its own document includes, declares.
+    Vector<const NML_Node *> constant_nodes;
+
+    String current_file;
+    while (files_to_parse.size() > 0) {
+        current_file = files_to_parse.front();
+
+        std::error_code path_error;
+        const path canonical = weakly_canonical(path(current_file), path_error);
+        const String canonical_file = path_error ? current_file : canonical.string();
+
+        if (parsed_files.count(canonical_file) != 0) {
+            files_to_parse.erase(files_to_parse.begin());
+            continue;
+        }
+        parsed_files.insert(canonical_file);
+
+        auto *root = parse_neuroml_file(current_file, files_to_parse);
+        files_to_parse.erase(files_to_parse.begin());
+        if (!root) continue;
+
+        for (NML_Node *child : children_of(root)) {
+            const NML_Tag &tag = child->body;
+            if (tag.tag_name == "Unit") {
+                String symbol = tag.get_attribute("symbol");
+                if (symbol.empty()) continue;
+
+                // LEMS: si = raw * scale * 10^power + offset. power is folded into scale here
+                // so resolution stays a single multiply-add.
+                units::UnitDefinition definition;
+                definition.scale = 1.0;
+                definition.offset = 0.0;
+
+                if (tag.has_attribute("scale")) {
+                    auto [scale_magnitude, scale_suffix] = units::split_quantity(tag.get_attribute("scale"));
+                    (void)scale_suffix;
+                    if (scale_magnitude != 0.0) definition.scale = scale_magnitude;
+                }
+                if (tag.has_attribute("power")) {
+                    auto [power_magnitude, power_suffix] = units::split_quantity(tag.get_attribute("power"));
+                    (void)power_suffix;
+                    definition.scale *= std::pow(10.0, power_magnitude);
+                }
+                if (tag.has_attribute("offset")) {
+                    auto [offset_magnitude, offset_suffix] =
+                            units::split_quantity(tag.get_attribute("offset"));
+                    (void)offset_suffix;
+                    definition.offset = offset_magnitude;
+                }
+
+                model_units[symbol] = definition;
+                continue;
+            }
+
+            if (tag.tag_name == "Constant") {
+                constant_nodes.push_back(child);
+                continue;
+            }
+
+            if (tag.tag_name == "Target") {
+                target_component_id = tag.get_attribute("component");
+                continue;
+            }
+        }
+
+        document_roots.push_back(root);
+        document_filepaths.push_back(canonical_file);
+        if (canonical_file == canonical_main_file) {
+            main_document_root = root;
+        }
+    }
+
+    for (const NML_Node *constant_node : constant_nodes) {
+        const String constant_name = constant_node->body.get_attribute("name");
+        if (constant_name.empty()) continue;
+
+        Real resolved;
+        resolved.float64 = resolve_quantity(constant_node->body.get_attribute("value"));
+        model_constants[constant_name] = resolved;
+    }
+
+    parse_component_types();
+    parse_component_instances();
+    parse_simulation_details(main_document_root);
+}
+
+// Records the <ComponentType> element type_node, read from source_filepath, in
+// component_types and returns its entry. Its extends link is left unset because the parent
+// may not be recorded yet; parse_component_types links every type once all are recorded.
+// nullptr when the element has no name.
+NML_ComponentType *NML_Context::create_component_type(
+        const NML_Node *type_node, const String &source_filepath) {
+    const String type_name = type_node->body.get_attribute("name");
+    if (type_name.empty()) {
+        log::logger().warn("Ignoring <ComponentType> with no name in {}", source_filepath);
+        return nullptr;
+    }
+
+    auto existing = component_types.find(type_name);
+    if (existing != component_types.end()) {
+        throw runtime_error(
+                "Duplicate ComponentType '" + type_name + "' declared in both " +
+                existing->second.source_file + " and " + source_filepath);
+    }
+
+    NML_ComponentType component_type(type_name);
+    component_type.source_file = source_filepath;
+    component_type.source_node = type_node;
+
+    return &component_types.emplace(type_name, std::move(component_type)).first->second;
+}
+
+void NML_Context::parse_component_types() {
+    for (usize document_index = 0; document_index < document_roots.size(); document_index += 1) {
+        const String &filepath = document_filepaths[document_index];
+
+        for (const NML_Node *child : children_of(document_roots[document_index])) {
+            if (child->body.tag_name != "ComponentType") continue;
+
+            create_component_type(child, filepath);
+        }
+    }
+
+    // Sorted, so an unresolved or cyclic extends chain is reported the same way on every run.
+    Vector<String> type_names;
+    type_names.reserve(component_types.size());
+    for (const auto &[type_name, component_type] : component_types) {
+        (void)component_type;
+        type_names.push_back(type_name);
+    }
+    std::sort(type_names.begin(), type_names.end());
+
+    // a parent need not be linked before its children: each link is only an address, and
+    // component_types never moves an element once it is inserted.
+    for (const String &type_name : type_names) {
+        NML_ComponentType &component_type = component_types.at(type_name);
+
+        const String parent_name = component_type.source_node->body.get_attribute("extends");
+        if (parent_name.empty()) continue;
+
+        auto parent = component_types.find(parent_name);
+        if (parent == component_types.end()) {
+            throw runtime_error(
+                    "Unresolved ComponentType '" + parent_name +
+                    "' referenced from extends chain: " + type_name + " -> " + parent_name);
+        }
+
+        component_type.extends = &parent->second;
+    }
+
+    // a cycle would send every walk up the chain, find_declaration's included, around it
+    // forever, so each chain is walked once here to its root.
+    for (const String &type_name : type_names) {
+        String chain;
+        Set<String> visited_type_names;
+
+        for (const NML_ComponentType *type = &component_types.at(type_name); type;
+             type = type->extends) {
+            if (!chain.empty()) chain += " -> ";
+            chain += type->name;
+
+            if (!visited_type_names.insert(type->name).second) {
+                throw runtime_error("Cyclic ComponentType extends chain: " + chain);
+            }
+        }
+    }
+
+    // Ancestors' state variables come first, so a subtype keeps its parent's slot order.
+    for (const String &type_name : type_names) {
+        NML_ComponentType &component_type = component_types.at(type_name);
+
+        Vector<const NML_ComponentType *> chain;
+        for (const NML_ComponentType *type = &component_type; type; type = type->extends) {
+            chain.push_back(type);
+        }
+
+        Set<String> seen_names;
+        for (usize chain_index = chain.size(); chain_index > 0; chain_index -= 1) {
+            Vector<const NML_Node *> pending_nodes = {chain[chain_index - 1]->source_node};
+            while (!pending_nodes.empty()) {
+                const NML_Node *node = pending_nodes.back();
+                pending_nodes.pop_back();
+
+                const Vector<NML_Node *> &child_nodes = children_of(node);
+                for (usize index = child_nodes.size(); index > 0; index -= 1) {
+                    pending_nodes.push_back(child_nodes[index - 1]);
+                }
+
+                if (node->body.tag_type != NML_DeclarationType::StateVariable) continue;
+
+                // A subtype that redeclares the name as something else shadows it.
+                const NML_Node *declaration =
+                        component_type.find_declaration(node->body.namespace_key());
+                if (!declaration || declaration->body.tag_type != NML_DeclarationType::StateVariable) {
+                    continue;
+                }
+
+                const String name = node->body.get_attribute("name");
+                if (seen_names.insert(name).second) {
+                    component_type.state_variable_names.push_back(name);
+                }
+            }
+        }
+    }
+}
+
+// Creates the instance that instance_node declares, keyed by its full path ("net1/pop0/0").
+// parent_instance is nullptr at document scope.
+NML_ComponentInstance *NML_Context::create_component_instance(
+        const NML_ComponentType *component_type, const NML_Node *instance_node,
+        NML_ComponentInstance *parent_instance) {
+    static const Set<NML_DeclarationType> instance_bound_declarations = {
         NML_DeclarationType::Parameter,
         NML_DeclarationType::Property,
         NML_DeclarationType::Text,
         NML_DeclarationType::Path,
         NML_DeclarationType::ComponentReference
     };
-    auto is_instance_bound = [instance_bound_declarations](NML_DeclarationType type) -> bool {
-        return instance_bound_declrations.contains(type);
+
+    const NML_Tag &tag = instance_node->body;
+    const String prefix = parent_instance ? parent_instance->id + "/" : "";
+
+    // An element with no id is named by its type and an ordinal, e.g. "member0".
+    String name = tag.get_attribute("id");
+    if (name.empty()) {
+        usize ordinal = 0;
+        while (component_instances.count(prefix + component_type->name + std::to_string(ordinal)) != 0) {
+            ordinal += 1;
+        }
+        name = component_type->name + std::to_string(ordinal);
+    }
+
+    const String instance_id = prefix + name;
+
+    if (component_instances.count(instance_id) != 0) {
+        throw runtime_error("Duplicate component instance '" + instance_id + "'");
+    }
+
+    NML_ComponentInstance &instance = component_instances[instance_id];
+    instance.id = instance_id;
+    instance.parent_instance = parent_instance;
+    instance.component_type = component_type;
+
+    // Bind only attributes the type declares as instance-set values.
+    for (const auto &[attribute_name, attribute_value] : tag.attributes) {
+        const NML_Node *declaration = component_type->find_declaration("var:" + attribute_name);
+        if (!declaration) {
+            declaration = component_type->find_declaration("pathsegment:" + attribute_name);
+        }
+        if (!declaration) continue;
+        if (instance_bound_declarations.count(declaration->body.tag_type) == 0) continue;
+
+        instance.instance_data[attribute_name] = attribute_value;
+    }
+
+    // <Fixed> overrides the tag's value; the nearest type's pin wins.
+    Set<String> pinned_parameters;
+    for (const NML_ComponentType *type = component_type; type; type = type->extends) {
+        for (const NML_Node *type_element : children_of(type->source_node)) {
+            if (type_element->body.tag_type != NML_DeclarationType::Fixed) continue;
+
+            const String parameter_name = type_element->body.get_attribute("parameter");
+            if (parameter_name.empty()) continue;
+            if (!pinned_parameters.insert(parameter_name).second) continue;
+
+            const NML_Node *pinned = component_type->find_declaration("var:" + parameter_name);
+            if (!pinned || pinned->body.tag_type != NML_DeclarationType::Parameter) continue;
+
+            instance.instance_data[parameter_name] = type_element->body.get_attribute("value");
+        }
+    }
+
+    if (parent_instance) parent_instance->data_order.push_back(instance_id);
+
+    return &instance;
+}
+
+// Instantiates every component the documents declare, nested children included.
+void NML_Context::parse_component_instances() {
+    // Rebuilt, not appended to: a second pass would append every child to its parent twice.
+    component_instances.clear();
+
+    struct PendingInstance {
+        const NML_Node *node;
+        NML_ComponentInstance *parent_instance;
     };
 
-    for (const auto &declaration : component_type.declarations.for_all()) {
-        if (!is_instance_bound(declaration.tag_type)) continue;
-        if (!declaration.has_value("name")) continue;
+    // Depth first in document order, so elements are pushed in reverse.
+    Vector<PendingInstance> pending;
 
-        String declaration_name = declaration.get_value("name");
-
-        // Absent is not empty: a Fixed-pinned Parameter or a Property with a defaultValue
-        // legitimately never appears on the instance tag.
-        if (!instance_node->has_attribute(declaration_name)) continue;
-
-        instance.instance_data[declaration_name] =
-                instance_node->get_attribute(declaration_name);
-    }
-}
-
-f64 NML_Parser::resolve_quantity(const String &value) const {
-    auto [magnitude, suffix] = split_quantity(value);
-    if (suffix.empty()) return magnitude;
-
-    // A <Unit> the document declared wins: it is authoritative for this model, and it is
-    // the only source that can express an offset (degC -> K).
-    auto declared = declared_units.find(suffix);
-    if (declared != declared_units.end()) {
-        return magnitude * declared->second.scale + declared->second.offset;
-    }
-
-    return magnitude * units::unit_suffix_scale(suffix);
-}
-
-
-
-void NML_Parser::ingest_document(const String &file_path) {
-    std::error_code path_error;
-    path canonical = weakly_canonical(path(file_path), path_error);
-    String canonical_text = path_error ? file_path : canonical.string();
-
-    if (parsed_neuroml_files.find(canonical_text) != parsed_neuroml_files.end()) return;
-
-    parsed_neuroml_files.insert(canonical_text);
-
-    NML_Node root;
-    if (!read_document_root(canonical_text, root)) return;
-
-    path containing_directory = path(canonical_text).parent_path();
-
-    for (NML_Node &child : root.body) {
-        if (child.tag_name == "Include" || child.tag_name == "include") {
-            String reference = child.has_attribute("file")
-                    ? child.get_attribute("file")
-                    : child.get_attribute("href");
-            if (reference.empty()) continue;
-
-            path included = path(reference);
-            if (included.is_relative()) included = containing_directory / included;
-
-            if (!exists(included) && !STANDARD_LIBRARY_PATH.empty()) {
-                const path from_standard_library =
-                        path(STANDARD_LIBRARY_PATH) / path(reference).filename();
-                if (exists(from_standard_library)) included = from_standard_library;
-            }
-
-            ingest_document(included.string());
-            continue;
+    for (const NML_Node *root : document_roots) {
+        const Vector<NML_Node *> &top_level_elements = children_of(root);
+        for (usize index = top_level_elements.size(); index > 0; index -= 1) {
+            const NML_Node *element = top_level_elements[index - 1];
+            if (is_document_scope_directive(element->body.tag_name)) continue;
+            pending.push_back({element, nullptr});
         }
 
-        if (child.tag_name == "ComponentType") {
-            String type_name = child.get_attribute("name");
-            if (type_name.empty()) {
-                log::logger().warn("Ignoring <ComponentType> with no name in {}", canonical_text);
+        while (!pending.empty()) {
+            const PendingInstance current = pending.back();
+            pending.pop_back();
+
+            const String &tag_name = current.node->body.tag_name;
+            auto type_entry = component_types.find(tag_name);
+            if (type_entry == component_types.end()) {
+                log::logger().warn("Ignoring <{}>: no such ComponentType is declared", tag_name);
                 continue;
             }
 
-            auto existing = component_type_source_files.find(type_name);
-            if (existing != component_type_source_files.end() &&
-                existing->second != canonical_text) {
-                throw runtime_error(
-                        "Duplicate ComponentType '" + type_name + "' declared in both " +
-                        existing->second + " and " + canonical_text);
+            NML_ComponentInstance *instance = create_component_instance(
+                    &type_entry->second, current.node, current.parent_instance);
+
+            const Vector<NML_Node *> &child_elements = children_of(current.node);
+            for (usize index = child_elements.size(); index > 0; index -= 1) {
+                pending.push_back({child_elements[index - 1], instance});
             }
-
-            component_type_catalogue[type_name] = std::move(child);
-            component_type_source_files[type_name] = canonical_text;
-            continue;
         }
-
-        if (child.tag_name == "Unit") {
-            String symbol = child.get_attribute("symbol");
-            if (symbol.empty()) continue;
-
-            // LEMS: si = raw * scale * 10^power + offset. power is folded into scale here
-            // so resolution stays a single multiply-add.
-            UnitDefinition definition;
-            definition.scale = 1.0;
-            definition.offset = 0.0;
-
-            if (child.has_attribute("scale")) {
-                auto [scale_magnitude, scale_suffix] = split_quantity(child.get_attribute("scale"));
-                (void)scale_suffix;
-                if (scale_magnitude != 0.0) definition.scale = scale_magnitude;
-            }
-            if (child.has_attribute("power")) {
-                auto [power_magnitude, power_suffix] = split_quantity(child.get_attribute("power"));
-                (void)power_suffix;
-                definition.scale *= std::pow(10.0, power_magnitude);
-            }
-            if (child.has_attribute("offset")) {
-                auto [offset_magnitude, offset_suffix] =
-                        split_quantity(child.get_attribute("offset"));
-                (void)offset_suffix;
-                definition.offset = offset_magnitude;
-            }
-
-            declared_units[symbol] = definition;
-            continue;
-        }
-
-        if (child.tag_name == "Dimension") continue; // todo?: dimensional analysis is not modelled
-
-        if (child.tag_name == "Constant") {
-            String constant_name = child.get_attribute("name");
-            if (constant_name.empty()) continue;
-
-            Real resolved;
-            resolved.float64 = resolve_quantity(child.get_attribute("value"));
-            document_constants[constant_name] = resolved;
-            continue;
-        }
-
-        if (child.tag_name == "Target") {
-            target_component_id = child.get_attribute("component");
-            continue;
-        }
-
-        // Anything else is a component instance
-        document_instance_nodes.push_back(std::move(child));
     }
 }
 
-void NML_Parser::extract_all_declarations_nested_in_node(
-    NML_Node *node,
-    DeclarationList &return_value
-) {
-    if (!node) return;
+const NML_ComponentInstance *NML_Context::find_instance(const String &instance_id) const {
+    auto entry = component_instances.find(instance_id);
+    if (entry == component_instances.end()) return nullptr;
+    return &entry->second;
+}
 
-    for (const NML_Node &child : node.body) {
-        if (child.is_declaration_type()) {
-            return_value.insert(child.to_declaration());
+bool NML_Context::is_instance_of(const NML_ComponentInstance *instance,
+                                const String &type_name) const {
+    return instance && instance->component_type && instance->component_type->name == type_name;
+}
+
+s64 NML_Context::resolve_path(
+    const String &path, 
+    const NML_ComponentInstance *current
+) const {
+    s64 start = 0;
+    s64 end = path.find('/');
+    const NML_ComponentInstance *walk = current == nullptr 
+        ? find_instance(simulation.target_network_id)
+        : current;
+    s64 component_index = 0;
+    s64 base_index = 0;
+
+    while (walk && start < path.size()) {
+        String token = path.substr(start, end - start); 
+
+        if (walk->component_type->name == "population") {
+            base_index = simulation.population_base_indices.at(walk->id);
+        }
+
+        if (token == ".") {
+            start = end + 1;
+            end = path.find('/', start);
+            if (end == String::npos) end = path.size();
             continue;
         }
 
-        extract_all_declarations_nested_in_node(child, return_value);
+        if (token != "..") {
+            const usize bracket = token.find('[');
+            if (bracket != String::npos) {
+                component_index = stoll(token.substr(bracket + 1));
+            }
+
+            // data_order holds full keys, so the child is looked up by its full name.
+            const String fully_qualified_name = walk->id + "/" + token;
+            auto child_id = std::find(walk->data_order.begin(), walk->data_order.end(), fully_qualified_name);
+            if (child_id == walk->data_order.end()) {
+                throw runtime_error("Path '" + path + "': '" + token + "' is not a child of '" + walk->id + "'");
+            }
+
+            auto search = component_instances.find(fully_qualified_name);
+            if (search == component_instances.end()) {
+                throw runtime_error("Path '" + path + "': no instance '" + fully_qualified_name + "'");
+            }
+
+            walk = &search->second;
+        }else {
+
+            // then token == ".."
+            walk = walk->parent_instance;
+        }
+
+        start = end + 1;
+        end = path.find('/', start);
+        if (end == String::npos) end = path.size();
     }
+
+    return component_index + base_index;
 }
 
-const ComponentType &NML_Parser::resolve_component_type(const String &type_name,
-                                                        Vector<String> &resolution_stack) {
-    auto already_resolved = declared_component_types.find(type_name);
-    if (already_resolved != declared_component_types.end()) return already_resolved->second;
-
-    auto catalogued = component_type_catalogue.find(type_name);
-    if (catalogued == component_type_catalogue.end()) {
-        String chain;
-        for (const String &entry : resolution_stack) chain += entry + " -> ";
-        throw runtime_error(
-                "Unresolved ComponentType '" + type_name +
-                "' referenced from extends chain: " + chain + type_name);
+void NML_Context::parse_simulation_details(NML_Node *lems_root) {
+    for (const auto &[constant_name, constant_value] : model_constants) {
+        simulation.global_constants[constant_name] = constant_value;
     }
 
-    for (const String &entry : resolution_stack) {
-        if (entry != type_name) continue;
-
-        String chain;
-        for (const String &stack_entry : resolution_stack) chain += stack_entry + " -> ";
-        throw runtime_error("Cyclic ComponentType extends chain: " + chain + type_name);
-    }
-
-    resolution_stack.push_back(type_name);
-
-    // A reference, not a copy: resolution only ever writes to declared_component_types,
-    // never to the catalogue, so this stays valid across the recursive parent resolve.
-    const NML_Node &type_node = catalogued->second;
-    String parent_name = type_node.get_attribute("extends");
-
-    DeclarationList declarations;
-    if (!parent_name.empty()) {
-        const ComponentType &parent = resolve_component_type(parent_name, resolution_stack);
-        declarations = parent.declarations;
-    }
-
-    DeclarationList own_declarations;
-    extract_all_declarations_nested_in_node(type_node, own_declarations);
-    for (NML_Declaration &declaration : own_declarations.for_all()) {
-        declarations.overlay(declaration)
-    }
-
-    /// +16 ???
-    // <Fixed parameter="tau" value="10ms"/> pins an inherited Parameter to a constant.
-    // Applied after the overlay so it can reach a Parameter this type never declared.
-    for (const NML_Declaration &declaration : declarations.for_all()) {
-        if (declaration.tag_type != NML_DeclarationType::Fixed) continue;
-
-        String parameter_name = declaration.value_or("parameter");
-        if (parameter_name.empty()) continue;
-
-        for (NML_Declaration &target : declarations.declarations) {
-            if (target.tag_type != NML_DeclarationType::Parameter) continue;
-            if (target.value_or("name") != parameter_name) continue;
-
-            target.datavalues["value"] = declaration.value_or("value");
+    // ── simulation data ──────────────────────────────────────────────────────────────
+    // get target component for simulation and capture simulation data
+    const NML_ComponentInstance *simulation_instance = nullptr;
+    if (!target_component_id.empty()) {
+        simulation_instance = find_instance(target_component_id);
+        if (!simulation_instance) {
+            throw runtime_error("<Target> names '" + target_component_id +
+                                "', which no instance declares");
+        }
+    } else if (lems_root) {
+        for (const NML_Node *node : children_of(lems_root)) {
+            if (node->body.tag_name != "Simulation") continue;
+            simulation_instance = find_instance(node->body.get_attribute("id"));
             break;
         }
     }
 
-    resolution_stack.pop_back();
-
-    ComponentType resolved(type_name, std::move(declarations));
-    resolved.extends = parent_name;
-
-    declared_component_types[type_name] = std::move(resolved);
-    return declared_component_types[type_name];
-}
-
-void NML_Parser::resolve_all_component_types() {
-    Vector<String> type_names;
-    type_names.reserve(component_type_catalogue.size());
-    for (const auto &[type_name, node] : component_type_catalogue) {
-        (void)node;
-        type_names.push_back(type_name);
-    }
-    std::sort(type_names.begin(), type_names.end());
-
-    for (const String &type_name : type_names) {
-        Vector<String> resolution_stack;
-        resolve_component_type(type_name, resolution_stack);
-    }
-}
-
-void NML_Parser::instantiate_component_type(NML_Node *instance_node) {
-    String no_parent;
-    instantiate_component_type(instance_node, no_parent);
-}
-
-void NML_Parser::instantiate_component_type(NML_Node *instance_node, String &parent_instance_id) {
-    if (!instance_node) return;
-
-    String component_type_name = instance_node->tag_name;
-
-    auto type_entry = declared_component_types.find(component_type_name);
-    if (type_entry == declared_component_types.end()) {
-        log::logger().warn("Ignoring <{}>: no such ComponentType is declared",
-                           component_type_name);
+    if (!simulation_instance) {
+        log::logger().warn("No Simulation instance found; the context has no step, duration or network");
         return;
     }
-    const ComponentType &component_to_instantiate = type_entry->second;
 
-    String own_id = instance_node->get_attribute("id");
-    if (own_id.empty()) {
-        // A <connection> inside a projection routinely carries no id. Without a synthetic
-        // one every such child collapses onto the same empty key and all but the last is
-        // lost.
-        usize ordinal = 0;
-        if (!parent_instance_id.empty()) {
-            auto parent = instance_table.find(parent_instance_id);
-            if (parent != instance_table.end()) {
-                ordinal = parent->second.structured_instance_data.size();
+    simulation.simulation_component_id = simulation_instance->id;
+    simulation.target_network_id = simulation_instance->value_or("target");
+    if (simulation_instance->has_value("step")) {
+        simulation.step_dt = resolve_quantity(simulation_instance->value_or("step"));
+    }
+    if (simulation_instance->has_value("length")) {
+        simulation.simulation_duration = resolve_quantity(simulation_instance->value_or("length"));
+    }
+    // Every time in the model is converted to ticks with the step, and the conversion
+    // divides by it.
+    if (simulation.step_dt <= 0.0) {
+        throw runtime_error("Simulation '" + simulation_instance->id + "' has no usable step (parsed " +
+                            std::to_string(simulation.step_dt) + " s)");
+    }
+    simulation.total_tick_count =
+            units::seconds_to_ticks(simulation.simulation_duration, simulation.step_dt);
+
+    if (simulation_instance->has_value("seed")) {
+        try {
+            simulation.random_seed = static_cast<u64>(std::stoull(simulation_instance->value_or("seed")));
+        } catch (const std::exception &) {
+            log::logger().warn("Simulation '{}' has a non-numeric seed '{}'; ignoring",
+                               simulation_instance->id, simulation_instance->value_or("seed"));
+        }
+    }
+
+    // ── network data ──────────────────────────────────────────────────────────────
+    const NML_ComponentInstance *network = find_instance(simulation.target_network_id);
+    if (!network) {
+        throw runtime_error("Simulation '" + simulation_instance->id + "' targets '" +
+                            simulation.target_network_id + "', which no instance declares");
+    }
+
+    // ── populations ──────────────────────────────────────────────────────────────
+    for (const String &child_id : network->data_order) {
+        const NML_ComponentInstance *population = find_instance(child_id);
+        if (!is_instance_of(population, "population")) continue;
+
+        // A populationList enumerates its members as <instance> children, and that count
+        // is authoritative; a plain population states a size.
+        s64 neuron_count = 0;
+        for (const String &member_id : population->data_order) {
+            if (!is_instance_of(find_instance(member_id), "instance")) continue;
+            neuron_count += 1;
+        }
+        if (neuron_count == 0 && population->has_value("size")) {
+            neuron_count = static_cast<s64>(
+                    std::llround(resolve_quantity(population->value_or("size"))));
+        }
+        if (neuron_count < 0) {
+            throw runtime_error("Population '" + population->id + "' has a negative size");
+        }
+
+        const String component_id = population->value_or("component");
+        const NML_ComponentInstance *cell = find_instance(component_id);
+        if (!cell || !cell->component_type) {
+            throw runtime_error("Population '" + population->id + "' references component '" +
+                                component_id + "', which no instance declares");
+        }
+
+        simulation.cell_instances.push_back(*cell);
+        simulation.population_base_indices[population->id] = cell->component_type->state_variable_names.size(); 
+        simulation.total_neuron_count += neuron_count;
+    }
+
+    if (simulation.cell_instances.empty()) {
+        log::logger().warn("Network '{}' declares no populations", network->id);
+        return;
+    }
+
+    // ── projections ──────────────────────────────────────────────────────────────
+    simulation.network_data = AdjacencyList(simulation.total_neuron_count, 0);
+    Set<String> registered_synapse_ids;
+
+    for (const String &child_id : network->data_order) {
+        const NML_ComponentInstance *projection = find_instance(child_id);
+        if (!is_instance_of(projection, "projection")) continue;
+
+        const String synapse_id = projection->value_or("synapse");
+        const NML_ComponentInstance *synapse = find_instance(synapse_id);
+        if (!synapse) {
+            throw runtime_error("Projection '" + projection->id + "' references synapse '" +
+                                synapse_id + "', which no instance declares");
+        }
+        if (registered_synapse_ids.insert(synapse_id).second) {
+            simulation.synapse_instances.push_back(*synapse);
+        }
+
+        for (const String &connection_id : projection->data_order) {
+            const NML_ComponentInstance *connection = find_instance(connection_id);
+            if (!is_instance_of(connection, "connection") &&
+                !is_instance_of(connection, "connectionWD")) {
+                continue;
             }
+
+            const String presynaptic_path = connection->value_or("preCellId");
+            const String postsynaptic_path = connection->value_or("postCellId");
+
+            NML_NetworkEdge edge;
+            edge.component_id = synapse_id;
+            edge.parent = resolve_path(presynaptic_path).neuron_index;
+            edge.child = resolve_path(postsynaptic_path).neuron_index;
+
+            if (edge.parent < 0 || edge.child < 0) {
+                throw runtime_error("Connection '" + connection->id + "' in projection '" +
+                                    projection->id + "' has an endpoint that resolves to no "
+                                    "neuron: pre='" + presynaptic_path + "' post='" +
+                                    postsynaptic_path + "'");
+            }
+
+            // A plain <connection> states neither; a connectionWD states both.
+            edge.weight = connection->has_value("weight")
+                    ? static_cast<f32>(resolve_quantity(connection->value_or("weight")))
+                    : 1.0f;
+            edge.delay_ticks = connection->has_value("delay")
+                    ? units::seconds_to_ticks(resolve_quantity(connection->value_or("delay")),
+                                              simulation.step_dt)
+                    : 0;
+
+            simulation.network_data.add(edge);
+            simulation.total_edge_count += 1;
+            simulation.maximum_edge_delay = std::max(simulation.maximum_edge_delay, edge.delay_ticks);
         }
-        own_id = component_type_name + "[" + std::to_string(ordinal) + "]";
     }
 
-    String instance_id = parent_instance_id.empty()
-            ? own_id
-            : parent_instance_id + "." + own_id;
-
-    if (instance_table.find(instance_id) != instance_table.end()) {
-        log::logger().warn("Duplicate component instance id '{}'; the later one wins",
-                           instance_id);
-    }
-
-    ComponentInstance &instance = instance_table[instance_id];
-    instance.id = instance_id;
-    instance.component_type_name = component_type_name;
-    instance.parent_instance_id = parent_instance_id;
-    instance.component_type = &component_to_instantiate;
-
-    bind_instance_data(instance_node, component_to_instantiate, instance);
-
-    // Registered on the parent before recursing, so structured_instance_data lists
-    // children in document order.
-    if (!parent_instance_id.empty()) {
-        instance_table[parent_instance_id].structured_instance_data.push_back(instance_id);
-    }
-
-    for (NML_Node &child_instance_node : instance_node->body) {
-        instantiate_component_type(&child_instance_node, instance_id);
-    }
-}
-
-void NML_Parser::parse_lems(const String &lems_main_file) {
-    if (!STANDARD_LIBRARY_PATH.empty() && exists(STANDARD_LIBRARY_PATH)) {
-        // Sorted: directory_iterator order is unspecified, and ingest order decides which
-        // file a duplicate ComponentType is blamed on.
-        Vector<String> standard_library_files;
-        for (const auto &entry : directory_iterator(STANDARD_LIBRARY_PATH)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".xml" && entry.path().extension() != ".nml") continue;
-
-            standard_library_files.push_back(entry.path().string());
+    // ── inputs ───────────────────────────────────────────────────────────────────
+    // The wiring (explicitInput, inputList) names the targets; the input component it
+    // references carries the amplitude, the timing and any spike train.
+    auto build_input_profile = [&](const String &input_component_id,
+                                   Vector<InputTarget> targets) {
+        const NML_ComponentInstance *input = find_instance(input_component_id);
+        if (!input) {
+            throw runtime_error("Input wiring references component '" + input_component_id +
+                                "', which no instance declares");
         }
-        std::sort(standard_library_files.begin(), standard_library_files.end());
 
-        for (const String &filepath : standard_library_files) {
-            ingest_document(filepath);
+        SimulationInputConfig profile;
+        profile.input_component_id = input->id;
+
+        if (input->has_value("amplitude")) {
+            profile.amplitude = resolve_quantity(input->value_or("amplitude"));
         }
-    } else {
-        log::logger().error("NML standard library path does not exist: {}",
-                            STANDARD_LIBRARY_PATH);
+        if (input->has_value("rate")) {
+            profile.rate = resolve_quantity(input->value_or("rate"));
+        }
+        if (input->has_value("delay")) {
+            profile.start_tick = units::seconds_to_ticks(
+                    resolve_quantity(input->value_or("delay")), simulation.step_dt);
+        }
+        if (input->has_value("duration")) {
+            profile.end_tick = profile.start_tick + units::seconds_to_ticks(
+                    resolve_quantity(input->value_or("duration")), simulation.step_dt);
+        }
+
+        // A spikeArray carries its train as <spike time="..."/> children; every target
+        // receives the same train.
+        Vector<s32> spike_ticks;
+        for (const String &spike_id : input->data_order) {
+            const NML_ComponentInstance *spike = find_instance(spike_id);
+            if (!is_instance_of(spike, "spike") || !spike->has_value("time")) continue;
+
+            spike_ticks.push_back(static_cast<s32>(
+                    units::seconds_to_ticks(resolve_quantity(spike->value_or("time")),
+                                            simulation.step_dt)));
+        }
+        std::sort(spike_ticks.begin(), spike_ticks.end());
+        for (InputTarget &target : targets) target.event_ticks = spike_ticks;
+
+        // A component carrying a spike train is an event source whatever else it declares;
+        // only one with no train and an amplitude injects current continuously.
+        profile.continuous_current_injection =
+                spike_ticks.empty() && input->has_value("amplitude");
+
+        profile.targets = std::move(targets);
+        simulation.input_profiles.push_back(std::move(profile));
+    };
+
+    for (const String &child_id : network->data_order) {
+        const NML_ComponentInstance *child = find_instance(child_id);
+
+        if (is_instance_of(child, "explicitInput")) {
+            const String target_path = child->value_or("target");
+
+            InputTarget target;
+            target.neuron_index = resolve_path(target_path).neuron_index;
+            if (target.neuron_index < 0) {
+                throw runtime_error("explicitInput '" + child->id + "' targets '" +
+                                    target_path + "', which resolves to no neuron");
+            }
+
+            build_input_profile(child->value_or("input"), {target});
+            continue;
+        }
+
+        if (!is_instance_of(child, "inputList")) continue;
+
+        Vector<InputTarget> targets;
+        for (const String &input_id : child->data_order) {
+            const NML_ComponentInstance *input = find_instance(input_id);
+            if (!is_instance_of(input, "input") && !is_instance_of(input, "inputW")) continue;
+
+            const String target_path = input->value_or("target");
+
+            InputTarget target;
+            target.neuron_index = resolve_path(target_path).neuron_index;
+            if (target.neuron_index < 0) {
+                throw runtime_error("Input '" + input->id + "' in inputList '" + child->id +
+                                    "' targets '" + target_path +
+                                    "', which resolves to no neuron");
+            }
+            if (input->has_value("weight")) {
+                target.weight = resolve_quantity(input->value_or("weight"));
+            }
+            targets.push_back(std::move(target));
+        }
+
+        if (!targets.empty()) build_input_profile(child->value_or("component"), std::move(targets));
     }
 
-    ingest_document(lems_main_file);
+    // ── recordings ───────────────────────────────────────────────────────────────
+    for (const String &output_id : simulation_instance->data_order) {
+        const NML_ComponentInstance *output = find_instance(output_id);
 
-    resolve_all_component_types();
+        // Display is on-screen only and names no file, so it contributes no profile.
+        const bool is_event_file = is_instance_of(output, "EventOutputFile");
+        if (!is_event_file && !is_instance_of(output, "OutputFile")) continue;
 
-    std::error_code path_error;
-    path canonical = weakly_canonical(path(lems_main_file), path_error);
-    read_document_root(path_error ? lems_main_file : canonical.string(), main_document_root);
-}
+        const String filename = output->value_or("fileName");
+        if (filename.empty()) continue;
 
-NML_Context NML_Parser::extract_neuroml_context(NML_Node *lems_root) {
-    NML_Context context;
-    //TODO
-    return context;
+        RecordingConfig profile{};
+        profile.output_filenames.push_back(filename);
+        profile.file_output_format.push_back(
+                is_event_file ? OutputFileFormat::SPIKE_EVENTS
+                              : output_format_for_filename(filename));
+        profile.recordings_count = 0;
+
+        for (const String &selection_id : output->data_order) {
+            const NML_ComponentInstance *selection = find_instance(selection_id);
+
+            RecordingSelection recorded;
+            if (is_instance_of(selection, "OutputColumn")) {
+                recorded.quantity_path = selection->value_or("quantity");
+            } else if (is_instance_of(selection, "EventSelection")) {
+                recorded.quantity_path = selection->value_or("select");
+                recorded.event_port = selection->value_or("eventPort");
+            } else {
+                continue;
+            }
+
+            const NML_ResolvedIdentifier resolved = resolve_path(recorded.quantity_path);
+            recorded.neuron_index = resolved.neuron_index;
+
+            // An OutputColumn names a variable after the cell; an EventSelection names
+            // only the cell, and its port says what is recorded.
+            if (recorded.event_port.empty()) recorded.variable_name = resolved.trailing;
+
+            if (recorded.neuron_index < 0) {
+                log::logger().warn("Recording '{}' in {} resolves to no neuron; recorded "
+                                   "with index -1", recorded.quantity_path, filename);
+            }
+
+            profile.selections.push_back(std::move(recorded));
+            profile.recordings_count += 1;
+        }
+
+        simulation.recording_profiles.push_back(std::move(profile));
+    }
 }
 
 // Accumulates each schema validation error's line number and message (libxml2's messages
@@ -376,10 +814,12 @@ NML_Context NML_Parser::extract_neuroml_context(NML_Node *lems_root) {
 // libxml2 2.12 made xmlStructuredErrorFunc take a `const xmlError *`; before that it took
 // a mutable xmlErrorPtr. This machine has both 2.9 (pkg-config, what the Makefile picks)
 // and 2.13 (xml2-config) installed, so the signature is selected rather than assumed.
+// static: utilities.cpp defines a function of the same name, and two external definitions
+// would collide at link time.
 #if LIBXML_VERSION >= 21200
-void collect_schema_validation_error(void *user_data, const xmlError *error) {
+static void collect_schema_validation_error(void *user_data, const xmlError *error) {
 #else
-void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
+static void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
 #endif
     if (!error || !error->message) return;
 
@@ -391,10 +831,10 @@ void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
     *destination += "line " + std::to_string(error->line) + ": " + message;
 }
 
-bool NML_Parser::validate_lems_schema(const String &lems_filepath) {
-    xmlDocPtr document = xmlReadFile(nml_file_path.c_str(), nullptr, 0);
+bool NML_Context::validate_lems_schema(const String &lems_filepath) {
+    xmlDocPtr document = xmlReadFile(lems_filepath.c_str(), nullptr, 0);
     if (!document) {
-        last_schema_validation_errors = "could not read " + nml_file_path;
+        last_schema_validation_errors = "could not read " + lems_filepath;
         return false;
     }
 
@@ -406,7 +846,7 @@ bool NML_Parser::validate_lems_schema(const String &lems_filepath) {
 
     if (!is_neuroml_document) {
         log::logger().debug("{} is not a NeuroML document root; skipping XSD validation",
-                            nml_file_path);
+                            lems_filepath);
         last_schema_validation_errors.clear();
         return true;
     }
@@ -438,7 +878,7 @@ bool NML_Parser::validate_lems_schema(const String &lems_filepath) {
 
     // xmlSchemaValidateFile: 0 = valid, >0 = validation errors (captured above, by element and line
     // number), <0 = internal/API error.
-    int result = xmlSchemaValidateFile(valid_context, nml_file_path.c_str(), 0);
+    int result = xmlSchemaValidateFile(valid_context, lems_filepath.c_str(), 0);
 
     xmlSchemaFreeValidCtxt(valid_context);
     xmlSchemaFree(schema);
@@ -446,21 +886,46 @@ bool NML_Parser::validate_lems_schema(const String &lems_filepath) {
     return result == 0;
 }
 
-xmlNodePtr NML_Parser::get_xml_root(const String &filepath) {
+xmlNodePtr NML_Context::get_xml_root(const String &filepath) {
     xmlDocPtr document = xmlReadFile(filepath.c_str(), nullptr, XML_PARSE_NOBLANKS);
     if (!document) {
-        log::logger().error("Could not parse NML standard library file {}", filepath);
+        log::logger().error("Could not parse NML/LEMS file {}", filepath);
         return nullptr;
     }
 
     xmlNodePtr root = xmlDocGetRootElement(document);
     if (!root) {
-        log::logger().error("NML standard library file {} has no root element", filepath);
+        log::logger().error("NML/LEMS file {} has no root element", filepath);
         xmlFreeDoc(document);
         return nullptr;
     }
 
     return root;
+}
+
+NML_Context::~NML_Context() {
+    for (NML_Node *root : document_roots) delete root;
+}
+
+f64 NML_Context::resolve_quantity(const String &value) const {
+    auto [magnitude, suffix] = units::split_quantity(value);
+    if (suffix.empty()) return magnitude;
+
+    // A <Unit> the document declared wins: it is authoritative for this model, and it is
+    // the only source that can express an offset (degC -> K).
+    auto declared = model_units.find(suffix);
+    if (declared != model_units.end()) {
+        return magnitude * declared->second.scale + declared->second.offset;
+    }
+
+    return magnitude * units::unit_suffix_scale(suffix);
+}
+
+// The number of per-neuron state slots a cell needs.
+s64 NML_Context::get_cell_variable_count(s64 cell_instance_index) {
+    const NML_ComponentType *cell_type =
+            simulation.cell_instances.at(static_cast<usize>(cell_instance_index)).component_type;
+    return static_cast<s64>(cell_type->state_variable_names.size());
 }
 
 

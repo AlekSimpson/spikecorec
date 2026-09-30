@@ -8,18 +8,12 @@ using namespace spikecorec;
 
 namespace spikecorec::units {
 
-s64 tick_count_from_ms(f64 total_ms, f64 ms_step) {
-    if (ms_step <= 0.0) throw invalid_argument("ms_step must be > 0");
-    if (total_ms <= 0.0) throw invalid_argument("total_ms must be > 0");
-
+s64 ms_to_ticks(f64 total_ms, f64 ms_step) {
     return static_cast<s64>(std::round(total_ms / ms_step));
 }
 
-s64 tick_count_from_seconds(f64 total_seconds, f64 seconds_step) {
-    if (seconds_step <= 0.0) throw invalid_argument("seconds_step must be > 0");
-    if (total_seconds <= 0.0) throw invalid_argument("total_seconds must be > 0");
-
-    return tick_count_from_ms(seconds_to_ms(total_seconds), seconds_to_ms(seconds_step));
+s64 seconds_to_ticks(f64 total_seconds, f64 seconds_step) {
+    return ms_to_ticks(seconds_to_ms(total_seconds), seconds_to_ms(seconds_step));
 }
 
 f64 ms_to_seconds(f64 ms) {
@@ -71,13 +65,8 @@ f64 unit_suffix_scale(const String &suffix) {
     return entry->second;
 }
 
-s64 tick_count_from_seconds(f64 seconds, f64 step_dt) {
-    if (step_dt <= 0.0) return 0;
-    return static_cast<s64>(std::llround(seconds / step_dt));
-}
-
 // Splits "-60mV" into its numeric magnitude and its unit suffix. Shared by parse_quantity
-// and NML_Parser::resolve_quantity so both scan numbers identically.
+// and NML_Context::resolve_quantity so both scan numbers identically.
 Pair<f64, String> split_quantity(const String &value) {
     if (value.empty()) return {0.0, ""};
 
