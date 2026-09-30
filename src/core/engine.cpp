@@ -16,7 +16,6 @@
 
 #include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
-#include "spikecorec/nml/dynamics_codegen.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -47,26 +46,25 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     : logger(log::make_logger())
     , hebbian_plasticity_enabled(enable_hebbian_plasticity) {
 
-    NML_Parser parser;
-    if (!parser.validate_against_schema(lems_input_file)) {
+    if (!context.validate_lems_schema(lems_input_file)) {
         log::throw_runtime_error(*logger,
                 "SpikeEngine: " + lems_input_file + " failed lems schema validation:\n" +
-                parser.last_schema_validation_errors);
+                context.last_schema_validation_errors);
     }
 
-    parser.parse_lems(lems_input_file);
+    context.parse(lems_input_file);
 
     if (!adjacency.empty()) {
         apply_topology(adjacency, synapse_component_ids, synapse_proportions,
                        connection_weight, connection_delay_seconds);
     }
 
-    context = parser.extract_neuroml_context(&parser.main_document_root)
-
-    total_neuron_count = context.total_neuron_count;
-    lifetime = context.total_tick_count;
-    step_dt = context.step_dt;
-    if (context.random_seed.has_value()) simulation_seed = *context.random_seed;
+    total_neuron_count = context.simulation.total_neuron_count;
+    lifetime = context.simulation.total_tick_count;
+    step_dt = context.simulation.step_dt;
+    if (context.simulation.random_seed.has_value()) {
+        simulation_seed = *context.simulation.random_seed;
+    }
 
     if (total_neuron_count == 0) {
         log::throw_runtime_error(*logger,
@@ -76,7 +74,7 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     if (step_dt <= 0.0f) {
         log::throw_runtime_error(*logger,
                 "SpikeEngine: " + lems_input_file + " gives the Simulation no usable step "
-                "(parsed " + to_string(context.step_dt) + " s)");
+                "(parsed " + to_string(context.simulation.step_dt) + " s)");
     }
 
     Codegen compiler = Codegen(context, &gpu);
@@ -93,7 +91,7 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
 
     //const Vector<Vector<s32>> network = build_adjacency_list(network_details);
 
-    // TODO: WeightMatrix should take in context.network_data as input instead of network
+    // TODO: WeightMatrix should take in context.simulation.network_data as input instead of network
     weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
                            correction_ceiling_fraction, weight_fit_rank_budget);
@@ -636,8 +634,6 @@ void SpikeEngine::shutdown() {
 
     gpu.release_function(kernel_function);
 
-    // Move-assigning an empty one releases this matrix's slab, which has to happen while
-    // the backend that owns it is still alive.
     weights = WeightMatrix();
 
     gpu.deallocate_slab(model_slab);

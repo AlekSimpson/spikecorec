@@ -4,7 +4,6 @@
 
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
-#include "spikecorec/nml/declarations.h"
 #include "spikecorec/nml/node.h"
 
 using namespace spikecorec;
@@ -22,6 +21,10 @@ const UnorderedMap<String, String> FUNCTIONS = {
     {"sinh", "sinh"}, {"cosh", "cosh"}, {"tanh", "tanh"},
     {"H", "spikecorec_heaviside"},
 };
+
+LemsParseBody lems_body(LemsNodeSubtype syntax_type, const LemsExpressionToken &token) {
+    return LemsParseBody(ParseNodeType::LEMS_NODE, syntax_type, token);
+}
 
 } // namespace
 
@@ -53,7 +56,7 @@ LemsParseNode *LemsExpressionParser::resolve_identifier(const LemsExpressionToke
                 ") resolves to no parameter, state variable, derived variable, constant "
                 "or engine quantity");
     }
-    return LemsParseNode::lems_node(LemsNodeSubtype::IDENTIFIER, name, 0);
+    return new LemsParseNode(lems_body(LemsNodeSubtype::IDENTIFIER, name));
 }
 
 LemsParseNode *LemsExpressionParser::parse_primary() {
@@ -61,7 +64,7 @@ LemsParseNode *LemsExpressionParser::parse_primary() {
 
     if (token.kind == LemsExpressionToken::Kind::Number) {
         token_index += 1;
-        auto *node = LemsParseNode::lems_node(LemsNodeSubtype::FLOAT, token, 0);
+        auto *node = new LemsParseNode(lems_body(LemsNodeSubtype::FLOAT, token));
         return node;
     }
 
@@ -77,9 +80,10 @@ LemsParseNode *LemsExpressionParser::parse_primary() {
 
     if (token.kind == LemsExpressionToken::Kind::Operator && (token.lexeme == "-" || token.lexeme == "+")) {
         token_index += 1;
-        auto *unary_operator = LemsParseNode::lems_node(LemsNodeSubtype::OPERATOR, token, 1);
+        auto *unary_operator =
+                new UnaryNode<LemsParseBody>(lems_body(LemsNodeSubtype::OPERATOR, token));
         auto *operand = parse_unary();
-        unary_operator->add_branch(operand);
+        unary_operator->child = operand;
         return unary_operator;
     }
 
@@ -108,14 +112,16 @@ LemsParseNode *LemsExpressionParser::parse_primary() {
         if (current().kind != LemsExpressionToken::Kind::CloseParen) fail("missing ')' after " + function_token.lexeme);
         token_index += 1; // move past CloseParen
         
-        auto *function_identifier_node = LemsParseNode::lems_node(LemsNodeSubtype::IDENTIFIER, function_token, 0);
-        auto *arguments_node = LemsParseNode::lems_node(LemsNodeSubtype::LIST, (s32)argument_nodes.size());
-        for (LemsParseNode *argument_node : argument_nodes) {
-            arguments_node->add_branch(argument_node);
-        }
-        auto *function_node = LemsParseNode::lems_node(LemsNodeSubtype::FUNCTION_CALL, function_token, 2);
-        function_node->add_branch(function_identifier_node);
-        function_node->add_branch(arguments_node);
+        auto *function_identifier_node =
+                new LemsParseNode(lems_body(LemsNodeSubtype::IDENTIFIER, function_token));
+        auto *arguments_node =
+                new ListNode<LemsParseBody>(lems_body(LemsNodeSubtype::LIST, LemsExpressionToken()));
+        arguments_node->children = std::move(argument_nodes);
+
+        auto *function_node = new BinaryNode<LemsParseBody>(
+                lems_body(LemsNodeSubtype::FUNCTION_CALL, function_token));
+        function_node->left = function_identifier_node;
+        function_node->right = arguments_node;
         return function_node;
     }
 
@@ -145,21 +151,24 @@ LemsParseNode *LemsExpressionParser::parse_binary(s32 minimum_precedence) {
             LemsExpressionToken power_token{LemsExpressionToken::Kind::Identifier, "pow"};
 
             auto *power_identifier_node =
-                    LemsParseNode::lems_node(LemsNodeSubtype::IDENTIFIER, power_token, 0);
+                    new LemsParseNode(lems_body(LemsNodeSubtype::IDENTIFIER, power_token));
 
-            auto *arguments_node = LemsParseNode::lems_node(LemsNodeSubtype::LIST, 2);
-            arguments_node->add_branch(left);
-            arguments_node->add_branch(right);
+            auto *arguments_node =
+                    new ListNode<LemsParseBody>(lems_body(LemsNodeSubtype::LIST, LemsExpressionToken()));
+            arguments_node->children.push_back(left);
+            arguments_node->children.push_back(right);
 
-            auto *power_node = LemsParseNode::lems_node(LemsNodeSubtype::FUNCTION_CALL, power_token, 2);
-            power_node->add_branch(power_identifier_node);
-            power_node->add_branch(arguments_node);
+            auto *power_node = new BinaryNode<LemsParseBody>(
+                    lems_body(LemsNodeSubtype::FUNCTION_CALL, power_token));
+            power_node->left = power_identifier_node;
+            power_node->right = arguments_node;
 
             left = power_node;
         } else {
-            auto *binary_node = LemsParseNode::lems_node(LemsNodeSubtype::OPERATOR, operator_token, 2);
-            binary_node->add_branch(left);
-            binary_node->add_branch(right);
+            auto *binary_node = new BinaryNode<LemsParseBody>(
+                    lems_body(LemsNodeSubtype::OPERATOR, operator_token));
+            binary_node->left = left;
+            binary_node->right = right;
 
             left = binary_node;
         }

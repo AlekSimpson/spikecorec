@@ -13,8 +13,7 @@
 #include "spikecorec/core/log.h"
 #include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/core/recording.h"
-#include "spikecorec/nml/nml.h"
-#include "spikecorec/nml/dynamics_codegen.h"
+#include "spikecorec/nml/parser.h"
 
 using namespace std;
 using namespace spikecorec::nml;
@@ -37,6 +36,8 @@ namespace spikecorec {
     public:
         log::SharedPointer<log::EngineLogger> logger;
 
+        // Lives as long as the engine: its instances point into its own component types
+        // and document trees, which stay valid until the engine is destroyed.
         NML_Context context;
 
         EngineBackend gpu;

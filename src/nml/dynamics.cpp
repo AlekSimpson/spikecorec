@@ -3,20 +3,22 @@
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
-#include "spikecorec/nml/declarations.h"
 #include "spikecorec/nml/node.h"
+#include "spikecorec/nml/parser.h"
 
 using namespace spikecorec;
 using namespace std;
 
 namespace spikecorec::nml {
 
-void Codegen::allocate_model_memory() {
-    device->partition(sizeof(f32) * context.cell_state_length, EngineDatatype::FLOAT32, data_partitions)
-        .partition(sizeof(s64) * 2 * context.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)
-       .partition(sizeof(u8) * (context.maximum_edge_delay + 1) * context.total_neuron_count,
+void Codegen::allocate_cell_model_memory() {
+    const NML_Context::NML_SimulationContext &simulation = context.simulation;
+
+    device->partition(sizeof(f32) * simulation.cell_state_length, EngineDatatype::FLOAT32, data_partitions)
+        .partition(sizeof(s64) * 2 * simulation.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)
+       .partition(sizeof(u8) * (simulation.maximum_edge_delay + 1) * simulation.total_neuron_count,
                   EngineDatatype::UNSIGNED8, data_partitions)
-       .partition(sizeof(s64) * context.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)
+       .partition(sizeof(s64) * simulation.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)
        .partition(sizeof(f32), EngineDatatype::FLOAT32, data_partitions);
 
     EnginePointer root = device->allocate(data_partitions);
@@ -24,9 +26,9 @@ void Codegen::allocate_model_memory() {
     data_partitions.push_back(root);
 
     logger->debug("SpikeEngine: {} bytes — cell_state {}, network_inputs {}, spike_history {}, "
-                  root.total_bytes, context.cell_state_length, 2 * context.total_neuron_count,
-                  (context.maximum_edge_delay+1) * context.total_neuron_count,
-                  total_neuron_count);
+                  root.total_bytes, simulation.cell_state_length, 2 * simulation.total_neuron_count,
+                  (simulation.maximum_edge_delay+1) * simulation.total_neuron_count,
+                  simulation.total_neuron_count);
 }
 
 // AST generation
@@ -52,7 +54,7 @@ f64 Codegen::get_starting_parameters(NML_DynamicsExpression &expression) {
 // code generation
 
 String Codegen::compile() {
-    switch (root->subtype) {
+    switch (root->body.syntax_type) {
         case LITERAL:
             return literal_to_string(root);
         case IDENTIFIER:
@@ -75,7 +77,7 @@ String Codegen::compile() {
 }
 
 String Codegen::compile(KernelNode *node) {
-    switch (node->subtype) {
+    switch (node->body.syntax_type) {
         case LITERAL:
             return literal_to_string(node);
         case IDENTIFIER:

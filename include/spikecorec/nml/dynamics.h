@@ -2,17 +2,17 @@
 
 #include <type_traits>
 
+// First, so metal-cpp is parsed before any header's `using namespace spikecorec` brings
+// String into global lookup.
+#include "spikecorec/core/backend.h"
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
-#include "spikecorec/nml/declarations.h"
 #include "spikecorec/nml/node.h"
 
 using namespace spikecorec;
 using namespace std;
 
 namespace spikecorec::nml {
-
-struct KernelToken : AbstractToken {};
 
 enum class KernelNodeType {
     LITERAL,
@@ -24,9 +24,16 @@ enum class KernelNodeType {
     KERNEL_FUNCTION_IMPL
 };
 
-using KernelNode = ParseNode<KernelNodeType, KernelToken>;
+// A kernel node's token is the source text it emits.
+using KernelParseBody = ParseBody<KernelNodeType, String>;
+using KernelNode = Node<KernelParseBody>;
 
 struct NML_DynamicsExpression;
+
+// Defined in components.h and parser.h, which include this file first.
+struct NML_ComponentType;
+struct NML_ComponentInstance;
+struct NML_Context;
 
 struct Codegen {
     const NML_Context &context;
@@ -49,11 +56,16 @@ struct Codegen {
 
     f64 get_starting_parameters(NML_DynamicsExpression &expression);
 
-    KernelNode *new_node(KernelNodeType type, String lexeme, s32 branch_capacity) {
+    // NodeShape picks how many children the node holds: Node (a leaf), UnaryNode,
+    // BinaryNode, TrinaryNode or ListNode, e.g. new_node<BinaryNode>(EXPRESSION, "+").
+    template <template <typename> class NodeShape = Node>
+    NodeShape<KernelParseBody> *new_node(KernelNodeType type, String lexeme) {
         #ifdef SPIKECOREMETALC
-            return new KernelNode(NodeType::MTL_NODE, type, KernelToken{lexeme}, branch_capacity);
+            return new NodeShape<KernelParseBody>(
+                    KernelParseBody(ParseNodeType::MTL_NODE, type, std::move(lexeme)));
         #else
-            return new KernelNode(NodeType::CUDAC_NODE, type, KernelToken{lexeme}, branch_capacity);
+            return new NodeShape<KernelParseBody>(
+                    KernelParseBody(ParseNodeType::CUDAC_NODE, type, std::move(lexeme)));
         #endif
     };
 };
@@ -70,14 +82,15 @@ struct NML_DynamicsExpression {
         : source_tag(source_tag) {};
 };
 
-struct LemsExpressionToken : AbstractToken {
+struct LemsExpressionToken {
     enum class Kind {Number, Identifier, Operator, OpenParen, CloseParen, Comma, End};
 
+    String lexeme;
     Kind kind = Kind::End;
 
     LemsExpressionToken() = default;
     LemsExpressionToken(Kind kind, String lexeme)
-        : AbstractToken(std::move(lexeme)), kind(kind) {};
+        : lexeme(std::move(lexeme)), kind(kind) {};
 
     LemsExpressionToken(const LemsExpressionToken &other) = default;
     LemsExpressionToken &operator=(const LemsExpressionToken &other) = default;
@@ -91,15 +104,11 @@ struct LemsExpressionToken : AbstractToken {
 // does this struct need to be in this file? feels a little out of place in the "dynamics" definitions file
 template <typename TokenType>
 struct Lexer {
-    static_assert(std::is_base_of_v<AbstractToken, TokenType>,
-                  "Lexer's TokenType must derive from AbstractToken");
-
     using Predicate = bool (*)(Lexer &, char);
     using Action = void (*)(Lexer &);
 
     Vector<Predicate> predicates;
     Vector<Action> actions;
-    // Vector<bool> does_continue;
     Vector<TokenType> tokens;
     String source;
     usize position = 0;
@@ -162,7 +171,8 @@ enum class LemsNodeSubtype {
     INT
 };
 
-using LemsParseNode = ParseNode<LemsNodeSubtype, LemsExpressionToken>;
+using LemsParseBody = ParseBody<LemsNodeSubtype, LemsExpressionToken>;
+using LemsParseNode = Node<LemsParseBody>;
 
 struct LemsExpressionParser {
     Vector<LemsExpressionToken> tokens;

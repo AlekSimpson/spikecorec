@@ -20,7 +20,7 @@ namespace spikecorec::nml {
 
 // Output format inferred from the file extension, matching resolve_spire_compression's
 // rules. A non-.spire extension means the NML-standard column matrix.
-static OutputFileFormat output_format_for_filename(const String &filename) {
+OutputFileFormat output_format_for_filename(const String &filename) {
     auto ends_with = [&filename](const String &suffix) {
         return filename.size() >= suffix.size() &&
                filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
@@ -33,28 +33,6 @@ static OutputFileFormat output_format_for_filename(const String &filename) {
 
     return OutputFileFormat::NML_STANDARD;
 }
-
-// Reads and converts a document, freeing the libxml document once the tree has been
-// copied into NML_Nodes. Returns false when the file could not be read.
-static bool read_document_root(const String &filepath, NML_Node &return_value) {
-    xmlDocPtr document = xmlReadFile(filepath.c_str(), nullptr, XML_PARSE_NOBLANKS);
-    if (!document) {
-        log::logger().error("Could not parse NML/LEMS file {}", filepath);
-        return false;
-    }
-
-    xmlNodePtr root = xmlDocGetRootElement(document);
-    if (!root) {
-        log::logger().error("NML/LEMS file {} has no root element", filepath);
-        xmlFreeDoc(document);
-        return false;
-    }
-
-    return_value = xnml_node_to_nml_node(root);
-    xmlFreeDoc(document);
-    return true;
-}
-
 
 
 // Accumulates each schema validation error's line number and message (libxml2's messages

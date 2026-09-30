@@ -2,15 +2,14 @@
 
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
+#include "spikecorec/core/recording.h"
 
 using namespace spikecorec;
 using namespace std;
 
 namespace spikecorec::nml {
 
-static OutputFileFormat output_format_for_filename(const String &filename);
-
-static bool read_document_root(const String &filepath, NML_Node &return_value);
+OutputFileFormat output_format_for_filename(const String &filename);
 
 union Real {
     s64 int64;
@@ -52,13 +51,13 @@ struct AdjacencyList {
 
     AdjacencyList(int node_count, int max_edge_count) {
         list.resize(node_count);
-        for (Vector<Type> &inner_list : list) {
+        for (Vector<NML_NetworkEdge> &inner_list : list) {
             inner_list.reserve(max_edge_count);
         }
     }
 
-    bool in_network(s64 x) {
-        return (x > 0 && x < list.size());
+    bool in_network(s64 node_index) {
+        return (node_index >= 0 && node_index < static_cast<s64>(list.size()));
     }
 
     void add(NML_NetworkEdge edge) {
