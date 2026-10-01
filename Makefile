@@ -93,7 +93,7 @@ CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 
 # ── Device-code includes shared with runtime-compiled kernels ────────────────
 # A kernel compiled at runtime by compile_kernel() has no include path, so
-# dynamics_codegen reads k2tree_device.metalinc from here and prepends its text to
+# the kernel codegen reads k2tree_device.metalinc from here and prepends its text to
 # the source it generates. Absolute, for the same reason the two paths above are.
 METAL_DEVICE_DIR := $(abspath src/metal)
 CXXFLAGS         += -DSPIKECOREC_METAL_DEVICE_DIR=\"$(METAL_DEVICE_DIR)\"
@@ -132,7 +132,7 @@ endif
 
 # ── Source files ─────────────────────────────────────────────
 CORE_SRCS      := $(wildcard $(SRC_DIR)/core/*.cpp)
-NML_SRCS       := $(filter-out $(SRC_DIR)/nml/dynamics_codegen.cpp, $(wildcard $(SRC_DIR)/nml/*.cpp))
+NML_SRCS       := $(wildcard $(SRC_DIR)/nml/*.cpp)
 CUDA_SRCS      := $(wildcard $(SRC_DIR)/cuda/*.cu)
 METAL_SRCS     := $(wildcard $(SRC_DIR)/metal/*.cpp)
 METAL_SHADERS  := $(wildcard $(SRC_DIR)/metal/*.metal)
@@ -269,7 +269,7 @@ examples: examples-$(BACKEND)
 # This target used to name examples/cuda_example.cpp, which has never existed in the tree.
 examples-cuda: check-cuda $(CUDA_LIB)
 	@echo "[spikecorec] the CUDA backend cannot yet run a generated kernel"
-	@echo "             (dynamics_codegen emits Metal only) — examples are Metal-only."
+	@echo "             (the kernel codegen emits Metal only) — examples are Metal-only."
 	@false
 
 # Every .cpp directly in examples/ is an example; the headers beside them are shared

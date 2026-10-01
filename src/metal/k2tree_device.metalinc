@@ -2,7 +2,7 @@
 // kernels.metal and by every runtime-compiled master kernel.
 //
 // It lives in its own file because a runtime-compiled kernel has no include path:
-// dynamics_codegen reads this text and prepends it to the source it generates, so
+// the kernel codegen reads this text and prepends it to the source it generates, so
 // both paths walk the adjacency with the same code rather than two copies that can
 // drift apart. SPIKECOREC_METAL_DEVICE_DIR is where the Makefile says to find it.
 
