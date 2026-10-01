@@ -44,7 +44,7 @@ const LemsExpressionToken &LemsExpressionParser::current() const {
 }
 
 [[noreturn]] void LemsExpressionParser::fail(const String &reason) const {
-    throw runtime_error("dynamics_codegen: " + reason + " in '" + expression + "' (" +
+    throw runtime_error("lems_parser: " + reason + " in '" + expression + "' (" +
                         owner_name + ")");
 }
 
@@ -52,7 +52,7 @@ LemsParseNode *LemsExpressionParser::resolve_identifier(const LemsExpressionToke
     auto bound = symbols.find(name.lexeme);
     if (bound == symbols.end()) {
         throw runtime_error(
-                "dynamics_codegen: '" + name.lexeme + "' in '" + expression + "' (" + owner_name +
+                "lems_parser: '" + name.lexeme + "' in '" + expression + "' (" + owner_name +
                 ") resolves to no parameter, state variable, derived variable, constant "
                 "or engine quantity");
     }
@@ -96,7 +96,7 @@ LemsParseNode *LemsExpressionParser::parse_primary() {
         auto function = FUNCTIONS.find(function_token.lexeme);
         if (function == FUNCTIONS.end()) {
             throw runtime_error(
-                    "dynamics_codegen: unknown function '" + function_token.lexeme + "' in '" + expression +
+                    "lems_parser: unknown function '" + function_token.lexeme + "' in '" + expression +
                     "' (" + owner_name + ")");
         }
         token_index += 1; // move past OpenParen 

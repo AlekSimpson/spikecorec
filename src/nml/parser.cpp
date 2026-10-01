@@ -454,51 +454,37 @@ s64 NML_Context::resolve_path(
     const String &path, 
     const NML_ComponentInstance *current
 ) const {
-    s64 start = 0;
-    s64 end = path.find('/');
-    const NML_ComponentInstance *walk = current == nullptr 
+    usize start = 0;
+    usize end = path.find('/');
+    if (end == String::npos) end = path.size();
+
+    const NML_ComponentInstance *walk = current == nullptr
         ? find_instance(simulation.target_network_id)
         : current;
-    s64 component_index = 0;
-    s64 base_index = 0;
+    const NML_ComponentInstance *population = nullptr;
+    s64 component_index = -1;
 
     while (walk && start < path.size()) {
-        String token = path.substr(start, end - start); 
+        const String token = path.substr(start, end - start);
 
-        if (walk->component_type->name == "population") {
-            base_index = simulation.population_base_indices.at(walk->id);
-        }
-
-        if (token == ".") {
-            start = end + 1;
-            end = path.find('/', start);
-            if (end == String::npos) end = path.size();
-            continue;
-        }
-
-        if (token != "..") {
+        if (token == "..") {
+            walk = walk->parent_instance;
+            if (walk == nullptr) return -1;
+        } else if (!token.empty() && token != ".") {
+            String name = token;
             const usize bracket = token.find('[');
             if (bracket != String::npos) {
                 component_index = stoll(token.substr(bracket + 1));
+                name = token.substr(0, bracket);
             }
 
-            // data_order holds full keys, so the child is looked up by its full name.
-            const String fully_qualified_name = walk->id + "/" + token;
-            auto child_id = std::find(walk->data_order.begin(), walk->data_order.end(), fully_qualified_name);
-            if (child_id == walk->data_order.end()) {
-                throw runtime_error("Path '" + path + "': '" + token + "' is not a child of '" + walk->id + "'");
-            }
+            // A segment that names no child ends the walk; the rest names a variable.
+            const NML_ComponentInstance *child = find_instance(walk->id + "/" + name);
+            if (child == nullptr) break;
 
-            auto search = component_instances.find(fully_qualified_name);
-            if (search == component_instances.end()) {
-                throw runtime_error("Path '" + path + "': no instance '" + fully_qualified_name + "'");
-            }
-
-            walk = &search->second;
-        }else {
-
-            // then token == ".."
-            walk = walk->parent_instance;
+            if (is_instance_of(child, "population")) population = child;
+            if (is_instance_of(child, "instance")) component_index = stoll(name);
+            walk = child;
         }
 
         start = end + 1;
@@ -506,7 +492,26 @@ s64 NML_Context::resolve_path(
         if (end == String::npos) end = path.size();
     }
 
-    return component_index + base_index;
+    if (population == nullptr || component_index < 0) return -1;
+
+    const String cell_id = population->value_or("component");
+    const Vector<String> &variable_names = find_instance(cell_id)->component_type->state_variable_names;
+    const s64 cell_index = simulation.population_base_indices.at(population->id) +
+            component_index * static_cast<s64>(variable_names.size());
+
+    // TODO: we dont have to do this case handling if we could identify ahead of time what kind of token each token is 
+    // because for things like pop0/3/cellId/v, cellId is redundant
+  
+    // What is left names a variable; "pop0/3/cellId/v" repeats the cell's id first.
+    String remainder = start < path.size() ? path.substr(start) : "";
+    if (remainder == cell_id || remainder.rfind(cell_id + "/", 0) == 0) {
+        remainder.erase(0, cell_id.size() + 1);
+    }
+    if (remainder.empty()) return cell_index;
+
+    const auto variable = std::find(variable_names.begin(), variable_names.end(), remainder);
+    if (variable == variable_names.end()) return -1;
+    return cell_index + static_cast<s64>(variable - variable_names.begin());
 }
 
 void NML_Context::parse_simulation_details(NML_Node *lems_root) {
@@ -570,6 +575,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
     }
 
     // ── populations ──────────────────────────────────────────────────────────────
+    s64 current_cell_base = 0;
     for (const String &child_id : network->data_order) {
         const NML_ComponentInstance *population = find_instance(child_id);
         if (!is_instance_of(population, "population")) continue;
@@ -597,7 +603,9 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
         }
 
         simulation.cell_instances.push_back(*cell);
-        simulation.population_base_indices[population->id] = cell->component_type->state_variable_names.size(); 
+        s64 cell_state_size = cell->component_type->state_variable_names.size();
+        simulation.population_base_indices[population->id] = current_cell_base; 
+        current_cell_base += neuron_count * cell_state_size;
         simulation.total_neuron_count += neuron_count;
     }
 
@@ -636,8 +644,8 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
             NML_NetworkEdge edge;
             edge.component_id = synapse_id;
-            edge.parent = resolve_path(presynaptic_path).neuron_index;
-            edge.child = resolve_path(postsynaptic_path).neuron_index;
+            edge.parent = resolve_path(presynaptic_path, projection);
+            edge.child = resolve_path(postsynaptic_path, projection);
 
             if (edge.parent < 0 || edge.child < 0) {
                 throw runtime_error("Connection '" + connection->id + "' in projection '" +
@@ -720,7 +728,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
             const String target_path = child->value_or("target");
 
             InputTarget target;
-            target.neuron_index = resolve_path(target_path).neuron_index;
+            target.neuron_index = resolve_path(target_path, network);
             if (target.neuron_index < 0) {
                 throw runtime_error("explicitInput '" + child->id + "' targets '" +
                                     target_path + "', which resolves to no neuron");
@@ -740,7 +748,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
             const String target_path = input->value_or("target");
 
             InputTarget target;
-            target.neuron_index = resolve_path(target_path).neuron_index;
+            target.neuron_index = resolve_path(target_path, child);
             if (target.neuron_index < 0) {
                 throw runtime_error("Input '" + input->id + "' in inputList '" + child->id +
                                     "' targets '" + target_path +
@@ -786,12 +794,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
                 continue;
             }
 
-            const NML_ResolvedIdentifier resolved = resolve_path(recorded.quantity_path);
-            recorded.neuron_index = resolved.neuron_index;
-
-            // An OutputColumn names a variable after the cell; an EventSelection names
-            // only the cell, and its port says what is recorded.
-            if (recorded.event_port.empty()) recorded.variable_name = resolved.trailing;
+            recorded.neuron_index = resolve_path(recorded.quantity_path);
 
             if (recorded.neuron_index < 0) {
                 log::logger().warn("Recording '{}' in {} resolves to no neuron; recorded "
@@ -926,6 +929,31 @@ s64 NML_Context::get_cell_variable_count(s64 cell_instance_index) {
     const NML_ComponentType *cell_type =
             simulation.cell_instances.at(static_cast<usize>(cell_instance_index)).component_type;
     return static_cast<s64>(cell_type->state_variable_names.size());
+}
+
+// The number of values in cell memory: every state variable of every cell, over all populations.
+s64 NML_Context::get_cell_state_size() const {
+    const NML_ComponentInstance *network = find_instance(simulation.target_network_id);
+    if (!network) return 0;
+
+    s64 cell_state_size = 0;
+    for (const String &child_id : network->data_order) {
+        const NML_ComponentInstance *population = find_instance(child_id);
+        if (!is_instance_of(population, "population")) continue;
+
+        // A populationList's <instance> children are its cells; a plain population states a size.
+        s64 population_size = 0;
+        for (const String &member_id : population->data_order) {
+            if (is_instance_of(find_instance(member_id), "instance")) population_size += 1;
+        }
+        if (population_size == 0 && population->has_value("size")) {
+            population_size = std::llround(resolve_quantity(population->value_or("size")));
+        }
+
+        const NML_ComponentInstance *cell = find_instance(population->value_or("component"));
+        cell_state_size += population_size * static_cast<s64>(cell->component_type->state_variable_names.size());
+    }
+    return cell_state_size;
 }
 
 

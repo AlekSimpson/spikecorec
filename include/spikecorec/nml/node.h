@@ -52,8 +52,7 @@ enum class NML_DeclarationType {
 enum class ParseNodeType {
     NML_NODE,
     LEMS_NODE,
-    CUDAC_NODE, 
-    MTL_NODE, 
+    KERNEL_NODE,
 };
 
 template <typename SyntaxType, typename TokenType>

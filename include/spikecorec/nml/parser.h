@@ -103,6 +103,7 @@ struct NML_Context {
     xmlNodePtr get_xml_root(const String &filepath);
 
     s64 get_cell_variable_count(s64 cell_instance_index);
+    s64 get_cell_state_size() const;
     s64 resolve_path(const String &path, const NML_ComponentInstance *current = nullptr) const;
 };
 

@@ -71,14 +71,14 @@ Vector<LemsExpressionToken> tokenize_lems(const String &expression, const String
             const usize closing_dot = lexer.source.find('.', lexer.position + 1);
             if (closing_dot == String::npos) {
                 throw runtime_error(
-                        "dynamics_codegen: unterminated dotted operator in '" + lexer.source);
+                        "lems_tokenizer: unterminated dotted operator in '" + lexer.source);
             }
 
             const String spelling = lexer.source.substr(lexer.position, closing_dot - lexer.position + 1);
             auto mapped = DOTTED_OPERATORS.find(spelling);
             if (mapped == DOTTED_OPERATORS.end()) {
                 throw runtime_error(
-                        "dynamics_codegen: unknown operator '" + spelling + "' in '" +
+                        "lems_tokenizer: unknown operator '" + spelling + "' in '" +
                         lexer.source);
             }
 
