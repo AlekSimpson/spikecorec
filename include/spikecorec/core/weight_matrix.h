@@ -51,12 +51,17 @@ namespace spikecorec {
     // that faithfulness against the model's own declarations rather than assuming it.
     class WeightMatrix {
     public:
-        // The two quantities the basis carries. Both share U/V and differ only by their
+        // The two quantities the basis is fitted to. Both share U/V and differ only by their
         // coefficient row -- see fit_basis_from_projections for why that is exact for a
         // network wired out of population-to-population projections.
         static constexpr s64 DEFAULT_MATRIX_INDEX = 0;  // synaptic weight
         static constexpr s64 DELAY_MATRIX_INDEX = 1;    // delay in whole ticks, rounded
-        static constexpr s64 MATRIX_COUNT = 2;
+
+        // Every plane from here up holds one per-edge synapse state variable. Their
+        // coefficient rows stay zero, so a state plane's value is its correction alone: an
+        // edge at rest holds none, and an edge holds one only while its synapse is active.
+        // The fits and refit leave them alone for the same reason.
+        static constexpr s64 FIRST_STATE_MATRIX_INDEX = 2;
 
         // U and V are float4-typed, so a logical rank is always rounded up to a multiple
         // of four and every lane in the group participates in the reconstruction. The old
@@ -82,12 +87,15 @@ namespace spikecorec {
 
         K2Tree k2tree;
 
+        // How many planes this matrix holds: weight, delay, then one per synapse state
+        // variable an edge carries.
+        s64 matrix_count = FIRST_STATE_MATRIX_INDEX;
+
         // The shared basis, row-major [node_count][rank_float4_stride].
         EnginePointer U_matrix;
         EnginePointer V_matrix;
 
-        // One coefficient row per matrix, [MATRIX_COUNT][rank_float4_stride * LANE_GROUP].
-        // Sized once at construction because the family is fixed: weight and delay.
+        // One coefficient row per matrix, [matrix_count][rank_float4_stride * LANE_GROUP].
         EnginePointer coefficients;
 
         // Prefix sum over real out-degree: edge_row_offset[n] is the ordinal of node n's
@@ -116,17 +124,22 @@ namespace spikecorec {
         //   row_start[m * (node_count + 1) + n] .. [.. + n + 1]  is node n's slice for matrix m
         //   entry_edge_ordinal[slice]                            sorted ascending within the slice
         //   entry_delta[slice]                                   the correction to add
-        EnginePointer sparse_delta_row_start;      // s32[MATRIX_COUNT * (node_count + 1)]
-        EnginePointer sparse_delta_edge_ordinal;   // s64[MATRIX_COUNT * sparse_delta_capacity]
-        EnginePointer sparse_delta_value;          // f32[MATRIX_COUNT * sparse_delta_capacity]
+        EnginePointer sparse_delta_row_start;      // s32[matrix_count * (node_count + 1)]
+        EnginePointer sparse_delta_edge_ordinal;   // s64[matrix_count * sparse_delta_capacity]
+        EnginePointer sparse_delta_value;          // f32[matrix_count * sparse_delta_capacity]
 
         // Updates arrive out of order and possibly from many device threads at once, so
         // they queue here and are merged into the CSR above on an interval. That batching
         // is deliberate: the merge is what the CSR's sortedness costs, and paying it per
         // update would defeat the point.
-        EnginePointer pending_delta_edge_ordinal;  // s64[sparse_delta_capacity]
-        EnginePointer pending_delta_value;         // f32[sparse_delta_capacity]
+        EnginePointer pending_delta_edge_ordinal;  // s64[pending_delta_capacity]
+        EnginePointer pending_delta_value;         // f32[pending_delta_capacity]
+        EnginePointer pending_delta_matrix_index;  // s32[pending_delta_capacity]
         EnginePointer pending_delta_count;         // s32[1], bumped atomically on device
+
+        // Room in the queue above: the plasticity reserve, plus one entry per state plane per
+        // edge, since every edge can start holding synapse state in the same tick.
+        s64 pending_delta_capacity = 0;
 
         // How many corrections each matrix can hold, and how many it does. Capacity is not
         // guessed: declare_projections fits the basis, measures how many edges the fit
@@ -134,7 +147,7 @@ namespace spikecorec {
         // captures allocates nothing here -- which is the common case, and the one a fixed
         // fraction used to charge for anyway.
         s64 sparse_delta_capacity = 0;
-        Vector<s64> sparse_delta_entry_count = Vector<s64>((usize)MATRIX_COUNT, 0);
+        Vector<s64> sparse_delta_entry_count = Vector<s64>((usize)FIRST_STATE_MATRIX_INDEX, 0);
 
         // The most of the edge set corrections may occupy. This is the accuracy-for-storage
         // dial, and the only reason it is not simply "as many as needed": a field with no
@@ -226,6 +239,7 @@ namespace spikecorec {
         // weight_seed:        seeds the basis before any fit; -1 uses hardware entropy
         // correction_ceiling_fraction: the most of the edge set corrections may occupy;
         //                     1.0 reproduces every model exactly.
+        // matrix_count:       weight and delay, plus one plane per synapse state variable
         WeightMatrix(
             EngineBackend &backend,
             const vector<vector<s32>> &network,
@@ -234,7 +248,8 @@ namespace spikecorec {
             s64 max_neighbor_count = -1,
             s64 weight_seed = -1,
             f32 correction_ceiling_fraction = 1.0f,
-            s64 fit_rank_budget = -1
+            s64 fit_rank_budget = -1,
+            s64 matrix_count = FIRST_STATE_MATRIX_INDEX
         );
 
         ~WeightMatrix();
@@ -255,6 +270,10 @@ namespace spikecorec {
             const Vector<f32> &weight,
             const Vector<s32> &delay_ticks
         );
+
+        // Starting values for one state plane, one per projection run. A run whose value is
+        // not zero gives every edge in it a correction, so those edges start active.
+        void declare_starting_state(s64 matrix_index, const Vector<f32> &value_per_run);
 
         // ── reading values back ──────────────────────────────────────────────────
         [[nodiscard]] f32 get(s32 source_node, s32 target_node) const;
@@ -286,8 +305,9 @@ namespace spikecorec {
         // refit. Reads see it from the moment it is merged.
         void accumulate_edge_delta(s64 matrix_index, s32 source_node, s32 target_node, f32 delta);
 
-        // Merges whatever the device staged this interval into the CSR. Cheap, and the
-        // point at which recent updates become visible to reads.
+        // Merges whatever the device staged this interval into the CSR, each entry into its
+        // own plane, and drops corrections that have returned to exactly zero. Cheap, and
+        // the point at which recent updates become visible to reads.
         void compact_pending_deltas();
 
         // Re-optimises U/V and every Ck against the values Sk currently corrects to, then
@@ -299,7 +319,8 @@ namespace spikecorec {
         // the edge set.
         [[nodiscard]] bool is_refit_due() const;
 
-        // Fraction of the edge set currently carrying a correction, across every matrix.
+        // Fraction of the edge set currently carrying a correction, across the fitted
+        // matrices. State planes are left out: their corrections are the state itself.
         [[nodiscard]] f32 sparse_delta_occupancy_fraction() const;
 
         // Applies one edge's delta straight into U/V as a rank-1 nudge, bypassing Sk.
@@ -350,7 +371,8 @@ namespace spikecorec {
         // re-allocation, and so a run stays reproducible across one.
         unsigned basis_seed = 0;
 
-        // Fills U/V with independent N(0,1) and both coefficient rows with 1.0.
+        // Fills U/V with independent N(0,1), the weight and delay coefficient rows with 1.0
+        // and every state plane's row with 0.0.
         void seed_basis(unsigned seed);
 
         void build_edge_row_offset();

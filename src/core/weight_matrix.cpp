@@ -108,9 +108,11 @@ WeightMatrix::WeightMatrix(
     s64 max_neighbor_count,
     s64 weight_seed,
     f32 correction_ceiling_fraction,
-    s64 fit_rank_budget
+    s64 fit_rank_budget,
+    s64 matrix_count
 )
     : k2tree(*K2Tree::from_adjacency_list(backend, validate_network(network), (s32)network.size()))
+    , matrix_count(matrix_count)
     , sparse_delta_capacity(0)
     , correction_ceiling_fraction(max(correction_ceiling_fraction, 0.0f))
     , fit_rank_budget(fit_rank_budget)
@@ -118,6 +120,12 @@ WeightMatrix::WeightMatrix(
     , node_count((s64)network.size())
     , check_indexing(check_indexing)
 {
+    if (matrix_count < FIRST_STATE_MATRIX_INDEX) {
+        log::throw_invalid_argument(log::logger(),
+            "WeightMatrix: matrix_count " + to_string(matrix_count) + " leaves no room for the weight "
+            "and delay planes");
+    }
+
     this->max_neighbor_count = max_neighbor_count;
     if (max_neighbor_count < 0) {
         s64 longest_row = 0;
@@ -163,23 +171,26 @@ void WeightMatrix::build_edge_row_offset() {
 void WeightMatrix::allocate_storage() {
     const u64 matrix_byte_size = (u64)node_count * (u64)rank_float4_stride * sizeof(float4);
     const u64 lane_count = (u64)rank_float4_stride * (u64)LANE_GROUP;
+    pending_delta_capacity = plasticity_reserve_entries +
+                             total_edge_count * (matrix_count - FIRST_STATE_MATRIX_INDEX);
 
     Vector<EnginePointer> partitions;
     owning_backend
         ->partition(matrix_byte_size, EngineDatatype::FLOAT32X4, partitions)                 // U
         .partition(matrix_byte_size, EngineDatatype::FLOAT32X4, partitions)                  // V
-        .partition((u64)MATRIX_COUNT * lane_count * sizeof(f32), EngineDatatype::FLOAT32, partitions)
+        .partition((u64)matrix_count * lane_count * sizeof(f32), EngineDatatype::FLOAT32, partitions)
         .partition((u64)(node_count + 1) * sizeof(s64), EngineDatatype::SIGNED64, partitions)
         .partition((u64)total_edge_count * sizeof(f32), EngineDatatype::FLOAT32, partitions)
-        .partition((u64)MATRIX_COUNT * (u64)(node_count + 1) * sizeof(s32),
+        .partition((u64)matrix_count * (u64)(node_count + 1) * sizeof(s32),
                    EngineDatatype::SIGNED32, partitions)
-        .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(s64),
+        .partition((u64)matrix_count * (u64)sparse_delta_capacity * sizeof(s64),
                    EngineDatatype::SIGNED64, partitions)
-        .partition((u64)MATRIX_COUNT * (u64)sparse_delta_capacity * sizeof(f32),
+        .partition((u64)matrix_count * (u64)sparse_delta_capacity * sizeof(f32),
                    EngineDatatype::FLOAT32, partitions)
-        .partition((u64)plasticity_reserve_entries * sizeof(s64), EngineDatatype::SIGNED64, partitions)
-        .partition((u64)plasticity_reserve_entries * sizeof(f32), EngineDatatype::FLOAT32, partitions)
-        .partition(plasticity_reserve_entries > 0 ? sizeof(s32) : 0,
+        .partition((u64)pending_delta_capacity * sizeof(s64), EngineDatatype::SIGNED64, partitions)
+        .partition((u64)pending_delta_capacity * sizeof(f32), EngineDatatype::FLOAT32, partitions)
+        .partition((u64)pending_delta_capacity * sizeof(s32), EngineDatatype::SIGNED32, partitions)
+        .partition(pending_delta_capacity > 0 ? sizeof(s32) : 0,
                    EngineDatatype::SIGNED32, partitions);
 
     owning_slab = owning_backend->allocate(partitions);
@@ -194,17 +205,18 @@ void WeightMatrix::allocate_storage() {
     sparse_delta_value = partitions[7];
     pending_delta_edge_ordinal = partitions[8];
     pending_delta_value = partitions[9];
-    pending_delta_count = partitions[10];
+    pending_delta_matrix_index = partitions[10];
+    pending_delta_count = partitions[11];
 
     memcpy(edge_row_offset.get_contents(), edge_row_offset_host.data(),
            ((usize)node_count + 1) * sizeof(s64));
 
     if (!sparse_delta_row_start.is_empty()) {
         memset(sparse_delta_row_start.get_contents(), 0,
-               (usize)MATRIX_COUNT * ((usize)node_count + 1) * sizeof(s32));
+               (usize)matrix_count * ((usize)node_count + 1) * sizeof(s32));
     }
-    sparse_delta_entry_count.assign((usize)MATRIX_COUNT, 0);
-    if (plasticity_reserve_entries > 0) {
+    sparse_delta_entry_count.assign((usize)matrix_count, 0);
+    if (pending_delta_capacity > 0) {
         *pending_delta_count.get_contents_as<s32>() = 0;
     }
 
@@ -251,13 +263,14 @@ void WeightMatrix::seed_basis(unsigned seed) {
 
     const s64 lane_count = rank_float4_stride * LANE_GROUP;
     f32 *coefficient_data = coefficients.get_contents_as<f32>();
-    for (s64 lane_index = 0; lane_index < MATRIX_COUNT * lane_count; lane_index += 1) {
-        coefficient_data[lane_index] = 1.0f;
+    for (s64 lane_index = 0; lane_index < matrix_count * lane_count; lane_index += 1) {
+        coefficient_data[lane_index] = lane_index < FIRST_STATE_MATRIX_INDEX * lane_count ? 1.0f : 0.0f;
     }
 }
 
 WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
     : k2tree(std::move(other.k2tree))
+    , matrix_count(other.matrix_count)
     , U_matrix(other.U_matrix)
     , V_matrix(other.V_matrix)
     , coefficients(other.coefficients)
@@ -268,8 +281,11 @@ WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
     , sparse_delta_value(other.sparse_delta_value)
     , pending_delta_edge_ordinal(other.pending_delta_edge_ordinal)
     , pending_delta_value(other.pending_delta_value)
+    , pending_delta_matrix_index(other.pending_delta_matrix_index)
     , pending_delta_count(other.pending_delta_count)
+    , pending_delta_capacity(other.pending_delta_capacity)
     , sparse_delta_capacity(other.sparse_delta_capacity)
+    , sparse_delta_entry_count(std::move(other.sparse_delta_entry_count))
     , projection_first_edge_ordinal(std::move(other.projection_first_edge_ordinal))
     , projection_edge_count(std::move(other.projection_edge_count))
     , projection_synapse_prototype(std::move(other.projection_synapse_prototype))
@@ -300,6 +316,7 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     if (owning_backend != nullptr) owning_backend->deallocate_slab(owning_slab);
 
     k2tree = std::move(other.k2tree);
+    matrix_count = other.matrix_count;
     U_matrix = other.U_matrix;
     V_matrix = other.V_matrix;
     coefficients = other.coefficients;
@@ -310,7 +327,9 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     sparse_delta_value = other.sparse_delta_value;
     pending_delta_edge_ordinal = other.pending_delta_edge_ordinal;
     pending_delta_value = other.pending_delta_value;
+    pending_delta_matrix_index = other.pending_delta_matrix_index;
     pending_delta_count = other.pending_delta_count;
+    pending_delta_capacity = other.pending_delta_capacity;
     sparse_delta_entry_count = other.sparse_delta_entry_count;
     sparse_delta_capacity = other.sparse_delta_capacity;
     projection_first_edge_ordinal = std::move(other.projection_first_edge_ordinal);
@@ -351,10 +370,10 @@ bool WeightMatrix::check_index_inbounds(s32 source, s32 target) const {
 }
 
 void WeightMatrix::validate_matrix_index(s64 matrix_index) const {
-    if (matrix_index < 0 || matrix_index >= MATRIX_COUNT) {
+    if (matrix_index < 0 || matrix_index >= matrix_count) {
         log::throw_invalid_argument(log::logger(),
             "WeightMatrix: matrix_index " + to_string(matrix_index) + " out of range [0, " +
-            to_string((s64)MATRIX_COUNT) + ")");
+            to_string(matrix_count) + ")");
     }
 }
 
@@ -499,7 +518,7 @@ s64 WeightMatrix::count_edges_needing_correction(
     vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
     s64 worst_matrix_need = 0;
 
-    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+    for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
         const f32 *coefficient_values = coefficient_row(matrix_index);
 
         const f32 field_scale = field_scale_of(targets_per_matrix[(usize)matrix_index]);
@@ -536,7 +555,7 @@ void WeightMatrix::resize_correction_capacity(s64 new_capacity) {
     vector<f32> saved_v(V_matrix.get_contents_as<f32>(),
                         V_matrix.get_contents_as<f32>() + node_count * lane_count);
     vector<f32> saved_coefficients(coefficients.get_contents_as<f32>(),
-                                   coefficients.get_contents_as<f32>() + MATRIX_COUNT * lane_count);
+                                   coefficients.get_contents_as<f32>() + matrix_count * lane_count);
 
     owning_backend->deallocate_slab(owning_slab);
     sparse_delta_capacity = new_capacity;
@@ -627,59 +646,74 @@ void WeightMatrix::compact_pending_deltas() {
     if (sparse_delta_capacity <= 0 || pending_delta_count.is_empty()) return;
 
     s32 *pending_count = pending_delta_count.get_contents_as<s32>();
-    const s64 staged = min<s64>((s64)*pending_count, sparse_delta_capacity);
+    const s64 staged = min<s64>((s64)*pending_count, pending_delta_capacity);
     if (staged <= 0) {
         *pending_count = 0;
         return;
     }
 
-    if ((s64)*pending_count > sparse_delta_capacity) {
+    if ((s64)*pending_count > pending_delta_capacity) {
         log::logger().warn("compact_pending_deltas: {} updates were dropped this interval "
                            "(capacity {}); compact more often",
-                           (s64)*pending_count - sparse_delta_capacity, sparse_delta_capacity);
+                           (s64)*pending_count - pending_delta_capacity, pending_delta_capacity);
     }
 
     const s64 *staged_ordinal = pending_delta_edge_ordinal.get_contents_as<s64>();
     const f32 *staged_value = pending_delta_value.get_contents_as<f32>();
+    const s32 *staged_matrix_index = pending_delta_matrix_index.get_contents_as<s32>();
 
-    Vector<Pair<s64, f32>> corrections;
-    const s64 existing_count = sparse_delta_entry_count[(usize)DEFAULT_MATRIX_INDEX];
-    const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
-                              DEFAULT_MATRIX_INDEX * sparse_delta_capacity;
-    const f32 *entry_value = sparse_delta_value.get_contents_as<f32>() +
-                             DEFAULT_MATRIX_INDEX * sparse_delta_capacity;
-    for (s64 index = 0; index < existing_count; index += 1) {
-        corrections.push_back({entry_ordinal[index], entry_value[index]});
-    }
+    Vector<Vector<Pair<s64, f32>>> staged_per_matrix((usize)matrix_count);
     for (s64 index = 0; index < staged; index += 1) {
-        corrections.push_back({staged_ordinal[index], staged_value[index]});
+        const s64 matrix_index = staged_matrix_index[index];
+        if (matrix_index < 0 || matrix_index >= matrix_count) continue;
+        staged_per_matrix[(usize)matrix_index].push_back({staged_ordinal[index], staged_value[index]});
     }
 
-    sort(corrections.begin(), corrections.end(),
-         [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
-             return left.first < right.first;
-         });
-    Vector<Pair<s64, f32>> merged;
-    for (const Pair<s64, f32> &correction : corrections) {
-        if (!merged.empty() && merged.back().first == correction.first) {
-            merged.back().second += correction.second;
-        } else {
-            merged.push_back(correction);
+    // A correction that came back to exactly zero is dropped: for a state plane that is the
+    // edge returning to rest. The device queues an empty update for it so it is merged here.
+    for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
+        Vector<Pair<s64, f32>> &corrections = staged_per_matrix[(usize)matrix_index];
+        if (corrections.empty()) continue;
+
+        const s64 existing_count = sparse_delta_entry_count[(usize)matrix_index];
+        const s64 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<s64>() +
+                                  matrix_index * sparse_delta_capacity;
+        const f32 *entry_value = sparse_delta_value.get_contents_as<f32>() +
+                                 matrix_index * sparse_delta_capacity;
+        for (s64 index = 0; index < existing_count; index += 1) {
+            corrections.push_back({entry_ordinal[index], entry_value[index]});
         }
-    }
 
-    rebuild_sparse_delta(DEFAULT_MATRIX_INDEX, merged);
+        sort(corrections.begin(), corrections.end(),
+             [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
+                 return left.first < right.first;
+             });
+        Vector<Pair<s64, f32>> merged;
+        for (const Pair<s64, f32> &correction : corrections) {
+            if (!merged.empty() && merged.back().first == correction.first) {
+                merged.back().second += correction.second;
+            } else {
+                merged.push_back(correction);
+            }
+        }
+        merged.erase(remove_if(merged.begin(), merged.end(),
+                               [](const Pair<s64, f32> &correction) { return correction.second == 0.0f; }),
+                     merged.end());
+
+        rebuild_sparse_delta(matrix_index, merged);
+    }
     *pending_count = 0;
 
-    log::logger().debug("compact_pending_deltas: merged {} updates, Sk now holds {} entries",
-                        staged, sparse_delta_entry_count[(usize)DEFAULT_MATRIX_INDEX]);
+    log::logger().debug("compact_pending_deltas: merged {} updates", staged);
 }
 
 f32 WeightMatrix::sparse_delta_occupancy_fraction() const {
     if (total_edge_count <= 0) return 0.0f;
 
     s64 worst = 0;
-    for (s64 count : sparse_delta_entry_count) worst = max(worst, count);
+    for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
+        worst = max(worst, sparse_delta_entry_count[(usize)matrix_index]);
+    }
     return (f32)worst / (f32)total_edge_count;
 }
 
@@ -740,8 +774,10 @@ void WeightMatrix::declare_projections(
     const s64 edges_needing_correction = count_edges_needing_correction(targets);
     const s64 ceiling_entries =
             (s64)(correction_ceiling_fraction * (f32)total_edge_count);
-    const s64 chosen_capacity =
-            max<s64>(min(edges_needing_correction, ceiling_entries), plasticity_reserve_entries);
+    // A state plane's value is its correction, and any edge can be active at once.
+    const s64 state_entries = matrix_count > FIRST_STATE_MATRIX_INDEX ? total_edge_count : 0;
+    const s64 chosen_capacity = max<s64>({min(edges_needing_correction, ceiling_entries),
+                                          plasticity_reserve_entries, state_entries});
 
     resize_correction_capacity(chosen_capacity);
 
@@ -774,8 +810,8 @@ void WeightMatrix::declare_projections(
     const s64 basis_bytes = 2 * node_count * rank * (s64)sizeof(f32);
 
     const s64 correction_bytes =
-            sparse_delta_capacity * (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32))) +
-            plasticity_reserve_entries * (s64)(sizeof(s64) + sizeof(f32));
+            sparse_delta_capacity * matrix_count * (s64)(sizeof(s64) + sizeof(f32)) +
+            pending_delta_capacity * (s64)(sizeof(s64) + sizeof(f32) + sizeof(s32));
     log::logger().info("WeightMatrix: {} projections over {} edges at rank {} -- the basis "
                        "reproduces {} of them, {} need correcting. Holding {} weight and {} "
                        "delay corrections; {} bytes basis + {} bytes corrections against {} "
@@ -818,6 +854,28 @@ s64 WeightMatrix::store_residual_corrections(
 
     rebuild_sparse_delta(matrix_index, corrections);
     return sparse_delta_entry_count[(usize)matrix_index];
+}
+
+void WeightMatrix::declare_starting_state(s64 matrix_index, const Vector<f32> &value_per_run) {
+    validate_matrix_index(matrix_index);
+    if (matrix_index < FIRST_STATE_MATRIX_INDEX) {
+        log::throw_invalid_argument(log::logger(),
+            "WeightMatrix::declare_starting_state: matrix " + to_string(matrix_index) +
+            " is fitted, not a state plane");
+    }
+    if (value_per_run.size() != projection_first_edge_ordinal.size()) {
+        log::throw_invalid_argument(log::logger(),
+            "WeightMatrix::declare_starting_state: one value per projection run is required");
+    }
+
+    Vector<Pair<s64, f32>> corrections;
+    for (usize run_index = 0; run_index < value_per_run.size(); run_index += 1) {
+        if (value_per_run[run_index] == 0.0f) continue;
+        for (s64 offset = 0; offset < projection_edge_count[run_index]; offset += 1) {
+            corrections.push_back({projection_first_edge_ordinal[run_index] + offset, value_per_run[run_index]});
+        }
+    }
+    rebuild_sparse_delta(matrix_index, corrections);
 }
 
 bool WeightMatrix::fit_basis_from_projections(
@@ -905,7 +963,7 @@ bool WeightMatrix::fit_basis_from_projections(
 Vector<Vector<f32>> WeightMatrix::targets_from_projections(
     const Vector<f32> &weight, const Vector<s32> &delay_ticks
 ) const {
-    Vector<Vector<f32>> targets((usize)MATRIX_COUNT,
+    Vector<Vector<f32>> targets((usize)FIRST_STATE_MATRIX_INDEX,
                                 Vector<f32>((usize)max<s64>(total_edge_count, 0), 0.0f));
     const s64 run_count = (s64)projection_first_edge_ordinal.size();
     if (run_count == 0) return targets;
@@ -923,7 +981,7 @@ Vector<Vector<f32>> WeightMatrix::targets_from_projections(
 }
 
 Vector<Vector<f32>> WeightMatrix::targets_from_current_values() const {
-    Vector<Vector<f32>> targets((usize)MATRIX_COUNT,
+    Vector<Vector<f32>> targets((usize)FIRST_STATE_MATRIX_INDEX,
                                 Vector<f32>((usize)max<s64>(total_edge_count, 0), 0.0f));
     if (total_edge_count == 0) return targets;
 
@@ -934,7 +992,7 @@ Vector<Vector<f32>> WeightMatrix::targets_from_current_values() const {
         for (s64 slot = 0; slot < degree; slot += 1) {
             const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
             const s32 target_node = neighbor_buffer[(usize)slot];
-            for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+            for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
                 targets[(usize)matrix_index][(usize)ordinal] =
                         reconstruct_entry((s32)source_node, target_node,
                                           coefficient_row(matrix_index)) +
@@ -954,8 +1012,8 @@ void WeightMatrix::fit_basis_to_targets(
     f32 *u_data = U_matrix.get_contents_as<f32>();
     f32 *v_data = V_matrix.get_contents_as<f32>();
 
-    Vector<f64> matrix_scale((usize)MATRIX_COUNT, 1.0);
-    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+    Vector<f64> matrix_scale((usize)FIRST_STATE_MATRIX_INDEX, 1.0);
+    for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
         f64 sum_of_squares = 0.0;
         for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
             const f64 value = (f64)targets_per_matrix[(usize)matrix_index][(usize)ordinal];
@@ -966,7 +1024,7 @@ void WeightMatrix::fit_basis_to_targets(
     }
 
     Vector<Vector<f32>> normalised_targets = targets_per_matrix;
-    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+    for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
         const f64 scale = matrix_scale[(usize)matrix_index];
         for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
             normalised_targets[(usize)matrix_index][(usize)ordinal] =
@@ -1009,7 +1067,7 @@ void WeightMatrix::fit_basis_to_targets(
 
             for (s64 ordinal = first; ordinal < last; ordinal += 1) {
                 const s64 target_node = edge_target[(usize)ordinal];
-                for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
                     if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
                     const f32 *coefficient_values = coefficient_row(matrix_index);
                     for (s64 lane = 0; lane < lane_count; lane += 1) {
@@ -1051,7 +1109,7 @@ void WeightMatrix::fit_basis_to_targets(
 
             for (s64 ordinal : ordinals) {
                 const s64 source_node = edge_source[(usize)ordinal];
-                for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+                for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
                     if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
                     const f32 *coefficient_values = coefficient_row(matrix_index);
                     for (s64 lane = 0; lane < lane_count; lane += 1) {
@@ -1084,7 +1142,7 @@ void WeightMatrix::fit_basis_to_targets(
             }
         }
 
-        for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+        for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
             if (matrix_index == DELAY_MATRIX_INDEX && using_constant_delay_ticks) continue;
             fill(gram.begin(), gram.end(), 0.0);
             fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
@@ -1122,7 +1180,7 @@ void WeightMatrix::fit_basis_to_targets(
         }
     }
 
-    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+    for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
         f32 *coefficient_values = coefficient_row(matrix_index);
         for (s64 lane = 0; lane < lane_count; lane += 1) {
             coefficient_values[lane] =
@@ -1136,11 +1194,11 @@ void WeightMatrix::fit_basis_to_targets(
 s64 WeightMatrix::search_for_best_fit_rank(const Vector<Vector<f32>> &targets_per_matrix) {
     const s64 hard_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
     const s64 exact_fit_rank =
-            (MATRIX_COUNT * total_edge_count) / max<s64>(2 * node_count, 1) + 1;
+            (FIRST_STATE_MATRIX_INDEX * total_edge_count) / max<s64>(2 * node_count, 1) + 1;
     const s64 highest_candidate = min(round_up_to_lane_group(exact_fit_rank), hard_limit);
 
     const s64 ceiling_entries = (s64)(correction_ceiling_fraction * (f32)total_edge_count);
-    const s64 correction_entry_bytes = (s64)(MATRIX_COUNT * (sizeof(s64) + sizeof(f32)));
+    const s64 correction_entry_bytes = (s64)(FIRST_STATE_MATRIX_INDEX * (sizeof(s64) + sizeof(f32)));
 
     s64 best_rank = LANE_GROUP;
     s64 best_total_bytes = numeric_limits<s64>::max();
@@ -1189,7 +1247,7 @@ void WeightMatrix::refit(s32 sweep_count, f32 ridge_regularization) {
     const Vector<Vector<f32>> targets = targets_from_current_values();
     fit_basis_to_targets(targets, sweep_count, ridge_regularization);
 
-    for (s64 matrix_index = 0; matrix_index < MATRIX_COUNT; matrix_index += 1) {
+    for (s64 matrix_index = 0; matrix_index < FIRST_STATE_MATRIX_INDEX; matrix_index += 1) {
         store_residual_corrections(matrix_index, targets[(usize)matrix_index]);
     }
 
@@ -1526,7 +1584,7 @@ void WeightMatrix::save(const char *filepath) const {
     file.write(reinterpret_cast<const char *>(U_matrix.get_contents()), (streamsize)basis_bytes);
     file.write(reinterpret_cast<const char *>(V_matrix.get_contents()), (streamsize)basis_bytes);
 
-    const s64 coefficient_bytes = MATRIX_COUNT * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
+    const s64 coefficient_bytes = matrix_count * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
     file.write(reinterpret_cast<const char *>(coefficients.get_contents()), (streamsize)coefficient_bytes);
 
     const u8 constant_delay_flag = using_constant_delay_ticks ? 1 : 0;
@@ -1561,7 +1619,7 @@ void WeightMatrix::load_from_disk(const char *filepath) {
     file.read(reinterpret_cast<char *>(U_matrix.get_contents()), (streamsize)basis_bytes);
     file.read(reinterpret_cast<char *>(V_matrix.get_contents()), (streamsize)basis_bytes);
 
-    const s64 coefficient_bytes = MATRIX_COUNT * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
+    const s64 coefficient_bytes = matrix_count * rank_float4_stride * LANE_GROUP * (s64)sizeof(f32);
     file.read(reinterpret_cast<char *>(coefficients.get_contents()), (streamsize)coefficient_bytes);
 
     u8 constant_delay_flag = 0;

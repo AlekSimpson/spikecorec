@@ -144,14 +144,11 @@ Vector<LemsExpressionToken> tokenize_lems(const String &expression, const String
         })
         .add_check([](LemsLexer &lexer, char) -> bool {
             // Two-character comparisons are also legal LEMS spelling alongside the dotted form.
-            return (lexer.position + 1 < lexer.source.size());
+            static const Set<String> pairs = {"<=", ">=", "==", "!=", "&&", "||"};
+            return pairs.count(lexer.source.substr(lexer.position, 2)) != 0;
         }, [](LemsLexer &lexer) {
-            const String pair = lexer.source.substr(lexer.position, 2);
-            if (pair == "<=" || pair == ">=" || pair == "==" || pair == "!=" ||
-                pair == "&&" || pair == "||") {
-                lexer.tokens.push_back({LemsExpressionToken::Kind::Operator, pair});
-                lexer.position += 2;
-            }
+            lexer.tokens.push_back({LemsExpressionToken::Kind::Operator, lexer.source.substr(lexer.position, 2)});
+            lexer.position += 2;
         })
         .add_check([](LemsLexer &, char character) -> bool {
             return (String("+-*/^<>").find(character) != String::npos);

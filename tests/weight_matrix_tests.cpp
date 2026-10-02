@@ -234,7 +234,7 @@ TEST(WeightMatrix, a_plasticity_reserve_is_allocated_even_when_the_fit_is_exact)
 
     // Sized by the reserve, never by the edge count.
     EXPECT_EQ(matrix.sparse_delta_edge_ordinal.total_bytes,
-              (u64)WeightMatrix::MATRIX_COUNT * 128 * sizeof(s64));
+              (u64)matrix.matrix_count * 128 * sizeof(s64));
 }
 
 // Rank is searched rather than capped at a constant, and the thing it minimises is basis
