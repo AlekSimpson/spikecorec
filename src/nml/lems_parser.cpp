@@ -48,14 +48,8 @@ const LemsExpressionToken &LemsExpressionParser::current() const {
                         owner_name + ")");
 }
 
+// Names stay LEMS names here; codegen binds them by substitution in the kernel tree.
 LemsParseNode *LemsExpressionParser::resolve_identifier(const LemsExpressionToken &name) const {
-    auto bound = symbols.find(name.lexeme);
-    if (bound == symbols.end()) {
-        throw runtime_error(
-                "lems_parser: '" + name.lexeme + "' in '" + expression + "' (" + owner_name +
-                ") resolves to no parameter, state variable, derived variable, constant "
-                "or engine quantity");
-    }
     return new LemsParseNode(lems_body(LemsNodeSubtype::IDENTIFIER, name));
 }
 
@@ -177,6 +171,18 @@ LemsParseNode *LemsExpressionParser::parse_binary(s32 minimum_precedence) {
     return left;
 }
 
+LemsParseNode *parse_lems_expression(const String &expression, const String &owner_name) {
+    LemsExpressionParser parser;
+    parser.expression = expression;
+    parser.owner_name = owner_name;
+    parser.tokens = tokenize_lems(expression, owner_name);
 
+    LemsParseNode *root = parser.parse_binary(0);
+    if (parser.current().kind != LemsExpressionToken::Kind::End) {
+        delete root;
+        parser.fail("unexpected '" + parser.current().lexeme + "'");
+    }
+    return root;
+}
 
 }

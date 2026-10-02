@@ -88,6 +88,8 @@ SRCS = [
     # in the extension or it fails to link.
     "src/nml/components.cpp",
     "src/nml/dynamics.cpp",
+    "src/nml/kernel_boilerplate.cpp",
+    "src/nml/kernel_parser.cpp",
     "src/nml/kernel_tokenizer.cpp",
     "src/nml/lems_parser.cpp",
     "src/nml/lems_tokenizer.cpp",

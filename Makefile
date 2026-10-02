@@ -93,8 +93,8 @@ CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 
 # ── Device-code includes shared with runtime-compiled kernels ────────────────
 # A kernel compiled at runtime by compile_kernel() has no include path, so
-# the kernel codegen reads k2tree_device.metalinc from here and prepends its text to
-# the source it generates. Absolute, for the same reason the two paths above are.
+# the kernel codegen reads k2tree_device.metalinc from here and parses it into the
+# kernel it generates. Absolute, for the same reason the two paths above are.
 METAL_DEVICE_DIR := $(abspath src/metal)
 CXXFLAGS         += -DSPIKECOREC_METAL_DEVICE_DIR=\"$(METAL_DEVICE_DIR)\"
 

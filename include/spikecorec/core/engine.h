@@ -3,6 +3,7 @@
 //
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,7 +26,6 @@ namespace spikecorec {
     // fired" is a state rather than "fired so long ago the arithmetic works out".
     constexpr s64 NEVER_SPIKED_TICK = -1;
 
-    // One spike, as the model asked for it to be recorded.
     struct RecordedSpike {
         f64 time_seconds = 0.0;
         s64 neuron_index = -1;
@@ -36,8 +36,6 @@ namespace spikecorec {
     public:
         log::SharedPointer<log::EngineLogger> logger;
 
-        // Lives as long as the engine: its instances point into its own component types
-        // and document trees, which stay valid until the engine is destroyed.
         NML_Context context;
 
         EngineBackend gpu;
@@ -46,6 +44,22 @@ namespace spikecorec {
 
         EngineFunction kernel_function;
 
+        // master_step's parameters in binding order, and where each one's buffer or value
+        // comes from. tick is bound per dispatch.
+        Vector<String> kernel_parameter_names;
+        UnorderedMap<String, std::function<EnginePointer()>> kernel_argument_sources;
+        s32 rank_float4_stride_argument = 0;
+        s32 projection_run_count = 0;
+
+        // The one allocation every model buffer below is carved from.
+        EnginePointer model_pointer;
+
+        // The weight matrix's projection runs, on the device, so the kernel can find each
+        // edge's synapse prototype. Carved from projection_run_pointer.
+        EnginePointer projection_run_pointer;
+        EnginePointer projection_first_edge_ordinal;  // s64[run count]
+        EnginePointer projection_synapse_prototype;   // s32[run count]
+
         EnginePointer cell_state;
 
         // Two rows, alternating by tick parity: a thread drains its slot in one row while
@@ -53,8 +67,6 @@ namespace spikecorec {
         // latency exactly one tick rather than one-or-two depending on thread order.
         EnginePointer network_inputs;     // [2][total_neuron_count]
 
-        // Bound wherever the kernel declares a per-edge buffer the model has no plane for.
-        // A model with no connections registers none of them
         EnginePointer empty_edge_plane;
 
         // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
@@ -63,7 +75,6 @@ namespace spikecorec {
         EnginePointer spike_history;
         EnginePointer last_spiked;        // [total_neuron_count]
 
-        // Host-side stimulus, applied before each dispatch.
         Vector<s64> continuous_injection_targets;
         Vector<f32> continuous_injection_amplitudes;
         Vector<s64> continuous_injection_start_ticks;
@@ -79,7 +90,7 @@ namespace spikecorec {
 
         Vector<s64> spike_counts_per_neuron;
         Vector<RecordedSpike> recorded_spikes;
-        // Row-major [recorded tick][traced quantity], parallel to traced_selections.
+        // row-major [recorded tick][traced quantity]
         Vector<f32> recorded_traces;
         Vector<RecordingSelection> traced_selections;
         Vector<f64> recorded_trace_times;
@@ -92,6 +103,7 @@ namespace spikecorec {
         Vector<f32> membrane_frame_scratch;
 
         s64 total_neuron_count = 0;
+        s64 spike_history_row_count = 0;
         s64 lifetime = 0;
         f64 step_dt = 0.0f;
         u64 simulation_seed = 0;
@@ -163,20 +175,27 @@ namespace spikecorec {
         void shutdown();
 
     private:
-        // Carves every model buffer out of one slab. Runs after the layout is known,
-        // because that is what sizes them.
-        void allocate_model_buffers();
-
-        // Zeroes and seeds what allocate_model_buffers only reserved. Separate because a
-        // slab is uninitialized memory and every one of these is read before it is
-        // written on the first tick.
+        // Zeroes and seeds what Codegen::allocate_cell_model_memory only reserved. A slab
+        // is uninitialized memory and every one of these is read before it is written on
+        // the first tick.
         void initialize_model_buffers();
-
-        void initialize_cell_state();
 
         void collect_stimulus();
 
-        void log_weight_matrix();
+        // Builds the k^2-tree and the weight and delay basis from network_data, with
+        // matrix_count planes: weight, delay and one per synapse state variable. Also writes
+        // the synapse planes' starting state and the device copy of the projection runs.
+        void build_weight_matrix(s64 matrix_count);
+
+        // Fills kernel_argument_sources, and refuses a master_step parameter the engine has
+        // nothing to bind to.
+        void register_kernel_arguments();
+
+        // The population neuron_index belongs to, with its first neuron, or nullptr.
+        [[nodiscard]] const NML_ComponentInstance *population_of_neuron(s64 neuron_index, s64 &first_neuron) const;
+
+        // Where one neuron's variable sits in cell_state.
+        [[nodiscard]] s64 cell_memory_index_of(s64 neuron_index, const String &variable_name) const;
 
         // Replaces whatever connections the document declared with `adjacency`, all
         // carrying one synapse prototype. Runs before the layout is computed, so

@@ -1,23 +1,394 @@
 #include "spikecorec/nml/dynamics.h"
 
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <memory>
 #include <sstream>
 
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/log.h"
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
+#include "spikecorec/core/weight_matrix.h"
 #include "spikecorec/nml/node.h"
 #include "spikecorec/nml/parser.h"
+
+#ifndef SPIKECOREC_METAL_DEVICE_DIR
+#define SPIKECOREC_METAL_DEVICE_DIR ""
+#endif
 
 using namespace spikecorec;
 using namespace std;
 
 namespace spikecorec::nml {
 
+namespace {
+
+// Names the generated dynamics read from master_step. A LEMS name equal to one of these
+// would be captured by the substitutions, so it is refused.
+const Set<String> ENGINE_NAMES = {
+    "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true"};
+
+// Names the generated synapse dynamics read from the propagate walk, on top of ENGINE_NAMES.
+const Set<String> SYNAPSE_ENGINE_NAMES = {
+    "target", "current_edge", "arrived", "next_row", "network_inputs", "neuron_count", "synapse_prototype",
+    "basis_u", "basis_v", "edge_coefficients", "rank_float4_stride", "sparse_delta_row_start",
+    "sparse_delta_edge_ordinal", "sparse_delta_value", "sparse_delta_capacity", "pending_delta_edge_ordinal",
+    "pending_delta_value", "pending_delta_matrix_index", "pending_delta_count", "pending_delta_capacity",
+    "projection_first_edge_ordinal", "projection_synapse_prototype", "projection_run_count"};
+
+const String DERIVED_PREFIX = "derived_";
+const String DERIVATIVE_PREFIX = "derivative_";
+
+// An edge returns to rest once every state variable is this small against its OnEvent increment.
+const String REST_FRACTION = "1e-06f";
+
+// LEMS function name -> neutral kernel function name.
+const UnorderedMap<String, String> LEMS_FUNCTIONS = {
+    {"exp", "exp"},   {"ln", "log"},    {"log", "log10"}, {"sqrt", "sqrt"},
+    {"abs", "fabs"},  {"ceil", "ceil"}, {"floor", "floor"}, {"pow", "pow"},
+    {"sin", "sin"},   {"cos", "cos"},   {"tan", "tan"},
+    {"sinh", "sinh"}, {"cosh", "cosh"}, {"tanh", "tanh"},
+    {"H", "heaviside"},
+};
+
+String float_literal(f64 value) {
+    if (!std::isfinite(value)) throw runtime_error("Cannot bake the non-finite value " + std::to_string(value) + " into a kernel");
+    std::ostringstream text;
+    text << std::setprecision(9) << value;
+    String literal = text.str();
+    if (literal.find_first_of(".e") == String::npos) literal += ".0";
+    return literal + "f";
+}
+
+KernelNode *identifier(const String &name) {
+    return new_node(KernelNodeType::IDENTIFIER, name);
+}
+
+KernelNode *literal(const String &text) {
+    return new_node(KernelNodeType::LITERAL, text);
+}
+
+bool starts_with(const String &text, const String &prefix) {
+    return text.rfind(prefix, 0) == 0;
+}
+
+KernelListNode *function_call(const String &name, const Vector<KernelNode *> &arguments) {
+    KernelListNode *call = new_node<ListNode>(KernelNodeType::FUNCTION_CALL, name);
+    call->children = arguments;
+    return call;
+}
+
+// The walking thread's neuron is the edge's source.
+KernelNode *edge_source() {
+    return new_cast(new_type("s32"), identifier("neuron_index"));
+}
+
+// The current edge's value in plane, read through the weight matrix.
+KernelNode *load_edge(s64 plane) {
+    return function_call("spikecorec_load_edge", {
+        identifier("basis_u"), identifier("basis_v"), identifier("edge_coefficients"), identifier("rank_float4_stride"),
+        identifier("sparse_delta_row_start"), identifier("sparse_delta_edge_ordinal"), identifier("sparse_delta_value"),
+        identifier("neuron_count"), identifier("sparse_delta_capacity"), literal(std::to_string(plane)),
+        edge_source(), identifier("target"), identifier("current_edge")});
+}
+
+// Adds delta to the current edge's value in plane.
+KernelNode *accumulate_edge(s64 plane, KernelNode *delta) {
+    return function_call("spikecorec_accumulate_edge", {
+        identifier("sparse_delta_row_start"), identifier("sparse_delta_edge_ordinal"), identifier("sparse_delta_value"),
+        identifier("pending_delta_edge_ordinal"), identifier("pending_delta_value"),
+        identifier("pending_delta_matrix_index"), identifier("pending_delta_count"), identifier("pending_delta_capacity"),
+        identifier("neuron_count"), identifier("sparse_delta_capacity"), literal(std::to_string(plane)),
+        edge_source(), identifier("current_edge"), delta});
+}
+
+// True while the current edge holds a correction in plane, which for a state plane means its
+// synapse is away from rest.
+KernelNode *edge_holds_correction(s64 plane) {
+    KernelNode *index = function_call("spikecorec_edge_correction_index", {
+        identifier("sparse_delta_row_start"), identifier("sparse_delta_edge_ordinal"), identifier("neuron_count"),
+        identifier("sparse_delta_capacity"), literal(std::to_string(plane)), edge_source(), identifier("current_edge")});
+    return new_expression(">=", index, literal("0"));
+}
+
+// A name the generated synapse dynamics use themselves.
+bool is_synapse_engine_name(const String &name) {
+    return ENGINE_NAMES.count(name) || SYNAPSE_ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) ||
+           starts_with(name, DERIVATIVE_PREFIX);
+}
+
+// Every name a LEMS expression reads; function names are not reads.
+void collect_lems_identifiers(const LemsParseNode *node, Set<String> &names) {
+    if (!node) return;
+    if (node->body.syntax_type == LemsNodeSubtype::IDENTIFIER) {
+        names.insert(node->body.token.lexeme);
+        return;
+    }
+    if (node->body.syntax_type == LemsNodeSubtype::FUNCTION_CALL) {
+        for (const LemsParseNode *argument : children_of(static_cast<const BinaryNode<LemsParseBody> *>(node)->right)) {
+            collect_lems_identifiers(argument, names);
+        }
+        return;
+    }
+    if (const auto *unary = dynamic_cast<const UnaryNode<LemsParseBody> *>(node)) {
+        collect_lems_identifiers(unary->child, names);
+    } else if (const auto *binary = dynamic_cast<const BinaryNode<LemsParseBody> *>(node)) {
+        collect_lems_identifiers(binary->left, names);
+        collect_lems_identifiers(binary->right, names);
+    }
+}
+
+} // namespace
+
+// Host-side value of a LEMS expression, for OnStart values and derived parameters.
+f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &values, const String &owner_name) {
+    const String &lexeme = node->body.token.lexeme;
+    switch (node->body.syntax_type) {
+        case LemsNodeSubtype::FLOAT:
+        case LemsNodeSubtype::INT:
+            return std::stod(lexeme);
+
+        case LemsNodeSubtype::IDENTIFIER: {
+            auto value = values.find(lexeme);
+            if (value == values.end()) throw runtime_error("'" + lexeme + "' has no value in " + owner_name);
+            return value->second;
+        }
+
+        case LemsNodeSubtype::OPERATOR: {
+            if (const auto *unary = dynamic_cast<const UnaryNode<LemsParseBody> *>(node)) {
+                const f64 operand = evaluate_lems(unary->child, values, owner_name);
+                return lexeme == "-" ? -operand : operand;
+            }
+            const auto *binary = static_cast<const BinaryNode<LemsParseBody> *>(node);
+            const f64 left = evaluate_lems(binary->left, values, owner_name);
+            const f64 right = evaluate_lems(binary->right, values, owner_name);
+            if (lexeme == "+") return left + right;
+            if (lexeme == "-") return left - right;
+            if (lexeme == "*") return left * right;
+            if (lexeme == "/") return left / right;
+            if (lexeme == ">") return left > right ? 1.0 : 0.0;
+            if (lexeme == "<") return left < right ? 1.0 : 0.0;
+            if (lexeme == ">=") return left >= right ? 1.0 : 0.0;
+            if (lexeme == "<=") return left <= right ? 1.0 : 0.0;
+            if (lexeme == "==") return left == right ? 1.0 : 0.0;
+            if (lexeme == "!=") return left != right ? 1.0 : 0.0;
+            if (lexeme == "&&") return (left != 0.0 && right != 0.0) ? 1.0 : 0.0;
+            if (lexeme == "||") return (left != 0.0 || right != 0.0) ? 1.0 : 0.0;
+            throw runtime_error("Operator '" + lexeme + "' cannot be evaluated in " + owner_name);
+        }
+
+        case LemsNodeSubtype::FUNCTION_CALL: {
+            static const UnorderedMap<String, f64 (*)(f64)> functions = {
+                {"exp", [](f64 value) { return std::exp(value); }},
+                {"ln", [](f64 value) { return std::log(value); }},
+                {"log", [](f64 value) { return std::log10(value); }},
+                {"sqrt", [](f64 value) { return std::sqrt(value); }},
+                {"abs", [](f64 value) { return std::fabs(value); }},
+                {"ceil", [](f64 value) { return std::ceil(value); }},
+                {"floor", [](f64 value) { return std::floor(value); }},
+                {"sin", [](f64 value) { return std::sin(value); }},
+                {"cos", [](f64 value) { return std::cos(value); }},
+                {"tan", [](f64 value) { return std::tan(value); }},
+                {"sinh", [](f64 value) { return std::sinh(value); }},
+                {"cosh", [](f64 value) { return std::cosh(value); }},
+                {"tanh", [](f64 value) { return std::tanh(value); }},
+                {"H", [](f64 value) { return value >= 0.0 ? 1.0 : 0.0; }},
+            };
+            const auto *call = static_cast<const BinaryNode<LemsParseBody> *>(node);
+            Vector<f64> arguments;
+            for (const LemsParseNode *argument : children_of(call->right)) {
+                arguments.push_back(evaluate_lems(argument, values, owner_name));
+            }
+            if (lexeme == "pow" && arguments.size() == 2) return std::pow(arguments[0], arguments[1]);
+            auto function = functions.find(lexeme);
+            if (function == functions.end() || arguments.size() != 1) {
+                throw runtime_error("Function '" + lexeme + "' cannot be evaluated in " + owner_name);
+            }
+            return function->second(arguments[0]);
+        }
+
+        default:
+            throw runtime_error("Malformed LEMS expression in " + owner_name);
+    }
+}
+
+f64 evaluate_lems(const String &expression, const UnorderedMap<String, f64> &values, const String &owner_name) {
+    std::unique_ptr<LemsParseNode> tree(parse_lems_expression(expression, owner_name));
+    return evaluate_lems(tree.get(), values, owner_name);
+}
+
+// Every Parameter, Constant and DerivedParameter the cell's type resolves, in SI units. An
+// unset parameter is left out; using one fails as an unresolved name.
+UnorderedMap<String, f64> component_parameter_values(const NML_Context &context, const NML_ComponentInstance &cell) {
+    const NML_ComponentType &component_type = *cell.component_type;
+    UnorderedMap<String, f64> values;
+    Vector<const NML_Node *> derived_parameters;
+
+    for (const NML_ComponentType *type = &component_type; type; type = type->extends) {
+        for (const NML_Node *element : children_of(type->source_node)) {
+            const NML_Tag &tag = element->body;
+            if (tag.tag_type != NML_DeclarationType::Parameter && tag.tag_type != NML_DeclarationType::Constant &&
+                tag.tag_type != NML_DeclarationType::DerivedParameter) {
+                continue;
+            }
+            // A subtype's declaration of the same name shadows this one.
+            if (component_type.find_declaration(tag.namespace_key()) != element) continue;
+
+            const String name = tag.get_attribute("name");
+            if (tag.tag_type == NML_DeclarationType::Parameter) {
+                if (cell.has_value(name)) values[name] = context.resolve_quantity(cell.value_or(name));
+            } else if (tag.tag_type == NML_DeclarationType::Constant) {
+                values[name] = context.resolve_quantity(tag.get_attribute("value"));
+            } else if (tag.has_attribute("value")) {
+                derived_parameters.push_back(element);
+            }
+        }
+    }
+
+    // Derived parameters can use each other, so each pass resolves those whose inputs are known.
+    bool resolved_one = true;
+    while (resolved_one && !derived_parameters.empty()) {
+        resolved_one = false;
+        for (usize index = 0; index < derived_parameters.size();) {
+            const NML_Tag &tag = derived_parameters[index]->body;
+            std::unique_ptr<LemsParseNode> tree(parse_lems_expression(tag.get_attribute("value"), component_type.name));
+
+            Set<String> inputs;
+            collect_lems_identifiers(tree.get(), inputs);
+            const bool inputs_known = std::all_of(inputs.begin(), inputs.end(),
+                    [&values](const String &input) { return values.count(input) != 0; });
+            if (!inputs_known) {
+                index += 1;
+                continue;
+            }
+
+            values[tag.get_attribute("name")] = evaluate_lems(tree.get(), values, component_type.name);
+            derived_parameters.erase(derived_parameters.begin() + index);
+            resolved_one = true;
+        }
+    }
+    return values;
+}
+
+UnorderedMap<String, f64> starting_values(const NML_Context &context, const NML_ComponentInstance &cell) {
+    const NML_ComponentType &component_type = *cell.component_type;
+    const Vector<String> &variable_names = component_type.state_variable_names;
+
+    UnorderedMap<String, f64> values = component_parameter_values(context, cell);
+    for (const String &name : variable_names) values[name] = 0.0;
+
+    // In order, so a value may use the state assigned above it.
+    for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+        if (entry.source_tag != NML_DeclarationType::OnStart) continue;
+        if (std::find(variable_names.begin(), variable_names.end(), entry.target) == variable_names.end()) {
+            throw runtime_error("OnStart in " + component_type.name + " assigns '" + entry.target +
+                                "', which is not a state variable");
+        }
+        values[entry.target] = evaluate_lems(entry.expression, values, component_type.name);
+    }
+    return values;
+}
+
+// The target network's populations, in document order.
+Vector<const NML_ComponentInstance *> network_populations(const NML_Context &context) {
+    Vector<const NML_ComponentInstance *> populations;
+    const NML_ComponentInstance *network = context.find_instance(context.simulation.target_network_id);
+    if (!network) return populations;
+
+    for (const String &child_id : network->data_order) {
+        const NML_ComponentInstance *population = context.find_instance(child_id);
+        if (context.is_instance_of(population, "population")) populations.push_back(population);
+    }
+    return populations;
+}
+
+// Rows in the spike_history ring. Every delay is at least one tick and a row written this
+// tick is never one a delayed arrival reads, so the ring is never shorter than two.
+s64 spike_history_length(const NML_Context &context) {
+    return std::max<s64>(2, context.simulation.maximum_edge_delay + 1);
+}
+
+const NML_ComponentInstance &population_cell(const NML_Context &context, const NML_ComponentInstance &population) {
+    const NML_ComponentInstance *cell = context.find_instance(population.value_or("component"));
+    if (!cell || !cell->component_type) {
+        throw runtime_error("Population '" + population.id + "' references no declared cell");
+    }
+    return *cell;
+}
+
+namespace {
+
+// The child slots of node that hold uses of names. Declared names, parameters, types,
+// function names and member names are left out.
+Vector<KernelNode **> use_slots(KernelNode *node) {
+    Vector<KernelNode **> slots;
+    switch (node->body.syntax_type) {
+        case KernelNodeType::LITERAL:
+        case KernelNodeType::IDENTIFIER:
+        case KernelNodeType::PARAMETER:
+        case KernelNodeType::PARAMETER_LIST:
+        case KernelNodeType::ATTRIBUTE:
+        case KernelNodeType::TYPE:
+        case KernelNodeType::POINTER:
+        case KernelNodeType::REFERENCE:
+        case KernelNodeType::INCLUDE:
+        case KernelNodeType::DEFINE:
+        case KernelNodeType::USING_NAMESPACE:
+            return slots;
+
+        case KernelNodeType::DECLARATION: {
+            KernelTrinaryNode *declaration = static_cast<KernelTrinaryNode *>(node);
+            // An array's size is a use; its name is not.
+            if (declaration->middle->body.syntax_type == KernelNodeType::EXPRESSION) {
+                slots.push_back(&static_cast<KernelBinaryNode *>(declaration->middle)->right);
+            }
+            slots.push_back(&declaration->right);
+            return slots;
+        }
+
+        case KernelNodeType::CAST:
+            slots.push_back(&static_cast<KernelBinaryNode *>(node)->right);
+            return slots;
+
+        case KernelNodeType::DEVICE_FUNCTION_IMPL:
+        case KernelNodeType::KERNEL_FUNCTION_IMPL:
+            slots.push_back(&static_cast<KernelListNode *>(node)->children[3]);
+            return slots;
+
+        default:
+            break;
+    }
+
+    if (node->body.syntax_type == KernelNodeType::EXPRESSION && (node->body.token == "." || node->body.token == "->")) {
+        slots.push_back(&static_cast<KernelBinaryNode *>(node)->left);
+        return slots;
+    }
+
+    if (KernelListNode *list = dynamic_cast<KernelListNode *>(node)) {
+        for (KernelNode *&child : list->children) slots.push_back(&child);
+    } else if (KernelTrinaryNode *trinary = dynamic_cast<KernelTrinaryNode *>(node)) {
+        slots.push_back(&trinary->left);
+        slots.push_back(&trinary->middle);
+        slots.push_back(&trinary->right);
+    } else if (KernelBinaryNode *binary = dynamic_cast<KernelBinaryNode *>(node)) {
+        slots.push_back(&binary->left);
+        slots.push_back(&binary->right);
+    } else if (KernelUnaryNode *unary = dynamic_cast<KernelUnaryNode *>(node)) {
+        slots.push_back(&unary->child);
+    }
+    return slots;
+}
+
+} // namespace
+
 void Codegen::allocate_cell_model_memory() {
     device->partition(sizeof(f32) * context.get_cell_state_size(), EngineDatatype::FLOAT32, data_partitions)            // cell_state
-          .partition(sizeof(s64) * 2 * context.simulation.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)   // network_inputs
-          .partition(sizeof(u8) * (context.simulation.maximum_edge_delay + 1) * context.simulation.total_neuron_count,
+          .partition(sizeof(f32) * 2 * context.simulation.total_neuron_count, EngineDatatype::FLOAT32, data_partitions)    // network_inputs
+          .partition(sizeof(u8) * spike_history_length(context) * context.simulation.total_neuron_count,
                      EngineDatatype::UNSIGNED8, data_partitions)                                                           // spike_history
           .partition(sizeof(s64) * context.simulation.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)       // last_spiked
           .partition(sizeof(f32), EngineDatatype::FLOAT32, data_partitions);                                               // empty_edge_plane
@@ -27,15 +398,55 @@ void Codegen::allocate_cell_model_memory() {
 
     log::logger().debug("Codegen: {} bytes: cell_state {}, network_inputs {}, spike_history {}, last_spiked {}",
                         slab.total_bytes, context.get_cell_state_size(), 2 * context.simulation.total_neuron_count,
-                        (context.simulation.maximum_edge_delay + 1) * context.simulation.total_neuron_count,
+                        spike_history_length(context) * context.simulation.total_neuron_count,
                         context.simulation.total_neuron_count);
+}
+
+Codegen::~Codegen() {
+    delete root;
+    for (auto &[type_name, template_body] : component_type_templates) delete template_body;
+    for (auto &[type_name, template_body] : synapse_type_templates) delete template_body;
+}
+
+void Codegen::initialize_cell_state() {
+    if (data_partitions.empty()) throw runtime_error("initialize_cell_state: cell memory is not allocated");
+    f32 *cell_state = data_partitions[0].get_contents_as<f32>();
+
+    for (const NML_ComponentInstance *population : network_populations(context)) {
+        const NML_ComponentInstance &cell = population_cell(context, *population);
+        const NML_ComponentType &component_type = *cell.component_type;
+        const Vector<String> &variable_names = component_type.state_variable_names;
+
+        const UnorderedMap<String, f64> values = starting_values(context, cell);
+        Vector<f32> starting_state;
+        for (const String &name : variable_names) starting_state.push_back(static_cast<f32>(values.at(name)));
+
+        const s64 population_base = context.simulation.population_base_indices.at(population->id);
+        const s64 population_size = context.get_population_size(population);
+        const s64 variable_count = static_cast<s64>(variable_names.size());
+        for (s64 local_index = 0; local_index < population_size; local_index += 1) {
+            std::copy(starting_state.begin(), starting_state.end(),
+                      cell_state + population_base + local_index * variable_count);
+        }
+    }
 }
 
 // AST construction
 
-KernelNode *new_declaration(const String &type, const String &name, KernelNode *value) {
-    KernelBinaryNode *declaration = new_node<BinaryNode>(KernelNodeType::DECLARATION, type);
-    declaration->left = new_node(KernelNodeType::IDENTIFIER, name);
+KernelNode *new_type(const String &type) {
+    return new_node(KernelNodeType::TYPE, type);
+}
+
+KernelNode *new_pointer(KernelNode *pointee) {
+    KernelUnaryNode *pointer = new_node<UnaryNode>(KernelNodeType::POINTER, "");
+    pointer->child = pointee;
+    return pointer;
+}
+
+KernelNode *new_declaration(KernelNode *type, const String &name, KernelNode *value) {
+    KernelTrinaryNode *declaration = new_node<TrinaryNode>(KernelNodeType::DECLARATION, "");
+    declaration->left = type;
+    declaration->middle = identifier(name);
     declaration->right = value;
     return declaration;
 }
@@ -54,10 +465,21 @@ KernelNode *new_expression(const String &expression_operator, KernelNode *left, 
     return expression;
 }
 
-KernelNode *new_cast(const String &type, KernelNode *value) {
-    KernelUnaryNode *cast = new_node<UnaryNode>(KernelNodeType::CAST, type);
-    cast->child = value;
+KernelNode *new_unary_expression(const String &expression_operator, KernelNode *operand) {
+    KernelUnaryNode *expression = new_node<UnaryNode>(KernelNodeType::EXPRESSION, expression_operator);
+    expression->child = operand;
+    return expression;
+}
+
+KernelNode *new_cast(KernelNode *type, KernelNode *value) {
+    KernelBinaryNode *cast = new_node<BinaryNode>(KernelNodeType::CAST, "");
+    cast->left = type;
+    cast->right = value;
     return cast;
+}
+
+KernelListNode *new_block() {
+    return new_node<ListNode>(KernelNodeType::BLOCK, "");
 }
 
 KernelListNode *new_conditional() {
@@ -76,24 +498,838 @@ void add_branch(KernelListNode *conditional, KernelNode *test, KernelNode *body)
     conditional->children.push_back(branch);
 }
 
+// Tree operations
+
+KernelListNode *find_function(KernelNode *program, const String &name) {
+    for (KernelNode *item : static_cast<KernelListNode *>(program)->children) {
+        const KernelNodeType type = item->body.syntax_type;
+        if (type != KernelNodeType::DEVICE_FUNCTION_IMPL && type != KernelNodeType::KERNEL_FUNCTION_IMPL) continue;
+
+        KernelListNode *function = static_cast<KernelListNode *>(item);
+        if (function->children[1]->body.token == name) return function;
+    }
+    return nullptr;
+}
+
+s64 find_statement(KernelListNode *block, const String &name) {
+    for (usize index = 0; index < block->children.size(); index += 1) {
+        KernelNode *statement = block->children[index];
+        KernelNode *named = nullptr;
+        if (statement->body.syntax_type == KernelNodeType::DECLARATION) {
+            named = static_cast<KernelTrinaryNode *>(statement)->middle;
+            if (named->body.syntax_type == KernelNodeType::EXPRESSION) named = static_cast<KernelBinaryNode *>(named)->left;
+        } else if (statement->body.syntax_type == KernelNodeType::ASSIGNMENT) {
+            named = static_cast<KernelBinaryNode *>(statement)->left;
+        }
+        if (named && named->body.syntax_type == KernelNodeType::IDENTIFIER && named->body.token == name) {
+            return static_cast<s64>(index);
+        }
+    }
+    return -1;
+}
+
+void insert_statements(KernelListNode *block, usize index, const Vector<KernelNode *> &statements) {
+    if (index > block->children.size()) throw runtime_error("insert_statements: index past the end of the block");
+    block->children.insert(block->children.begin() + index, statements.begin(), statements.end());
+}
+
+KernelNode *clone(const KernelNode *node) {
+    if (!node) return nullptr;
+
+    if (const KernelListNode *list = dynamic_cast<const KernelListNode *>(node)) {
+        KernelListNode *copy = new KernelListNode(list->body);
+        for (const KernelNode *child : list->children) copy->children.push_back(clone(child));
+        return copy;
+    }
+    if (const KernelTrinaryNode *trinary = dynamic_cast<const KernelTrinaryNode *>(node)) {
+        KernelTrinaryNode *copy = new KernelTrinaryNode(trinary->body);
+        copy->left = clone(trinary->left);
+        copy->middle = clone(trinary->middle);
+        copy->right = clone(trinary->right);
+        return copy;
+    }
+    if (const KernelBinaryNode *binary = dynamic_cast<const KernelBinaryNode *>(node)) {
+        KernelBinaryNode *copy = new KernelBinaryNode(binary->body);
+        copy->left = clone(binary->left);
+        copy->right = clone(binary->right);
+        return copy;
+    }
+    if (const KernelUnaryNode *unary = dynamic_cast<const KernelUnaryNode *>(node)) {
+        KernelUnaryNode *copy = new KernelUnaryNode(unary->body);
+        copy->child = clone(unary->child);
+        return copy;
+    }
+    return new KernelNode(node->body);
+}
+
+void replace_identifier(KernelNode *&node, const String &name, const KernelNode *replacement) {
+    if (!node) return;
+    if (node->body.syntax_type == KernelNodeType::IDENTIFIER) {
+        if (node->body.token != name) return;
+        delete node;
+        node = clone(replacement);
+        return;
+    }
+    for (KernelNode **slot : use_slots(node)) replace_identifier(*slot, name, replacement);
+}
+
+void collect_identifiers(const KernelNode *node, Set<String> &names) {
+    if (!node) return;
+    if (node->body.syntax_type == KernelNodeType::IDENTIFIER) {
+        names.insert(node->body.token);
+        return;
+    }
+    for (KernelNode **slot : use_slots(const_cast<KernelNode *>(node))) collect_identifiers(*slot, names);
+}
+
+void bake_parameter(KernelListNode *function, const String &name, const KernelNode *value) {
+    KernelListNode *parameters = static_cast<KernelListNode *>(function->children[2]);
+    auto parameter = std::find_if(parameters->children.begin(), parameters->children.end(), [&name](KernelNode *candidate) {
+        return static_cast<KernelTrinaryNode *>(candidate)->middle->body.token == name;
+    });
+    if (parameter == parameters->children.end()) {
+        throw runtime_error("bake_parameter: " + function->children[1]->body.token + " has no parameter '" + name + "'");
+    }
+    delete *parameter;
+    parameters->children.erase(parameter);
+    replace_identifier(function->children[3], name, value);
+}
+
 // AST generation
 
 KernelNode *Codegen::create_kernel_root() {
+    const char *boilerplate = backend == KernelBackend::METAL ? METAL_KERNEL_BOILERPLATE : CUDA_KERNEL_BOILERPLATE;
+    std::unique_ptr<KernelListNode> program(KernelParser(tokenize_kernel(boilerplate, backend), backend).parse_program());
+
+    // Metal's k^2-tree helpers are shared with the precompiled kernels, so they stay in their own
+    // file and go in ahead of the first function that calls them.
+    if (backend == KernelBackend::METAL) {
+        const String helpers_path = String(SPIKECOREC_METAL_DEVICE_DIR) + "/k2tree_device.metalinc";
+        std::ifstream helpers_file(helpers_path);
+        if (!helpers_file) throw runtime_error("create_kernel_root: cannot read " + helpers_path);
+        std::stringstream helpers_text;
+        helpers_text << helpers_file.rdbuf();
+
+        std::unique_ptr<KernelListNode> helpers(
+                KernelParser(tokenize_kernel(helpers_text.str(), backend), backend).parse_program());
+
+        auto first_function = std::find_if(program->children.begin(), program->children.end(), [](KernelNode *item) {
+            return item->body.syntax_type == KernelNodeType::DEVICE_FUNCTION_IMPL ||
+                   item->body.syntax_type == KernelNodeType::KERNEL_FUNCTION_IMPL;
+        });
+        program->children.insert(first_function, helpers->children.begin(), helpers->children.end());
+        helpers->children.clear();
+    }
+
+    delete root;
+    root = program.release();
+    return root;
 }
 
 KernelNode *Codegen::translate_kernel_code() {
+    create_kernel_root();
+
+    KernelListNode *master_step = find_function(root, "master_step");
+    if (!master_step) throw runtime_error("translate_kernel_code: the boilerplate has no master_step");
+    KernelListNode *body = static_cast<KernelListNode *>(master_step->children[3]);
+
+    // One branch per population, over its range of neurons.
+    KernelListNode *dispatch = new_conditional();
+    s64 first_neuron = 0;
+    try {
+        for (const NML_ComponentInstance *population : network_populations(context)) {
+            const s64 population_size = context.get_population_size(population);
+            if (population_size == 0) continue;
+
+            KernelListNode *population_body = translate_component_instance(*population, first_neuron);
+            KernelNode *test = new_expression("<", identifier("neuron_index"),
+                                              literal(std::to_string(first_neuron + population_size)));
+            add_branch(dispatch, test, population_body);
+            first_neuron += population_size;
+        }
+    } catch (...) {
+        delete dispatch;
+        throw;
+    }
+
+    const s64 spiked_index = find_statement(body, "spiked");
+    if (spiked_index < 0) {
+        delete dispatch;
+        throw runtime_error("translate_kernel_code: master_step declares no 'spiked'");
+    }
+    if (dispatch->children.empty()) {
+        delete dispatch;
+    } else {
+        insert_statements(body, static_cast<usize>(spiked_index) + 1, {dispatch});
+    }
+
+    // Each edge runs its prototype's synapse, numbered in synapse_instances order as the
+    // engine numbers the projection runs.
+    const Vector<NML_ComponentInstance> &synapses = context.simulation.synapse_instances;
+    if (!synapses.empty()) {
+        KernelListNode *walk = nullptr;
+        s64 arrived_index = -1;
+        for (KernelNode *statement : body->children) {
+            if (statement->body.syntax_type != KernelNodeType::WHILE) continue;
+            KernelListNode *loop_body = static_cast<KernelListNode *>(static_cast<KernelBinaryNode *>(statement)->right);
+            arrived_index = find_statement(loop_body, "arrived");
+            if (arrived_index < 0) continue;
+            walk = loop_body;
+            break;
+        }
+        if (!walk) throw runtime_error("translate_kernel_code: master_step's propagate walk declares no 'arrived'");
+
+        Vector<KernelNode *> statements;
+        if (synapses.size() == 1) {
+            KernelListNode *synapse_body = translate_synapse_instance(synapses[0]);
+            statements = synapse_body->children;
+            synapse_body->children.clear();
+            delete synapse_body;
+        } else {
+            KernelListNode *prototypes = new_conditional();
+            try {
+                for (usize prototype = 0; prototype < synapses.size(); prototype += 1) {
+                    add_branch(prototypes,
+                               new_expression("==", identifier("synapse_prototype"), literal(std::to_string(prototype))),
+                               translate_synapse_instance(synapses[prototype]));
+                }
+            } catch (...) {
+                delete prototypes;
+                throw;
+            }
+            statements.push_back(new_declaration(
+                    new_type("const s32"), "synapse_prototype",
+                    function_call("spikecorec_synapse_prototype",
+                                  {identifier("projection_first_edge_ordinal"), identifier("projection_synapse_prototype"),
+                                   identifier("projection_run_count"), identifier("current_edge")})));
+            statements.push_back(prototypes);
+        }
+        insert_statements(walk, static_cast<usize>(arrived_index) + 1, statements);
+    }
+
+    // Constant for the whole run, so baked in rather than bound. Last, so the inserted
+    // dynamics' uses are baked too.
+    const std::unique_ptr<KernelNode> neuron_count(literal(std::to_string(context.simulation.total_neuron_count)));
+    const std::unique_ptr<KernelNode> history_length(literal(std::to_string(spike_history_length(context))));
+    bake_parameter(master_step, "neuron_count", neuron_count.get());
+    bake_parameter(master_step, "spike_history_length", history_length.get());
+    return root;
 }
 
-KernelNode *Codegen::translate_component_type(NML_ComponentType &component_type) {
+namespace {
+
+// Each derived variable declared once as derived_<name>, placed so a variable comes after
+// the ones it reads. A select's value comes from selected_value.
+void place_derived_variables(KernelListNode *body, const Vector<String> &derived_names,
+                             const UnorderedMap<String, Vector<const NML_DynamicsExpression *>> &derived_entries,
+                             const std::function<KernelNode *(const String &)> &translate,
+                             const std::function<KernelNode *(const NML_DynamicsExpression &)> &selected_value,
+                             const std::function<runtime_error(const String &)> &unsupported,
+                             Set<String> &lems_names) {
+    UnorderedMap<String, Vector<KernelNode *>> derived_statements;
+    UnorderedMap<String, Set<String>> derived_dependencies;
+    for (const String &name : derived_names) {
+        const Vector<const NML_DynamicsExpression *> &entries = derived_entries.at(name);
+        Vector<KernelNode *> &statements = derived_statements[name];
+        lems_names.insert(name);
+
+        if (entries.front()->source_tag == NML_DeclarationType::DerivedVariable) {
+            const NML_DynamicsExpression &entry = *entries.front();
+            KernelNode *value = nullptr;
+            if (!entry.select.empty()) {
+                value = selected_value(entry);
+            } else if (!entry.expression.empty()) {
+                value = translate(entry.expression);
+            } else {
+                throw unsupported("DerivedVariable '" + name + "' has neither value nor select");
+            }
+            statements.push_back(new_declaration(new_type("const f32"), DERIVED_PREFIX + name, value));
+        } else {
+            statements.push_back(new_declaration(new_type("f32"), DERIVED_PREFIX + name, literal("0.0f")));
+            KernelListNode *cases = new_conditional();
+            for (const NML_DynamicsExpression *entry : entries) {
+                KernelListNode *case_body = new_block();
+                case_body->children.push_back(
+                        new_assignment(identifier(DERIVED_PREFIX + name), "=", translate(entry->expression)));
+                add_branch(cases, entry->condition.empty() ? nullptr : translate(entry->condition), case_body);
+            }
+            statements.push_back(cases);
+        }
+
+        Set<String> used_names;
+        for (const KernelNode *statement : statements) collect_identifiers(statement, used_names);
+        for (const String &used_name : used_names) {
+            if (used_name != name && derived_entries.count(used_name)) derived_dependencies[name].insert(used_name);
+        }
+    }
+
+    UnorderedMap<String, s32> visit_state;
+    std::function<void(const String &)> place_derived = [&](const String &name) {
+        if (visit_state[name] == 2) return;
+        if (visit_state[name] == 1) throw unsupported("derived variable '" + name + "' depends on itself");
+        visit_state[name] = 1;
+        for (const String &dependency : derived_dependencies[name]) place_derived(dependency);
+        visit_state[name] = 2;
+        for (KernelNode *statement : derived_statements[name]) body->children.push_back(statement);
+    };
+    for (const String &name : derived_names) place_derived(name);
 }
 
-KernelNode *Codegen::translate_component_instance(NML_ComponentInstance &component_instance) {
+} // namespace
+
+// The type's dynamics with LEMS names still in them: per population, translate_component_instance
+// puts each state variable's cell_state slot and each parameter's value in their place.
+//
+// Order: derived variables (by dependency), the refractory flag, every derivative into a
+// temporary, the Euler steps, then the OnConditions. All derivatives read the state from before
+// the step, and all conditions see the state after it.
+KernelListNode *Codegen::translate_component_type(const NML_ComponentType &component_type) {
+    auto cached = component_type_templates.find(component_type.name);
+    if (cached != component_type_templates.end()) return cached->second;
+
+    const String &owner_name = component_type.name;
+    auto unsupported = [&owner_name](const String &reason) {
+        return runtime_error("ComponentType '" + owner_name + "': " + reason);
+    };
+
+    struct EventHandler {
+        String regime_name;
+        String test;
+        Vector<const NML_DynamicsExpression *> assignments;
+        bool emits_spike = false;
+        String transition;
+    };
+
+    // Sort the flat entries by kind.
+    Vector<std::pair<String, bool>> regimes;
+    Vector<String> derived_names;
+    UnorderedMap<String, Vector<const NML_DynamicsExpression *>> derived_entries;
+    Vector<const NML_DynamicsExpression *> derivative_entries;
+    Vector<EventHandler> handlers;
+    UnorderedMap<String, Vector<const NML_DynamicsExpression *>> entry_assignments;
+
+    enum class Group { NONE, HANDLER, ENTRY };
+    Group group = Group::NONE;
+    for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+        switch (entry.source_tag) {
+            case NML_DeclarationType::Regime:
+                regimes.push_back({entry.target, entry.expression == "true"});
+                group = Group::NONE;
+                break;
+            case NML_DeclarationType::DerivedVariable:
+            case NML_DeclarationType::Case:
+                if (derived_entries.count(entry.target) == 0) derived_names.push_back(entry.target);
+                derived_entries[entry.target].push_back(&entry);
+                group = Group::NONE;
+                break;
+            case NML_DeclarationType::TimeDerivative:
+                derivative_entries.push_back(&entry);
+                group = Group::NONE;
+                break;
+            case NML_DeclarationType::OnStart:
+                group = Group::NONE;
+                break;
+            case NML_DeclarationType::OnCondition:
+                handlers.push_back({entry.regime_name, entry.expression, {}, false, ""});
+                group = Group::HANDLER;
+                break;
+            case NML_DeclarationType::OnEntry:
+                group = Group::ENTRY;
+                break;
+            case NML_DeclarationType::OnEvent:
+                throw unsupported("OnEvent is not supported in cell dynamics");
+            case NML_DeclarationType::StateAssignment:
+                if (group == Group::HANDLER) handlers.back().assignments.push_back(&entry);
+                else if (group == Group::ENTRY) entry_assignments[entry.regime_name].push_back(&entry);
+                break;
+            case NML_DeclarationType::EventOut:
+                if (group != Group::HANDLER) throw unsupported("EventOut is only supported in an OnCondition");
+                handlers.back().emits_spike = true;
+                break;
+            case NML_DeclarationType::Transition:
+                if (group != Group::HANDLER) throw unsupported("Transition is only supported in an OnCondition");
+                handlers.back().transition = entry.target;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Regimes: only the integrating / refractory pair, lowered to a test on last_spiked. The
+    // refractory regime's timer, its OnEntry and its Transitions all collapse into that test.
+    String active_regime;
+    String refractory_regime;
+    String timer_name;
+    std::unique_ptr<KernelNode> refractory_duration;
+
+    if (regimes.size() > 2) throw unsupported("only an integrating / refractory regime pair is supported");
+    if (regimes.size() == 1) active_regime = regimes[0].first;
+    if (regimes.size() == 2) {
+        if (regimes[0].second == regimes[1].second) throw unsupported("exactly one regime must be initial");
+        active_regime = regimes[0].second ? regimes[0].first : regimes[1].first;
+        refractory_regime = regimes[0].second ? regimes[1].first : regimes[0].first;
+
+        Vector<const EventHandler *> exits;
+        for (const EventHandler &handler : handlers) {
+            if (handler.regime_name == refractory_regime) exits.push_back(&handler);
+        }
+        if (exits.size() != 1 || exits[0]->transition != active_regime || !exits[0]->assignments.empty() ||
+            exits[0]->emits_spike) {
+            throw unsupported("the refractory regime must have exactly one OnCondition, a plain Transition back");
+        }
+
+        // The exit test is timer .geq. duration (or .gt.).
+        std::unique_ptr<LemsParseNode> exit_test(parse_lems_expression(exits[0]->test, owner_name));
+        const auto *comparison = dynamic_cast<const BinaryNode<LemsParseBody> *>(exit_test.get());
+        const String comparison_operator = exit_test->body.token.lexeme;
+        if (!comparison || exit_test->body.syntax_type != LemsNodeSubtype::OPERATOR ||
+            (comparison_operator != ">=" && comparison_operator != ">") ||
+            comparison->left->body.syntax_type != LemsNodeSubtype::IDENTIFIER) {
+            throw unsupported("the refractory exit must test a timer against a duration");
+        }
+        timer_name = comparison->left->body.token.lexeme;
+        refractory_duration.reset(translate_expression(comparison->right));
+
+        for (const NML_DynamicsExpression *derivative : derivative_entries) {
+            if (derivative->regime_name != refractory_regime) continue;
+            if (derivative->target != timer_name || evaluate_lems(derivative->expression, {}, owner_name) != 1.0) {
+                throw unsupported("the refractory regime may only count time in '" + timer_name + "'");
+            }
+        }
+        if (!entry_assignments[active_regime].empty()) throw unsupported("OnEntry is only supported in the refractory regime");
+
+        // Entering refractory happens exactly when an active OnCondition transitions into it, so
+        // the OnEntry assignments other than the timer's move into those handlers.
+        for (EventHandler &handler : handlers) {
+            if (handler.regime_name != active_regime) continue;
+            if (handler.transition.empty()) continue;
+            if (handler.transition != refractory_regime) throw unsupported("unknown Transition '" + handler.transition + "'");
+            for (const NML_DynamicsExpression *assignment : entry_assignments[refractory_regime]) {
+                if (assignment->target != timer_name) handler.assignments.push_back(assignment);
+            }
+        }
+    }
+    for (const EventHandler &handler : handlers) {
+        if (refractory_regime.empty() && !handler.transition.empty()) throw unsupported("Transition without a regime pair");
+    }
+
+    const bool has_refractory = !refractory_regime.empty();
+    auto is_gated = [&](const String &regime_name) { return has_refractory && regime_name == active_regime; };
+
+    Set<String> lems_names;
+    auto translate = [&](const String &expression) {
+        KernelNode *node = translate_lems(expression, owner_name);
+        collect_identifiers(node, lems_names);
+        return node;
+    };
+    const String step_dt = float_literal(context.simulation.step_dt);
+
+    // Phase 1 synapses are current-based, so a summed select is the drained input.
+    auto selected_value = [&unsupported](const NML_DynamicsExpression &entry) -> KernelNode * {
+        if (entry.reduce != "add") throw unsupported("DerivedVariable '" + entry.target + "' selects without reduce=\"add\"");
+        return identifier("network_input");
+    };
+    KernelListNode *body = new_block();
+    place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
+
+    // refractory = last_spiked >= 0 && (tick - last_spiked) * dt < duration
+    if (has_refractory) {
+        KernelNode *last_spike = new_expression("[]", identifier("last_spiked"), identifier("neuron_index"));
+        KernelNode *has_spiked = new_expression(">=", last_spike, literal("0"));
+        KernelNode *elapsed = new_expression(
+                "*", new_cast(new_type("f32"), new_expression("-", identifier("tick"), clone(last_spike))), literal(step_dt));
+        KernelNode *within_duration = new_expression("<", elapsed, refractory_duration.release());
+        body->children.push_back(new_declaration(
+                new_type("const bool"), "refractory", new_expression("&&", has_spiked, within_duration)));
+    }
+
+    // Every derivative from the pre-step state, then every Euler step.
+    KernelListNode *gated = new_block();
+    Vector<KernelNode *> updates;
+    Set<String> integrated_names;
+    for (const NML_DynamicsExpression *derivative : derivative_entries) {
+        if (has_refractory && derivative->regime_name == refractory_regime) continue;
+        if (!integrated_names.insert(derivative->target).second) {
+            throw unsupported("'" + derivative->target + "' has more than one TimeDerivative");
+        }
+        lems_names.insert(derivative->target);
+
+        body->children.push_back(new_declaration(
+                new_type("const f32"), DERIVATIVE_PREFIX + derivative->target, translate(derivative->expression)));
+        KernelNode *update = new_assignment(
+                identifier(derivative->target), "+=",
+                new_expression("*", literal(step_dt), identifier(DERIVATIVE_PREFIX + derivative->target)));
+        (is_gated(derivative->regime_name) ? gated->children : updates).push_back(update);
+    }
+    for (KernelNode *update : updates) body->children.push_back(update);
+
+    // OnConditions, after every step.
+    Vector<KernelNode *> conditions;
+    for (const EventHandler &handler : handlers) {
+        if (has_refractory && handler.regime_name == refractory_regime) continue;
+
+        KernelListNode *handler_body = new_block();
+        for (const NML_DynamicsExpression *assignment : handler.assignments) {
+            lems_names.insert(assignment->target);
+            handler_body->children.push_back(
+                    new_assignment(identifier(assignment->target), "=", translate(assignment->expression)));
+        }
+        if (handler.emits_spike) handler_body->children.push_back(new_assignment(identifier("spiked"), "=", identifier("true")));
+
+        KernelListNode *condition = new_conditional();
+        add_branch(condition, translate(handler.test), handler_body);
+        (is_gated(handler.regime_name) ? gated->children : conditions).push_back(condition);
+    }
+
+    if (gated->children.empty()) {
+        delete gated;
+    } else {
+        KernelListNode *integrating = new_conditional();
+        add_branch(integrating, new_unary_expression("!", identifier("refractory")), gated);
+        body->children.push_back(integrating);
+    }
+    for (KernelNode *condition : conditions) body->children.push_back(condition);
+
+    for (const String &name : lems_names) {
+        if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX)) {
+            delete body;
+            throw unsupported("the name '" + name + "' is reserved by the generated kernel");
+        }
+    }
+
+    // Derived variables are read through their declared locals, and t is the tick's time.
+    KernelNode *body_node = body;
+    for (const String &name : derived_names) {
+        const std::unique_ptr<KernelNode> local(identifier(DERIVED_PREFIX + name));
+        replace_identifier(body_node, name, local.get());
+    }
+    const std::unique_ptr<KernelNode> tick_time(new_expression(
+            "*", new_cast(new_type("f32"), identifier("tick")), literal(step_dt)));
+    replace_identifier(body_node, "t", tick_time.get());
+
+    component_type_templates[component_type.name] = body;
+    return body;
 }
 
-KernelNode *Codegen::translate_expression(NML_DynamicsExpression &expression) {
+// The population's dynamics: the type's template with every state variable replaced by its
+// slot in cell_state and every parameter by its value.
+KernelListNode *Codegen::translate_component_instance(const NML_ComponentInstance &population, s64 first_neuron) {
+    const NML_ComponentInstance &cell = population_cell(context, population);
+    const NML_ComponentType &component_type = *cell.component_type;
+    KernelNode *body = clone(translate_component_type(component_type));
+
+    try {
+        // Neuron n's variable at offset is cell_state[n * count + base - first_neuron * count + offset].
+        const Vector<String> &variable_names = component_type.state_variable_names;
+        const s64 variable_count = static_cast<s64>(variable_names.size());
+        const s64 population_base = context.simulation.population_base_indices.at(population.id);
+        for (usize offset = 0; offset < variable_names.size(); offset += 1) {
+            const s64 constant_part = population_base - first_neuron * variable_count + static_cast<s64>(offset);
+            const std::unique_ptr<KernelNode> slot(new_expression(
+                    "[]", identifier("cell_state"),
+                    new_expression(constant_part < 0 ? "-" : "+",
+                                   new_expression("*", identifier("neuron_index"), literal(std::to_string(variable_count))),
+                                   literal(std::to_string(std::llabs(constant_part))))));
+            replace_identifier(body, variable_names[offset], slot.get());
+        }
+
+        for (const auto &[name, value] : component_parameter_values(context, cell)) {
+            const std::unique_ptr<KernelNode> value_literal(literal(float_literal(value)));
+            replace_identifier(body, name, value_literal.get());
+        }
+
+        Set<String> remaining_names;
+        collect_identifiers(body, remaining_names);
+        for (const String &name : remaining_names) {
+            if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX)) continue;
+            throw runtime_error("ComponentType '" + component_type.name + "' (cell '" + cell.id + "'): '" + name +
+                                "' is not a state variable, a set parameter, a constant or a derived variable");
+        }
+    } catch (...) {
+        delete body;
+        throw;
+    }
+    return static_cast<KernelListNode *>(body);
 }
 
-f64 Codegen::get_starting_parameters(NML_DynamicsExpression &expression) {
+// The synapse's dynamics for the current edge, with LEMS names still in them. Each state
+// variable lives in its own weight-matrix plane, so a read is a load_edge and a write is an
+// accumulate_edge of the change.
+//
+// It runs on the tick a spike arrives and on every tick the edge holds state, which is every
+// tick its synapse is away from rest. Order: derived variables, every derivative into a
+// temporary, the Euler steps, the OnEvent on an arrival, the current into the target, then the
+// return to rest once the state has decayed.
+KernelListNode *Codegen::translate_synapse_type(const NML_ComponentType &component_type) {
+    auto cached = synapse_type_templates.find(component_type.name);
+    if (cached != synapse_type_templates.end()) return cached->second;
+
+    const String &owner_name = component_type.name;
+    auto unsupported = [&owner_name](const String &reason) {
+        return runtime_error("Synapse ComponentType '" + owner_name + "': " + reason);
+    };
+
+    const Vector<String> &variable_names = component_type.state_variable_names;
+    auto plane_of = [&](const String &variable_name) -> s64 {
+        auto variable = std::find(variable_names.begin(), variable_names.end(), variable_name);
+        if (variable == variable_names.end()) throw unsupported("'" + variable_name + "' is not a state variable");
+        return WeightMatrix::FIRST_STATE_MATRIX_INDEX + static_cast<s64>(variable - variable_names.begin());
+    };
+
+    // Sort the flat entries by kind.
+    Vector<String> derived_names;
+    UnorderedMap<String, Vector<const NML_DynamicsExpression *>> derived_entries;
+    Vector<const NML_DynamicsExpression *> derivative_entries;
+    Vector<const NML_DynamicsExpression *> event_assignments;
+    bool receives_spikes = false;
+    bool in_event = false;
+    for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+        switch (entry.source_tag) {
+            case NML_DeclarationType::DerivedVariable:
+            case NML_DeclarationType::Case:
+                if (derived_entries.count(entry.target) == 0) derived_names.push_back(entry.target);
+                derived_entries[entry.target].push_back(&entry);
+                in_event = false;
+                break;
+            case NML_DeclarationType::TimeDerivative:
+                derivative_entries.push_back(&entry);
+                in_event = false;
+                break;
+            case NML_DeclarationType::OnStart:
+                in_event = false;
+                break;
+            case NML_DeclarationType::OnEvent:
+                if (entry.target != "in") throw unsupported("OnEvent on port '" + entry.target + "': a synapse only receives spikes on \"in\"");
+                receives_spikes = true;
+                in_event = true;
+                break;
+            case NML_DeclarationType::StateAssignment:
+                if (!in_event) throw unsupported("a StateAssignment outside OnStart and OnEvent");
+                event_assignments.push_back(&entry);
+                break;
+            case NML_DeclarationType::Regime:
+            case NML_DeclarationType::OnCondition:
+            case NML_DeclarationType::OnEntry:
+            case NML_DeclarationType::EventOut:
+            case NML_DeclarationType::Transition:
+                throw unsupported("only OnEvent, TimeDerivative and DerivedVariable are supported in a synapse");
+            default:
+                break;
+        }
+    }
+    if (!receives_spikes) throw unsupported("no OnEvent port=\"in\", so no spike ever drives it");
+    const bool exposes_current = derived_entries.count("i") != 0 ||
+                                 std::find(variable_names.begin(), variable_names.end(), "i") != variable_names.end();
+    if (!exposes_current) throw unsupported("no current 'i' to deliver to the target");
+
+    Set<String> lems_names;
+    auto translate = [&](const String &expression) {
+        KernelNode *node = translate_lems(expression, owner_name);
+        collect_identifiers(node, lems_names);
+        return node;
+    };
+    auto selected_value = [&unsupported](const NML_DynamicsExpression &entry) -> KernelNode * {
+        throw unsupported("DerivedVariable '" + entry.target + "' selects, which a synapse cannot");
+    };
+    const String step_dt = float_literal(context.simulation.step_dt);
+
+    KernelListNode *active = new_block();
+    place_derived_variables(active, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
+
+    // Every derivative from the pre-step state, then every Euler step.
+    Set<String> integrated_names;
+    Vector<KernelNode *> updates;
+    for (const NML_DynamicsExpression *derivative : derivative_entries) {
+        if (!integrated_names.insert(derivative->target).second) {
+            throw unsupported("'" + derivative->target + "' has more than one TimeDerivative");
+        }
+        lems_names.insert(derivative->target);
+        active->children.push_back(new_declaration(
+                new_type("const f32"), DERIVATIVE_PREFIX + derivative->target, translate(derivative->expression)));
+        updates.push_back(accumulate_edge(
+                plane_of(derivative->target),
+                new_expression("*", literal(step_dt), identifier(DERIVATIVE_PREFIX + derivative->target))));
+    }
+    for (KernelNode *update : updates) active->children.push_back(update);
+
+    // The OnEvent, as the change each assignment makes.
+    KernelListNode *on_arrival = new_block();
+    Vector<KernelNode *> increments;
+    for (const NML_DynamicsExpression *assignment : event_assignments) {
+        lems_names.insert(assignment->target);
+        KernelNode *increment = new_expression("-", translate(assignment->expression), identifier(assignment->target));
+        increments.push_back(clone(increment));
+        on_arrival->children.push_back(accumulate_edge(plane_of(assignment->target), increment));
+    }
+    KernelListNode *arrival = new_conditional();
+    add_branch(arrival, identifier("arrived"), on_arrival);
+    active->children.push_back(arrival);
+
+    // The current, into the target's next input row.
+    KernelNode *input_slot = new_expression(
+            "[]", identifier("network_inputs"),
+            new_expression("+", new_expression("*", identifier("next_row"), identifier("neuron_count")), identifier("target")));
+    active->children.push_back(function_call("atomic_add", {input_slot, identifier("i")}));
+
+    // Back to rest once every state variable is negligible against what one spike adds:
+    // zeroing the corrections makes the edge inactive until its next arrival.
+    if (!variable_names.empty() && !increments.empty()) {
+        KernelNode *scale = function_call("fabs", {increments[0]});
+        for (usize index = 1; index < increments.size(); index += 1) {
+            scale = function_call("fmax", {scale, function_call("fabs", {increments[index]})});
+        }
+        const std::unique_ptr<KernelNode> tolerance(new_expression("*", literal(REST_FRACTION), scale));
+
+        KernelNode *at_rest = new_unary_expression("!", identifier("arrived"));
+        KernelListNode *rest = new_block();
+        for (const String &variable_name : variable_names) {
+            lems_names.insert(variable_name);
+            at_rest = new_expression("&&", at_rest,
+                                     new_expression("<=", function_call("fabs", {identifier(variable_name)}), clone(tolerance.get())));
+            rest->children.push_back(
+                    accumulate_edge(plane_of(variable_name), new_unary_expression("-", identifier(variable_name))));
+        }
+        KernelListNode *return_to_rest = new_conditional();
+        add_branch(return_to_rest, at_rest, rest);
+        active->children.push_back(return_to_rest);
+    } else {
+        for (KernelNode *increment : increments) delete increment;
+    }
+
+    // Only on an arrival or while the edge holds state.
+    KernelNode *runs = identifier("arrived");
+    for (const String &variable_name : variable_names) {
+        runs = new_expression("||", runs, edge_holds_correction(plane_of(variable_name)));
+    }
+    KernelListNode *gate = new_conditional();
+    add_branch(gate, runs, active);
+    KernelListNode *body = new_block();
+    body->children.push_back(gate);
+
+    for (const String &name : lems_names) {
+        if (is_synapse_engine_name(name)) {
+            delete body;
+            throw unsupported("the name '" + name + "' is reserved by the generated kernel");
+        }
+    }
+
+    // Derived variables are read through their declared locals, and t is the tick's time.
+    KernelNode *body_node = body;
+    for (const String &name : derived_names) {
+        const std::unique_ptr<KernelNode> local(identifier(DERIVED_PREFIX + name));
+        replace_identifier(body_node, name, local.get());
+    }
+    const std::unique_ptr<KernelNode> tick_time(new_expression(
+            "*", new_cast(new_type("f32"), identifier("tick")), literal(step_dt)));
+    replace_identifier(body_node, "t", tick_time.get());
+
+    synapse_type_templates[component_type.name] = body;
+    return body;
+}
+
+KernelListNode *Codegen::translate_synapse_instance(const NML_ComponentInstance &synapse) {
+    if (!synapse.component_type) throw runtime_error("Synapse '" + synapse.id + "' has no ComponentType");
+    const NML_ComponentType &component_type = *synapse.component_type;
+    KernelNode *body = clone(translate_synapse_type(component_type));
+
+    try {
+        for (const auto &[name, value] : component_parameter_values(context, synapse)) {
+            const std::unique_ptr<KernelNode> value_literal(literal(float_literal(value)));
+            replace_identifier(body, name, value_literal.get());
+        }
+
+        // weight is the connection's, stored in the weight plane.
+        const std::unique_ptr<KernelNode> edge_weight(load_edge(WeightMatrix::DEFAULT_MATRIX_INDEX));
+        replace_identifier(body, "weight", edge_weight.get());
+
+        const Vector<String> &variable_names = component_type.state_variable_names;
+        for (usize offset = 0; offset < variable_names.size(); offset += 1) {
+            const std::unique_ptr<KernelNode> stored(load_edge(WeightMatrix::FIRST_STATE_MATRIX_INDEX + static_cast<s64>(offset)));
+            replace_identifier(body, variable_names[offset], stored.get());
+        }
+
+        Set<String> remaining_names;
+        collect_identifiers(body, remaining_names);
+        for (const String &name : remaining_names) {
+            if (is_synapse_engine_name(name)) continue;
+            throw runtime_error("Synapse ComponentType '" + component_type.name + "' ('" + synapse.id + "'): '" + name +
+                                "' is not a state variable, a set parameter, a constant, a derived variable or weight");
+        }
+    } catch (...) {
+        delete body;
+        throw;
+    }
+    return static_cast<KernelListNode *>(body);
+}
+
+s64 Codegen::edge_plane_count() const {
+    s64 state_variable_count = 0;
+    for (const NML_ComponentInstance &synapse : context.simulation.synapse_instances) {
+        if (!synapse.component_type) throw runtime_error("Synapse '" + synapse.id + "' has no ComponentType");
+        state_variable_count = std::max<s64>(state_variable_count, synapse.component_type->state_variable_names.size());
+    }
+    return WeightMatrix::FIRST_STATE_MATRIX_INDEX + state_variable_count;
+}
+
+KernelNode *Codegen::translate_expression(const LemsParseNode *node) {
+    const String &lexeme = node->body.token.lexeme;
+    switch (node->body.syntax_type) {
+        case LemsNodeSubtype::FLOAT:
+        case LemsNodeSubtype::INT:
+            // Always a float, so 1/2 is never integer division.
+            return literal(float_literal(std::stod(lexeme)));
+
+        case LemsNodeSubtype::IDENTIFIER:
+            return identifier(lexeme);
+
+        case LemsNodeSubtype::OPERATOR: {
+            if (const auto *unary = dynamic_cast<const UnaryNode<LemsParseBody> *>(node)) {
+                return new_unary_expression(lexeme, translate_expression(unary->child));
+            }
+            const auto *binary = static_cast<const BinaryNode<LemsParseBody> *>(node);
+            KernelNode *left = translate_expression(binary->left);
+            return new_expression(lexeme, left, translate_expression(binary->right));
+        }
+
+        case LemsNodeSubtype::FUNCTION_CALL: {
+            auto function = LEMS_FUNCTIONS.find(lexeme);
+            if (function == LEMS_FUNCTIONS.end()) throw runtime_error("LEMS function '" + lexeme + "' has no kernel equivalent");
+
+            KernelListNode *call = new_node<ListNode>(KernelNodeType::FUNCTION_CALL, function->second);
+            for (const LemsParseNode *argument : children_of(static_cast<const BinaryNode<LemsParseBody> *>(node)->right)) {
+                call->children.push_back(translate_expression(argument));
+            }
+            return call;
+        }
+
+        default:
+            throw runtime_error("Malformed LEMS expression '" + lexeme + "'");
+    }
+}
+
+KernelNode *Codegen::translate_lems(const String &expression, const String &owner_name) {
+    std::unique_ptr<LemsParseNode> tree(parse_lems_expression(expression, owner_name));
+    return translate_expression(tree.get());
+}
+
+void Codegen::bake_kernel_constant(const String &name, s64 value) {
+    KernelListNode *master_step = root ? find_function(root, "master_step") : nullptr;
+    if (!master_step) throw runtime_error("bake_kernel_constant: there is no master_step until translate_kernel_code runs");
+    const std::unique_ptr<KernelNode> value_literal(literal(std::to_string(value)));
+    bake_parameter(master_step, name, value_literal.get());
+}
+
+Vector<String> Codegen::kernel_parameter_names() const {
+    Vector<String> names;
+    KernelListNode *master_step = root ? find_function(root, "master_step") : nullptr;
+    if (!master_step) return names;
+
+    for (KernelNode *parameter_node : static_cast<KernelListNode *>(master_step->children[2])->children) {
+        KernelTrinaryNode *parameter = static_cast<KernelTrinaryNode *>(parameter_node);
+        if (parameter->right) continue;
+        names.push_back(parameter->middle->body.token);
+    }
+    return names;
 }
 
 // code generation
@@ -130,6 +1366,12 @@ String Codegen::compile(KernelNode *node) {
         case KernelNodeType::JUMP:                 return jump_to_string(node);
         case KernelNodeType::ATTRIBUTE:            return attribute_to_string(node);
         case KernelNodeType::PROGRAM:              return program_to_string(node);
+        case KernelNodeType::TYPE:                 return type_to_string(node->body.token);
+        case KernelNodeType::POINTER:              return pointer_to_string(node);
+        case KernelNodeType::REFERENCE:            return compile(static_cast<KernelUnaryNode *>(node)->child) + " &";
+        case KernelNodeType::INCLUDE:              return "#include " + node->body.token;
+        case KernelNodeType::DEFINE:               return define_to_string(node);
+        case KernelNodeType::USING_NAMESPACE:      return "using namespace " + node->body.token + ";";
         case KernelNodeType::CONDITIONAL_BRANCH:
         case KernelNodeType::PARAMETER:
         case KernelNodeType::PARAMETER_LIST:       break;
@@ -138,7 +1380,12 @@ String Codegen::compile(KernelNode *node) {
 }
 
 String Codegen::compile_or_empty(KernelNode *node) {
-    return node ? compile(node) : String();
+    return node ? compile_unparenthesized(node) : String();
+}
+
+String Codegen::compile_unparenthesized(KernelNode *node) {
+    if (node->body.syntax_type == KernelNodeType::EXPRESSION) return expression_to_string(node, false);
+    return compile(node);
 }
 
 // Words that are neutral type names are mapped; qualifiers and platform-only types pass through.
@@ -155,9 +1402,28 @@ String Codegen::type_to_string(const String &type) const {
     return source;
 }
 
+String Codegen::pointer_to_string(KernelNode *node) {
+    KernelUnaryNode *pointer = static_cast<KernelUnaryNode *>(node);
+    String source = compile(pointer->child) + " *";
+    if (!pointer->body.token.empty()) source += " " + pointer->body.token;
+    return source;
+}
+
+String Codegen::define_to_string(KernelNode *node) {
+    KernelBinaryNode *define = static_cast<KernelBinaryNode *>(node);
+    String source = "#define " + compile(define->left);
+    if (define->right) source += " " + compile(define->right);
+    return source;
+}
+
+// Directives and using lines one per line; functions separated by a blank line.
 String Codegen::program_to_string(KernelNode *node) {
     String source;
-    for (KernelNode *item : static_cast<KernelListNode *>(node)->children) source += compile(item) + "\n\n";
+    for (KernelNode *item : static_cast<KernelListNode *>(node)->children) {
+        const KernelNodeType type = item->body.syntax_type;
+        const bool is_function = type == KernelNodeType::DEVICE_FUNCTION_IMPL || type == KernelNodeType::KERNEL_FUNCTION_IMPL;
+        source += is_function ? "\n" + compile(item) + "\n" : compile(item) + "\n";
+    }
     return source;
 }
 
@@ -166,34 +1432,55 @@ String Codegen::attribute_to_string(KernelNode *node) {
     return "[[ " + node->body.token + " ]]";
 }
 
-// The tree is the precedence, so operators are fully parenthesized.
-String Codegen::expression_to_string(KernelNode *node) {
+// The tree is the precedence, so operators are fully parenthesized unless the place the
+// expression sits already delimits it.
+String Codegen::expression_to_string(KernelNode *node, bool parenthesize) {
     const String &expression_operator = node->body.token;
+    const String open = parenthesize ? "(" : "";
+    const String close = parenthesize ? ")" : "";
+
     if (KernelBinaryNode *binary = dynamic_cast<KernelBinaryNode *>(node)) {
-        if (expression_operator == "[]") return compile(binary->left) + "[" + compile(binary->right) + "]";
+        if (expression_operator == "[]") return compile(binary->left) + "[" + compile_unparenthesized(binary->right) + "]";
         if (expression_operator == "." || expression_operator == "->")
             return compile(binary->left) + expression_operator + compile(binary->right);
-        return "(" + compile(binary->left) + " " + expression_operator + " " + compile(binary->right) + ")";
+        return open + compile(binary->left) + " " + expression_operator + " " + compile(binary->right) + close;
     }
     if (KernelUnaryNode *unary = dynamic_cast<KernelUnaryNode *>(node))
-        return "(" + expression_operator + compile(unary->child) + ")";
+        return open + expression_operator + compile(unary->child) + close;
     if (KernelTrinaryNode *ternary = dynamic_cast<KernelTrinaryNode *>(node))
-        return "(" + compile(ternary->left) + " ? " + compile(ternary->middle) + " : " + compile(ternary->right) + ")";
+        return open + compile(ternary->left) + " ? " + compile(ternary->middle) + " : " + compile(ternary->right) + close;
     throw runtime_error("EXPRESSION node has no operands");
 }
 
 String Codegen::cast_to_string(KernelNode *node) {
-    KernelUnaryNode *cast = static_cast<KernelUnaryNode *>(node);
-    return "((" + type_to_string(cast->body.token) + ")" + compile(cast->child) + ")";
+    KernelBinaryNode *cast = static_cast<KernelBinaryNode *>(node);
+    return "((" + compile(cast->left) + ")" + compile(cast->right) + ")";
 }
 
+// Neutral names that differ per backend are mapped; every other name passes through.
 String Codegen::function_call_to_string(KernelNode *node) {
-    String arguments;
-    for (KernelNode *argument : static_cast<KernelListNode *>(node)->children) {
-        if (!arguments.empty()) arguments += ", ";
-        arguments += compile(argument);
+    const Vector<KernelNode *> &arguments = static_cast<KernelListNode *>(node)->children;
+    const String &name = node->body.token;
+
+    // atomic_add(target, value): target is the slot itself, not its address.
+    if (name == "atomic_add") {
+        if (arguments.size() != 2) throw runtime_error("atomic_add takes a target and a value");
+        if (backend == KernelBackend::METAL) {
+            return "atomic_fetch_add_explicit((device atomic_float *)&(" + compile_unparenthesized(arguments[0]) + "), " +
+                   compile_unparenthesized(arguments[1]) + ", memory_order_relaxed)";
+        }
+        return "atomicAdd(&(" + compile_unparenthesized(arguments[0]) + "), " + compile_unparenthesized(arguments[1]) + ")";
     }
-    return node->body.token + "(" + arguments + ")";
+
+    static const UnorderedMap<String, String> function_spellings = {{"heaviside", "spikecorec_heaviside"}};
+    auto spelling = function_spellings.find(name);
+
+    String source = (spelling == function_spellings.end() ? name : spelling->second) + "(";
+    for (usize index = 0; index < arguments.size(); index += 1) {
+        if (index > 0) source += ", ";
+        source += compile_unparenthesized(arguments[index]);
+    }
+    return source + ")";
 }
 
 // The block adds the semicolons, so declarations and assignments can be reused in loop headers.
@@ -205,7 +1492,7 @@ String Codegen::block_to_string(KernelNode *node) {
     String source = "{\n";
     indentation_depth += 1;
     for (KernelNode *statement : static_cast<KernelListNode *>(node)->children) {
-        source += String(4 * indentation_depth, ' ') + compile(statement);
+        source += String(4 * indentation_depth, ' ') + compile_unparenthesized(statement);
         if (compound_statements.count(statement->body.syntax_type) == 0) source += ";";
         source += "\n";
     }
@@ -214,15 +1501,15 @@ String Codegen::block_to_string(KernelNode *node) {
 }
 
 String Codegen::declaration_to_string(KernelNode *node) {
-    KernelBinaryNode *declaration = static_cast<KernelBinaryNode *>(node);
-    String source = type_to_string(declaration->body.token) + " " + compile(declaration->left);
-    if (declaration->right) source += " = " + compile(declaration->right);
+    KernelTrinaryNode *declaration = static_cast<KernelTrinaryNode *>(node);
+    String source = compile(declaration->left) + " " + compile(declaration->middle);
+    if (declaration->right) source += " = " + compile_unparenthesized(declaration->right);
     return source;
 }
 
 String Codegen::assignment_to_string(KernelNode *node) {
     KernelBinaryNode *assignment = static_cast<KernelBinaryNode *>(node);
-    return compile(assignment->left) + " " + assignment->body.token + " " + compile(assignment->right);
+    return compile(assignment->left) + " " + assignment->body.token + " " + compile_unparenthesized(assignment->right);
 }
 
 String Codegen::conditional_to_string(KernelNode *node) {
@@ -230,7 +1517,7 @@ String Codegen::conditional_to_string(KernelNode *node) {
     for (KernelNode *branch_node : static_cast<KernelListNode *>(node)->children) {
         KernelBinaryNode *branch = static_cast<KernelBinaryNode *>(branch_node);
         if (!source.empty()) source += " else ";
-        if (branch->left) source += "if (" + compile(branch->left) + ") ";
+        if (branch->left) source += "if (" + compile_unparenthesized(branch->left) + ") ";
         source += compile(branch->right);
     }
     return source;
@@ -244,13 +1531,13 @@ String Codegen::for_to_string(KernelNode *node) {
 
 String Codegen::while_to_string(KernelNode *node) {
     KernelBinaryNode *loop = static_cast<KernelBinaryNode *>(node);
-    return "while (" + compile(loop->left) + ") " + compile(loop->right);
+    return "while (" + compile_unparenthesized(loop->left) + ") " + compile(loop->right);
 }
 
 String Codegen::jump_to_string(KernelNode *node) {
     KernelUnaryNode *jump = static_cast<KernelUnaryNode *>(node);
     if (!jump->child) return jump->body.token;
-    return jump->body.token + " " + compile(jump->child);
+    return jump->body.token + " " + compile_unparenthesized(jump->child);
 }
 
 // Metal buffer indices come from position, so inserting a parameter never renumbers anything by hand.
@@ -258,9 +1545,9 @@ String Codegen::parameters_to_string(KernelNode *node, bool number_buffers) {
     String source;
     s64 buffer_index = 0;
     for (KernelNode *parameter_node : static_cast<KernelListNode *>(node)->children) {
-        KernelBinaryNode *parameter = static_cast<KernelBinaryNode *>(parameter_node);
+        KernelTrinaryNode *parameter = static_cast<KernelTrinaryNode *>(parameter_node);
         if (!source.empty()) source += ",";
-        source += "\n    " + type_to_string(parameter->body.token) + " " + compile(parameter->left);
+        source += "\n    " + compile(parameter->left) + " " + compile(parameter->middle);
         if (parameter->right) {
             source += " " + compile(parameter->right);
         } else if (number_buffers && backend == KernelBackend::METAL) {
@@ -272,18 +1559,17 @@ String Codegen::parameters_to_string(KernelNode *node, bool number_buffers) {
 }
 
 String Codegen::device_function_impl_to_string(KernelNode *node) {
-    KernelTrinaryNode *function = static_cast<KernelTrinaryNode *>(node);
+    const Vector<KernelNode *> &parts = static_cast<KernelListNode *>(node)->children;
     const String qualifier = backend == KernelBackend::METAL ? "inline " : "__device__ inline ";
-    return qualifier + type_to_string(function->body.token) + " " + compile(function->left) +
-           "(" + parameters_to_string(function->middle, false) + ") " + compile(function->right);
+    return qualifier + compile(parts[0]) + " " + compile(parts[1]) +
+           "(" + parameters_to_string(parts[2], false) + ") " + compile(parts[3]);
 }
 
 String Codegen::kernel_function_impl_to_string(KernelNode *node) {
-    KernelTrinaryNode *function = static_cast<KernelTrinaryNode *>(node);
+    const Vector<KernelNode *> &parts = static_cast<KernelListNode *>(node)->children;
     const String qualifier = backend == KernelBackend::METAL ? "kernel " : "extern \"C\" __global__ ";
-    return qualifier + type_to_string(function->body.token) + " " + compile(function->left) +
-           "(" + parameters_to_string(function->middle, true) + ") " + compile(function->right);
+    return qualifier + compile(parts[0]) + " " + compile(parts[1]) +
+           "(" + parameters_to_string(parts[2], true) + ") " + compile(parts[3]);
 }
 
 }
-

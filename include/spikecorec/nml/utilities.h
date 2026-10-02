@@ -56,6 +56,10 @@ struct AdjacencyList {
         }
     }
 
+    void clear() {
+        list.clear();
+    }
+
     bool in_network(s64 node_index) {
         return (node_index >= 0 && node_index < static_cast<s64>(list.size()));
     }

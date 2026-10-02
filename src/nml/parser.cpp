@@ -32,6 +32,106 @@ bool is_document_scope_directive(const String &tag_name) {
     return directives.count(tag_name) != 0;
 }
 
+// One entry per StateAssignment, EventOut and Transition inside an event handler.
+void collect_event_actions(const NML_Node *handler, const String &regime_name, const String &condition,
+                           Vector<NML_DynamicsExpression> &dynamics) {
+    for (const NML_Node *action : children_of(handler)) {
+        const NML_Tag &tag = action->body;
+        NML_DynamicsExpression entry(tag.tag_type);
+        entry.regime_name = regime_name;
+        entry.condition = condition;
+
+        if (tag.tag_type == NML_DeclarationType::StateAssignment) {
+            entry.target = tag.get_attribute("variable");
+            entry.expression = tag.get_attribute("value");
+        } else if (tag.tag_type == NML_DeclarationType::EventOut) {
+            entry.target = tag.get_attribute("port");
+        } else if (tag.tag_type == NML_DeclarationType::Transition) {
+            entry.target = tag.get_attribute("regime");
+        } else {
+            continue;
+        }
+        dynamics.push_back(std::move(entry));
+    }
+}
+
+// Flattens a <Dynamics> or <Regime> element into dynamics entries, in document order.
+// OnStart assignments are entries of their own (source_tag OnStart); OnCondition, OnEntry
+// and OnEvent are followed by the entries of their actions.
+void collect_dynamics(const NML_Node *element, const String &regime_name,
+                      Vector<NML_DynamicsExpression> &dynamics) {
+    for (const NML_Node *child : children_of(element)) {
+        const NML_Tag &tag = child->body;
+        NML_DynamicsExpression entry(tag.tag_type);
+        entry.regime_name = regime_name;
+
+        switch (tag.tag_type) {
+            case NML_DeclarationType::DerivedVariable:
+                entry.target = tag.get_attribute("name");
+                entry.expression = tag.get_attribute("value");
+                entry.select = tag.get_attribute("select");
+                entry.reduce = tag.get_attribute("reduce");
+                dynamics.push_back(std::move(entry));
+                break;
+
+            case NML_DeclarationType::ConditionalDerivedVariable:
+                for (const NML_Node *case_node : children_of(child)) {
+                    if (case_node->body.tag_type != NML_DeclarationType::Case) continue;
+                    NML_DynamicsExpression case_entry(NML_DeclarationType::Case);
+                    case_entry.regime_name = regime_name;
+                    case_entry.target = tag.get_attribute("name");
+                    case_entry.condition = case_node->body.get_attribute("condition");
+                    case_entry.expression = case_node->body.get_attribute("value");
+                    dynamics.push_back(std::move(case_entry));
+                }
+                break;
+
+            case NML_DeclarationType::TimeDerivative:
+                entry.target = tag.get_attribute("variable");
+                entry.expression = tag.get_attribute("value");
+                dynamics.push_back(std::move(entry));
+                break;
+
+            case NML_DeclarationType::OnStart:
+                for (const NML_Node *assignment : children_of(child)) {
+                    if (assignment->body.tag_type != NML_DeclarationType::StateAssignment) continue;
+                    NML_DynamicsExpression start_entry(NML_DeclarationType::OnStart);
+                    start_entry.target = assignment->body.get_attribute("variable");
+                    start_entry.expression = assignment->body.get_attribute("value");
+                    dynamics.push_back(std::move(start_entry));
+                }
+                break;
+
+            case NML_DeclarationType::OnCondition:
+                entry.expression = tag.get_attribute("test");
+                dynamics.push_back(entry);
+                collect_event_actions(child, regime_name, entry.expression, dynamics);
+                break;
+
+            case NML_DeclarationType::OnEntry:
+                dynamics.push_back(entry);
+                collect_event_actions(child, regime_name, "", dynamics);
+                break;
+
+            case NML_DeclarationType::OnEvent:
+                entry.target = tag.get_attribute("port");
+                dynamics.push_back(entry);
+                collect_event_actions(child, regime_name, "", dynamics);
+                break;
+
+            case NML_DeclarationType::Regime:
+                entry.target = tag.get_attribute("name");
+                entry.expression = tag.get_attribute("initial");
+                dynamics.push_back(std::move(entry));
+                collect_dynamics(child, tag.get_attribute("name"), dynamics);
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
 NML_Node *NML_Context::parse_neuroml(const String &filepath) {
     xmlNodePtr xml_root = get_xml_root(filepath);
     if (!xml_root) return nullptr;
@@ -322,6 +422,23 @@ void NML_Context::parse_component_types() {
                 }
             }
         }
+    }
+
+    // A type's own <Dynamics> replaces its ancestors'; without one it inherits the nearest.
+    for (const String &type_name : type_names) {
+        NML_ComponentType &component_type = component_types.at(type_name);
+
+        const NML_Node *dynamics_node = nullptr;
+        for (const NML_ComponentType *type = &component_type; type && !dynamics_node; type = type->extends) {
+            for (const NML_Node *child : children_of(type->source_node)) {
+                if (child->body.tag_name != "Dynamics") continue;
+                dynamics_node = child;
+                break;
+            }
+        }
+
+        component_type.dynamics.clear();
+        if (dynamics_node) collect_dynamics(dynamics_node, "", component_type.dynamics);
     }
 }
 
@@ -644,8 +761,8 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
             NML_NetworkEdge edge;
             edge.component_id = synapse_id;
-            edge.parent = resolve_path(presynaptic_path, projection);
-            edge.child = resolve_path(postsynaptic_path, projection);
+            edge.parent = neuron_index_of(resolve_path(presynaptic_path, projection));
+            edge.child = neuron_index_of(resolve_path(postsynaptic_path, projection));
 
             if (edge.parent < 0 || edge.child < 0) {
                 throw runtime_error("Connection '" + connection->id + "' in projection '" +
@@ -929,6 +1046,35 @@ s64 NML_Context::get_cell_variable_count(s64 cell_instance_index) {
     const NML_ComponentType *cell_type =
             simulation.cell_instances.at(static_cast<usize>(cell_instance_index)).component_type;
     return static_cast<s64>(cell_type->state_variable_names.size());
+}
+
+// A populationList's <instance> children are its cells; a plain population states a size.
+s64 NML_Context::neuron_index_of(s64 cell_memory_index) const {
+    s64 first_neuron = 0;
+    for (const NML_ComponentInstance *population : network_populations(*this)) {
+        const s64 population_size = get_population_size(population);
+        const s64 variable_count =
+                (s64)population_cell(*this, *population).component_type->state_variable_names.size();
+        const s64 base = simulation.population_base_indices.at(population->id);
+
+        if (variable_count > 0 && cell_memory_index >= base &&
+            cell_memory_index < base + population_size * variable_count) {
+            return first_neuron + (cell_memory_index - base) / variable_count;
+        }
+        first_neuron += population_size;
+    }
+    return -1;
+}
+
+s64 NML_Context::get_population_size(const NML_ComponentInstance *population) const {
+    s64 population_size = 0;
+    for (const String &member_id : population->data_order) {
+        if (is_instance_of(find_instance(member_id), "instance")) population_size += 1;
+    }
+    if (population_size == 0 && population->has_value("size")) {
+        population_size = std::llround(resolve_quantity(population->value_or("size")));
+    }
+    return population_size;
 }
 
 // The number of values in cell memory: every state variable of every cell, over all populations.

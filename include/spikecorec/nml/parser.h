@@ -104,6 +104,10 @@ struct NML_Context {
 
     s64 get_cell_variable_count(s64 cell_instance_index);
     s64 get_cell_state_size() const;
+    s64 get_population_size(const NML_ComponentInstance *population) const;
+
+    // The neuron whose cells occupy cell_memory_index (a resolve_path result), or -1.
+    s64 neuron_index_of(s64 cell_memory_index) const;
     s64 resolve_path(const String &path, const NML_ComponentInstance *current = nullptr) const;
 };
 
