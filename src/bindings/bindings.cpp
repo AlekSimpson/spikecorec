@@ -641,6 +641,7 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readonly("node_count", &WeightMatrix::node_count)
         .def_readonly("total_edge_count", &WeightMatrix::total_edge_count)
         .def_readonly("max_neighbor_count", &WeightMatrix::max_neighbor_count)
+        .def_readonly("max_predecessor_count", &WeightMatrix::max_predecessor_count)
         .def_readonly("matrix_count", &WeightMatrix::matrix_count,
                       "Planes: weight, delay, then the largest synapse type's state variables.")
         .def_readonly("updated_plane_count", &WeightMatrix::updated_plane_count,
@@ -762,7 +763,7 @@ PYBIND11_MODULE(_spikecorec, m) {
             return to_numpy(buffer.data(), found);
         }, py::arg("node_index"), "Targets of node_index's edges, in canonical (ordinal) order.")
         .def("get_predecessors", [](const WeightMatrix &self, s64 node_index) {
-            std::vector<s32> buffer(static_cast<usize>(std::max<s64>(self.max_neighbor_count, 1)));
+            std::vector<s32> buffer(static_cast<usize>(std::max<s64>(self.max_predecessor_count, 1)));
             const s64 found = self.get_predecessors(node_index, buffer.data());
             return to_numpy(buffer.data(), found);
         }, py::arg("node_index"), "Sources of the edges into node_index.")
