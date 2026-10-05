@@ -16,6 +16,9 @@ examples/notebooks/*.ipynb
 
 recordings/
 
+# The uv-managed environment `make python` builds into.
+.venv/
+
 # CUDA
 *.ptx
 *.cubin

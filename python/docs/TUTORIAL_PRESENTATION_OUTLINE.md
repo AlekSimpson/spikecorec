@@ -161,8 +161,9 @@ Each slide only uses ideas introduced on earlier ones.
 ## Part 4: The Python API, step by step
 
 ### Slide 14: Installing
-- `make python` builds the extension (macOS, Metal)
-- Needs pybind11, numpy and libxml2; matplotlib and ffmpeg for plots and videos
+- `make python` builds the extension into a uv-managed `.venv` (macOS, Metal)
+- Needs uv and libxml2; `make python` installs pybind11, numpy and matplotlib into `.venv`;
+  ffmpeg for videos
 - `import spikecorec as spc`
 - Docs: `python/docs/README.md` (guide) and `python/docs/API_REFERENCE.md` (every name)
 

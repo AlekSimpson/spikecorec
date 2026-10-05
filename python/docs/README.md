@@ -10,12 +10,14 @@ conversion. [API_REFERENCE.md](API_REFERENCE.md) lists everything.
 ## Install
 
 ```bash
-make python          # builds the extension in place (Metal on macOS)
-python3 -c "import spikecorec; print('ok')"
+make python                     # builds the extension into .venv (Metal on macOS)
+.venv/bin/python -c "import spikecorec; print('ok')"
 ```
 
-Needs `pybind11`, `numpy`, libxml2 (found through `pkg-config`), and `matplotlib` for the
-renderer.
+Needs [uv](https://docs.astral.sh/uv/) and libxml2 (found through `pkg-config`). The first
+`make python` creates `.venv` with Python 3.13 (`PYTHON_VERSION=3.12 make python` picks
+another) and installs `pybind11`, `numpy`, `setuptools` and `matplotlib` into it. Run
+scripts with `.venv/bin/python`, or `source .venv/bin/activate` first.
 
 ## Quick start
 

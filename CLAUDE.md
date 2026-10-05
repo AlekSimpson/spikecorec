@@ -155,7 +155,7 @@ Notes for working these tickets:
 make              # auto-detect (Metal on macOS, CUDA elsewhere)
 make metal
 make cuda
-make python       # builds pybind11 Python extension
+make python       # builds the Python extension into .venv (uv); run with .venv/bin/python
 make clean
 ```
 
