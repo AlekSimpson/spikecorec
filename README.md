@@ -9,13 +9,13 @@ A high-performance C++ library with CUDA and Metal GPU backends, importable as a
 | C++17 compiler (`clang++` / `g++`) | Core and binding compilation |
 | [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) | CUDA backend (`nvcc`) |
 | macOS 13+ with Xcode CLI tools | Metal backend |
-| Python 3.9+ with `pybind11` | Python bindings |
+| [uv](https://docs.astral.sh/uv/) | Python bindings: `make python` builds into a uv-managed `.venv` |
 | `zlib` / `liblzma` / `libbz2` (optional, via `pkg-config`) | gzip/xz/bz2 support for `.spire` recordings — auto-detected at build time (`make info` shows what was found); uncompressed `.spire` always works |
 | `bear` (optional) | Regenerate `compile_commands.json` for IDE tooling |
 
 ```bash
-pip install pybind11
-brew install bear        # optional, for IDE setup
+curl -LsSf https://astral.sh/uv/install.sh | sh   # uv, for the Python bindings
+brew install bear                                 # optional, for IDE setup
 ```
 
 Clone with submodules to get metal-cpp:
@@ -98,14 +98,11 @@ SPIKECOREC_BACKEND=metal make python
 SPIKECOREC_BACKEND=cuda  make python
 ```
 
-Or directly with pip:
-```bash
-SPIKECOREC_BACKEND=metal pip install -e .
-```
+It creates `.venv` with uv on first use, installs `pybind11`, `numpy`, `setuptools` and
+`matplotlib` into it, and builds the extension there as an editable install:
 
-```python
-import spikecorec
-print(spikecorec.__version__)
+```bash
+.venv/bin/python -c "import spikecorec; print(spikecorec.__version__)"
 ```
 
 See **[`python/README.md`](python/README.md)** for full Python API documentation

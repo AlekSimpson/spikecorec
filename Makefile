@@ -5,7 +5,7 @@
 #   make              — auto-detect backend and build
 #   make cuda         — build CUDA backend
 #   make metal        — build Metal backend
-#   make python       — build Python extension (pip editable install)
+#   make python       — build Python extension (editable install into .venv, via uv)
 #   make test         — build and run C++ tests
 #   make examples     — build examples
 #   make clean        — remove build artifacts
@@ -155,9 +155,12 @@ CUDA_LIB    := $(BUILD_DIR)/lib$(PROJECT)_cuda.a
 METAL_LIB   := $(BUILD_DIR)/lib$(PROJECT)_metal.a
 
 # ── Python toolchain ─────────────────────────────────────────
-PYTHON     ?= python3
-PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null)
-PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
+# The extension builds into a uv-managed virtual environment, .venv, made on first use.
+UV              ?= uv
+VENV            := .venv
+PYTHON_VERSION  ?= 3.13
+PYTHON          := $(VENV)/bin/python
+PYTHON_PACKAGES := pybind11 numpy setuptools matplotlib
 
 # ── Top-level targets ────────────────────────────────────────
 .PHONY: demos all cuda metal python test examples clean info
@@ -223,16 +226,15 @@ $(BUILD_DIR)/default.metallib: $(AIR_FILES)
 	$(METALLIB) $(AIR_FILES) -o $@
 
 # ── Python extension ─────────────────────────────────────────
-# Builds an editable install so `import spikecorec` works from the repo root.
-# pybind11 must be installed: pip install pybind11
+# An editable install into .venv, so `import spikecorec` works from the repo root with
+# .venv/bin/python, or with any python after `source .venv/bin/activate`. Needs uv.
+# uv only notices changes to pyproject.toml and setup.py, so the package is always rebuilt.
 python:
-ifeq ($(PY_INC),)
-	$(error Python headers not found. Run: pip install pybind11)
-endif
-ifeq ($(PYBIND_INC),)
-	$(error pybind11 not found. Run: pip install pybind11)
-endif
-	SPIKECOREC_BACKEND=$(BACKEND) $(PYTHON) -m pip install -e . --no-build-isolation -q
+	@command -v $(UV) >/dev/null || { echo "uv not found: see https://docs.astral.sh/uv/"; exit 1; }
+	$(UV) venv --quiet --allow-existing --python $(PYTHON_VERSION) $(VENV)
+	$(UV) pip install --quiet --python $(PYTHON) $(PYTHON_PACKAGES)
+	SPIKECOREC_BACKEND=$(BACKEND) $(UV) pip install --quiet --python $(PYTHON) --no-build-isolation \
+	    --reinstall-package spikecorec -e .
 ifeq ($(BACKEND),metal)
 	$(MAKE) $(BUILD_DIR)/default.metallib
 	cp $(BUILD_DIR)/default.metallib python/spikecorec/default.metallib
@@ -284,7 +286,7 @@ examples-metal: check-metal $(EX_PROGRAMS)
 # building its network, running it, and rendering a video into build/demos/. They import
 # nothing but examples/video_utils.py, so each one reads top to bottom on its own.
 #
-# `make demos` runs them all; `python3 examples/demo_glif1_torus.py` runs one.
+# `make demos` runs them all; `.venv/bin/python examples/demo_glif1_torus.py` runs one.
 PYTHON_DEMOS := $(sort $(wildcard $(EX_DIR)/demo_*.py))
 
 demos: python
