@@ -48,7 +48,15 @@ namespace spikecorec {
         // comes from. tick is bound per dispatch.
         Vector<String> kernel_parameter_names;
         UnorderedMap<String, std::function<EnginePointer()>> kernel_argument_sources;
+        // The generated master kernel exactly as it was compiled, every constant baked in.
+        String master_kernel_source;
+        // Ticks after a neuron spikes during which its outgoing synapses run: the longest delay
+        // plus the slowest synapse's settle time (Codegen::synapse_active_ticks). -1 when every
+        // synapse runs every tick.
+        s64 synapse_active_ticks = -1;
         s32 rank_float4_stride_argument = 0;
+        // Bound per tick rather than baked: S is resized after a refit when the threshold changed.
+        s64 sparse_delta_capacity_argument = 0;
         s32 projection_run_count = 0;
 
         // The one allocation every model buffer below is carved from.
@@ -74,6 +82,15 @@ namespace spikecorec {
         // remembered, not just the most recent one.
         EnginePointer spike_history;
         EnginePointer last_spiked;        // [total_neuron_count]
+
+        // Draws every random() the run calls, seeded with simulation_seed: OnStart values at
+        // construction, then random_values before every tick.
+        RandomGenerator random_generator;
+        // This tick's uniform draws, one slot per random() call per neuron that runs it
+        // (Codegen::random_values_count). Carved from random_values_pointer.
+        EnginePointer random_values_pointer;
+        EnginePointer random_values;      // f32[max(1, random_values_count)]
+        s64 random_values_count = 0;
 
         Vector<s64> continuous_injection_targets;
         Vector<f32> continuous_injection_amplitudes;
@@ -114,9 +131,33 @@ namespace spikecorec {
 
         static constexpr s64 DEFAULT_PLASTICITY_DELTA_CAPACITY = 1 << 16;
 
-        f32 correction_ceiling_fraction = 1.0f;
-
         s64 weight_fit_rank_budget = -1;
+
+        // Presets for fit_tolerance: the worst relative error the weight matrix may leave on any
+        // per-edge value of a synapse, against the larger of the value and its plane's RMS.
+        // Tighter costs rank (memory) and fitting time. A delay stays on its exact tick while
+        // tolerance * delay is under half a tick, so each lists the longest delay it keeps exact.
+        static constexpr f32 FIT_TOLERANCE_PRECISE = 1e-5f;   // comparisons against reference simulators; 50000 ticks
+        static constexpr f32 FIT_TOLERANCE_ACCURATE = 1e-4f;  // validation runs and reported results; 5000 ticks
+        static constexpr f32 FIT_TOLERANCE_STANDARD = WeightMatrix::DEFAULT_FIT_TOLERANCE;  // the default; 500 ticks
+        static constexpr f32 FIT_TOLERANCE_COMPACT = 1e-2f;   // the largest networks, where memory matters most; 50 ticks
+
+        // Applies to the fit at construction and to every refit after it.
+        f32 fit_tolerance = FIT_TOLERANCE_STANDARD;
+
+        // When the weight matrix refits during a run, folding the updates in S into the basis
+        // and emptying S. Both are checked after each tick's merge, and 0 disables either:
+        // every this many ticks, and once the fullest plane of S holds updates on this
+        // fraction of the edge set -- which is also the size S is kept at between refits. Set
+        // the threshold with set_refit_occupancy_threshold_fraction, which resizes S to it.
+        s64 refit_every_n_ticks = 0;
+        f32 refit_occupancy_threshold_fraction = WeightMatrix::DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION;
+
+        // Refits are at least this many ticks apart, so a busy network whose S refills every
+        // tick does not refit every tick; S grows in between instead. 0 allows any spacing.
+        s64 minimum_ticks_between_refits = 1000;
+        // The construction fit counts as the first.
+        s64 last_refit_tick = 0;
         s64 plasticity_fold_every_n_ticks = 64;
         f32 plasticity_learning_rate = 0.01f;
         f32 plasticity_l2_regularization = 1e-6f;
@@ -131,14 +172,16 @@ namespace spikecorec {
         SpikeEngine &operator=(SpikeEngine &&) = delete;
 
         explicit SpikeEngine(const String &lems_input_file,
-                             bool enable_hebbian_plasticity = false);
+                             bool enable_hebbian_plasticity = false,
+                             f32 fit_tolerance = FIT_TOLERANCE_STANDARD);
 
         SpikeEngine(const String &lems_input_file,
                     const vector<vector<s32>> &adjacency,
                     const String &synapse_component_id,
                     f64 connection_weight = 1.0,
                     f64 connection_delay_seconds = 0.0,
-                    bool enable_hebbian_plasticity = false);
+                    bool enable_hebbian_plasticity = false,
+                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD);
 
         SpikeEngine(const String &lems_input_file,
                     const vector<vector<s32>> &adjacency,
@@ -146,7 +189,8 @@ namespace spikecorec {
                     const vector<f64> &synapse_proportions = {},
                     f64 connection_weight = 1.0,
                     f64 connection_delay_seconds = 0.0,
-                    bool enable_hebbian_plasticity = false);
+                    bool enable_hebbian_plasticity = false,
+                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD);
 
         ~SpikeEngine();
 
@@ -154,8 +198,17 @@ namespace spikecorec {
 
         void step_simulation(s64 tick);
 
+        // Sets the refit threshold, which is also the size S is kept at per plane, and resizes S
+        // to it now. S keeps the updates it holds, so it never shrinks below them.
+        void set_refit_occupancy_threshold_fraction(f32 fraction);
+
         // The state variable named `variable_name` for one neuron, read back from the GPU.
         [[nodiscard]] f32 read_state_variable(s64 neuron_index, const String &variable_name) const;
+
+        // The weight-matrix plane that holds `variable_name`, one of the named synapse's LEMS
+        // StateVariables, on every edge that synapse carries.
+        [[nodiscard]] s64 synapse_state_variable_plane(const String &synapse_component_id,
+                                                       const String &variable_name) const;
 
         // Spikes per neuron per second over the whole run, and the fraction of neurons that
         // spiked at least once. What a demo has to clear to count as alive.
@@ -185,7 +238,7 @@ namespace spikecorec {
         // Builds the k^2-tree and the weight and delay basis from network_data, with
         // matrix_count planes: weight, delay and one per synapse state variable. Also writes
         // the synapse planes' starting state and the device copy of the projection runs.
-        void build_weight_matrix(s64 matrix_count);
+        void build_weight_matrix(s64 matrix_count, s64 updated_plane_count);
 
         // Fills kernel_argument_sources, and refuses a master_step parameter the engine has
         // nothing to bind to.

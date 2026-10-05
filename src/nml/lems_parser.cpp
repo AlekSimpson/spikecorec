@@ -15,11 +15,11 @@ namespace {
 
 // LEMS function name -> the name emitted into GPU source.
 const UnorderedMap<String, String> FUNCTIONS = {
-    {"exp", "exp"},   {"ln", "log"},    {"log", "log10"}, {"sqrt", "sqrt"},
+    {"exp", "exp"},   {"ln", "log"},    {"log", "log"},   {"sqrt", "sqrt"},
     {"abs", "fabs"},  {"ceil", "ceil"}, {"floor", "floor"},
     {"sin", "sin"},   {"cos", "cos"},   {"tan", "tan"},
     {"sinh", "sinh"}, {"cosh", "cosh"}, {"tanh", "tanh"},
-    {"H", "spikecorec_heaviside"},
+    {"H", "spikecorec_heaviside"},    {"random", "random_values"},
 };
 
 LemsParseBody lems_body(LemsNodeSubtype syntax_type, const LemsExpressionToken &token) {

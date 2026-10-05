@@ -24,20 +24,21 @@ using namespace std;
 using namespace spikecorec;
 using namespace spikecorec::nml;
 
-SpikeEngine::SpikeEngine(const String &lems_input_file, bool enable_hebbian_plasticity)
-    : SpikeEngine(lems_input_file, {}, "", 1.0, 0.0, enable_hebbian_plasticity) {}
+SpikeEngine::SpikeEngine(const String &lems_input_file, bool enable_hebbian_plasticity, f32 fit_tolerance)
+    : SpikeEngine(lems_input_file, {}, "", 1.0, 0.0, enable_hebbian_plasticity, fit_tolerance) {}
 
 SpikeEngine::SpikeEngine(const String &lems_input_file,
                          const vector<vector<s32>> &adjacency,
                          const String &synapse_component_id,
                          f64 connection_weight,
                          f64 connection_delay_seconds,
-                         bool enable_hebbian_plasticity)
+                         bool enable_hebbian_plasticity,
+                         f32 fit_tolerance)
     : SpikeEngine(lems_input_file, adjacency,
                   synapse_component_id.empty() ? vector<String>{}
            : vector<String>{synapse_component_id},
                   {}, connection_weight, connection_delay_seconds,
-                  enable_hebbian_plasticity) {}
+                  enable_hebbian_plasticity, fit_tolerance) {}
 
 SpikeEngine::SpikeEngine(const String &lems_input_file,
                          const vector<vector<s32>> &adjacency,
@@ -45,9 +46,11 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
                          const vector<f64> &synapse_proportions,
                          f64 connection_weight,
                          f64 connection_delay_seconds,
-                         bool enable_hebbian_plasticity)
+                         bool enable_hebbian_plasticity,
+                         f32 fit_tolerance)
     : logger(log::make_logger())
-    , hebbian_plasticity_enabled(enable_hebbian_plasticity) {
+    , hebbian_plasticity_enabled(enable_hebbian_plasticity)
+    , fit_tolerance(fit_tolerance) {
 
     if (!context.validate_lems_schema(lems_input_file)) {
         log::throw_runtime_error(*logger,
@@ -69,6 +72,7 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     if (context.simulation.random_seed.has_value()) {
         simulation_seed = *context.simulation.random_seed;
     }
+    random_generator = RandomGenerator(simulation_seed);
 
     if (total_neuron_count == 0) {
         log::throw_runtime_error(*logger,
@@ -82,6 +86,7 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     }
 
     Codegen compiler(context, &gpu);
+    compiler.check_cell_inputs();
 
     compiler.allocate_cell_model_memory();
     cell_state = compiler.data_partitions[0];
@@ -92,9 +97,9 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     model_pointer = compiler.data_partitions[5];
 
     initialize_model_buffers();
-    compiler.initialize_cell_state();
+    compiler.initialize_cell_state(random_generator);
 
-    build_weight_matrix(compiler.edge_plane_count());
+    build_weight_matrix(compiler.edge_plane_count(), compiler.updated_edge_plane_count());
 
     weights.plasticity_reserve_entries = 0;
     if (hebbian_plasticity_enabled) {
@@ -106,10 +111,18 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
         logger->warn("SpikeEngine: plasticity is enabled, but the generated kernel stages no "
                      "plasticity deltas yet, so weights will not change");
     }
+    weights.resize_delta_capacity(weights.delta_capacity_for_threshold(refit_occupancy_threshold_fraction));
 
     collect_stimulus();
 
     compiler.translate_kernel_code();
+
+    // Refilled before every tick. At least one slot, so there is always a buffer to bind.
+    random_values_count = compiler.random_values_count;
+    Vector<EnginePointer> random_partitions;
+    gpu.partition((u64)std::max<s64>(1, random_values_count) * sizeof(f32), EngineDatatype::FLOAT32, random_partitions);
+    random_values_pointer = gpu.allocate(random_partitions);
+    random_values = random_partitions[0];
 
     // Fixed once the weight matrix is built, so baked in rather than bound. Metal also has
     // only 31 buffer slots for everything master_step takes.
@@ -118,10 +131,11 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     compiler.bake_kernel_constant("padded_node_count", weights.k2tree.padded_node_count);
     compiler.bake_kernel_constant("tree_height", weights.k2tree.tree_height);
     compiler.bake_kernel_constant("internal_bit_count", weights.k2tree.internal_bit_count);
-    compiler.bake_kernel_constant("sparse_delta_capacity", weights.sparse_delta_capacity);
     compiler.bake_kernel_constant("pending_delta_capacity", weights.pending_delta_capacity);
     compiler.bake_kernel_constant("projection_run_count", projection_run_count);
-    const String master_kernel_source = compiler.compile();
+    synapse_active_ticks = compiler.synapse_active_ticks();
+    compiler.bake_kernel_constant("synapse_active_ticks", synapse_active_ticks);
+    master_kernel_source = compiler.compile();
     logger->debug("SpikeEngine: generated master kernel, {} bytes", master_kernel_source.size());
 
     Optional<EngineFunction> result = gpu.create_function("master_step", master_kernel_source);
@@ -162,7 +176,7 @@ void SpikeEngine::initialize_model_buffers() {
     std::fill_n(last_spiked.get_contents_as<s64>(), total_neuron_count, NEVER_SPIKED_TICK);
 }
 
-void SpikeEngine::build_weight_matrix(s64 matrix_count) {
+void SpikeEngine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count) {
     Vector<Vector<NML_NetworkEdge>> edges_by_source((usize)total_neuron_count);
     for (const Vector<NML_NetworkEdge> &row : context.simulation.network_data.list) {
         for (const NML_NetworkEdge &edge : row) edges_by_source[(usize)edge.parent].push_back(edge);
@@ -232,16 +246,8 @@ void SpikeEngine::build_weight_matrix(s64 matrix_count) {
         }
     }
 
-    weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
-                           /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
-                           correction_ceiling_fraction, weight_fit_rank_budget, matrix_count);
-    if (ordinal > 0) {
-        weights.declare_projections(first_edge_ordinal, edge_count, synapse_prototype,
-                                    weight, delay_ticks);
-    }
-
-    // A synapse state plane starts at each prototype's OnStart value; zero needs nothing,
-    // since a state plane with no corrections reads zero.
+    // Every per-edge variable's starting value, per run: the connection's weight and delay,
+    // then each of its synapse's StateVariables at its OnStart value.
     Vector<Vector<f32>> starting_state_per_prototype;
     for (const NML_ComponentInstance &synapse : context.simulation.synapse_instances) {
         const UnorderedMap<String, f64> values = starting_values(context, synapse);
@@ -250,17 +256,27 @@ void SpikeEngine::build_weight_matrix(s64 matrix_count) {
             starting_state.push_back((f32)values.at(name));
         }
     }
-    for (s64 matrix_index = WeightMatrix::FIRST_STATE_MATRIX_INDEX; matrix_index < matrix_count; matrix_index += 1) {
-        const usize variable = (usize)(matrix_index - WeightMatrix::FIRST_STATE_MATRIX_INDEX);
-        Vector<f32> value_per_run;
-        bool any_nonzero = false;
-        for (s32 prototype : synapse_prototype) {
-            const Vector<f32> &starting_state = starting_state_per_prototype[(usize)prototype];
-            value_per_run.push_back(variable < starting_state.size() ? starting_state[variable] : 0.0f);
-            any_nonzero = any_nonzero || value_per_run.back() != 0.0f;
+    Vector<Vector<f32>> initial_values((usize)matrix_count);
+    for (usize run_index = 0; run_index < synapse_prototype.size(); run_index += 1) {
+        const Vector<f32> &starting_state = starting_state_per_prototype[(usize)synapse_prototype[run_index]];
+        for (s64 plane = 0; plane < matrix_count; plane += 1) {
+            f32 value = 0.0f;
+            if (plane == WeightMatrix::WEIGHT_PLANE) {
+                value = weight[run_index];
+            } else if (plane == WeightMatrix::DELAY_PLANE) {
+                value = (f32)delay_ticks[run_index];
+            } else if ((usize)(plane - WeightMatrix::FIRST_STATE_VARIABLE_PLANE) < starting_state.size()) {
+                value = starting_state[(usize)(plane - WeightMatrix::FIRST_STATE_VARIABLE_PLANE)];
+            }
+            initial_values[(usize)plane].push_back(value);
         }
-        if (any_nonzero) weights.declare_starting_state(matrix_index, value_per_run);
     }
+
+    weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
+                           /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
+                           weight_fit_rank_budget, matrix_count, updated_plane_count);
+    weights.fit_tolerance = fit_tolerance;
+    if (ordinal > 0) weights.declare_projections(first_edge_ordinal, edge_count, synapse_prototype, initial_values);
 
     // The runs on the device, for the kernel's per-edge prototype lookup.
     Vector<EnginePointer> run_partitions;
@@ -275,15 +291,14 @@ void SpikeEngine::build_weight_matrix(s64 matrix_count) {
     }
     projection_run_count = (s32)first_edge_ordinal.size();
 
-    logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, {} projection runs, "
-                  "rank {}, worst weight error {:.3e}",
-                  weights.node_count, weights.total_edge_count, first_edge_ordinal.size(),
-                  weights.rank, weights.measured_weight_fit_error);
+    logger->debug("SpikeEngine: weight matrix built — {} nodes, {} edges, {} projection runs, rank {}",
+                  weights.node_count, weights.total_edge_count, first_edge_ordinal.size(), weights.rank);
 }
 
 void SpikeEngine::register_kernel_arguments() {
     kernel_argument_sources = {
         {"rank_float4_stride",        [this] { return inline_scalar_argument(rank_float4_stride_argument); }},
+        {"sparse_delta_capacity",     [this] { return inline_scalar_argument(sparse_delta_capacity_argument); }},
         {"cell_state",                [this] { return cell_state; }},
         {"network_inputs",            [this] { return network_inputs; }},
         {"spike_history",             [this] { return spike_history; }},
@@ -305,6 +320,7 @@ void SpikeEngine::register_kernel_arguments() {
         {"pending_delta_count",       [this] { return resolve_edge_plane(weights.pending_delta_count); }},
         {"projection_first_edge_ordinal", [this] { return resolve_edge_plane(projection_first_edge_ordinal); }},
         {"projection_synapse_prototype",  [this] { return resolve_edge_plane(projection_synapse_prototype); }},
+        {"random_values",             [this] { return random_values; }},
     };
 
     for (const String &name : kernel_parameter_names) {
@@ -587,7 +603,14 @@ EnginePointer SpikeEngine::resolve_edge_plane(const EnginePointer &plane) const 
 void SpikeEngine::step_simulation(s64 tick) {
     apply_stimulus(tick);
 
+    // This tick's draw for every random() slot.
+    f32 *random_value_data = random_values.get_contents_as<f32>();
+    for (s64 index = 0; index < random_values_count; index += 1) {
+        random_value_data[index] = (f32)random_generator.uniform();
+    }
+
     rank_float4_stride_argument = (s32)weights.rank_float4_stride;
+    sparse_delta_capacity_argument = weights.sparse_delta_capacity;
 
     Vector<EnginePointer> parameters;
     parameters.reserve(kernel_parameter_names.size());
@@ -600,28 +623,36 @@ void SpikeEngine::step_simulation(s64 tick) {
                 "SpikeEngine: tick " + to_string(tick) + " failed on the GPU");
     }
 
-    // Synapse state an edge started holding this tick is queued; merge it so the next tick
-    // reads it.
-    if (weights.matrix_count > WeightMatrix::FIRST_STATE_MATRIX_INDEX) weights.compact_pending_deltas();
+    // Updates queued this tick by edges with no entry in S yet; merge them so the next tick
+    // reads them. A merge that would overflow S refits instead.
+    const bool plasticity_fold_due = hebbian_plasticity_enabled && plasticity_fold_every_n_ticks > 0 &&
+                                     (tick + 1) % plasticity_fold_every_n_ticks == 0;
+    if (weights.updated_plane_count > 0 || plasticity_fold_due) weights.compact_pending_deltas();
 
-    if (hebbian_plasticity_enabled &&
-        plasticity_fold_every_n_ticks > 0 &&
-        (tick + 1) % plasticity_fold_every_n_ticks == 0) {
+    // Fold S into the basis and empty it. This runs between dispatches, so no kernel reads the
+    // matrix while it changes.
+    const bool refit_scheduled = refit_every_n_ticks > 0 && (tick + 1) % refit_every_n_ticks == 0;
+    const bool spaced_out = tick - last_refit_tick >= minimum_ticks_between_refits;
+    if (spaced_out && (refit_scheduled || weights.is_refit_due(refit_occupancy_threshold_fraction))) {
+        weights.fit_tolerance = fit_tolerance;
+        weights.refit();
+        last_refit_tick = tick;
 
-        weights.compact_pending_deltas();
-
-        // re optimise the basis
-        if (weights.is_refit_due()) {
-            weights.refit();
-
-            if (plasticity_target_root_mean_square >= 0.0f) {
-                weights.scale_neighbor_weights_to_root_mean_square(
-                        plasticity_target_root_mean_square);
-            }
+        if (hebbian_plasticity_enabled && plasticity_target_root_mean_square >= 0.0f) {
+            weights.scale_neighbor_weights_to_root_mean_square(plasticity_target_root_mean_square);
         }
+        // S is empty now, so it goes back to the size the threshold asks for.
+        weights.resize_delta_capacity(weights.delta_capacity_for_threshold(refit_occupancy_threshold_fraction));
     }
 
     record_tick(tick);
+}
+
+void SpikeEngine::set_refit_occupancy_threshold_fraction(f32 fraction) {
+    refit_occupancy_threshold_fraction = fraction;
+    s64 largest_plane = 0;
+    for (s64 entry_count : weights.sparse_delta_entry_count) largest_plane = std::max(largest_plane, entry_count);
+    weights.resize_delta_capacity(std::max(weights.delta_capacity_for_threshold(fraction), largest_plane));
 }
 
 void SpikeEngine::run() {
@@ -667,6 +698,22 @@ void SpikeEngine::record_tick(s64 tick) {
 
 f32 SpikeEngine::read_state_variable(s64 neuron_index, const String &variable_name) const {
     return static_cast<const f32 *>(cell_state.get_contents())[cell_memory_index_of(neuron_index, variable_name)];
+}
+
+s64 SpikeEngine::synapse_state_variable_plane(const String &synapse_component_id,
+                                              const String &variable_name) const {
+    for (const NML_ComponentInstance &synapse : context.simulation.synapse_instances) {
+        if (synapse.id != synapse_component_id) continue;
+
+        const Vector<String> &names = synapse.component_type->state_variable_names;
+        for (usize index = 0; index < names.size(); index += 1) {
+            if (names[index] == variable_name) return WeightMatrix::FIRST_STATE_VARIABLE_PLANE + (s64)index;
+        }
+        log::throw_runtime_error(*logger, "synapse_state_variable_plane: synapse '" + synapse_component_id +
+                                 "' has no state variable '" + variable_name + "'");
+    }
+    log::throw_runtime_error(*logger, "synapse_state_variable_plane: the network uses no synapse '" +
+                             synapse_component_id + "'");
 }
 
 f64 SpikeEngine::mean_firing_rate_hertz() const {
@@ -791,6 +838,7 @@ void SpikeEngine::shutdown() {
 
     gpu.deallocate_slab(model_pointer);
     gpu.deallocate_slab(projection_run_pointer);
+    gpu.deallocate_slab(random_values_pointer);
 
     alive = false;
 }
