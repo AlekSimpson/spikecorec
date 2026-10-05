@@ -272,7 +272,7 @@ Every read adds S. A refit fits the basis to basis + S and empties S.
 
 | name | type | meaning |
 |---|---|---|
-| `node_count`, `total_edge_count`, `max_neighbor_count` | int | |
+| `node_count`, `total_edge_count`, `max_neighbor_count`, `max_predecessor_count` | int | |
 | `matrix_count` | int | planes: weight, delay, then the largest synapse type's state variables |
 | `updated_plane_count` | int | planes the kernel updates each tick |
 | `rank`, `rank_float4_stride` | int | lanes in the basis, and lanes / 4 |
@@ -303,7 +303,7 @@ Every read adds S. A refit fits the basis to basis + S and empties S.
 | `get_edge_synapse_prototype(source_node, target_node)` | the edge's synapse, as an index into `context.simulation.synapse_instances` |
 | `edge_ordinal(source_node, target_node)` | the edge's number in canonical order, or `None` |
 | `get_neighbors(node_index)` | int32[]: targets, in ordinal order |
-| `get_predecessors(node_index)` | int32[]: sources (at most `max_neighbor_count` of them) |
+| `get_predecessors(node_index)` | int32[]: every source of an edge into node_index |
 | `neighbor_weights()` | float32[total_edge_count]: the weight plane, by ordinal |
 | `neighbor_weights_for_matrix(matrix_index)` | float32[total_edge_count]: any plane, by ordinal |
 | `neighbor_weight_stats()` | `WeightStats` of the weight plane |

@@ -186,6 +186,9 @@ namespace spikecorec {
         // get_neighbors() writes into, and nothing else -- in particular it sizes no
         // allocation anywhere.
         s64 max_neighbor_count = 0;
+        // Upper bound on any node's in-degree. Bounds the caller-supplied buffer
+        // get_predecessors() writes into, and nothing else.
+        s64 max_predecessor_count = 0;
 
         s64 rank = 0;
         s64 rank_float4_stride = 0; // ceil(rank / LANE_GROUP)

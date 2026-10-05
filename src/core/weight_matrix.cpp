@@ -131,6 +131,12 @@ WeightMatrix::WeightMatrix(
         this->max_neighbor_count = longest_row;
     }
 
+    vector<s64> in_degree((usize)node_count, 0);
+    for (const vector<s32> &row : network) {
+        for (s32 target : row) in_degree[(usize)target] += 1;
+    }
+    max_predecessor_count = in_degree.empty() ? 0 : *max_element(in_degree.begin(), in_degree.end());
+
     this->rank = (rank > 0) ? round_up_to_lane_group(rank) : LANE_GROUP;
     rank_float4_stride = this->rank / LANE_GROUP;
 
@@ -295,6 +301,7 @@ WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
     , node_count(other.node_count)
     , total_edge_count(other.total_edge_count)
     , max_neighbor_count(other.max_neighbor_count)
+    , max_predecessor_count(other.max_predecessor_count)
     , rank(other.rank)
     , rank_float4_stride(other.rank_float4_stride)
     , check_indexing(other.check_indexing)
@@ -342,6 +349,7 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     node_count = other.node_count;
     total_edge_count = other.total_edge_count;
     max_neighbor_count = other.max_neighbor_count;
+    max_predecessor_count = other.max_predecessor_count;
     rank = other.rank;
     rank_float4_stride = other.rank_float4_stride;
     check_indexing = other.check_indexing;
@@ -385,7 +393,7 @@ s64 WeightMatrix::get_neighbors(s64 node_index, s32 *output_buffer) const {
 s64 WeightMatrix::get_predecessors(s64 node_index, s32 *output_buffer) const {
     if (!can_safely_cast_s64_to_s32(node_index)) return 0;
     if (node_index < 0 || node_index >= node_count) return 0;
-    return k2tree.get_predecessors((s32)node_index, output_buffer, max_neighbor_count);
+    return k2tree.get_predecessors((s32)node_index, output_buffer, max_predecessor_count);
 }
 
 optional<s64> WeightMatrix::edge_ordinal(s32 source_node, s32 target_node) const {
