@@ -30,7 +30,7 @@ namespace {
 // Names the generated dynamics read from master_step. A LEMS name equal to one of these
 // would be captured by the substitutions, so it is refused.
 const Set<String> ENGINE_NAMES = {
-    "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true"};
+    "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true", "random_values"};
 
 // Names the generated synapse dynamics read from the propagate walk, on top of ENGINE_NAMES.
 const Set<String> SYNAPSE_ENGINE_NAMES = {
@@ -38,17 +38,23 @@ const Set<String> SYNAPSE_ENGINE_NAMES = {
     "basis_u", "basis_v", "edge_coefficients", "rank_float4_stride", "sparse_delta_row_start",
     "sparse_delta_edge_ordinal", "sparse_delta_value", "sparse_delta_capacity", "pending_delta_edge_ordinal",
     "pending_delta_value", "pending_delta_matrix_index", "pending_delta_count", "pending_delta_capacity",
-    "projection_first_edge_ordinal", "projection_synapse_prototype", "projection_run_count"};
+    "projection_first_edge_ordinal", "projection_synapse_prototype", "projection_run_count", "synapse_active_ticks"};
 
 const String DERIVED_PREFIX = "derived_";
 const String DERIVATIVE_PREFIX = "derivative_";
+// rest_<name> stands for a synapse state variable's OnStart value until the instance fills it in.
+const String REST_PREFIX = "rest_";
+// random_slot_<n> stands for random() call n's slot in random_values until the population
+// that runs it is placed.
+const String RANDOM_SLOT_PREFIX = "random_slot_";
 
-// An edge returns to rest once every state variable is this small against its OnEvent increment.
-const String REST_FRACTION = "1e-06f";
+// A synapse has settled once every state variable is this close to rest, against the largest
+// deviation from rest it reached after the spike.
+constexpr f64 REST_FRACTION = 1e-6;
 
-// LEMS function name -> neutral kernel function name.
+// LEMS function name -> neutral kernel function name. LEMS log is the natural log, like ln.
 const UnorderedMap<String, String> LEMS_FUNCTIONS = {
-    {"exp", "exp"},   {"ln", "log"},    {"log", "log10"}, {"sqrt", "sqrt"},
+    {"exp", "exp"},   {"ln", "log"},    {"log", "log"},   {"sqrt", "sqrt"},
     {"abs", "fabs"},  {"ceil", "ceil"}, {"floor", "floor"}, {"pow", "pow"},
     {"sin", "sin"},   {"cos", "cos"},   {"tan", "tan"},
     {"sinh", "sinh"}, {"cosh", "cosh"}, {"tanh", "tanh"},
@@ -106,19 +112,10 @@ KernelNode *accumulate_edge(s64 plane, KernelNode *delta) {
         edge_source(), identifier("current_edge"), delta});
 }
 
-// True while the current edge holds a correction in plane, which for a state plane means its
-// synapse is away from rest.
-KernelNode *edge_holds_correction(s64 plane) {
-    KernelNode *index = function_call("spikecorec_edge_correction_index", {
-        identifier("sparse_delta_row_start"), identifier("sparse_delta_edge_ordinal"), identifier("neuron_count"),
-        identifier("sparse_delta_capacity"), literal(std::to_string(plane)), edge_source(), identifier("current_edge")});
-    return new_expression(">=", index, literal("0"));
-}
-
 // A name the generated synapse dynamics use themselves.
 bool is_synapse_engine_name(const String &name) {
     return ENGINE_NAMES.count(name) || SYNAPSE_ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) ||
-           starts_with(name, DERIVATIVE_PREFIX);
+           starts_with(name, DERIVATIVE_PREFIX) || starts_with(name, REST_PREFIX) || starts_with(name, RANDOM_SLOT_PREFIX);
 }
 
 // Every name a LEMS expression reads; function names are not reads.
@@ -142,10 +139,30 @@ void collect_lems_identifiers(const LemsParseNode *node, Set<String> &names) {
     }
 }
 
+// Whether a LEMS expression calls function_name anywhere.
+bool calls_function(const LemsParseNode *node, const String &function_name) {
+    if (!node) return false;
+    if (node->body.syntax_type == LemsNodeSubtype::FUNCTION_CALL) {
+        if (node->body.token.lexeme == function_name) return true;
+        for (const LemsParseNode *argument : children_of(static_cast<const BinaryNode<LemsParseBody> *>(node)->right)) {
+            if (calls_function(argument, function_name)) return true;
+        }
+        return false;
+    }
+    if (const auto *unary = dynamic_cast<const UnaryNode<LemsParseBody> *>(node)) {
+        return calls_function(unary->child, function_name);
+    }
+    if (const auto *binary = dynamic_cast<const BinaryNode<LemsParseBody> *>(node)) {
+        return calls_function(binary->left, function_name) || calls_function(binary->right, function_name);
+    }
+    return false;
+}
+
 } // namespace
 
 // Host-side value of a LEMS expression, for OnStart values and derived parameters.
-f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &values, const String &owner_name) {
+f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &values, const String &owner_name,
+                  RandomGenerator *random_generator) {
     const String &lexeme = node->body.token.lexeme;
     switch (node->body.syntax_type) {
         case LemsNodeSubtype::FLOAT:
@@ -160,12 +177,12 @@ f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &va
 
         case LemsNodeSubtype::OPERATOR: {
             if (const auto *unary = dynamic_cast<const UnaryNode<LemsParseBody> *>(node)) {
-                const f64 operand = evaluate_lems(unary->child, values, owner_name);
+                const f64 operand = evaluate_lems(unary->child, values, owner_name, random_generator);
                 return lexeme == "-" ? -operand : operand;
             }
             const auto *binary = static_cast<const BinaryNode<LemsParseBody> *>(node);
-            const f64 left = evaluate_lems(binary->left, values, owner_name);
-            const f64 right = evaluate_lems(binary->right, values, owner_name);
+            const f64 left = evaluate_lems(binary->left, values, owner_name, random_generator);
+            const f64 right = evaluate_lems(binary->right, values, owner_name, random_generator);
             if (lexeme == "+") return left + right;
             if (lexeme == "-") return left - right;
             if (lexeme == "*") return left * right;
@@ -185,7 +202,7 @@ f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &va
             static const UnorderedMap<String, f64 (*)(f64)> functions = {
                 {"exp", [](f64 value) { return std::exp(value); }},
                 {"ln", [](f64 value) { return std::log(value); }},
-                {"log", [](f64 value) { return std::log10(value); }},
+                {"log", [](f64 value) { return std::log(value); }},
                 {"sqrt", [](f64 value) { return std::sqrt(value); }},
                 {"abs", [](f64 value) { return std::fabs(value); }},
                 {"ceil", [](f64 value) { return std::ceil(value); }},
@@ -201,9 +218,16 @@ f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &va
             const auto *call = static_cast<const BinaryNode<LemsParseBody> *>(node);
             Vector<f64> arguments;
             for (const LemsParseNode *argument : children_of(call->right)) {
-                arguments.push_back(evaluate_lems(argument, values, owner_name));
+                arguments.push_back(evaluate_lems(argument, values, owner_name, random_generator));
             }
             if (lexeme == "pow" && arguments.size() == 2) return std::pow(arguments[0], arguments[1]);
+            if (lexeme == "random" && arguments.size() == 1) {
+                if (!random_generator) {
+                    throw runtime_error("random() in " + owner_name + " has no random generator to draw from: only a cell's "
+                                        "OnStart and dynamics may call it");
+                }
+                return arguments[0] * random_generator->uniform();
+            }
             auto function = functions.find(lexeme);
             if (function == functions.end() || arguments.size() != 1) {
                 throw runtime_error("Function '" + lexeme + "' cannot be evaluated in " + owner_name);
@@ -216,9 +240,10 @@ f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &va
     }
 }
 
-f64 evaluate_lems(const String &expression, const UnorderedMap<String, f64> &values, const String &owner_name) {
+f64 evaluate_lems(const String &expression, const UnorderedMap<String, f64> &values, const String &owner_name,
+                  RandomGenerator *random_generator) {
     std::unique_ptr<LemsParseNode> tree(parse_lems_expression(expression, owner_name));
-    return evaluate_lems(tree.get(), values, owner_name);
+    return evaluate_lems(tree.get(), values, owner_name, random_generator);
 }
 
 // Every Parameter, Constant and DerivedParameter the cell's type resolves, in SI units. An
@@ -274,7 +299,8 @@ UnorderedMap<String, f64> component_parameter_values(const NML_Context &context,
     return values;
 }
 
-UnorderedMap<String, f64> starting_values(const NML_Context &context, const NML_ComponentInstance &cell) {
+UnorderedMap<String, f64> starting_values(const NML_Context &context, const NML_ComponentInstance &cell,
+                                          RandomGenerator *random_generator) {
     const NML_ComponentType &component_type = *cell.component_type;
     const Vector<String> &variable_names = component_type.state_variable_names;
 
@@ -288,7 +314,7 @@ UnorderedMap<String, f64> starting_values(const NML_Context &context, const NML_
             throw runtime_error("OnStart in " + component_type.name + " assigns '" + entry.target +
                                 "', which is not a state variable");
         }
-        values[entry.target] = evaluate_lems(entry.expression, values, component_type.name);
+        values[entry.target] = evaluate_lems(entry.expression, values, component_type.name, random_generator);
     }
     return values;
 }
@@ -408,7 +434,7 @@ Codegen::~Codegen() {
     for (auto &[type_name, template_body] : synapse_type_templates) delete template_body;
 }
 
-void Codegen::initialize_cell_state() {
+void Codegen::initialize_cell_state(RandomGenerator &random_generator) {
     if (data_partitions.empty()) throw runtime_error("initialize_cell_state: cell memory is not allocated");
     f32 *cell_state = data_partitions[0].get_contents_as<f32>();
 
@@ -416,15 +442,25 @@ void Codegen::initialize_cell_state() {
         const NML_ComponentInstance &cell = population_cell(context, *population);
         const NML_ComponentType &component_type = *cell.component_type;
         const Vector<String> &variable_names = component_type.state_variable_names;
-
-        const UnorderedMap<String, f64> values = starting_values(context, cell);
-        Vector<f32> starting_state;
-        for (const String &name : variable_names) starting_state.push_back(static_cast<f32>(values.at(name)));
-
         const s64 population_base = context.simulation.population_base_indices.at(population->id);
         const s64 population_size = context.get_population_size(population);
         const s64 variable_count = static_cast<s64>(variable_names.size());
+
+        // Every neuron starts the same, unless an OnStart calls random(); then each draws its own.
+        bool draws_on_start = false;
+        for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+            if (entry.source_tag != NML_DeclarationType::OnStart) continue;
+            const std::unique_ptr<LemsParseNode> tree(parse_lems_expression(entry.expression, component_type.name));
+            draws_on_start = draws_on_start || calls_function(tree.get(), "random");
+        }
+
+        Vector<f32> starting_state;
         for (s64 local_index = 0; local_index < population_size; local_index += 1) {
+            if (local_index == 0 || draws_on_start) {
+                const UnorderedMap<String, f64> values = starting_values(context, cell, &random_generator);
+                starting_state.clear();
+                for (const String &name : variable_names) starting_state.push_back(static_cast<f32>(values.at(name)));
+            }
             std::copy(starting_state.begin(), starting_state.end(),
                       cell_state + population_base + local_index * variable_count);
         }
@@ -775,7 +811,199 @@ void place_derived_variables(KernelListNode *body, const Vector<String> &derived
     for (const String &name : derived_names) place_derived(name);
 }
 
+// Ticks a synapse needs after a spike arrives to settle back at rest: every state variable within
+// REST_FRACTION of the largest deviation from rest it reached. Simulated on the host the way the
+// kernel integrates it, with the given weight. -1 when it cannot be skipped at rest: its OnStart
+// values are not a rest state (a derivative or the current is not zero there), or it has not
+// settled within the run.
+s64 synapse_settle_ticks(const NML_Context &context, const NML_ComponentInstance &synapse, f64 weight) {
+    const NML_ComponentType &component_type = *synapse.component_type;
+    const String &owner_name = component_type.name;
+    const Vector<String> &variable_names = component_type.state_variable_names;
+    const f64 step_dt = context.simulation.step_dt;
+
+    struct ParsedEntry {
+        String target;
+        std::unique_ptr<LemsParseNode> condition;
+        std::unique_ptr<LemsParseNode> value;
+    };
+    auto parse = [&owner_name](const String &expression) {
+        return std::unique_ptr<LemsParseNode>(expression.empty() ? nullptr : parse_lems_expression(expression, owner_name));
+    };
+
+    Vector<String> derived_names;
+    UnorderedMap<String, Vector<ParsedEntry>> derived_entries;
+    Vector<ParsedEntry> derivatives;
+    Vector<ParsedEntry> event_assignments;
+    bool in_event = false;
+    for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+        switch (entry.source_tag) {
+            case NML_DeclarationType::DerivedVariable:
+            case NML_DeclarationType::Case:
+                if (derived_entries.count(entry.target) == 0) derived_names.push_back(entry.target);
+                derived_entries[entry.target].push_back({entry.target, parse(entry.condition), parse(entry.expression)});
+                in_event = false;
+                break;
+            case NML_DeclarationType::TimeDerivative:
+                derivatives.push_back({entry.target, nullptr, parse(entry.expression)});
+                in_event = false;
+                break;
+            case NML_DeclarationType::OnEvent:
+                in_event = true;
+                break;
+            case NML_DeclarationType::StateAssignment:
+                if (in_event) event_assignments.push_back({entry.target, nullptr, parse(entry.expression)});
+                break;
+            default:
+                in_event = false;
+                break;
+        }
+    }
+
+    // Derived variables in an order where each comes after the ones it reads.
+    Vector<String> derived_order;
+    while (derived_order.size() < derived_names.size()) {
+        const usize placed = derived_order.size();
+        for (const String &name : derived_names) {
+            if (std::find(derived_order.begin(), derived_order.end(), name) != derived_order.end()) continue;
+            Set<String> inputs;
+            for (const ParsedEntry &entry : derived_entries.at(name)) {
+                if (entry.condition) collect_lems_identifiers(entry.condition.get(), inputs);
+                if (entry.value) collect_lems_identifiers(entry.value.get(), inputs);
+            }
+            const bool inputs_placed = std::all_of(inputs.begin(), inputs.end(), [&](const String &input) {
+                return input == name || derived_entries.count(input) == 0 ||
+                       std::find(derived_order.begin(), derived_order.end(), input) != derived_order.end();
+            });
+            if (inputs_placed) derived_order.push_back(name);
+        }
+        if (derived_order.size() == placed) return -1;
+    }
+
+    UnorderedMap<String, f64> values = starting_values(context, synapse);
+    values["weight"] = weight;
+    values["t"] = 0.0;
+    auto evaluate_derived = [&]() {
+        for (const String &name : derived_order) {
+            f64 value = 0.0;
+            for (const ParsedEntry &entry : derived_entries.at(name)) {
+                if (entry.condition && evaluate_lems(entry.condition.get(), values, owner_name) == 0.0) continue;
+                if (entry.value) value = evaluate_lems(entry.value.get(), values, owner_name);
+                break;
+            }
+            values[name] = value;
+        }
+    };
+
+    // At rest nothing may change and nothing may reach the target.
+    const UnorderedMap<String, f64> rest = values;
+    evaluate_derived();
+    for (const ParsedEntry &derivative : derivatives) {
+        if (evaluate_lems(derivative.value.get(), values, owner_name) != 0.0) return -1;
+    }
+    if (values.count("i") == 0 || values.at("i") != 0.0) return -1;
+
+    Vector<f64> largest_deviation(variable_names.size(), 0.0);
+    const s64 tick_limit = std::max<s64>(1, std::llround(context.simulation.simulation_duration / step_dt));
+    for (s64 tick = 0; tick < tick_limit; tick += 1) {
+        values["t"] = (f64)tick * step_dt;
+        evaluate_derived();
+        Vector<f64> changes;
+        for (const ParsedEntry &derivative : derivatives) {
+            changes.push_back(step_dt * evaluate_lems(derivative.value.get(), values, owner_name));
+        }
+        for (usize index = 0; index < derivatives.size(); index += 1) values[derivatives[index].target] += changes[index];
+        if (tick == 0) {
+            for (const ParsedEntry &assignment : event_assignments) {
+                values[assignment.target] = evaluate_lems(assignment.value.get(), values, owner_name);
+            }
+        }
+
+        bool settled = true;
+        for (usize index = 0; index < variable_names.size(); index += 1) {
+            const f64 deviation = std::fabs(values.at(variable_names[index]) - rest.at(variable_names[index]));
+            largest_deviation[index] = std::max(largest_deviation[index], deviation);
+            settled = settled && deviation <= REST_FRACTION * largest_deviation[index];
+        }
+        // The state after this tick is what the next tick starts from.
+        if (settled) return tick + 1;
+    }
+    return -1;
+}
+
 } // namespace
+
+// LEMS attaches every synapse on an incoming edge and every current input to the target cell,
+// and the cell reads them through its select DerivedVariables (synapses[*]/i). The engine sums
+// them all into network_input, so each one has to expose what those selects read, in the
+// dimension they read it. A spike train is the engine's own kick into network_input; it only
+// needs a cell that reads its input.
+void Codegen::check_cell_inputs() const {
+    Vector<std::pair<s64, const NML_ComponentType *>> population_ends;
+    s64 first_neuron = 0;
+    for (const NML_ComponentInstance *population : network_populations(context)) {
+        first_neuron += context.get_population_size(population);
+        population_ends.push_back({first_neuron, population_cell(context, *population).component_type});
+    }
+    auto cell_type_of = [&](s64 neuron_index) -> const NML_ComponentType * {
+        for (const auto &[population_end, cell_type] : population_ends) {
+            if (neuron_index < population_end) return cell_type;
+        }
+        return nullptr;
+    };
+
+    auto check_attached = [](const NML_ComponentType &cell_type, const NML_ComponentInstance &attached,
+                             const String &role, bool must_expose_input) {
+        const String described = role + " '" + attached.id + "' (" + attached.component_type->name + ") into a '" +
+                                 cell_type.name + "'";
+        bool reads_input = false;
+        for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
+            if (entry.select.empty()) continue;
+            reads_input = true;
+            if (!must_expose_input) continue;
+
+            const String exposure_name = entry.select.substr(entry.select.rfind('/') + 1);
+            const NML_Node *selector = cell_type.find_declaration("var:" + entry.target);
+            const String read_dimension = selector ? selector->body.get_attribute_or("dimension", "none") : "none";
+            const NML_Node *exposure = attached.component_type->find_declaration("exposure:" + exposure_name);
+            if (!exposure) {
+                throw runtime_error(described + ": it exposes no '" + exposure_name + "', which the cell reads as '" +
+                                    entry.target + "'");
+            }
+            const String exposed_dimension = exposure->body.get_attribute_or("dimension", "none");
+            if (exposed_dimension != read_dimension) {
+                throw runtime_error(described + ": it exposes '" + exposure_name + "' as " + exposed_dimension +
+                                    ", but the cell reads it as " + read_dimension);
+            }
+        }
+        if (!reads_input) throw runtime_error(described + ": the cell reads no input");
+    };
+
+    // Each synapse against each cell type it reaches, once.
+    UnorderedMap<String, Set<const NML_ComponentType *>> checked_cell_types_per_synapse;
+    for (const Vector<NML_NetworkEdge> &row : context.simulation.network_data.list) {
+        for (const NML_NetworkEdge &edge : row) {
+            const NML_ComponentType *cell_type = cell_type_of(edge.child);
+            if (!cell_type || !checked_cell_types_per_synapse[edge.component_id].insert(cell_type).second) continue;
+
+            const NML_ComponentInstance *synapse = context.find_instance(edge.component_id);
+            if (!synapse || !synapse->component_type) continue;
+            check_attached(*cell_type, *synapse, "Synapse", true);
+        }
+    }
+
+    for (const SimulationInputConfig &profile : context.simulation.input_profiles) {
+        const NML_ComponentInstance *input = context.find_instance(profile.input_component_id);
+        if (!input || !input->component_type) continue;
+
+        Set<const NML_ComponentType *> checked_cell_types;
+        for (const InputTarget &target : profile.targets) {
+            const NML_ComponentType *cell_type = cell_type_of(context.neuron_index_of(target.neuron_index));
+            if (!cell_type || !checked_cell_types.insert(cell_type).second) continue;
+            check_attached(*cell_type, *input, "Input", profile.continuous_current_injection);
+        }
+    }
+}
 
 // The type's dynamics with LEMS names still in them: per population, translate_component_instance
 // puts each state variable's cell_state slot and each parameter's value in their place.
@@ -861,6 +1089,7 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
     String refractory_regime;
     String timer_name;
     std::unique_ptr<KernelNode> refractory_duration;
+    String refractory_comparison;
 
     if (regimes.size() > 2) throw unsupported("only an integrating / refractory regime pair is supported");
     if (regimes.size() == 1) active_regime = regimes[0].first;
@@ -888,13 +1117,72 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
             throw unsupported("the refractory exit must test a timer against a duration");
         }
         timer_name = comparison->left->body.token.lexeme;
-        refractory_duration.reset(translate_expression(comparison->right));
+        // The exit is elapsed > duration or elapsed >= duration; refractory is its negation.
+        refractory_comparison = comparison_operator == ">" ? "<=" : "<";
 
         for (const NML_DynamicsExpression *derivative : derivative_entries) {
             if (derivative->regime_name != refractory_regime) continue;
             if (derivative->target != timer_name || evaluate_lems(derivative->expression, {}, owner_name) != 1.0) {
-                throw unsupported("the refractory regime may only count time in '" + timer_name + "'");
+                throw unsupported("'" + derivative->target + "' has a TimeDerivative in the refractory regime; only a "
+                                  "refractory timer may");
             }
+        }
+
+        // The test has to measure the time since the spike that entered the regime, which is what
+        // last_spiked holds. Two forms do:
+        //   timer .geq. duration      OnEntry sets timer = 0, TimeDerivative of timer is 1
+        //   t .gt. stamp + duration   OnEntry sets stamp = t
+        auto entry_assignment_of = [&](const String &variable_name) -> const NML_DynamicsExpression * {
+            for (const NML_DynamicsExpression *assignment : entry_assignments[refractory_regime]) {
+                if (assignment->target == variable_name) return assignment;
+            }
+            return nullptr;
+        };
+        String stamp_name;
+        const LemsParseNode *duration = comparison->right;
+        if (timer_name == "t") {
+            duration = nullptr;
+            const auto *sum = dynamic_cast<const BinaryNode<LemsParseBody> *>(comparison->right);
+            if (sum && sum->body.syntax_type == LemsNodeSubtype::OPERATOR && sum->body.token.lexeme == "+") {
+                for (const auto &[stamp, candidate] : {std::pair{sum->left, sum->right}, std::pair{sum->right, sum->left}}) {
+                    if (stamp->body.syntax_type != LemsNodeSubtype::IDENTIFIER) continue;
+                    const NML_DynamicsExpression *stamp_entry = entry_assignment_of(stamp->body.token.lexeme);
+                    if (!stamp_entry) continue;
+                    std::unique_ptr<LemsParseNode> stamp_value(parse_lems_expression(stamp_entry->expression, owner_name));
+                    if (stamp_value->body.syntax_type != LemsNodeSubtype::IDENTIFIER || stamp_value->body.token.lexeme != "t") continue;
+                    stamp_name = stamp->body.token.lexeme;
+                    duration = candidate;
+                    break;
+                }
+            }
+            if (!duration) throw unsupported("a refractory exit on t must be t .gt. stamp + duration, with OnEntry setting stamp = t");
+
+            // The stamp has to hold the spike's time for the whole refractory period.
+            for (const NML_DynamicsExpression *derivative : derivative_entries) {
+                if (derivative->target == stamp_name) throw unsupported("the refractory stamp '" + stamp_name + "' has a TimeDerivative");
+            }
+            for (const EventHandler &handler : handlers) {
+                for (const NML_DynamicsExpression *assignment : handler.assignments) {
+                    if (assignment->target == stamp_name) throw unsupported("the refractory stamp '" + stamp_name + "' is assigned in an OnCondition");
+                }
+            }
+        } else {
+            const NML_DynamicsExpression *timer_entry = entry_assignment_of(timer_name);
+            bool counts_time = false;
+            for (const NML_DynamicsExpression *derivative : derivative_entries) {
+                if (derivative->regime_name == refractory_regime && derivative->target == timer_name) counts_time = true;
+            }
+            if (!timer_entry || !counts_time || evaluate_lems(timer_entry->expression, {}, owner_name) != 0.0) {
+                throw unsupported("the refractory timer '" + timer_name +
+                                  "' must be set to 0 on entry and count time with a TimeDerivative of 1");
+            }
+        }
+        refractory_duration.reset(translate_expression(duration));
+
+        Set<String> duration_names;
+        collect_identifiers(refractory_duration.get(), duration_names);
+        if (duration_names.count("t") || duration_names.count(timer_name) || duration_names.count(stamp_name)) {
+            throw unsupported("the refractory duration cannot depend on time");
         }
         if (!entry_assignments[active_regime].empty()) throw unsupported("OnEntry is only supported in the refractory regime");
 
@@ -918,9 +1206,9 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
 
     Set<String> lems_names;
     auto translate = [&](const String &expression) {
-        KernelNode *node = translate_lems(expression, owner_name);
-        collect_identifiers(node, lems_names);
-        return node;
+        const std::unique_ptr<LemsParseNode> tree(parse_lems_expression(expression, owner_name));
+        collect_lems_identifiers(tree.get(), lems_names);
+        return translate_expression(tree.get());
     };
     const String step_dt = float_literal(context.simulation.step_dt);
 
@@ -932,13 +1220,13 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
     KernelListNode *body = new_block();
     place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
 
-    // refractory = last_spiked >= 0 && (tick - last_spiked) * dt < duration
+    // refractory = last_spiked >= 0 && (tick - last_spiked) * dt < duration   (<= for a .gt. exit)
     if (has_refractory) {
         KernelNode *last_spike = new_expression("[]", identifier("last_spiked"), identifier("neuron_index"));
         KernelNode *has_spiked = new_expression(">=", last_spike, literal("0"));
         KernelNode *elapsed = new_expression(
                 "*", new_cast(new_type("f32"), new_expression("-", identifier("tick"), clone(last_spike))), literal(step_dt));
-        KernelNode *within_duration = new_expression("<", elapsed, refractory_duration.release());
+        KernelNode *within_duration = new_expression(refractory_comparison, elapsed, refractory_duration.release());
         body->children.push_back(new_declaration(
                 new_type("const bool"), "refractory", new_expression("&&", has_spiked, within_duration)));
     }
@@ -991,7 +1279,8 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
     for (KernelNode *condition : conditions) body->children.push_back(condition);
 
     for (const String &name : lems_names) {
-        if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX)) {
+        if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX) ||
+            starts_with(name, RANDOM_SLOT_PREFIX)) {
             delete body;
             throw unsupported("the name '" + name + "' is reserved by the generated kernel");
         }
@@ -1019,6 +1308,20 @@ KernelListNode *Codegen::translate_component_instance(const NML_ComponentInstanc
     KernelNode *body = clone(translate_component_type(component_type));
 
     try {
+        // Each random() call gets a slot per neuron of the population, so every neuron draws
+        // its own value: neuron n reads random_values[n + slot_start - first_neuron].
+        const s64 population_size = context.get_population_size(&population);
+        Set<String> template_names;
+        collect_identifiers(body, template_names);
+        for (const String &name : template_names) {
+            if (!starts_with(name, RANDOM_SLOT_PREFIX)) continue;
+            const s64 constant_part = random_values_count - first_neuron;
+            const std::unique_ptr<KernelNode> slot(new_expression(constant_part < 0 ? "-" : "+", identifier("neuron_index"),
+                                                                  literal(std::to_string(std::llabs(constant_part)))));
+            replace_identifier(body, name, slot.get());
+            random_values_count += population_size;
+        }
+
         // Neuron n's variable at offset is cell_state[n * count + base - first_neuron * count + offset].
         const Vector<String> &variable_names = component_type.state_variable_names;
         const s64 variable_count = static_cast<s64>(variable_names.size());
@@ -1056,10 +1359,11 @@ KernelListNode *Codegen::translate_component_instance(const NML_ComponentInstanc
 // variable lives in its own weight-matrix plane, so a read is a load_edge and a write is an
 // accumulate_edge of the change.
 //
-// It runs on the tick a spike arrives and on every tick the edge holds state, which is every
-// tick its synapse is away from rest. Order: derived variables, every derivative into a
-// temporary, the Euler steps, the OnEvent on an arrival, the current into the target, then the
-// return to rest once the state has decayed.
+// It runs on every edge of a neuron whose synapses are in their active window (see
+// synapse_active_ticks). Order: derived variables, every derivative into a temporary, the Euler
+// steps, the OnEvent on an arrival, then the current into the target. On the window's last tick
+// the synapse has settled, and instead of the Euler steps it is put exactly back at rest, where
+// it stays while the walk is skipped.
 KernelListNode *Codegen::translate_synapse_type(const NML_ComponentType &component_type) {
     auto cached = synapse_type_templates.find(component_type.name);
     if (cached != synapse_type_templates.end()) return cached->second;
@@ -1073,7 +1377,7 @@ KernelListNode *Codegen::translate_synapse_type(const NML_ComponentType &compone
     auto plane_of = [&](const String &variable_name) -> s64 {
         auto variable = std::find(variable_names.begin(), variable_names.end(), variable_name);
         if (variable == variable_names.end()) throw unsupported("'" + variable_name + "' is not a state variable");
-        return WeightMatrix::FIRST_STATE_MATRIX_INDEX + static_cast<s64>(variable - variable_names.begin());
+        return WeightMatrix::FIRST_STATE_VARIABLE_PLANE + static_cast<s64>(variable - variable_names.begin());
     };
 
     // Sort the flat entries by kind.
@@ -1124,17 +1428,18 @@ KernelListNode *Codegen::translate_synapse_type(const NML_ComponentType &compone
 
     Set<String> lems_names;
     auto translate = [&](const String &expression) {
-        KernelNode *node = translate_lems(expression, owner_name);
-        collect_identifiers(node, lems_names);
-        return node;
+        const std::unique_ptr<LemsParseNode> tree(parse_lems_expression(expression, owner_name));
+        if (calls_function(tree.get(), "random")) throw unsupported("random() is not supported in a synapse");
+        collect_lems_identifiers(tree.get(), lems_names);
+        return translate_expression(tree.get());
     };
     auto selected_value = [&unsupported](const NML_DynamicsExpression &entry) -> KernelNode * {
         throw unsupported("DerivedVariable '" + entry.target + "' selects, which a synapse cannot");
     };
     const String step_dt = float_literal(context.simulation.step_dt);
 
-    KernelListNode *active = new_block();
-    place_derived_variables(active, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
+    KernelListNode *body = new_block();
+    place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
 
     // Every derivative from the pre-step state, then every Euler step.
     Set<String> integrated_names;
@@ -1144,67 +1449,47 @@ KernelListNode *Codegen::translate_synapse_type(const NML_ComponentType &compone
             throw unsupported("'" + derivative->target + "' has more than one TimeDerivative");
         }
         lems_names.insert(derivative->target);
-        active->children.push_back(new_declaration(
+        body->children.push_back(new_declaration(
                 new_type("const f32"), DERIVATIVE_PREFIX + derivative->target, translate(derivative->expression)));
         updates.push_back(accumulate_edge(
                 plane_of(derivative->target),
                 new_expression("*", literal(step_dt), identifier(DERIVATIVE_PREFIX + derivative->target))));
     }
-    for (KernelNode *update : updates) active->children.push_back(update);
+    KernelListNode *steps = new_block();
+    for (KernelNode *update : updates) steps->children.push_back(update);
+
+    KernelListNode *return_to_rest = new_block();
+    for (const String &variable_name : variable_names) {
+        lems_names.insert(variable_name);
+        return_to_rest->children.push_back(accumulate_edge(
+                plane_of(variable_name),
+                new_expression("-", identifier(REST_PREFIX + variable_name), identifier(variable_name))));
+    }
+    KernelNode *last_active_tick = new_expression(
+            "==",
+            new_expression("-", identifier("tick"), new_expression("[]", identifier("last_spiked"), identifier("neuron_index"))),
+            identifier("synapse_active_ticks"));
+    KernelListNode *advance = new_conditional();
+    add_branch(advance, last_active_tick, return_to_rest);
+    add_branch(advance, nullptr, steps);
+    body->children.push_back(advance);
 
     // The OnEvent, as the change each assignment makes.
     KernelListNode *on_arrival = new_block();
-    Vector<KernelNode *> increments;
     for (const NML_DynamicsExpression *assignment : event_assignments) {
         lems_names.insert(assignment->target);
         KernelNode *increment = new_expression("-", translate(assignment->expression), identifier(assignment->target));
-        increments.push_back(clone(increment));
         on_arrival->children.push_back(accumulate_edge(plane_of(assignment->target), increment));
     }
     KernelListNode *arrival = new_conditional();
     add_branch(arrival, identifier("arrived"), on_arrival);
-    active->children.push_back(arrival);
+    body->children.push_back(arrival);
 
     // The current, into the target's next input row.
     KernelNode *input_slot = new_expression(
             "[]", identifier("network_inputs"),
             new_expression("+", new_expression("*", identifier("next_row"), identifier("neuron_count")), identifier("target")));
-    active->children.push_back(function_call("atomic_add", {input_slot, identifier("i")}));
-
-    // Back to rest once every state variable is negligible against what one spike adds:
-    // zeroing the corrections makes the edge inactive until its next arrival.
-    if (!variable_names.empty() && !increments.empty()) {
-        KernelNode *scale = function_call("fabs", {increments[0]});
-        for (usize index = 1; index < increments.size(); index += 1) {
-            scale = function_call("fmax", {scale, function_call("fabs", {increments[index]})});
-        }
-        const std::unique_ptr<KernelNode> tolerance(new_expression("*", literal(REST_FRACTION), scale));
-
-        KernelNode *at_rest = new_unary_expression("!", identifier("arrived"));
-        KernelListNode *rest = new_block();
-        for (const String &variable_name : variable_names) {
-            lems_names.insert(variable_name);
-            at_rest = new_expression("&&", at_rest,
-                                     new_expression("<=", function_call("fabs", {identifier(variable_name)}), clone(tolerance.get())));
-            rest->children.push_back(
-                    accumulate_edge(plane_of(variable_name), new_unary_expression("-", identifier(variable_name))));
-        }
-        KernelListNode *return_to_rest = new_conditional();
-        add_branch(return_to_rest, at_rest, rest);
-        active->children.push_back(return_to_rest);
-    } else {
-        for (KernelNode *increment : increments) delete increment;
-    }
-
-    // Only on an arrival or while the edge holds state.
-    KernelNode *runs = identifier("arrived");
-    for (const String &variable_name : variable_names) {
-        runs = new_expression("||", runs, edge_holds_correction(plane_of(variable_name)));
-    }
-    KernelListNode *gate = new_conditional();
-    add_branch(gate, runs, active);
-    KernelListNode *body = new_block();
-    body->children.push_back(gate);
+    body->children.push_back(function_call("atomic_add", {input_slot, identifier("i")}));
 
     for (const String &name : lems_names) {
         if (is_synapse_engine_name(name)) {
@@ -1239,13 +1524,16 @@ KernelListNode *Codegen::translate_synapse_instance(const NML_ComponentInstance 
         }
 
         // weight is the connection's, stored in the weight plane.
-        const std::unique_ptr<KernelNode> edge_weight(load_edge(WeightMatrix::DEFAULT_MATRIX_INDEX));
+        const std::unique_ptr<KernelNode> edge_weight(load_edge(WeightMatrix::WEIGHT_PLANE));
         replace_identifier(body, "weight", edge_weight.get());
 
         const Vector<String> &variable_names = component_type.state_variable_names;
+        const UnorderedMap<String, f64> rest_values = starting_values(context, synapse);
         for (usize offset = 0; offset < variable_names.size(); offset += 1) {
-            const std::unique_ptr<KernelNode> stored(load_edge(WeightMatrix::FIRST_STATE_MATRIX_INDEX + static_cast<s64>(offset)));
+            const std::unique_ptr<KernelNode> stored(load_edge(WeightMatrix::FIRST_STATE_VARIABLE_PLANE + static_cast<s64>(offset)));
             replace_identifier(body, variable_names[offset], stored.get());
+            const std::unique_ptr<KernelNode> rest_value(literal(float_literal(rest_values.at(variable_names[offset]))));
+            replace_identifier(body, REST_PREFIX + variable_names[offset], rest_value.get());
         }
 
         Set<String> remaining_names;
@@ -1268,7 +1556,48 @@ s64 Codegen::edge_plane_count() const {
         if (!synapse.component_type) throw runtime_error("Synapse '" + synapse.id + "' has no ComponentType");
         state_variable_count = std::max<s64>(state_variable_count, synapse.component_type->state_variable_names.size());
     }
-    return WeightMatrix::FIRST_STATE_MATRIX_INDEX + state_variable_count;
+    return WeightMatrix::FIRST_STATE_VARIABLE_PLANE + state_variable_count;
+}
+
+s64 Codegen::updated_edge_plane_count() const {
+    // A synapse's dynamics write every one of its StateVariables: the Euler steps, the OnEvent
+    // and the return to rest.
+    return edge_plane_count() - WeightMatrix::FIRST_STATE_VARIABLE_PLANE;
+}
+
+s64 Codegen::synapse_active_ticks() const {
+    UnorderedMap<String, f64> largest_weight;
+    for (const Vector<NML_NetworkEdge> &row : context.simulation.network_data.list) {
+        for (const NML_NetworkEdge &edge : row) {
+            f64 &largest = largest_weight[edge.component_id];
+            largest = std::max(largest, std::fabs((f64)edge.weight));
+        }
+    }
+
+    // At least a tick, so no arrival ever lands on the tick that puts a synapse back at rest.
+    s64 settle_ticks = 1;
+    for (const NML_ComponentInstance &synapse : context.simulation.synapse_instances) {
+        auto weight = largest_weight.find(synapse.id);
+        if (weight == largest_weight.end()) continue;
+
+        s64 ticks = -1;
+        try {
+            ticks = synapse_settle_ticks(context, synapse, weight->second);
+        } catch (const runtime_error &error) {
+            log::logger().warn("Codegen: synapse '{}' cannot be simulated on the host: {}", synapse.id, error.what());
+        }
+        if (ticks < 0) {
+            log::logger().warn("Codegen: synapse '{}' does not settle back to its OnStart values, so every "
+                               "synapse runs every tick", synapse.id);
+            return -1;
+        }
+        settle_ticks = std::max(settle_ticks, ticks);
+    }
+
+    const s64 active_ticks = std::max<s64>(1, context.simulation.maximum_edge_delay) + settle_ticks;
+    log::logger().info("Codegen: a neuron's synapses run for {} ticks after it spikes ({} of delay, {} to settle)",
+                       active_ticks, active_ticks - settle_ticks, settle_ticks);
+    return active_ticks;
 }
 
 KernelNode *Codegen::translate_expression(const LemsParseNode *node) {
@@ -1292,6 +1621,16 @@ KernelNode *Codegen::translate_expression(const LemsParseNode *node) {
         }
 
         case LemsNodeSubtype::FUNCTION_CALL: {
+            // random(x) is x times this tick's uniform draw in the call's own random_values slot.
+            if (lexeme == "random") {
+                const Vector<LemsParseNode *> &arguments = children_of(static_cast<const BinaryNode<LemsParseBody> *>(node)->right);
+                if (arguments.size() != 1) throw runtime_error("LEMS random takes one argument");
+                KernelNode *slot = identifier(RANDOM_SLOT_PREFIX + std::to_string(random_call_count));
+                random_call_count += 1;
+                return new_expression("*", translate_expression(arguments[0]),
+                                      new_expression("[]", identifier("random_values"), slot));
+            }
+
             auto function = LEMS_FUNCTIONS.find(lexeme);
             if (function == LEMS_FUNCTIONS.end()) throw runtime_error("LEMS function '" + lexeme + "' has no kernel equivalent");
 

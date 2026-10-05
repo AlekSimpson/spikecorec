@@ -95,6 +95,7 @@ SRCS = [
     "src/nml/lems_tokenizer.cpp",
     "src/nml/node.cpp",
     "src/nml/parser.cpp",
+    "src/nml/random_generator.cpp",
     "src/nml/utilities.cpp",
 ]
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
@@ -123,18 +124,31 @@ for _macro, _package in (
     for _flag in _libs:
         EXTRA_LINK_ARGS.append(_flag)
 
+# ── XML parsing (libxml2 — the NML/LEMS front-end) ────────────────────────────
+# Not optional: every NML source includes libxml2's headers. Mirrors the Makefile's
+# HAS_LIBXML2 probing. A Python extension on macOS links with -undefined dynamic_lookup,
+# so leaving -lxml2 out does not fail the build -- it fails the import, on a missing symbol.
+_libxml2_libs = _pkg_config("--libs", package="libxml-2.0")
+if _libxml2_libs is None:
+    raise RuntimeError("libxml2 not found through pkg-config (libxml-2.0); the NML front-end needs it.")
+DEFINE_MACROS.append(("SPIKECOREC_HAVE_LIBXML2", None))
+for _flag in _pkg_config("--cflags", package="libxml-2.0") or []:
+    if _flag.startswith("-I"):
+        INC.append(_flag[2:])
+    else:
+        EXTRA_COMPILE_ARGS.append(_flag)
+EXTRA_LINK_ARGS += _libxml2_libs
+
 # ── CUDA backend ─────────────────────────────────────────────
 if BACKEND == "cuda":
     CUDA_PATH = os.environ.get("CUDA_PATH", "/usr/local/cuda")
     INC.append(f"{CUDA_PATH}/include")
-    # src/cuda/kernels.cu was deleted in the backend rework and has no replacement yet.
-    # The CUDA backend also cannot run a generated kernel at all — the kernel codegen emits
-    # Metal only — so a CUDA extension would link short of the gpu_* wrappers and, if it
-    # linked, would report successful ticks having run no dynamics. Fail here instead.
+    # The kernel codegen emits CUDA source as well as Metal, but the CUDA backend has no
+    # generic launcher to run it with yet (ticket #56) -- an extension built here would
+    # construct an engine whose ticks cannot be dispatched. Fail here instead.
     raise RuntimeError(
-        "The CUDA backend is not currently buildable: src/cuda/kernels.cu was removed in "
-        "the backend rework, and the kernel codegen emits Metal only. Build with "
-        "SPIKECOREC_BACKEND=metal."
+        "The CUDA backend is not currently buildable: the generated kernel has no CUDA "
+        "launcher yet (ticket #56). Build with SPIKECOREC_BACKEND=metal."
     )
     # backend.cpp uses the driver API (cuInit/cuCtxCreate/cuModuleLoadData) and
     # NVRTC in addition to the runtime API, so link -lcuda and -lnvrtc too. The
@@ -157,18 +171,22 @@ elif BACKEND == "metal":
     DEFINE_MACROS.append(("SPIKECOREC_METAL", None))
 
 # ── Compile-time paths ───────────────────────────────────────
-# The engine reads two directories out of the source tree at runtime, and both reach it
-# as compile-time defines rather than as a search: the NeuroML standard library, without
-# which every document resolves to zero known ComponentTypes and so to zero neurons, and
-# src/metal, whose k2tree_device.metalinc is prepended to every generated kernel.
+# The engine reads three paths out of the source tree at runtime, and all reach it as
+# compile-time defines rather than as a search: the NeuroML standard library, without
+# which every document resolves to zero known ComponentTypes and so to zero neurons; the
+# NeuroML XSD, which validate_lems_schema checks a NeuroML document against; and
+# src/metal, whose k2tree_device.metalinc is parsed into every generated kernel.
 #
-# The Makefile passes both, and an extension built without them is not obviously broken:
-# it imports and constructs cleanly, then reports that the model declares no neurons,
-# which reads as a bad document rather than as a missing define.
+# The Makefile passes all three, and an extension built without them is not obviously
+# broken: it imports and constructs cleanly, then reports that the model declares no
+# neurons, which reads as a bad document rather than as a missing define.
 _source_root = os.path.abspath(os.path.dirname(__file__))
 DEFINE_MACROS.append(
     ("SPIKECOREC_NML_STD_LIB_DIR",
      '"' + os.path.join(_source_root, "third_party", "neuroml2", "std_lib") + '"'))
+DEFINE_MACROS.append(
+    ("SPIKECOREC_NML_SCHEMA_PATH",
+     '"' + os.path.join(_source_root, "third_party", "neuroml2", "schema", "NeuroML_v2.3.xsd") + '"'))
 if BACKEND == "metal":
     DEFINE_MACROS.append(
         ("SPIKECOREC_METAL_DEVICE_DIR",

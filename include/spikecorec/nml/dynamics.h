@@ -8,6 +8,7 @@
 #include "spikecorec/core/units.h"
 #include "spikecorec/core/types.h"
 #include "spikecorec/nml/node.h"
+#include "spikecorec/nml/random_generator.h"
 
 using namespace spikecorec;
 using namespace std;
@@ -281,17 +282,21 @@ struct NML_ComponentType;
 struct NML_ComponentInstance;
 struct NML_Context;
 
-// Host-side value of a LEMS expression; every name it reads must be in values.
-f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &values, const String &owner_name);
-f64 evaluate_lems(const String &expression, const UnorderedMap<String, f64> &values, const String &owner_name);
+// Host-side value of a LEMS expression; every name it reads must be in values. random()
+// draws from random_generator and fails without one.
+f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &values, const String &owner_name,
+                  RandomGenerator *random_generator = nullptr);
+f64 evaluate_lems(const String &expression, const UnorderedMap<String, f64> &values, const String &owner_name,
+                  RandomGenerator *random_generator = nullptr);
 
 // Every Parameter, Constant and DerivedParameter the cell's type resolves, in SI units. An
 // unset parameter is left out.
 UnorderedMap<String, f64> component_parameter_values(const NML_Context &context, const NML_ComponentInstance &cell);
 
 // The cell's parameter values plus every state variable's starting value: its OnStart
-// value, otherwise 0.
-UnorderedMap<String, f64> starting_values(const NML_Context &context, const NML_ComponentInstance &cell);
+// value, otherwise 0. An OnStart that calls random() draws from random_generator.
+UnorderedMap<String, f64> starting_values(const NML_Context &context, const NML_ComponentInstance &cell,
+                                          RandomGenerator *random_generator = nullptr);
 
 // The target network's populations, in document order.
 Vector<const NML_ComponentInstance *> network_populations(const NML_Context &context);
@@ -320,6 +325,13 @@ struct Codegen {
     // The same per synapse type; each synapse prototype clones it.
     UnorderedMap<String, KernelListNode *> synapse_type_templates;
 
+    // random() calls translated so far. Each one reads its own placeholder slot in the type's
+    // template until translate_component_instance places it.
+    s64 random_call_count = 0;
+    // The size of the random_values buffer the kernel reads each tick: one slot per random()
+    // call per neuron that runs it.
+    s64 random_values_count = 0;
+
     Codegen(NML_Context &context, EngineBackend *device): context(context), device(device) {};
     ~Codegen();
 
@@ -328,17 +340,21 @@ struct Codegen {
     Codegen &operator=(const Codegen &other) = delete;
 
     void allocate_cell_model_memory();
-    // Writes every cell's starting state (OnStart values, otherwise 0) into cell_state.
-    void initialize_cell_state();
+    // Writes every cell's starting state (OnStart values, otherwise 0) into cell_state. An
+    // OnStart that calls random() draws for each neuron from random_generator.
+    void initialize_cell_state(RandomGenerator &random_generator);
+
+    // Refuses a synapse or input that does not provide the input its target cell reads: an
+    // exposure the cell's select names, in the same dimension. Called before anything is built.
+    void check_cell_inputs() const;
 
     KernelNode *create_kernel_root();
     KernelNode *translate_kernel_code();
     KernelListNode *translate_component_type(const NML_ComponentType &component_type);
     KernelListNode *translate_component_instance(const NML_ComponentInstance &population, s64 first_neuron);
 
-    // A synapse type's dynamics for one edge, with LEMS names still in it. Runs on the tick a
-    // spike arrives and while the edge holds state; each state variable lives in its own
-    // weight-matrix plane.
+    // A synapse type's dynamics for one edge, with LEMS names still in it. Runs on every edge
+    // every tick; each state variable lives in its own weight-matrix plane.
     KernelListNode *translate_synapse_type(const NML_ComponentType &component_type);
     // The type's template with every state variable read from its plane, weight from the
     // weight plane and every parameter by its value.
@@ -347,6 +363,12 @@ struct Codegen {
     // Weight-matrix planes the kernel uses: weight, delay, then one per state variable of the
     // largest synapse type.
     s64 edge_plane_count() const;
+    // How many of those planes the generated kernel writes each tick.
+    s64 updated_edge_plane_count() const;
+    // Ticks after a neuron spikes during which its outgoing synapses can be away from rest: the
+    // longest delay plus the slowest synapse's settle time. -1 when some synapse cannot be left
+    // at rest, so every synapse runs every tick.
+    s64 synapse_active_ticks() const;
     KernelNode *translate_expression(const LemsParseNode *node);
     KernelNode *translate_lems(const String &expression, const String &owner_name);
 
