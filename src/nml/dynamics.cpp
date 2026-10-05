@@ -213,7 +213,7 @@ f64 evaluate_lems(const LemsParseNode *node, const UnorderedMap<String, f64> &va
                 {"sinh", [](f64 value) { return std::sinh(value); }},
                 {"cosh", [](f64 value) { return std::cosh(value); }},
                 {"tanh", [](f64 value) { return std::tanh(value); }},
-                {"H", [](f64 value) { return value >= 0.0 ? 1.0 : 0.0; }},
+                {"H", [](f64 value) { return value > 0.0 ? 1.0 : 0.0; }},  // H(0) is 0
             };
             const auto *call = static_cast<const BinaryNode<LemsParseBody> *>(node);
             Vector<f64> arguments;

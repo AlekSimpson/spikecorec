@@ -20,7 +20,7 @@ const char *METAL_KERNEL_BOILERPLATE = R"METAL(
 using namespace metal;
 
 inline float spikecorec_heaviside(float value) {
-    return value >= 0.0f ? 1.0f : 0.0f;
+    return value > 0.0f ? 1.0f : 0.0f;
 }
 
 // One edge's stored value, reconstructed from the shared basis: U[source] . (Ck * V[target]).
@@ -253,7 +253,7 @@ const char *CUDA_KERNEL_BOILERPLATE = R"CUDA(
 #define MAX_K2TREE_HEIGHT 32
 
 __device__ inline float spikecorec_heaviside(float value) {
-    return value >= 0.0f ? 1.0f : 0.0f;
+    return value > 0.0f ? 1.0f : 0.0f;
 }
 
 // k^2-tree bit-walk helpers, ported from k2tree_device.metalinc.
