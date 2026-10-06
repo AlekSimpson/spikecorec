@@ -1,31 +1,28 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <filesystem>
+#include <numeric>
+#include <random>
 #include <string>
-#include <unistd.h>
 #include <vector>
-
 #include <gtest/gtest.h>
 
 #include "spikecorec/core/backend.h"
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/weight_matrix.h"
+#include "support/test_support.h"
 
 using namespace std;
 using namespace spikecorec;
+using namespace spikecorec::test_support;
 
 namespace {
 
-// One backend for the file. Every matrix carves its own slab and releases it when it dies,
-// so sharing the backend is not sharing storage -- it only avoids standing up a Metal
-// device per test.
-EngineBackend &test_backend() {
-    static EngineBackend backend;
-    return backend;
-}
+constexpr s64 WEIGHT = WeightMatrix::WEIGHT_PLANE;
+constexpr s64 DELAY = WeightMatrix::DELAY_PLANE;
+constexpr s64 FIRST_STATE = WeightMatrix::FIRST_STATE_VARIABLE_PLANE;
 
-// Two source nodes into one target, plus an unconnected fourth. Small enough that every
-// edge ordinal can be named in a comment, which is what the run tables are indexed by.
+// Two source nodes into one target, plus an unconnected fourth. Small enough to name every edge:
 //
 //   node 0 -> 1, 2      ordinals 0, 1
 //   node 1 -> 2         ordinal  2
@@ -35,392 +32,546 @@ vector<vector<s32>> small_network() {
     return {{1, 2}, {2}, {}, {}};
 }
 
-// One run per edge, each with its own weight and delay, so the runs are distinguishable
-// from each other and from a matrix that ignored them.
-void declare_one_run_per_edge(WeightMatrix &matrix,
-                              const Vector<f32> &weights,
-                              const Vector<s32> &delays) {
-    Vector<s64> first_edge_ordinal;
-    Vector<s64> edge_count;
-    Vector<s32> synapse_prototype;
-    for (usize index = 0; index < weights.size(); index += 1) {
-        first_edge_ordinal.push_back((s64)index);
-        edge_count.push_back(1);
-        synapse_prototype.push_back((s32)index);
+// Every source reaches out_degree distinct other nodes, chosen at random.
+vector<vector<s32>> random_network(s32 node_count, s32 out_degree, unsigned seed) {
+    mt19937 random_engine(seed);
+    vector<vector<s32>> network((usize)node_count);
+    for (s32 source = 0; source < node_count; source += 1) {
+        vector<s32> candidates;
+        for (s32 target = 0; target < node_count; target += 1) {
+            if (target != source) candidates.push_back(target);
+        }
+        shuffle(candidates.begin(), candidates.end(), random_engine);
+        candidates.resize((usize)out_degree);
+        sort(candidates.begin(), candidates.end());
+        network[(usize)source] = candidates;
     }
-    matrix.declare_projections(first_edge_ordinal, edge_count, synapse_prototype, weights, delays);
+    return network;
 }
 
-} // namespace
-
-// ── edge numbering ────────────────────────────────────────────────────────────────
-
-// The canonical ordinal is what every run table and every staged delta is keyed by, so a
-// disagreement about it silently gives edges the wrong synapse. It has to be a prefix sum
-// over REAL out-degree -- not over a padded maximum, which is the storage this class
-// exists to avoid.
-TEST(WeightMatrix, edges_are_numbered_by_real_out_degree) {
-    WeightMatrix matrix(test_backend(), small_network());
-
-    EXPECT_EQ(matrix.total_edge_count, 3);
-
-    EXPECT_EQ(matrix.edge_ordinal(0, 1).value(), 0);
-    EXPECT_EQ(matrix.edge_ordinal(0, 2).value(), 1);
-    EXPECT_EQ(matrix.edge_ordinal(1, 2).value(), 2);
-
-    // Node 2 has an incoming edge but no outgoing one, and node 3 has neither.
-    EXPECT_FALSE(matrix.edge_ordinal(2, 0).has_value());
-    EXPECT_FALSE(matrix.edge_ordinal(3, 0).has_value());
-
-    // A pair that is not an edge has no ordinal even when both endpoints exist.
-    EXPECT_FALSE(matrix.edge_ordinal(1, 0).has_value());
-}
-
-// The ordering has to be stable, because the codegen bakes run boundaries against it while
-// the engine hands the same boundaries to this class. Both derive it independently.
-TEST(WeightMatrix, edge_numbering_is_contiguous_and_covers_every_edge) {
-    WeightMatrix matrix(test_backend(), small_network());
-
-    vector<bool> seen((usize)matrix.total_edge_count, false);
+// The (source, target) pair of every edge, indexed by ordinal.
+vector<Pair<s32, s32>> edges_by_ordinal(const WeightMatrix &matrix) {
+    vector<Pair<s32, s32>> edges((usize)matrix.total_edge_count);
     vector<s32> neighbors((usize)max<s64>(matrix.max_neighbor_count, 1));
     for (s64 source = 0; source < matrix.node_count; source += 1) {
         const s64 degree = matrix.get_neighbors(source, neighbors.data());
         for (s64 slot = 0; slot < degree; slot += 1) {
-            const optional<s64> ordinal = matrix.edge_ordinal((s32)source, neighbors[(usize)slot]);
-            ASSERT_TRUE(ordinal.has_value());
-            ASSERT_GE(*ordinal, 0);
-            ASSERT_LT(*ordinal, matrix.total_edge_count);
-            EXPECT_FALSE(seen[(usize)*ordinal]) << "ordinal " << *ordinal << " used twice";
-            seen[(usize)*ordinal] = true;
+            const s64 ordinal = *matrix.edge_ordinal((s32)source, neighbors[(usize)slot]);
+            edges[(usize)ordinal] = {(s32)source, neighbors[(usize)slot]};
         }
+    }
+    return edges;
+}
+
+// One run per edge, so values_per_plane[plane][ordinal] is that edge's starting value.
+void declare_one_run_per_edge(WeightMatrix &matrix, const Vector<Vector<f32>> &values_per_plane) {
+    Vector<s64> first_edge_ordinal;
+    Vector<s64> edge_count;
+    Vector<s32> synapse_prototype;
+    for (s64 ordinal = 0; ordinal < matrix.total_edge_count; ordinal += 1) {
+        first_edge_ordinal.push_back(ordinal);
+        edge_count.push_back(1);
+        synapse_prototype.push_back(0);
+    }
+    matrix.declare_projections(first_edge_ordinal, edge_count, synapse_prototype, values_per_plane);
+}
+
+// What every edge of one plane reads, basis plus S, by ordinal.
+Vector<f32> plane_values(const WeightMatrix &matrix, s64 plane) {
+    Vector<f32> values((usize)matrix.total_edge_count);
+    matrix.neighbor_weights_for_matrix(values.data(), plane);
+    return values;
+}
+
+// The worst error over the edges, against the larger of each expected value and the plane's RMS:
+// what fit_tolerance bounds.
+f64 worst_relative_error(const Vector<f32> &read, const Vector<f32> &expected) {
+    f64 sum_of_squares = 0.0;
+    for (f32 value : expected) sum_of_squares += (f64)value * (f64)value;
+    const f64 root_mean_square = expected.empty() ? 1.0 : sqrt(sum_of_squares / (f64)expected.size());
+    const f64 scale_floor = root_mean_square > 0.0 ? root_mean_square : 1.0;
+    f64 worst = 0.0;
+    for (usize index = 0; index < expected.size(); index += 1) {
+        const f64 scale = max(fabs((f64)expected[index]), scale_floor);
+        worst = max(worst, fabs((f64)read[index] - (f64)expected[index]) / scale);
+    }
+    return worst;
+}
+
+// Queues an update the way the kernel does, in the device-side queue that compact_pending_deltas
+// merges into S.
+void queue_update(WeightMatrix &matrix, s64 plane, s64 ordinal, f32 delta) {
+    s32 &count = *matrix.pending_delta_count.get_contents_as<s32>();
+    ASSERT_LT(count, matrix.pending_delta_capacity);
+    matrix.pending_delta_edge_ordinal.get_contents_as<s64>()[count] = ordinal;
+    matrix.pending_delta_value.get_contents_as<f32>()[count] = delta;
+    matrix.pending_delta_matrix_index.get_contents_as<s32>()[count] = (s32)plane;
+    count += 1;
+}
+
+Vector<f32> uniform_values(s64 count, f32 low, f32 high, unsigned seed) {
+    mt19937 random_engine(seed);
+    uniform_real_distribution<f32> distribution(low, high);
+    Vector<f32> values((usize)count);
+    for (f32 &value : values) value = distribution(random_engine);
+    return values;
+}
+
+Vector<f32> whole_tick_delays(s64 count, s32 shortest, s32 longest, unsigned seed) {
+    mt19937 random_engine(seed);
+    uniform_int_distribution<s32> distribution(shortest, longest);
+    Vector<f32> values((usize)count);
+    for (f32 &value : values) value = (f32)distribution(random_engine);
+    return values;
+}
+
+// A matrix whose four planes all start from values drawn per connection, so no lane count short
+// of the exact solve reproduces them.
+struct RandomValuesMatrix {
+    WeightMatrix matrix;
+    Vector<Vector<f32>> declared;
+
+    RandomValuesMatrix(s32 node_count, s32 out_degree, s64 updated_plane_count)
+        : matrix(shared_backend(), random_network(node_count, out_degree, 11), -1, true, -1, /*weight_seed=*/7,
+                 /*matrix_count=*/4, updated_plane_count) {
+        const s64 edge_count = matrix.total_edge_count;
+        declared = {uniform_values(edge_count, 0.5f, 1.5f, 1), whole_tick_delays(edge_count, 1, 30, 2),
+                    uniform_values(edge_count, -2e-9f, 2e-9f, 3), Vector<f32>((usize)edge_count, 0.0f)};
+        declare_one_run_per_edge(matrix, declared);
+    }
+};
+
+} // namespace
+
+// ── edge numbering ──────────────────────────────────────────────────────────────
+
+// The ordinal keys every run table and every update, and it is a prefix sum over real out-degree,
+// never over a padded maximum.
+TEST(WeightMatrix, edges_are_numbered_by_real_out_degree) {
+    WeightMatrix matrix(shared_backend(), small_network());
+
+    EXPECT_EQ(matrix.total_edge_count, 3);
+    EXPECT_EQ(matrix.edge_ordinal(0, 1).value(), 0);
+    EXPECT_EQ(matrix.edge_ordinal(0, 2).value(), 1);
+    EXPECT_EQ(matrix.edge_ordinal(1, 2).value(), 2);
+
+    // Node 2 has an incoming edge but no outgoing one, node 3 has neither, and (1, 0) is no edge.
+    EXPECT_FALSE(matrix.edge_ordinal(2, 0).has_value());
+    EXPECT_FALSE(matrix.edge_ordinal(3, 0).has_value());
+    EXPECT_FALSE(matrix.edge_ordinal(1, 0).has_value());
+}
+
+TEST(WeightMatrix, edge_numbering_is_contiguous_and_covers_every_edge) {
+    WeightMatrix matrix(shared_backend(), random_network(40, 6, 5));
+
+    vector<bool> seen((usize)matrix.total_edge_count, false);
+    for (const auto &[source, target] : edges_by_ordinal(matrix)) {
+        const s64 ordinal = *matrix.edge_ordinal(source, target);
+        EXPECT_FALSE(seen[(usize)ordinal]) << "ordinal " << ordinal << " used twice";
+        seen[(usize)ordinal] = true;
     }
     EXPECT_EQ(count(seen.begin(), seen.end(), true), matrix.total_edge_count);
 }
 
-// ── the shared basis ──────────────────────────────────────────────────────────────
+// A hub with an in-degree far above the average: the buffer get_predecessors writes into is
+// bounded by the largest in-degree, not the largest out-degree.
+TEST(WeightMatrix, get_predecessors_lists_every_source_into_a_node) {
+    const s32 node_count = 64;
+    vector<vector<s32>> star((usize)node_count);
+    for (s32 source = 1; source < node_count; source += 1) star[(usize)source].push_back(0);
+    star[0].push_back(1);
 
-// The whole design rests on this: a network wired out of projections is representable
-// EXACTLY, with no fit iteration, because each run gets its own latent lane and no other
-// lane is nonzero at both endpoints of that run's edges.
-TEST(WeightMatrix, projection_weights_reconstruct_exactly) {
-    WeightMatrix matrix(test_backend(), small_network());
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+    WeightMatrix matrix(shared_backend(), star);
+    EXPECT_EQ(matrix.max_neighbor_count, 1);
+    EXPECT_EQ(matrix.max_predecessor_count, node_count - 1);
 
-    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.25f);
-    EXPECT_FLOAT_EQ(matrix.get(0, 2), 1.75f);
-    EXPECT_FLOAT_EQ(matrix.get(1, 2), 0.001f);
+    vector<s32> buffer((usize)matrix.max_predecessor_count);
+    const s64 found_count = matrix.get_predecessors(0, buffer.data());
+    vector<s32> found(buffer.begin(), buffer.begin() + found_count);
+    sort(found.begin(), found.end());
+    vector<s32> expected((usize)(node_count - 1));
+    iota(expected.begin(), expected.end(), 1);
+    EXPECT_EQ(found, expected);
 
-    // The engine's own measurement of the same thing, which is what decides whether a
-    // model is allowed to load at all.
-    EXPECT_FLOAT_EQ(matrix.measured_weight_fit_error, 0.0f);
+    EXPECT_EQ(matrix.get_predecessors(1, buffer.data()), 1);
+    EXPECT_EQ(buffer[0], 0);
 }
 
-// Realistic synaptic weights sit at 1e-9 and below. The representation this replaced
-// seeded U and V from N(0,1) and stored the residual, which rounded a 5e-10 weight away
-// entirely -- the bug that made someone pin the coefficients to zero and store the values
-// raw. Scale is a property of the basis, so it has to survive at any magnitude.
-TEST(WeightMatrix, tiny_weights_survive_the_basis) {
-    WeightMatrix matrix(test_backend(), small_network());
-    declare_one_run_per_edge(matrix, {5.0e-10f, 1.0e-12f, 2.5e-9f}, {1, 1, 1});
+// ── declared values ─────────────────────────────────────────────────────────────
+
+// A few distinct combinations of values get one lane each, so every plane reads exactly what was
+// declared, at no fitting cost.
+TEST(WeightMatrix, projection_values_reconstruct_exactly_on_every_plane) {
+    WeightMatrix matrix(shared_backend(), small_network(), -1, true, -1, 7, /*matrix_count=*/4);
+    const Vector<Vector<f32>> declared = {{0.25f, 1.75f, 0.001f}, {10.0f, 20.0f, 30.0f},
+                                          {-1.0f, 0.0f, 3e-3f}, {0.0f, 0.0f, 0.0f}};
+    declare_one_run_per_edge(matrix, declared);
+
+    const vector<Pair<s32, s32>> edges = edges_by_ordinal(matrix);
+    for (s64 plane = 0; plane < 4; plane += 1) {
+        for (usize ordinal = 0; ordinal < edges.size(); ordinal += 1) {
+            EXPECT_FLOAT_EQ(matrix.get_for_matrix(edges[ordinal].first, edges[ordinal].second, plane),
+                            declared[(usize)plane][ordinal])
+                << "plane " << plane << ", ordinal " << ordinal;
+        }
+        EXPECT_FLOAT_EQ(matrix.measured_fit_error[(usize)plane], 0.0f) << "plane " << plane;
+    }
+    EXPECT_FLOAT_EQ(matrix.get(0, 2), 1.75f);
+}
+
+// Synaptic weights sit at 1e-9 and below. Scale belongs to the basis, so it survives any magnitude.
+TEST(WeightMatrix, tiny_values_survive_the_basis) {
+    WeightMatrix matrix(shared_backend(), small_network());
+    declare_one_run_per_edge(matrix, {{5.0e-10f, 1.0e-12f, 2.5e-9f}, {1.0f, 1.0f, 1.0f}});
 
     EXPECT_FLOAT_EQ(matrix.get(0, 1), 5.0e-10f);
     EXPECT_FLOAT_EQ(matrix.get(0, 2), 1.0e-12f);
     EXPECT_FLOAT_EQ(matrix.get(1, 2), 2.5e-9f);
-    EXPECT_FLOAT_EQ(matrix.measured_weight_fit_error, 0.0f);
 }
 
-// Delay shares U and V with weight and differs only by its coefficient row. It must
-// round-trip as an exact integer, not to a tolerance: one tick out reads the wrong row of
-// the spike-history ring, which is a different simulation rather than a rounder one.
-TEST(WeightMatrix, delays_round_trip_as_exact_integers) {
-    WeightMatrix matrix(test_backend(), small_network());
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+// A delay is used as a whole number of ticks, at least one.
+TEST(WeightMatrix, delays_land_on_their_ticks) {
+    WeightMatrix matrix(shared_backend(), small_network());
+    declare_one_run_per_edge(matrix, {{1.0f, 1.0f, 1.0f}, {10.0f, 0.4f, 30.0f}});
 
     EXPECT_EQ(matrix.get_edge_delay_ticks(0, 1), 10);
-    EXPECT_EQ(matrix.get_edge_delay_ticks(0, 2), 20);
+    EXPECT_EQ(matrix.get_edge_delay_ticks(0, 2), 1);
     EXPECT_EQ(matrix.get_edge_delay_ticks(1, 2), 30);
 }
 
-// One value for the whole network needs no basis at all, and the uniform-delay path is
-// what keeps a topology-built network from reconstructing a delay per edge.
-TEST(WeightMatrix, a_single_run_uses_the_constant_delay_path) {
-    WeightMatrix matrix(test_backend(), small_network());
-    matrix.declare_projections({0}, {3}, {0}, {0.5f}, {7});
-
-    EXPECT_TRUE(matrix.using_constant_delay_ticks);
-    EXPECT_EQ(matrix.get_edge_delay_ticks(0, 1), 7);
-    EXPECT_EQ(matrix.get_edge_delay_ticks(1, 2), 7);
-    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.5f);
-    EXPECT_FLOAT_EQ(matrix.get(1, 2), 0.5f);
-}
-
-// ── prototype runs ────────────────────────────────────────────────────────────────
-
-// Prototype index deliberately does NOT go through the basis: it selects a switch case in
-// the kernel, so a reconstruction error would be a wrong synapse type rather than a small
-// numeric one.
+// The prototype selects a switch case in the kernel, so it comes from the run table and never from
+// a reconstruction.
 TEST(WeightMatrix, synapse_prototype_comes_from_the_run_table) {
-    WeightMatrix matrix(test_backend(), small_network());
-
-    // Two runs: ordinals 0-1 use prototype 0, ordinal 2 uses prototype 1.
-    matrix.declare_projections({0, 2}, {2, 1}, {0, 1}, {0.25f, 0.75f}, {1, 1});
+    WeightMatrix matrix(shared_backend(), small_network());
+    // Ordinals 0-1 use prototype 0 and ordinal 2 uses prototype 1, with different weights.
+    matrix.declare_projections({0, 2}, {2, 1}, {0, 1}, {{0.25f, 0.75f}, {1.0f, 1.0f}});
 
     EXPECT_EQ(matrix.get_edge_synapse_prototype(0, 1), 0);
     EXPECT_EQ(matrix.get_edge_synapse_prototype(0, 2), 0);
     EXPECT_EQ(matrix.get_edge_synapse_prototype(1, 2), 1);
-
-    // Not an edge, so no run contains it.
     EXPECT_EQ(matrix.get_edge_synapse_prototype(3, 0), -1);
-
-    // The two runs carry different weights, which is what tells a correct lookup apart
-    // from one that always answers with the first run.
     EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.25f);
     EXPECT_FLOAT_EQ(matrix.get(1, 2), 0.75f);
 }
 
-// ── storage ───────────────────────────────────────────────────────────────────────
+// Values drawn per connection have no structure for a basis to find, so construction falls back on
+// each plane's exact solve. Every plane must still meet fit_tolerance and every delay its tick.
+TEST(WeightMatrix, per_connection_random_values_meet_the_tolerance_on_every_plane) {
+    RandomValuesMatrix random_values(/*node_count=*/200, /*out_degree=*/12, /*updated_plane_count=*/0);
+    const WeightMatrix &matrix = random_values.matrix;
 
-// The invariant, asserted rather than assumed: nothing this class allocates may scale with
-// node_count * max_neighbor_count. A regression here is the whole design coming undone,
-// and it would be invisible in every numerical test above.
+    for (s64 plane = 0; plane < 3; plane += 1) {
+        const Vector<f32> read = plane_values(matrix, plane);
+        EXPECT_LE(worst_relative_error(read, random_values.declared[(usize)plane]), matrix.fit_tolerance)
+            << "plane " << plane;
+        EXPECT_LE(matrix.measured_fit_error[(usize)plane], matrix.fit_tolerance) << "plane " << plane;
+    }
+
+    s64 delays_off_their_tick = 0;
+    for (const auto &[source, target] : edges_by_ordinal(matrix)) {
+        const s64 ordinal = *matrix.edge_ordinal(source, target);
+        const s32 declared_ticks = (s32)random_values.declared[(usize)DELAY][(usize)ordinal];
+        delays_off_their_tick += matrix.get_edge_delay_ticks(source, target) != declared_ticks ? 1 : 0;
+    }
+    EXPECT_EQ(delays_off_their_tick, 0);
+
+    // A plane of zeros needs no lanes and reads exactly zero.
+    const Vector<f32> zeros = plane_values(matrix, FIRST_STATE + 1);
+    EXPECT_EQ(zeros, Vector<f32>(zeros.size(), 0.0f));
+    EXPECT_LE(matrix.rank, MAX_RANK_FLOAT4_STRIDE * WeightMatrix::LANE_GROUP);
+}
+
+// ── updates ─────────────────────────────────────────────────────────────────────
+
+// A read is the basis plus S: an update shows at once, on its own edge and plane only, and updates
+// to the same edge add up.
+TEST(WeightMatrix, an_update_changes_only_its_own_edge_and_plane) {
+    WeightMatrix matrix(shared_backend(), small_network(), -1, true, -1, 7, /*matrix_count=*/3);
+    declare_one_run_per_edge(matrix, {{0.25f, 1.75f, 0.001f}, {1.0f, 2.0f, 3.0f}, {0.0f, 0.0f, 0.0f}});
+
+    matrix.accumulate_edge_delta(WEIGHT, 0, 1, 0.5f);
+    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.75f);
+    EXPECT_FLOAT_EQ(matrix.get(0, 2), 1.75f);
+    EXPECT_FLOAT_EQ(matrix.get(1, 2), 0.001f);
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(0, 1, DELAY), 1.0f);
+
+    matrix.accumulate_edge_delta(WEIGHT, 0, 1, -0.25f);
+    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.5f);
+
+    matrix.accumulate_edge_delta(FIRST_STATE, 1, 2, 4.0f);
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(1, 2, FIRST_STATE), 4.0f);
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(0, 1, FIRST_STATE), 0.0f);
+    EXPECT_EQ(matrix.sparse_delta_entry_count[(usize)WEIGHT], 1);
+    EXPECT_EQ(matrix.sparse_delta_entry_count[(usize)FIRST_STATE], 1);
+}
+
+// The kernel queues updates; compact_pending_deltas sums each edge's into one entry of S, drops any
+// that came back to exactly zero, and empties the queue.
+TEST(WeightMatrix, compact_pending_deltas_merges_the_queue_into_S) {
+    WeightMatrix matrix(shared_backend(), small_network(), -1, true, -1, 7, /*matrix_count=*/4,
+                        /*updated_plane_count=*/2);
+    declare_one_run_per_edge(matrix, {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f},
+                                      {0.0f, 0.0f, 0.0f}});
+
+    queue_update(matrix, FIRST_STATE, 0, 1.0f);
+    queue_update(matrix, FIRST_STATE, 0, 0.5f);
+    queue_update(matrix, FIRST_STATE + 1, 1, 2.0f);
+    queue_update(matrix, FIRST_STATE + 1, 1, -2.0f);
+    queue_update(matrix, FIRST_STATE + 1, 2, -3.0f);
+    matrix.compact_pending_deltas();
+
+    EXPECT_EQ(*matrix.pending_delta_count.get_contents_as<s32>(), 0);
+    EXPECT_EQ(matrix.sparse_delta_entry_count[(usize)FIRST_STATE], 1);
+    EXPECT_EQ(matrix.sparse_delta_entry_count[(usize)(FIRST_STATE + 1)], 1);
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(0, 1, FIRST_STATE), 1.5f);
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(0, 2, FIRST_STATE + 1), 0.0f);
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(1, 2, FIRST_STATE + 1), -3.0f);
+
+    // A later merge adds onto what S already holds.
+    queue_update(matrix, FIRST_STATE, 0, 0.25f);
+    matrix.compact_pending_deltas();
+    EXPECT_FLOAT_EQ(matrix.get_for_matrix(0, 1, FIRST_STATE), 1.75f);
+}
+
+// S is sized to the refit threshold, a fifth of the edges by default, plus the plasticity reserve.
+TEST(WeightMatrix, S_is_sized_to_the_refit_threshold) {
+    EXPECT_FLOAT_EQ(WeightMatrix::DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION, 0.2f);
+
+    WeightMatrix matrix(shared_backend(), random_network(50, 7, 3));
+    matrix.plasticity_reserve_entries = 16;
+    declare_one_run_per_edge(matrix, {uniform_values(matrix.total_edge_count, 0.5f, 1.5f, 4),
+                                      Vector<f32>((usize)matrix.total_edge_count, 1.0f)});
+
+    // The threshold is an f32, so 0.2 is 0.2000000030 and a fifth of these 350 edges rounds up to 71.
+    const s64 edge_count = matrix.total_edge_count;
+    EXPECT_EQ(matrix.sparse_delta_capacity, (s64)ceil((f64)0.2f * (f64)edge_count) + 16);
+    EXPECT_EQ(matrix.delta_capacity_for_threshold(0.5f), (s64)ceil(0.5 * (f64)edge_count) + 16);
+    // Without a threshold S must be able to hold every edge.
+    EXPECT_EQ(matrix.delta_capacity_for_threshold(0.0f), edge_count + 16);
+}
+
+// When a merge would overflow S, S grows instead: no update is dropped.
+TEST(WeightMatrix, S_grows_rather_than_dropping_an_update) {
+    WeightMatrix matrix(shared_backend(), random_network(30, 5, 6), -1, true, -1, 7, /*matrix_count=*/3,
+                        /*updated_plane_count=*/1);
+    const s64 edge_count = matrix.total_edge_count;
+    declare_one_run_per_edge(matrix, {Vector<f32>((usize)edge_count, 1.0f), Vector<f32>((usize)edge_count, 1.0f),
+                                      Vector<f32>((usize)edge_count, 0.0f)});
+    matrix.resize_delta_capacity(1);
+
+    for (s64 ordinal = 0; ordinal < edge_count; ordinal += 1) {
+        queue_update(matrix, FIRST_STATE, ordinal, (f32)(ordinal + 1));
+    }
+    matrix.compact_pending_deltas();
+
+    EXPECT_GE(matrix.sparse_delta_capacity, edge_count);
+    EXPECT_EQ(matrix.sparse_delta_entry_count[(usize)FIRST_STATE], edge_count);
+    Vector<f32> expected((usize)edge_count);
+    iota(expected.begin(), expected.end(), 1.0f);
+    EXPECT_EQ(plane_values(matrix, FIRST_STATE), expected);
+}
+
+TEST(WeightMatrix, a_refit_is_due_once_the_fullest_plane_reaches_the_threshold) {
+    WeightMatrix matrix(shared_backend(), random_network(20, 5, 8), -1, true, -1, 7, /*matrix_count=*/3,
+                        /*updated_plane_count=*/1);
+    const s64 edge_count = matrix.total_edge_count;  // 100
+    declare_one_run_per_edge(matrix, {Vector<f32>((usize)edge_count, 1.0f), Vector<f32>((usize)edge_count, 1.0f),
+                                      Vector<f32>((usize)edge_count, 0.0f)});
+
+    for (s64 ordinal = 0; ordinal < 19; ordinal += 1) queue_update(matrix, FIRST_STATE, ordinal, 1.0f);
+    matrix.compact_pending_deltas();
+    EXPECT_FLOAT_EQ(matrix.sparse_delta_occupancy_fraction(), 0.19f);
+    EXPECT_FALSE(matrix.is_refit_due(0.2f));
+
+    queue_update(matrix, FIRST_STATE, 19, 1.0f);
+    matrix.compact_pending_deltas();
+    EXPECT_TRUE(matrix.is_refit_due(0.2f));
+    EXPECT_FALSE(matrix.is_refit_due(0.0f)) << "a threshold of zero never refits";
+}
+
+// ── refits ──────────────────────────────────────────────────────────────────────
+
+// Synapse state changes on most edges: a refit folds S into the basis, empties S, and leaves every
+// plane within fit_tolerance of what it read before.
+TEST(WeightMatrix, a_refit_empties_S_and_keeps_every_plane_within_the_tolerance) {
+    RandomValuesMatrix random_values(/*node_count=*/200, /*out_degree=*/12, /*updated_plane_count=*/3);
+    WeightMatrix &matrix = random_values.matrix;
+    const s64 edge_count = matrix.total_edge_count;
+
+    mt19937 random_engine(21);
+    normal_distribution<f32> state_change(0.0f, 1e-9f);
+    bernoulli_distribution changes_state(0.9);
+    bernoulli_distribution changes_weight(0.05);
+    for (s64 ordinal = 0; ordinal < edge_count; ordinal += 1) {
+        if (changes_state(random_engine)) {
+            queue_update(matrix, FIRST_STATE, ordinal, state_change(random_engine));
+            queue_update(matrix, FIRST_STATE + 1, ordinal, state_change(random_engine));
+        }
+        if (changes_weight(random_engine)) queue_update(matrix, WEIGHT, ordinal, 0.01f);
+    }
+    matrix.compact_pending_deltas();
+
+    Vector<Vector<f32>> before;
+    for (s64 plane = 0; plane < 4; plane += 1) before.push_back(plane_values(matrix, plane));
+    matrix.refit();
+
+    for (s64 plane = 0; plane < 4; plane += 1) {
+        EXPECT_EQ(matrix.sparse_delta_entry_count[(usize)plane], 0) << "plane " << plane;
+        EXPECT_LE(worst_relative_error(plane_values(matrix, plane), before[(usize)plane]), matrix.fit_tolerance)
+            << "plane " << plane;
+        EXPECT_LE(matrix.measured_fit_error[(usize)plane], matrix.fit_tolerance) << "plane " << plane;
+    }
+}
+
+// A refit changes only lanes no other plane reads, so the planes without updates come out of it
+// bit for bit as they went in.
+TEST(WeightMatrix, refitting_one_plane_leaves_every_other_plane_bit_identical) {
+    RandomValuesMatrix random_values(/*node_count=*/150, /*out_degree=*/10, /*updated_plane_count=*/1);
+    WeightMatrix &matrix = random_values.matrix;
+
+    Vector<Vector<f32>> before;
+    for (s64 plane = 0; plane < 4; plane += 1) before.push_back(plane_values(matrix, plane));
+
+    for (s64 ordinal = 0; ordinal < matrix.total_edge_count; ordinal += 2) {
+        queue_update(matrix, FIRST_STATE, ordinal, 1e-9f * (f32)(ordinal % 7));
+    }
+    matrix.compact_pending_deltas();
+    matrix.refit();
+
+    for (s64 plane : {WEIGHT, DELAY, FIRST_STATE + 1}) {
+        EXPECT_EQ(plane_values(matrix, plane), before[(usize)plane]) << "plane " << plane;
+    }
+}
+
+TEST(WeightMatrix, a_refit_with_no_updates_changes_nothing) {
+    RandomValuesMatrix random_values(/*node_count=*/100, /*out_degree=*/8, /*updated_plane_count=*/0);
+    WeightMatrix &matrix = random_values.matrix;
+    const s64 rank_before = matrix.rank;
+
+    Vector<Vector<f32>> before;
+    for (s64 plane = 0; plane < 4; plane += 1) before.push_back(plane_values(matrix, plane));
+    matrix.refit();
+
+    EXPECT_EQ(matrix.rank, rank_before);
+    for (s64 plane = 0; plane < 4; plane += 1) {
+        EXPECT_EQ(plane_values(matrix, plane), before[(usize)plane]) << "plane " << plane;
+    }
+}
+
+// Plasticity's pattern: weight updates on the edges of a few nodes, then a refit, over and over.
+// Every refit must stay fast, and the weights must not drift from the running total of the updates.
+TEST(WeightMatrix, repeated_weight_updates_stay_fast_and_within_the_tolerance) {
+    RandomValuesMatrix random_values(/*node_count=*/200, /*out_degree=*/12, /*updated_plane_count=*/1);
+    WeightMatrix &matrix = random_values.matrix;
+    const vector<Pair<s32, s32>> edges = edges_by_ordinal(matrix);
+
+    Vector<f32> running_total = plane_values(matrix, WEIGHT);
+    mt19937 random_engine(31);
+    bernoulli_distribution spiked(0.1);
+    normal_distribution<f32> step(0.01f, 0.003f);
+    for (s32 cycle = 0; cycle < 10; cycle += 1) {
+        vector<bool> node_spiked((usize)matrix.node_count);
+        for (usize node = 0; node < node_spiked.size(); node += 1) node_spiked[node] = spiked(random_engine);
+        for (usize ordinal = 0; ordinal < edges.size(); ordinal += 1) {
+            if (!node_spiked[(usize)edges[ordinal].first] && !node_spiked[(usize)edges[ordinal].second]) continue;
+            const f32 delta = node_spiked[(usize)edges[ordinal].second] ? step(random_engine) : -step(random_engine);
+            queue_update(matrix, WEIGHT, (s64)ordinal, delta);
+            running_total[ordinal] += delta;
+        }
+        matrix.compact_pending_deltas();
+
+        const auto started = chrono::steady_clock::now();
+        matrix.refit();
+        const f64 seconds = chrono::duration<f64>(chrono::steady_clock::now() - started).count();
+        // 2,400 edges took about 4 ms when measured; the bound only catches a refit gone slow.
+        EXPECT_LT(seconds, 2.0) << "cycle " << cycle;
+        EXPECT_LE(worst_relative_error(plane_values(matrix, WEIGHT), running_total), matrix.fit_tolerance)
+            << "cycle " << cycle;
+    }
+}
+
+// The exact solve needs (largest degree + 4) lanes per plane, all within the 256-lane limit. Three
+// planes of degree-80 random values take 252, so the fourth gets 4: it must say it missed the
+// tolerance rather than pass quietly, and the other planes must still meet it.
+TEST(WeightMatrix, a_plane_without_enough_lanes_warns_that_it_misses_the_tolerance) {
+    CapturedLog captured_log;
+    WeightMatrix matrix(shared_backend(), random_network(/*node_count=*/128, /*out_degree=*/80, 13), -1, true, -1,
+                        7, /*matrix_count=*/4);
+    const s64 edge_count = matrix.total_edge_count;
+    const Vector<Vector<f32>> declared = {uniform_values(edge_count, 0.5f, 1.5f, 1), whole_tick_delays(edge_count, 1, 30, 2),
+                                          uniform_values(edge_count, -1.0f, 1.0f, 3),
+                                          uniform_values(edge_count, -1.0f, 1.0f, 4)};
+    declare_one_run_per_edge(matrix, declared);
+
+    EXPECT_LE(matrix.rank, MAX_RANK_FLOAT4_STRIDE * WeightMatrix::LANE_GROUP);
+    for (s64 plane = 0; plane < 3; plane += 1) {
+        EXPECT_LE(matrix.measured_fit_error[(usize)plane], matrix.fit_tolerance) << "plane " << plane;
+    }
+    EXPECT_GT(matrix.measured_fit_error[3], matrix.fit_tolerance);
+    EXPECT_TRUE(captured_log.contains("short of the"));
+}
+
+// ── whole-network reads ─────────────────────────────────────────────────────────
+
+// One value per real edge, by ordinal: no padding rows and no sentinels.
+TEST(WeightMatrix, neighbor_weights_is_indexed_by_edge_ordinal) {
+    WeightMatrix matrix(shared_backend(), small_network());
+    declare_one_run_per_edge(matrix, {{0.25f, 1.75f, 0.001f}, {1.0f, 1.0f, 1.0f}});
+
+    vector<f32> edge_weights((usize)matrix.total_edge_count, -1.0f);
+    matrix.neighbor_weights(edge_weights.data());
+    EXPECT_NEAR(edge_weights[0], 0.25f, 1e-6f);
+    EXPECT_NEAR(edge_weights[1], 1.75f, 1e-6f);
+    EXPECT_NEAR(edge_weights[2], 0.001f, 1e-6f);
+}
+
+TEST(WeightMatrix, statistics_are_taken_over_edges_not_padded_slots) {
+    WeightMatrix matrix(shared_backend(), small_network());
+    declare_one_run_per_edge(matrix, {{1.0f, 2.0f, 3.0f}, {1.0f, 1.0f, 1.0f}});
+
+    const WeightStats statistics = matrix.neighbor_weight_stats();
+    EXPECT_NEAR(statistics.mean, 2.0f, 1e-5f);
+    EXPECT_NEAR(statistics.min_value, 1.0f, 1e-5f);
+    EXPECT_NEAR(statistics.max_value, 3.0f, 1e-5f);
+}
+
+// ── storage ─────────────────────────────────────────────────────────────────────
+
+// Nothing may be sized by node_count * max_neighbor_count. A hub makes the padded size far larger
+// than the real edge count, which is where padded storage would show.
 TEST(WeightMatrix, nothing_is_sized_by_the_padded_neighbour_count) {
-    // A hub node gives max_neighbor_count a value far above the average degree, which is
-    // exactly the shape padded storage wastes the most on.
     vector<vector<s32>> hub_network((usize)64);
     for (s32 target = 1; target < 64; target += 1) hub_network[0].push_back(target);
     for (s32 source = 1; source < 64; source += 1) hub_network[(usize)source].push_back(0);
 
-    WeightMatrix matrix(test_backend(), hub_network);
-
+    WeightMatrix matrix(shared_backend(), hub_network);
     ASSERT_EQ(matrix.max_neighbor_count, 63);
     ASSERT_EQ(matrix.total_edge_count, 126);
 
-    const u64 padded_plane_bytes =
-            (u64)matrix.node_count * (u64)matrix.max_neighbor_count * sizeof(f32);
-
-    // The basis scales with nodes and rank, and the scratch with edges. Neither may reach
-    // the size of even one padded plane on a graph this lopsided.
+    const u64 padded_plane_bytes = (u64)matrix.node_count * (u64)matrix.max_neighbor_count * sizeof(f32);
     EXPECT_LT(matrix.U_matrix.total_bytes, padded_plane_bytes);
     EXPECT_LT(matrix.V_matrix.total_bytes, padded_plane_bytes);
-    EXPECT_EQ(matrix.neighbor_weight_scratch.total_bytes,
-              (u64)matrix.total_edge_count * sizeof(f32));
-    EXPECT_EQ(matrix.edge_row_offset.total_bytes,
-              (u64)(matrix.node_count + 1) * sizeof(s64));
+    EXPECT_EQ(matrix.neighbor_weight_scratch.total_bytes, (u64)matrix.total_edge_count * sizeof(f32));
+    EXPECT_EQ(matrix.edge_row_offset.total_bytes, (u64)(matrix.node_count + 1) * sizeof(s64));
 }
 
-// Capacity is measured, not guessed. A model the basis reproduces needs no corrections and
-// must allocate none -- that is the whole point of sizing after the fit rather than before
-// it, and the case a fixed fraction used to charge for.
-TEST(WeightMatrix, a_reproducible_model_allocates_no_correction_layer) {
-    WeightMatrix matrix(test_backend(), small_network());
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+// ── lifetime ────────────────────────────────────────────────────────────────────
 
-    EXPECT_FLOAT_EQ(matrix.measured_weight_fit_error, 0.0f);
-    EXPECT_EQ(matrix.sparse_delta_capacity, 0);
-    EXPECT_TRUE(matrix.sparse_delta_edge_ordinal.is_empty());
-    EXPECT_TRUE(matrix.sparse_delta_value.is_empty());
-    EXPECT_FLOAT_EQ(matrix.sparse_delta_occupancy_fraction(), 0.0f);
-}
-
-// A reserve is what a model with nothing to correct still needs when something is going to
-// write updates -- otherwise there is nowhere to queue them.
-TEST(WeightMatrix, a_plasticity_reserve_is_allocated_even_when_the_fit_is_exact) {
-    WeightMatrix matrix(test_backend(), small_network());
-    matrix.plasticity_reserve_entries = 128;
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
-
-    EXPECT_EQ(matrix.sparse_delta_capacity, 128);
-    EXPECT_FALSE(matrix.sparse_delta_edge_ordinal.is_empty());
-
-    // Sized by the reserve, never by the edge count.
-    EXPECT_EQ(matrix.sparse_delta_edge_ordinal.total_bytes,
-              (u64)matrix.matrix_count * 128 * sizeof(s64));
-}
-
-// Rank is searched rather than capped at a constant, and the thing it minimises is basis
-// plus corrections TOGETHER -- raising the rank shrinks one and grows the other, so the
-// cheapest rank is a property of the model.
-//
-// For a field with no structure, extra rank buys almost no corrections back, so the search
-// should stay at the bottom rather than spend on a basis that cannot help.
-TEST(WeightMatrix, the_rank_search_does_not_overspend_on_an_incompressible_field) {
-    // Thirty nodes, each reaching the next three, with a weight per edge chosen so no two
-    // agree -- there is no lower-rank structure for a basis to find.
-    const s64 node_count = 30;
-    vector<vector<s32>> ring((usize)node_count);
-    for (s64 source = 0; source < node_count; source += 1) {
-        for (s64 step = 1; step <= 3; step += 1) {
-            ring[(usize)source].push_back((s32)((source + step) % node_count));
-        }
-    }
-
-    Vector<s64> first, count;
-    Vector<s32> prototype, delays;
-    Vector<f32> weights;
-    for (s64 ordinal = 0; ordinal < node_count * 3; ordinal += 1) {
-        first.push_back(ordinal);
-        count.push_back(1);
-        prototype.push_back(0);
-        delays.push_back(1);
-        weights.push_back(1.0f + 0.37f * (f32)((ordinal * 7919) % 101));
-    }
-
-    WeightMatrix searched(test_backend(), ring);
-    searched.declare_projections(first, count, prototype, weights, delays);
-
-    WeightMatrix fixed_budget(test_backend(), ring, -1, true, -1, 7, 1.0f,
-                              /*fit_rank_budget=*/64);
-    fixed_budget.declare_projections(first, count, prototype, weights, delays);
-
-    // The search must not land above a rank it was given no reason to reach.
-    EXPECT_LE(searched.rank, fixed_budget.rank);
-
-    // And the basis it chose must cost no more than the fixed budget's, which is the
-    // measure it was optimising.
-    const s64 searched_basis = 2 * searched.node_count * searched.rank * (s64)sizeof(f32);
-    const s64 fixed_basis = 2 * fixed_budget.node_count * fixed_budget.rank * (s64)sizeof(f32);
-    EXPECT_LE(searched_basis, fixed_basis);
-
-    // Cheaper, not worse: corrections still bring both to the same accuracy.
-    EXPECT_LE(searched.measured_weight_fit_error,
-              WeightMatrix::WEIGHT_FIT_WARNING_TOLERANCE);
-}
-
-// An explicit budget overrides the search outright, for a caller who knows their model.
-TEST(WeightMatrix, an_explicit_rank_budget_is_honoured) {
-    WeightMatrix matrix(test_backend(), small_network(), -1, true, -1, 7, 1.0f,
-                        /*fit_rank_budget=*/16);
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
-
-    // This model takes the exact construction, which sizes rank to the run count -- the
-    // budget only ever binds on the general fit, and never raises the rank above what the
-    // exact path needs.
-    EXPECT_LE(matrix.rank, 16);
-    EXPECT_FLOAT_EQ(matrix.measured_weight_fit_error, 0.0f);
-}
-
-// The ceiling is the accuracy-for-storage dial: it caps what a model with no exploitable
-// structure may spend, and the largest residuals are the ones kept.
-TEST(WeightMatrix, the_ceiling_caps_what_an_unstructured_model_may_spend) {
-    // Weights chosen so no two edges share a value and the runs cannot coalesce.
-    WeightMatrix unbounded(test_backend(), small_network(), -1, true, -1, 7,
-                           /*correction_ceiling_fraction=*/1.0f);
-    declare_one_run_per_edge(unbounded, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
-
-    WeightMatrix bounded(test_backend(), small_network(), -1, true, -1, 7,
-                         /*correction_ceiling_fraction=*/0.0f);
-    declare_one_run_per_edge(bounded, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
-
-    // A ceiling of zero forbids corrections outright, so the basis is the whole answer.
-    EXPECT_EQ(bounded.sparse_delta_capacity, 0);
-
-    // Both reproduce this model regardless, because the exact construction covers it --
-    // which is the point: the ceiling only ever binds on a model that needs corrections.
-    EXPECT_FLOAT_EQ(unbounded.measured_weight_fit_error, 0.0f);
-    EXPECT_FLOAT_EQ(bounded.measured_weight_fit_error, 0.0f);
-}
-
-// An update queues rather than moving U/V, and becomes visible to reads once merged. This
-// is the whole read-path contract: basis plus correction, never one or the other.
-TEST(WeightMatrix, a_queued_correction_changes_what_a_read_returns) {
-    WeightMatrix matrix(test_backend(), small_network());
-    matrix.plasticity_reserve_entries = 128;
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
-
-    ASSERT_FLOAT_EQ(matrix.get(0, 1), 0.25f);
-
-    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 0.5f);
-    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.75f);
-
-    // Only that edge moves. A correction is per-edge, and one that leaked into its
-    // neighbours would be the CSR row bounds being wrong.
-    EXPECT_FLOAT_EQ(matrix.get(0, 2), 1.75f);
-    EXPECT_FLOAT_EQ(matrix.get(1, 2), 0.001f);
-
-    // Corrections on the same edge accumulate rather than replacing.
-    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, -0.25f);
-    EXPECT_FLOAT_EQ(matrix.get(0, 1), 0.5f);
-}
-
-// refit re-optimises the basis toward the values the corrections point at, then drops the
-// corrections it has absorbed. The values a read returns must survive that unchanged --
-// that is the entire point of the loop.
-TEST(WeightMatrix, refit_absorbs_corrections_without_changing_what_reads_return) {
-    WeightMatrix matrix(test_backend(), small_network());
-    matrix.plasticity_reserve_entries = 128;
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
-
-    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 0, 1, 0.5f);
-    matrix.accumulate_edge_delta(WeightMatrix::DEFAULT_MATRIX_INDEX, 1, 2, 0.1f);
-
-    const f32 before_0_1 = matrix.get(0, 1);
-    const f32 before_0_2 = matrix.get(0, 2);
-    const f32 before_1_2 = matrix.get(1, 2);
-
-    matrix.refit();
-
-    EXPECT_NEAR(matrix.get(0, 1), before_0_1, 1e-3f);
-    EXPECT_NEAR(matrix.get(0, 2), before_0_2, 1e-3f);
-    EXPECT_NEAR(matrix.get(1, 2), before_1_2, 1e-3f);
-}
-
-// ── whole-network reads ───────────────────────────────────────────────────────────
-
-// neighbor_weights writes one value per REAL edge, indexed by ordinal -- no padding rows
-// and no sentinels to skip. It also has a GPU path and a host fallback, and the two must
-// agree, which this checks by construction: the values come back either way.
-TEST(WeightMatrix, neighbor_weights_is_indexed_by_edge_ordinal) {
-    WeightMatrix matrix(test_backend(), small_network());
-    declare_one_run_per_edge(matrix, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
-
-    vector<f32> edge_weights((usize)matrix.total_edge_count, -1.0f);
-    matrix.neighbor_weights(edge_weights.data());
-
-    ASSERT_EQ(edge_weights.size(), 3u);
-    EXPECT_NEAR(edge_weights[0], 0.25f, 1e-6f);
-    EXPECT_NEAR(edge_weights[1], 1.75f, 1e-6f);
-    EXPECT_NEAR(edge_weights[2], 0.001f, 1e-6f);
-
-    // Every entry was written; a padded implementation would leave sentinels behind.
-    for (f32 weight : edge_weights) EXPECT_NE(weight, -1.0f);
-}
-
-TEST(WeightMatrix, statistics_are_taken_over_edges_not_padded_slots) {
-    WeightMatrix matrix(test_backend(), small_network());
-    declare_one_run_per_edge(matrix, {1.0f, 2.0f, 3.0f}, {1, 1, 1});
-
-    const WeightStats stats = matrix.neighbor_weight_stats();
-
-    // Mean of exactly the three real edges. Padding slots would drag it toward zero.
-    EXPECT_NEAR(stats.mean, 2.0f, 1e-5f);
-    EXPECT_NEAR(stats.min_value, 1.0f, 1e-5f);
-    EXPECT_NEAR(stats.max_value, 3.0f, 1e-5f);
-}
-
-// ── lifetime ──────────────────────────────────────────────────────────────────────
-
-// EnginePointer owns nothing; the slab does. Moving must hand that slab over exactly once,
-// or the two objects both release it.
+// The slab moves exactly once, or both objects release it.
 TEST(WeightMatrix, moving_transfers_the_slab_exactly_once) {
-    WeightMatrix original(test_backend(), small_network());
-    declare_one_run_per_edge(original, {0.25f, 1.75f, 0.001f}, {1, 1, 1});
+    WeightMatrix original(shared_backend(), small_network());
+    declare_one_run_per_edge(original, {{0.25f, 1.75f, 0.001f}, {1.0f, 1.0f, 1.0f}});
 
     WeightMatrix moved = std::move(original);
     EXPECT_FLOAT_EQ(moved.get(0, 1), 0.25f);
-    EXPECT_EQ(moved.total_edge_count, 3);
-
-    // The source must not still believe it owns anything: both destructors run.
     EXPECT_EQ(original.owning_backend, nullptr);
 
-    // Move-assignment over a live matrix releases the destination's own slab first.
-    WeightMatrix destination(test_backend(), small_network());
+    WeightMatrix destination(shared_backend(), small_network());
     destination = std::move(moved);
     EXPECT_FLOAT_EQ(destination.get(0, 1), 0.25f);
     EXPECT_EQ(moved.owning_backend, nullptr);
 }
 
-// The empty network is an ordinary state, not an error: it is what an engine holds before
-// it has parsed a model, and what a model with no connections keeps.
 TEST(WeightMatrix, the_default_matrix_owns_nothing_and_destructs_cleanly) {
     WeightMatrix empty;
     EXPECT_EQ(empty.node_count, 0);
@@ -429,27 +580,23 @@ TEST(WeightMatrix, the_default_matrix_owns_nothing_and_destructs_cleanly) {
     EXPECT_TRUE(empty.U_matrix.is_empty());
 }
 
-// ── serialization ─────────────────────────────────────────────────────────────────
+// ── saving ──────────────────────────────────────────────────────────────────────
 
-// The coefficients are where the declared values actually live, so a save that dropped
-// them would restore a basis that reconstructs nothing meaningful.
-TEST(WeightMatrix, save_and_load_round_trip_preserves_reconstructed_values) {
-    const string path = filesystem::temp_directory_path().string() +
-                        "/spikecorec_weight_matrix_" + to_string(getpid()) + ".bin";
+// The basis and the updates S still holds both survive a save and a load.
+TEST(WeightMatrix, save_and_load_preserve_every_value) {
+    const TemporaryDirectory directory;
+    const String path = directory.path_of("weights.bin");
 
-    WeightMatrix saved(test_backend(), small_network());
-    declare_one_run_per_edge(saved, {0.25f, 1.75f, 0.001f}, {10, 20, 30});
+    WeightMatrix saved(shared_backend(), small_network());
+    declare_one_run_per_edge(saved, {{0.25f, 1.75f, 0.001f}, {10.0f, 20.0f, 30.0f}});
+    saved.accumulate_edge_delta(WEIGHT, 1, 2, 0.5f);
     saved.save(path.c_str());
 
-    WeightMatrix loaded(test_backend(), small_network());
+    WeightMatrix loaded(shared_backend(), small_network());
     loaded.load_from_disk(path.c_str());
-
     EXPECT_FLOAT_EQ(loaded.get(0, 1), 0.25f);
     EXPECT_FLOAT_EQ(loaded.get(0, 2), 1.75f);
-    EXPECT_FLOAT_EQ(loaded.get(1, 2), 0.001f);
-
+    EXPECT_FLOAT_EQ(loaded.get(1, 2), 0.501f);
     EXPECT_EQ(loaded.get_edge_delay_ticks(0, 1), 10);
     EXPECT_EQ(loaded.get_edge_delay_ticks(1, 2), 30);
-
-    filesystem::remove(path);
 }

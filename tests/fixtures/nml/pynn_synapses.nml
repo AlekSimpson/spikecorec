@@ -1,0 +1,48 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="PynnSynapses">
+
+  <!--
+    The PyNN current synapses against jNeuroML. A spikeGenerator fires every 10 ms into four
+    PyNN cells through expCurrSynapse and alphaCurrSynapse:
+      - expPsp and alphaPsp sit at rest (i_offset 0), so each arrival is one postsynaptic
+        potential whose height and rise time the tests compare;
+      - expSpiking and alphaSpiking are held 1 mV below threshold by i_offset, so arrivals
+        make them fire, and the tests compare the spike times.
+    tests/fixtures/reference/regenerate_references.sh runs this through jNeuroML.
+  -->
+
+  <expCurrSynapse id="expSynapse" tau_syn="5"/>
+  <alphaCurrSynapse id="alphaSynapse" tau_syn="5"/>
+
+  <IF_curr_exp id="expRestingCell" cm="1" i_offset="0" tau_m="20" tau_refrac="5" v_init="-65" v_reset="-70"
+               v_rest="-65" v_thresh="-50" tau_syn_E="5" tau_syn_I="5"/>
+  <IF_curr_alpha id="alphaRestingCell" cm="1" i_offset="0" tau_m="20" tau_refrac="5" v_init="-65" v_reset="-70"
+                 v_rest="-65" v_thresh="-50" tau_syn_E="5" tau_syn_I="5"/>
+  <IF_curr_exp id="expDrivenCell" cm="1" i_offset="0.7" tau_m="20" tau_refrac="5" v_init="-65" v_reset="-70"
+               v_rest="-65" v_thresh="-50" tau_syn_E="5" tau_syn_I="5"/>
+  <IF_curr_alpha id="alphaDrivenCell" cm="1" i_offset="0.7" tau_m="20" tau_refrac="5" v_init="-65" v_reset="-70"
+                 v_rest="-65" v_thresh="-50" tau_syn_E="5" tau_syn_I="5"/>
+
+  <spikeGenerator id="regularSource" period="10 ms"/>
+
+  <network id="pynnSynapseNetwork">
+    <population id="source" component="regularSource" size="1"/>
+    <population id="expPsp" component="expRestingCell" size="1"/>
+    <population id="alphaPsp" component="alphaRestingCell" size="1"/>
+    <population id="expSpiking" component="expDrivenCell" size="1"/>
+    <population id="alphaSpiking" component="alphaDrivenCell" size="1"/>
+
+    <projection id="expPspProjection" presynapticPopulation="source" postsynapticPopulation="expPsp" synapse="expSynapse">
+      <connectionWD id="0" preCellId="../source[0]" postCellId="../expPsp[0]" weight="1" delay="2 ms"/>
+    </projection>
+    <projection id="alphaPspProjection" presynapticPopulation="source" postsynapticPopulation="alphaPsp" synapse="alphaSynapse">
+      <connectionWD id="0" preCellId="../source[0]" postCellId="../alphaPsp[0]" weight="1" delay="2 ms"/>
+    </projection>
+    <projection id="expSpikingProjection" presynapticPopulation="source" postsynapticPopulation="expSpiking" synapse="expSynapse">
+      <connectionWD id="0" preCellId="../source[0]" postCellId="../expSpiking[0]" weight="1" delay="2 ms"/>
+    </projection>
+    <projection id="alphaSpikingProjection" presynapticPopulation="source" postsynapticPopulation="alphaSpiking" synapse="alphaSynapse">
+      <connectionWD id="0" preCellId="../source[0]" postCellId="../alphaSpiking[0]" weight="1" delay="2 ms"/>
+    </projection>
+  </network>
+
+</neuroml>

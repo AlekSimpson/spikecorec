@@ -1,0 +1,22 @@
+<Lems>
+    <Target component="sim1"/>
+    <Include file="Cells.xml"/>
+    <Include file="PyNN.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="pynn_synapses.nml"/>
+
+    <Simulation id="sim1" length="200ms" step="0.025ms" target="pynnSynapseNetwork">
+        <OutputFile id="potentials" fileName="pynn_synapses_v.dat">
+            <OutputColumn id="exp_psp" quantity="expPsp[0]/v"/>
+            <OutputColumn id="alpha_psp" quantity="alphaPsp[0]/v"/>
+            <OutputColumn id="exp_spiking" quantity="expSpiking[0]/v"/>
+            <OutputColumn id="alpha_spiking" quantity="alphaSpiking[0]/v"/>
+        </OutputFile>
+        <EventOutputFile id="spikes" fileName="pynn_synapses_spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="source[0]" eventPort="spike"/>
+            <EventSelection id="3" select="expSpiking[0]" eventPort="spike"/>
+            <EventSelection id="4" select="alphaSpiking[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+</Lems>

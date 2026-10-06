@@ -7,6 +7,7 @@
 #   make metal        — build Metal backend
 #   make python       — build Python extension (editable install into .venv, via uv)
 #   make test         — build and run C++ tests
+#   make test-python  — run the Python tests in tests/python (pytest, in .venv)
 #   make examples     — build examples
 #   make clean        — remove build artifacts
 #   make info         — show detected platform/toolchain
@@ -242,7 +243,10 @@ endif
 	@echo "[spikecorec] Python extension installed (backend=$(BACKEND))"
 
 # ── Tests ────────────────────────────────────────────────────
-.PHONY: test test-cuda test-metal
+# `make test` builds every tests/*.cpp into one GoogleTest runner and runs all of it;
+# TEST_ARGUMENTS passes through, e.g. make test TEST_ARGUMENTS=--gtest_filter='Units*'.
+# `make test-python` runs the pytest suite in tests/python against the extension in .venv.
+.PHONY: test test-cuda test-metal test-python
 
 test: test-$(BACKEND)
 
@@ -252,17 +256,30 @@ $(GTEST_OBJ): $(GTEST_DIR)/src/gtest-all.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(GTEST_DIR) -c $< -o $@
 
-test-cuda: check-cuda $(CUDA_LIB) $(GTEST_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
+# Each test file is its own object, so editing one rebuilds one. The fixture directory is
+# baked in as an absolute path, so the runner finds its fixtures from any working directory.
+TEST_CXXFLAGS := $(CXXFLAGS) -I$(TEST_DIR) -DSPIKECOREC_TEST_FIXTURE_DIR=\"$(abspath $(TEST_DIR))/fixtures\"
+TEST_OBJS     := $(patsubst $(TEST_DIR)/%.cpp, $(BUILD_DIR)/tests/%.o, $(TEST_CORE_SRCS))
+
+$(BUILD_DIR)/tests/%.o: $(TEST_DIR)/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(TEST_CXXFLAGS) -c $< -o $@
+
+test-cuda: check-cuda $(CUDA_LIB) $(GTEST_OBJ) $(TEST_OBJS)
+	$(CXX) $(TEST_OBJS) $(GTEST_OBJ) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_cuda
-	$(BUILD_DIR)/test_runner_cuda
+	$(BUILD_DIR)/test_runner_cuda $(TEST_ARGUMENTS)
 
-test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
+test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ) $(TEST_OBJS)
+	$(CXX) $(TEST_OBJS) $(GTEST_OBJ) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_metal
-	$(BUILD_DIR)/test_runner_metal
+	$(BUILD_DIR)/test_runner_metal $(TEST_ARGUMENTS)
+
+test-python: python
+	$(UV) pip install --quiet --python $(PYTHON) pytest
+	$(PYTHON) -m pytest $(TEST_DIR)/python $(TEST_ARGUMENTS)
 
 # ── Examples ─────────────────────────────────────────────────
 examples: examples-$(BACKEND)
@@ -333,5 +350,5 @@ clean:
 # ── Header dependencies ──────────────────────────────────────
 # One .d per .o, written by -MMD -MP above. `-include` rather than `include` so a clean
 # tree (where none exist yet) is not an error.
-DEPENDENCY_FILES := $(CORE_OBJS:.o=.d) $(NML_OBJS:.o=.d) $(METAL_OBJS:.o=.d) $(CUDA_OBJS:.o=.d)
+DEPENDENCY_FILES := $(CORE_OBJS:.o=.d) $(NML_OBJS:.o=.d) $(METAL_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 -include $(DEPENDENCY_FILES)

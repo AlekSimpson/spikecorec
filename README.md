@@ -116,10 +116,15 @@ features, weight scaling, simulation recording to `.spire` files, etc.).
 Tests use [GoogleTest](https://github.com/google/googletest) (vendored as a submodule).
 
 ```bash
-make test          # build + run all tests (auto-detects backend)
+make test          # build + run all C++ tests (auto-detects backend), recurrent networks included
 make test-metal    # Metal backend explicitly
 make test-cuda     # CUDA backend explicitly
+make test-python   # the Python binding tests in tests/python, with pytest in .venv
 ```
+
+`make test TEST_ARGUMENTS=--gtest_filter='WeightMatrix.*'` passes arguments through to the runner.
+Fixtures live in `tests/fixtures`; the jNeuroML reference outputs in `tests/fixtures/reference`
+are regenerated with `tests/fixtures/reference/regenerate_references.sh`.
 
 To run a subset after the initial build, invoke the runner directly with `--gtest_filter`:
 
@@ -128,7 +133,7 @@ To run a subset after the initial build, invoke the runner directly with `--gtes
 ./build/test_runner_metal --gtest_filter='K2Tree.*'
 
 # A single test
-./build/test_runner_metal --gtest_filter='SpikeEngine.spike_fanout'
+./build/test_runner_metal --gtest_filter='SingleCell.a_pulse_delivers_exactly_its_charge'
 
 # Wildcard across all suites
 ./build/test_runner_metal --gtest_filter='*.save_load'

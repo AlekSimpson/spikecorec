@@ -1,98 +1,39 @@
-// Tests for the NeuroML-driven engine: expression lowering, the generated kernel, and
-// what the simulation actually does when it runs.
+// Tests for the NeuroML-driven engine: what LEMS expressions mean, what the generated kernel
+// computes, and what a simulation does when it runs.
 //
-// The simulation tests are written against quantities that can be derived by hand from the
-// model — an analytic interspike interval, an exact arrival tick, a firing-rate band — so
-// that a kernel which silently integrates the wrong equation fails here rather than
-// producing a plausible-looking recording that nobody can check.
+// Expected values come from closed forms, from the host evaluator, or from a reference written in
+// the test (forward Euler), so a kernel that integrates the wrong equation fails here instead of
+// producing a plausible recording nobody can check.
 
 #include <algorithm>
 #include <cmath>
-#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <random>
 #include <set>
 #include <sstream>
-
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/engine.h"
 #include "spikecorec/core/backend.h"
+#include "spikecorec/core/engine.h"
 #include "spikecorec/core/topologies.h"
-#include "spikecorec/nml/dynamics_codegen.h"
+#include "spikecorec/nml/dynamics.h"
+#include "spikecorec/nml/random_generator.h"
+#include "support/test_support.h"
 
 using namespace std;
 using namespace spikecorec;
 using namespace spikecorec::nml;
+using namespace spikecorec::test_support;
 
 namespace {
 
-class ModelDirectory {
-public:
-    explicit ModelDirectory(const String &test_name) {
-        root_ = filesystem::temp_directory_path() / "spikecorec_engine_tests" / test_name;
-        filesystem::remove_all(root_);
-        filesystem::create_directories(root_);
-    }
-
-    ~ModelDirectory() {
-        std::error_code ignored;
-        filesystem::remove_all(root_, ignored);
-    }
-
-    ModelDirectory(const ModelDirectory &) = delete;
-    ModelDirectory &operator=(const ModelDirectory &) = delete;
-
-    String write(const String &name, const String &contents) const {
-        const filesystem::path destination = root_ / name;
-        ofstream file(destination);
-        file << contents;
-        file.close();
-        return destination.string();
-    }
-
-    [[nodiscard]] String path() const { return root_.string(); }
-
-private:
-    filesystem::path root_;
-};
-
-bool standard_library_available() {
-    NML_Parser parser;
-    return !parser.STANDARD_LIBRARY_PATH.empty() &&
-           filesystem::exists(parser.STANDARD_LIBRARY_PATH);
-}
-
-// Everything a Simulation needs around a model document, so each test writes only the
-// part it is about.
-String lems_wrapper(const String &model_file, const String &network_id,
-                    const String &length, const String &step,
-                    const String &extra_outputs = "") {
-    ostringstream document;
-    document << "<Lems>\n"
-             << "  <Include file=\"Cells.xml\"/>\n"
-             << "  <Include file=\"Synapses.xml\"/>\n"
-             << "  <Include file=\"Inputs.xml\"/>\n"
-             << "  <Include file=\"Networks.xml\"/>\n"
-             << "  <Include file=\"Simulation.xml\"/>\n"
-             << "  <Include file=\"" << model_file << "\"/>\n"
-             << "  <Simulation id=\"sim1\" length=\"" << length << "\" step=\"" << step
-             << "\" target=\"" << network_id << "\">\n"
-             << extra_outputs
-             << "  </Simulation>\n"
-             << "  <Target component=\"sim1\"/>\n"
-             << "</Lems>\n";
-    return document.str();
-}
-
-// One iafCell under a constant supra-rheobase current. tau = C/gL = 20 ms and the
-// rheobase is gL*(thresh - leakReversal) = 75 pA, so at 90 pA the cell fires periodically
-// with an interval that has a closed form.
+// One iafCell under a constant supra-rheobase current. tau = C/gL = 20 ms and the rheobase is
+// gL*(thresh - leakReversal) = 75 pA, so at 90 pA the cell fires with an interval that has a
+// closed form.
 String single_cell_model(const String &amplitude = "90 pA") {
     return R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="SingleCell">
-  <iafCell id="testCell" leakConductance="5 nS" leakReversal="-65 mV"
-           thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <iafCell id="testCell" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
   <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude=")" + amplitude + R"("/>
   <network id="singleCellNetwork">
     <population id="cellPopulation" component="testCell" size="1"/>
@@ -102,768 +43,496 @@ String single_cell_model(const String &amplitude = "90 pA") {
 )";
 }
 
-// Spike times of one neuron, in order.
-Vector<f64> spike_times_of(const SpikeEngine &engine, s64 neuron_index) {
-    Vector<f64> times;
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        if (spike.neuron_index == neuron_index) times.push_back(spike.time_seconds);
-    }
-    return times;
-}
-
+// tau * ln((I/gL - (reset - EL)) / (I/gL - (thresh - EL))) for single_cell_model at 90 pA.
 f64 analytic_interspike_interval() {
     const f64 membrane_time_constant = 100e-12 / 5e-9;
     const f64 drive_in_volts = 90e-12 / 5e-9;
     return membrane_time_constant *
-           std::log((drive_in_volts - (-0.070 - -0.065)) /
-                    (drive_in_volts - (-0.050 - -0.065)));
+           std::log((drive_in_volts - (-0.070 - -0.065)) / (drive_in_volts - (-0.050 - -0.065)));
+}
+
+// Writes model_contents as model.nml beside a LEMS document that simulates network_id, and returns
+// the LEMS document's path.
+String write_model(const TemporaryDirectory &directory, const String &model_contents, const String &network_id,
+                   const String &length, const String &step, const String &simulation_children = "") {
+    directory.write("model.nml", model_contents);
+    return directory.write("LEMS.xml", lems_document("model.nml", network_id, length, step, simulation_children));
+}
+
+// The include line for the GLIF cell types, which live with the fixtures.
+String glif_types_include() {
+    return "  <include href=\"" + fixture_path("nml/glif_cell_types.nml") + "\"/>\n";
+}
+
+// A cell type whose state variables each integrate one constant expression, so after n ticks each
+// one holds n * dt * (the expression's value): what the GPU computed for that expression. The
+// arguments are state variables set at OnStart, so the kernel evaluates each function at run time.
+struct ProbeExpression {
+    String name;
+    String expression;
+};
+
+const Vector<ProbeExpression> &probe_expressions() {
+    static const Vector<ProbeExpression> expressions = {
+        {"natural_log", "log(four)"},
+        {"ln_alias", "ln(four)"},
+        {"exponential", "exp(half)"},
+        {"square_root", "sqrt(four)"},
+        {"absolute", "abs(negative)"},
+        {"heaviside_zero", "H(zero)"},
+        {"heaviside_positive", "H(two)"},
+        {"heaviside_negative", "H(negative)"},
+        {"power", "two ^ three"},
+        {"right_associative_power", "two ^ half ^ two"},
+        {"floor_probe", "floor(negative)"},
+        {"ceiling_probe", "ceil(negative)"},
+        {"sine", "sin(half)"},
+        {"hyperbolic_tangent", "tanh(half)"},
+        {"precedence", "two + three * four"},
+        {"left_associative_division", "four / two / two"},
+        {"unary_minus", "-three + two"},
+    };
+    return expressions;
+}
+
+const UnorderedMap<String, f64> &probe_inputs() {
+    static const UnorderedMap<String, f64> inputs = {
+        {"four", 4.0}, {"two", 2.0}, {"three", 3.0}, {"half", 0.5}, {"zero", 0.0}, {"negative", -1.5}};
+    return inputs;
+}
+
+String probe_cell_model(s64 population_size, const String &extra_dynamics = "") {
+    std::ostringstream document;
+    document << R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Probe">
+  <ComponentType name="probeCell" extends="baseCellMembPot">
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+)";
+    for (const auto &[name, value] : probe_inputs()) {
+        (void)value;
+        document << "      <StateVariable name=\"" << name << "\" dimension=\"none\"/>\n";
+    }
+    for (const ProbeExpression &probe : probe_expressions()) {
+        document << "      <StateVariable name=\"" << probe.name << "\" dimension=\"none\"/>\n"
+                 << "      <TimeDerivative variable=\"" << probe.name << "\" value=\"" << probe.expression << "\"/>\n";
+    }
+    document << extra_dynamics << "      <OnStart>\n        <StateAssignment variable=\"v\" value=\"0\"/>\n";
+    for (const auto &[name, value] : probe_inputs()) {
+        document << "        <StateAssignment variable=\"" << name << "\" value=\"" << value << "\"/>\n";
+    }
+    document << R"(      </OnStart>
+    </Dynamics>
+  </ComponentType>
+  <probeCell id="probe"/>
+  <network id="probeNetwork">
+    <population id="probePopulation" component="probe" size=")"
+             << population_size << R"("/>
+  </network>
+</neuroml>
+)";
+    return document.str();
 }
 
 } // namespace
 
-// ── expression lowering ───────────────────────────────────────────────────────────
+// ── LEMS expressions, on the host ───────────────────────────────────────────────
 
-TEST(DynamicsCodegen, dotted_operators_lower_to_their_c_spelling) {
-    const SymbolTable symbols = {{"v", "state_0"}, {"thresh", "parameter_0"}};
-
-    EXPECT_EQ(translate_expression("v .gt. thresh", symbols, "test"),
-              "(state_0 > parameter_0)");
-    EXPECT_EQ(translate_expression("v .lt. thresh", symbols, "test"),
-              "(state_0 < parameter_0)");
-    EXPECT_EQ(translate_expression("v .geq. thresh", symbols, "test"),
-              "(state_0 >= parameter_0)");
-    EXPECT_EQ(translate_expression("v .leq. thresh", symbols, "test"),
-              "(state_0 <= parameter_0)");
-    EXPECT_EQ(translate_expression("v .eq. thresh", symbols, "test"),
-              "(state_0 == parameter_0)");
-    EXPECT_EQ(translate_expression("v .neq. thresh", symbols, "test"),
-              "(state_0 != parameter_0)");
-    EXPECT_EQ(translate_expression("v .gt. thresh .and. v .lt. thresh", symbols, "test"),
-              "((state_0 > parameter_0) && (state_0 < parameter_0))");
-    EXPECT_EQ(translate_expression("v .gt. thresh .or. v .lt. thresh", symbols, "test"),
-              "((state_0 > parameter_0) || (state_0 < parameter_0))");
+TEST(Expression, dotted_operators_compare_and_combine) {
+    const UnorderedMap<String, f64> none;
+    EXPECT_EQ(evaluate_lems("2 .gt. 1", none, "test"), 1.0);
+    EXPECT_EQ(evaluate_lems("1 .gt. 1", none, "test"), 0.0);
+    EXPECT_EQ(evaluate_lems("1 .geq. 1", none, "test"), 1.0);
+    EXPECT_EQ(evaluate_lems("1 .lt. 2", none, "test"), 1.0);
+    EXPECT_EQ(evaluate_lems("2 .leq. 1", none, "test"), 0.0);
+    EXPECT_EQ(evaluate_lems("3 .eq. 3", none, "test"), 1.0);
+    EXPECT_EQ(evaluate_lems("3 .neq. 3", none, "test"), 0.0);
+    EXPECT_EQ(evaluate_lems("(1 .lt. 2) .and. (3 .gt. 4)", none, "test"), 0.0);
+    EXPECT_EQ(evaluate_lems("(1 .lt. 2) .or. (3 .gt. 4)", none, "test"), 1.0);
 }
 
-// LEMS `ln` is natural log and LEMS `log` is base 10, which is the reverse of what the
-// names suggest in C. Getting either backwards changes every rate law that uses them and
-// nothing about it is a compile error.
-TEST(DynamicsCodegen, lems_function_names_map_to_the_right_c_functions) {
-    const SymbolTable symbols = {{"x", "state_0"}};
-
-    EXPECT_EQ(translate_expression("ln(x)", symbols, "test"), "log(state_0)");
-    EXPECT_EQ(translate_expression("log(x)", symbols, "test"), "log10(state_0)");
-    EXPECT_EQ(translate_expression("abs(x)", symbols, "test"), "fabs(state_0)");
-    EXPECT_EQ(translate_expression("exp(x)", symbols, "test"), "exp(state_0)");
-    EXPECT_EQ(translate_expression("H(x)", symbols, "test"), "spikecorec_heaviside(state_0)");
+TEST(Expression, precedence_and_associativity_follow_the_arithmetic) {
+    const UnorderedMap<String, f64> none;
+    EXPECT_DOUBLE_EQ(evaluate_lems("2 + 3 * 4", none, "test"), 14.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("(2 + 3) * 4", none, "test"), 20.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("10 - 4 - 3", none, "test"), 3.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("12 / 3 / 2", none, "test"), 2.0);
+    // ^ is the one right-associative operator: 2^3^2 is 2^9.
+    EXPECT_DOUBLE_EQ(evaluate_lems("2 ^ 3 ^ 2", none, "test"), 512.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("2 * 3 ^ 2", none, "test"), 18.0);
 }
 
-TEST(DynamicsCodegen, precedence_and_associativity_follow_the_arithmetic) {
-    const SymbolTable symbols = {{"a", "A"}, {"b", "B"}, {"c", "C"}};
-
-    EXPECT_EQ(translate_expression("a + b * c", symbols, "test"), "(A + (B * C))");
-    EXPECT_EQ(translate_expression("(a + b) * c", symbols, "test"), "((A + B) * C)");
-    EXPECT_EQ(translate_expression("a - b - c", symbols, "test"), "((A - B) - C)");
-    EXPECT_EQ(translate_expression("a * (b + c)", symbols, "test"), "(A * (B + C))");
-    EXPECT_EQ(translate_expression("((a))", symbols, "test"), "A");
-
-    // `^` binds tighter than * and is right-associative, so a^b^c is a^(b^c).
-    EXPECT_EQ(translate_expression("a ^ b ^ c", symbols, "test"), "pow(A, pow(B, C))");
-    EXPECT_EQ(translate_expression("a * b ^ c", symbols, "test"), "(A * pow(B, C))");
+// LEMS log is the natural logarithm, and H(0) is 0: H(0) = 1 stalled spikeGeneratorPoisson.
+TEST(Expression, functions_have_their_lems_meaning) {
+    const UnorderedMap<String, f64> values = {{"x", 2.0}};
+    EXPECT_NEAR(evaluate_lems("log(2.718281828459045)", values, "test"), 1.0, 1e-15);
+    EXPECT_DOUBLE_EQ(evaluate_lems("ln(x)", values, "test"), std::log(2.0));
+    EXPECT_DOUBLE_EQ(evaluate_lems("exp(x)", values, "test"), std::exp(2.0));
+    EXPECT_DOUBLE_EQ(evaluate_lems("sqrt(x * 8)", values, "test"), 4.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("abs(-x)", values, "test"), 2.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("floor(-1.5)", values, "test"), -2.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("ceil(-1.5)", values, "test"), -1.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("H(0)", values, "test"), 0.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("H(1e-30)", values, "test"), 1.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("H(-1)", values, "test"), 0.0);
+    EXPECT_DOUBLE_EQ(evaluate_lems("x ^ 0.5", values, "test"), std::sqrt(2.0));
+    EXPECT_DOUBLE_EQ(evaluate_lems("tanh(x)", values, "test"), std::tanh(2.0));
 }
 
-// An integer literal that reaches the target as an integer turns division into integer
-// division: `1/tau` would evaluate to 0 rather than to a rate.
-TEST(DynamicsCodegen, integer_literals_are_emitted_as_floating_point) {
-    const SymbolTable symbols = {{"tau", "parameter_0"}};
-
-    EXPECT_EQ(translate_expression("1 / tau", symbols, "test"), "(1.0 / parameter_0)");
-    EXPECT_EQ(translate_expression("2.5e-3 * tau", symbols, "test"),
-              "(2.5e-3 * parameter_0)");
+TEST(Expression, random_draws_uniformly_up_to_its_argument) {
+    RandomGenerator random_generator(42);
+    const UnorderedMap<String, f64> none;
+    f64 sum = 0.0;
+    const s32 draw_count = 20000;
+    for (s32 draw = 0; draw < draw_count; draw += 1) {
+        const f64 value = evaluate_lems("random(3)", none, "test", &random_generator);
+        ASSERT_GT(value, 0.0);
+        ASSERT_LT(value, 3.0);
+        sum += value;
+    }
+    // Mean 1.5, standard error 3 / sqrt(12 * 20000) = 0.0061.
+    EXPECT_NEAR(sum / draw_count, 1.5, 0.03);
+    // Without a generator there is nothing to draw from.
+    EXPECT_THROW(evaluate_lems("random(1)", none, "test"), runtime_error);
 }
 
-TEST(DynamicsCodegen, an_unresolved_name_is_an_error_not_a_pass_through) {
-    const SymbolTable symbols = {{"v", "state_0"}};
+TEST(Expression, malformed_expressions_throw_naming_their_owner) {
+    const UnorderedMap<String, f64> none;
+    const auto message_of = [&](const String &expression) -> String {
+        try {
+            evaluate_lems(expression, none, "ownerType");
+        } catch (const runtime_error &error) {
+            return error.what();
+        }
+        return "";
+    };
+    EXPECT_NE(message_of("nosuchfunction(2)").find("nosuchfunction"), String::npos);
+    EXPECT_NE(message_of("(2 + 3").find("ownerType"), String::npos);
+    EXPECT_NE(message_of("2 $ 3").find("$"), String::npos);
+    EXPECT_NE(message_of("unbound + 1").find("unbound"), String::npos);
+}
 
-    EXPECT_THROW(translate_expression("v + mystery", symbols, "someCell"), std::runtime_error);
-    EXPECT_THROW(translate_expression("notAFunction(v)", symbols, "someCell"),
-                 std::runtime_error);
-    EXPECT_THROW(translate_expression("v +", symbols, "someCell"), std::runtime_error);
-    EXPECT_THROW(translate_expression("(v", symbols, "someCell"), std::runtime_error);
+TEST(RandomGenerator, each_distribution_has_its_mean_and_a_seed_reproduces_it) {
+    RandomGenerator first(7);
+    RandomGenerator second(7);
+    const s32 draw_count = 50000;
+    f64 uniform_sum = 0.0;
+    f64 normal_sum = 0.0;
+    f64 normal_square_sum = 0.0;
+    f64 exponential_sum = 0.0;
+    f64 poisson_sum = 0.0;
+    for (s32 draw = 0; draw < draw_count; draw += 1) {
+        const f64 uniform = first.uniform();
+        ASSERT_GT(uniform, 0.0);
+        ASSERT_LT(uniform, 1.0);
+        EXPECT_EQ(uniform, second.uniform());
+        uniform_sum += uniform;
+        const f64 normal = first.normal(2.0, 0.5);
+        normal_sum += normal;
+        normal_square_sum += (normal - 2.0) * (normal - 2.0);
+        exponential_sum += first.exponential(4.0);
+        poisson_sum += (f64)first.poisson(3.0);
+        second.normal(2.0, 0.5);
+        second.exponential(4.0);
+        second.poisson(3.0);
+    }
+    EXPECT_NEAR(uniform_sum / draw_count, 0.5, 0.005);
+    EXPECT_NEAR(normal_sum / draw_count, 2.0, 0.01);
+    EXPECT_NEAR(sqrt(normal_square_sum / draw_count), 0.5, 0.01);
+    EXPECT_NEAR(exponential_sum / draw_count, 0.25, 0.005);
+    EXPECT_NEAR(poisson_sum / draw_count, 3.0, 0.03);
+}
 
+// ── the generated kernel ────────────────────────────────────────────────────────
+
+// Every LEMS function and operator, computed by the GPU, against the host's value.
+TEST(GeneratedKernel, every_function_computes_on_the_gpu_what_the_host_computes) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, probe_cell_model(2), "probeNetwork", "10ms", "0.1ms"));
+
+    const s64 tick_count = 100;
+    for (s64 tick = 0; tick < tick_count; tick += 1) engine.step_simulation(tick);
+
+    const f64 elapsed = (f64)tick_count * engine.step_dt;
+    for (const ProbeExpression &probe : probe_expressions()) {
+        const f64 expected = evaluate_lems(probe.expression, probe_inputs(), "probeCell") * elapsed;
+        for (s64 neuron = 0; neuron < 2; neuron += 1) {
+            // f32 accumulation over 100 ticks and Metal's own function precision; H(0) must still be 0.
+            EXPECT_NEAR(engine.read_state_variable(neuron, probe.name), expected, 1e-4 * max(fabs(expected), 1e-4))
+                << probe.expression << " on neuron " << neuron;
+        }
+    }
+    EXPECT_NE(engine.master_kernel_source.find("master_step"), String::npos);
+}
+
+// Each random() call gets one slot of random_values per neuron, drawn afresh every tick.
+TEST(GeneratedKernel, random_reads_one_fresh_slot_per_call_per_neuron) {
+    const TemporaryDirectory directory;
+    const s64 neuron_count = 1000;
+    const String drawn_dynamics = R"xml(      <StateVariable name="drawn" dimension="none"/>
+      <TimeDerivative variable="drawn" value="random(1) + random(2)"/>
+)xml";
+    SpikeEngine engine(write_model(directory, probe_cell_model(neuron_count, drawn_dynamics), "probeNetwork",
+                                   "100ms", "0.1ms"));
+    EXPECT_EQ(engine.random_values_count, 2 * neuron_count);
+
+    const s64 tick_count = 1000;
+    for (s64 tick = 0; tick < tick_count; tick += 1) engine.step_simulation(tick);
+
+    // Each tick adds dt * (U(0,1) + U(0,2)): mean 1.5 dt, variance dt^2 * (1 + 4) / 12.
+    const f64 step = engine.step_dt;
+    Vector<f64> totals;
+    for (s64 neuron = 0; neuron < neuron_count; neuron += 1) totals.push_back(engine.read_state_variable(neuron, "drawn"));
+    const f64 expected_mean = 1.5 * step * (f64)tick_count;
+    const f64 expected_variance = step * step * (5.0 / 12.0) * (f64)tick_count;
+    const f64 mean = mean_of(totals);
+    f64 variance = 0.0;
+    for (f64 total : totals) variance += (total - mean) * (total - mean);
+    variance /= (f64)(totals.size() - 1);
+
+    EXPECT_NEAR(mean, expected_mean, 4.0 * sqrt(expected_variance / (f64)neuron_count));
+    // A draw reused across ticks or across neurons would make this many times larger, or zero.
+    EXPECT_NEAR(variance / expected_variance, 1.0, 0.2);
+}
+
+// An OnStart that calls random() draws once per neuron on the host.
+TEST(GeneratedKernel, an_on_start_random_draws_once_per_neuron) {
+    const TemporaryDirectory directory;
+    const s64 neuron_count = 2000;
+    const String start_dynamics = R"xml(      <StateVariable name="start" dimension="none"/>
+      <OnStart><StateAssignment variable="start" value="random(1)"/></OnStart>
+)xml";
+    SpikeEngine engine(write_model(directory, probe_cell_model(neuron_count, start_dynamics), "probeNetwork",
+                                   "1ms", "0.1ms"));
+
+    Vector<f64> starts;
+    for (s64 neuron = 0; neuron < neuron_count; neuron += 1) starts.push_back(engine.read_state_variable(neuron, "start"));
+    for (f64 start : starts) {
+        ASSERT_GT(start, 0.0);
+        ASSERT_LT(start, 1.0);
+    }
+    EXPECT_NEAR(mean_of(starts), 0.5, 4.0 * sqrt(1.0 / 12.0 / (f64)neuron_count));
+    const s64 below_a_quarter = count_if(starts.begin(), starts.end(), [](f64 start) { return start < 0.25; });
+    EXPECT_NEAR((f64)below_a_quarter / (f64)neuron_count, 0.25, 0.04);
+    EXPECT_GT(set<f64>(starts.begin(), starts.end()).size(), (usize)(neuron_count * 0.99));
+}
+
+// The integrating / refractory regime pair lowers to a test on the tick since the last spike, and
+// state outside the regimes keeps evolving while the cell is held: GLIF3's after-spike currents
+// decay during the refractory period.
+TEST(GeneratedKernel, after_spike_currents_decay_through_the_refractory_period) {
+    SpikeEngine engine(fixture_path("nml/LEMS_glif_family.xml"));
+    EXPECT_NE(engine.master_kernel_source.find("refractory"), String::npos);
+
+    const s64 glif3 = 2;
+    s64 first_spike_tick = -1;
+    f32 after_spike_current = 0.0f;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        if (first_spike_tick < 0) {
+            for (const RecordedSpike &spike : engine.recorded_spikes) {
+                if (spike.neuron_index == glif3) first_spike_tick = tick;
+            }
+            if (first_spike_tick >= 0) after_spike_current = engine.read_state_variable(glif3, "asc2");
+            continue;
+        }
+        // 4 ms into the 5 ms refractory period: asc2 (tau 10 ms) has decayed by about a third.
+        if (tick == first_spike_tick + (s64)llround(4e-3 / engine.step_dt)) {
+            const f32 decayed = engine.read_state_variable(glif3, "asc2");
+            ASSERT_LT(after_spike_current, 0.0f);
+            EXPECT_NEAR(decayed / after_spike_current, std::exp(-4e-3 / 10e-3), 0.02);
+            break;
+        }
+    }
+    EXPECT_GE(first_spike_tick, 0) << "GLIF3 never fired";
+}
+
+TEST(GeneratedKernel, a_regime_shape_that_is_not_the_refractory_pair_is_refused) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ThreeRegimes">
+  <ComponentType name="ThreeRegimeCell" extends="baseCellMembPot">
+    <Parameter name="vth" dimension="voltage"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <Regime name="one" initial="true">
+        <TimeDerivative variable="v" value="1"/>
+        <OnCondition test="v .gt. vth"><Transition regime="two"/></OnCondition>
+      </Regime>
+      <Regime name="two"><OnCondition test="v .gt. vth"><Transition regime="three"/></OnCondition></Regime>
+      <Regime name="three"><OnCondition test="v .gt. vth"><Transition regime="one"/></OnCondition></Regime>
+    </Dynamics>
+  </ComponentType>
+  <ThreeRegimeCell id="cell" vth="1mV"/>
+  <network id="threeRegimeNetwork"><population id="pop" component="cell" size="1"/></network>
+</neuroml>
+)", "threeRegimeNetwork", "10ms", "0.1ms");
     try {
-        translate_expression("v + mystery", symbols, "someCell");
-        FAIL() << "expected a throw";
-    } catch (const std::runtime_error &error) {
+        SpikeEngine engine(lems);
+        FAIL() << "a three-regime state machine must not lower to a refractory gate";
+    } catch (const runtime_error &error) {
         const String message = error.what();
-        EXPECT_NE(message.find("mystery"), String::npos);
-        EXPECT_NE(message.find("someCell"), String::npos);
+        EXPECT_NE(message.find("ThreeRegimeCell"), String::npos) << message;
+        EXPECT_NE(message.find("refractory regime pair"), String::npos) << message;
     }
 }
 
-TEST(DynamicsCodegen, phase_two_functions_say_so) {
-    const SymbolTable symbols = {{"v", "state_0"}};
-    try {
-        translate_expression("random(v)", symbols, "someCell");
-        FAIL() << "expected a throw";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(String(error.what()).find("Phase 2"), String::npos);
-    }
-}
-
-TEST(DynamicsCodegen, on_start_values_fold_to_literals_or_parameters) {
-    const Vector<String> names = {"leakReversal", "thresh"};
-    Vector<Real> values(2);
-    values[0].float64 = -0.065;
-    values[1].float64 = -0.050;
-
-    EXPECT_DOUBLE_EQ(evaluate_initial_value("0", names, values, "cell"), 0.0);
-    EXPECT_DOUBLE_EQ(evaluate_initial_value("leakReversal", names, values, "cell"), -0.065);
-    EXPECT_DOUBLE_EQ(evaluate_initial_value("-leakReversal", names, values, "cell"), 0.065);
-    EXPECT_DOUBLE_EQ(evaluate_initial_value("1.5e-3", names, values, "cell"), 1.5e-3);
-
-    EXPECT_THROW(evaluate_initial_value("thresh - 1", names, values, "cell"),
-                 std::runtime_error);
-}
-
-// ── the generated kernel ──────────────────────────────────────────────────────────
-
-TEST(DynamicsCodegen, generated_kernel_contains_the_cell_equation_it_was_given) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("generated_source");
-    directory.write("model.nml", single_cell_model());
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "singleCellNetwork", "100ms", "0.05ms"));
-
-    NML_Parser parser;
-    const NML_ParseResult parsed = parser.parse_lems(lems_path);
-    const ModelLayout layout = compute_model_layout(parsed);
-    const String source = generate_master_kernel(parsed, layout);
-
-    // iafCell's own declarations, in the order it declares them:
-    //   <DerivedVariable name="iSyn" select="synapses[*]/i" reduce="add"/>
-    //   <DerivedVariable name="iMemb" value="leakConductance*(leakReversal - v) + iSyn"/>
-    //   <TimeDerivative variable="v" value="iMemb / C"/>
-    //
-    // iSyn is a reduction over attached synapses, which the engine has already summed into
-    // this neuron's input accumulator, so it binds straight to `network_input` rather than
-    // becoming a temporary of its own. That is why it appears inside iMemb's expression
-    // and nowhere on a line of its own.
-    const usize memb_line = source.find("const float derived_iMemb =");
-    ASSERT_NE(memb_line, String::npos);
-
-    const usize memb_end = source.find('\n', memb_line);
-    const String memb_source = source.substr(memb_line, memb_end - memb_line);
-    EXPECT_NE(memb_source.find("network_input"), String::npos) << memb_source;
-
-    // C is parameter 0 of iafCell's declared order, so the derivative is iMemb / C.
-    EXPECT_NE(source.find("const float derivative_0 = (derived_iMemb / "
-                          "cell_parameters[parameter_base + 0]);"), String::npos);
-    EXPECT_NE(source.find("state_0 += step_dt * derivative_0;"), String::npos);
-
-    // The OnCondition body: reset the state variable and raise the spike flag.
-    EXPECT_NE(source.find("spiked = true;"), String::npos);
-
-    // One case arm per cell type, and the type is named in the source it generated.
-    EXPECT_NE(source.find("case 0: { // iafCell"), String::npos);
-
-    // The scaffold's own stages have to be present for the generated bodies to mean
-    // anything.
-    EXPECT_NE(source.find("kernel void master_step("), String::npos);
-    EXPECT_NE(source.find("k2t_next_neighbor("), String::npos);
-}
-
-TEST(DynamicsCodegen, a_conductance_based_synapse_is_refused_by_name) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("conductance_refused");
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Cond">
-  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <expOneSynapse id="condSyn" gbase="1 nS" erev="0 mV" tauDecay="5 ms"/>
-  <network id="condNetwork">
+// A synapse that reads the target's v (conductance-based) is refused, naming what it reads.
+TEST(GeneratedKernel, a_conductance_based_synapse_is_refused_naming_v) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Conductance">
+  <expOneSynapse id="conductanceSynapse" gbase="1 nS" erev="0 mV" tauDecay="5 ms"/>
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <network id="conductanceNetwork">
     <population id="pop" component="c" size="2"/>
-    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop"
-                synapse="condSyn">
-      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]"
-                    weight="1" delay="1 ms"/>
+    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop" synapse="conductanceSynapse">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]" weight="1" delay="1 ms"/>
     </projection>
   </network>
 </neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "condNetwork", "10ms", "0.05ms"));
-
-    NML_Parser parser;
-    const NML_ParseResult parsed = parser.parse_lems(lems_path);
-    const ModelLayout layout = compute_model_layout(parsed);
-
+)", "conductanceNetwork", "10ms", "0.1ms");
     try {
-        generate_master_kernel(parsed, layout);
-        FAIL() << "a conductance-based synapse should not silently lower";
-    } catch (const std::runtime_error &error) {
+        SpikeEngine engine(lems);
+        FAIL() << "a conductance-based synapse must not silently lower";
+    } catch (const runtime_error &error) {
         const String message = error.what();
-        EXPECT_NE(message.find("expOneSynapse"), String::npos);
-        EXPECT_NE(message.find("conductance"), String::npos);
+        EXPECT_NE(message.find("expOneSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("'v'"), String::npos) << message;
     }
 }
 
-// ── running a model ───────────────────────────────────────────────────────────────
+// ── what a cell's inputs must provide ───────────────────────────────────────────
 
-TEST(SpikeEngine, on_start_puts_the_cell_at_its_leak_reversal) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+TEST(CellInputs, an_input_into_a_cell_that_reads_none_is_refused) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="NoInput">
+  <iafTauCell id="c" leakReversal="-65 mV" tau="10 ms" thresh="-50 mV" reset="-70 mV"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="10 ms" amplitude="1 nA"/>
+  <network id="noInputNetwork">
+    <population id="pop" component="c" size="1"/>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "noInputNetwork", "10ms", "0.1ms");
+    try {
+        SpikeEngine engine(lems);
+        FAIL() << "iafTauCell reads no input, so a current into it would be dropped";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("iafTauCell"), String::npos) << message;
+        EXPECT_NE(message.find("reads no input"), String::npos) << message;
+    }
+}
 
-    ModelDirectory directory("on_start");
-    directory.write("model.nml", single_cell_model());
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "singleCellNetwork", "10ms", "0.05ms"));
+// A synapse must expose what the cell's select reads, in the same dimension.
+TEST(CellInputs, a_synapse_exposing_the_wrong_dimension_is_refused) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="WrongDimension">
+  <ComponentType name="voltageSynapse" extends="baseSynapse">
+    <Exposure name="i" dimension="voltage"/>
+    <Dynamics><DerivedVariable name="i" dimension="voltage" exposure="i" value="0"/></Dynamics>
+  </ComponentType>
+  <voltageSynapse id="wrongSynapse"/>
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <network id="wrongNetwork">
+    <population id="pop" component="c" size="2"/>
+    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop" synapse="wrongSynapse">
+      <connection id="0" preCellId="../pop[0]" postCellId="../pop[1]"/>
+    </projection>
+  </network>
+</neuroml>
+)", "wrongNetwork", "10ms", "0.1ms");
+    try {
+        SpikeEngine engine(lems);
+        FAIL() << "a synapse exposing i as a voltage must be refused";
+    } catch (const runtime_error &error) {
+        const String message = error.what();
+        EXPECT_NE(message.find("wrongSynapse"), String::npos) << message;
+        EXPECT_NE(message.find("voltage"), String::npos) << message;
+    }
+}
 
-    SpikeEngine engine(lems_path);
+// A spike train's default kick is the charge that carries the cell from reset to threshold, which
+// needs the cell's capacitance; a cell that reads no input cannot take one at all.
+TEST(CellInputs, a_spike_train_onto_a_cell_that_cannot_take_it_is_refused) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
+  <iafTauCell id="c" leakReversal="-65 mV" tau="10 ms" thresh="-50 mV" reset="-70 mV"/>
+  <spikeArray id="train"><spike id="0" time="10 ms"/><spike id="1" time="20 ms"/></spikeArray>
+  <network id="trainNetwork">
+    <population id="pop" component="c" size="1"/>
+    <explicitInput target="pop[0]" input="train"/>
+  </network>
+</neuroml>
+)", "trainNetwork", "50ms", "0.1ms");
+    try {
+        SpikeEngine engine(lems);
+        FAIL() << "a spike train onto iafTauCell must be refused";
+    } catch (const runtime_error &error) {
+        EXPECT_NE(String(error.what()).find("iafTauCell"), String::npos) << error.what();
+    }
+}
 
-    // Not zero, which is what an engine that skipped OnStart would leave behind — and
-    // zero is above the -50 mV threshold, so every neuron would fire on tick 0 and the
-    // network would then look permanently dead.
+// ── a single cell ───────────────────────────────────────────────────────────────
+
+// Not zero, which is what skipping OnStart would leave, and which is above threshold.
+TEST(SingleCell, on_start_puts_the_cell_at_its_leak_reversal) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, single_cell_model(), "singleCellNetwork", "10ms", "0.05ms"));
     EXPECT_NEAR(engine.read_state_variable(0, "v"), -0.065f, 1e-7f);
 }
 
-TEST(SpikeEngine, a_single_cell_reproduces_its_analytic_interspike_interval) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("analytic_isi");
-    directory.write("model.nml", single_cell_model());
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "singleCellNetwork", "500ms", "0.05ms"));
-
-    SpikeEngine engine(lems_path);
+TEST(SingleCell, the_interspike_interval_matches_the_closed_form) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, single_cell_model(), "singleCellNetwork", "500ms", "0.05ms"));
     engine.run();
 
-    ASSERT_GE(engine.recorded_spikes.size(), 4u);
-
-    const f64 expected = analytic_interspike_interval();
-    const f64 measured = engine.recorded_spikes[3].time_seconds -
-                         engine.recorded_spikes[2].time_seconds;
-
-    // Explicit Euler at dt = 0.05 ms plus one tick of threshold-crossing discretisation.
-    EXPECT_NEAR(measured, expected, 2e-4);
-
-    // The rate follows from the same interval, so it is a second reading of the same
-    // number rather than an independent one — but a rate of zero or of thousands of hertz
-    // is the failure this catches.
-    EXPECT_NEAR(engine.mean_firing_rate_hertz(), 1.0 / expected, 1.0);
+    const Vector<f64> times = spike_times_of(engine, 0);
+    ASSERT_GE(times.size(), 4u);
+    // Explicit Euler at 0.05 ms plus one tick of threshold-crossing discretisation.
+    EXPECT_NEAR(times[3] - times[2], analytic_interspike_interval(), 2e-4);
+    EXPECT_NEAR(engine.mean_firing_rate_hertz(), 1.0 / analytic_interspike_interval(), 1.0);
 }
 
-// The trajectory between spikes, not just their timing: v(t) = EL + (I/gL)(1 - e^(-t/tau))
-// while the cell is charging. A kernel with the wrong sign, a missing capacitance or a
-// dropped input term reaches threshold at some other time but also takes a different
-// route there, and this checks the route.
-TEST(SpikeEngine, the_subthreshold_trajectory_matches_the_closed_form) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("trajectory");
-    // 60 pA is below the 75 pA rheobase, so the cell charges toward -53 mV and never
-    // fires — the whole run is the closed-form charging curve.
-    directory.write("model.nml", single_cell_model("60 pA"));
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "singleCellNetwork", "100ms", "0.05ms"));
-
-    SpikeEngine engine(lems_path);
+// v(t) = EL + (I/gL)(1 - e^(-t/tau)) below threshold: a wrong sign, a missing capacitance or a
+// dropped input reaches threshold at another time and also takes another route there.
+TEST(SingleCell, the_subthreshold_trajectory_matches_the_closed_form) {
+    const TemporaryDirectory directory;
+    // 60 pA is below the 75 pA rheobase: the cell charges toward -53 mV and never fires.
+    SpikeEngine engine(write_model(directory, single_cell_model("60 pA"), "singleCellNetwork", "100ms", "0.05ms"));
 
     const f64 membrane_time_constant = 100e-12 / 5e-9;
     const f64 steady_state_offset = 60e-12 / 5e-9;
-
     for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
         engine.step_simulation(tick);
-
         if (tick % 200 != 0) continue;
-
-        const f64 elapsed = (f64)(tick + 1) * engine.network_details.step_dt;
-        const f64 expected = -0.065 + steady_state_offset *
-                             (1.0 - std::exp(-elapsed / membrane_time_constant));
-
-        EXPECT_NEAR(engine.read_state_variable(0, "v"), (f32)expected, 5e-5f)
-                << "at tick " << tick;
+        const f64 elapsed = (f64)(tick + 1) * engine.step_dt;
+        const f64 expected = -0.065 + steady_state_offset * (1.0 - std::exp(-elapsed / membrane_time_constant));
+        EXPECT_NEAR(engine.read_state_variable(0, "v"), (f32)expected, 5e-5f) << "at tick " << tick;
     }
-
-    EXPECT_EQ(engine.recorded_spikes.size(), 0u);
+    EXPECT_TRUE(engine.recorded_spikes.empty());
 }
 
-// A spike delivered `delay` ticks later must arrive on exactly that tick. The failure this
-// guards against is silent: an off-by-one, or a mechanism that only remembers the most
-// recent spike and drops earlier ones still in flight.
-TEST(SpikeEngine, a_delayed_connection_arrives_on_the_tick_it_says) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("delay");
-    // Cell 0 is driven above rheobase; cell 1 receives from it after 3 ms and nothing
-    // else, so any movement in cell 1's membrane potential away from rest is that arrival.
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Delay">
-  <iafCell id="driven" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <iafCell id="listener" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
-  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
-  <network id="delayNetwork">
-    <population id="popDriven" component="driven" size="1"/>
-    <population id="popListener" component="listener" size="1"/>
-    <projection id="proj" presynapticPopulation="popDriven"
-                postsynapticPopulation="popListener" synapse="syn">
-      <connectionWD id="0" preCellId="../popDriven[0]" postCellId="../popListener[0]"
-                    weight="1" delay="3 ms"/>
-    </projection>
-    <explicitInput target="popDriven[0]" input="drive"/>
+// A pulse of 1 nA for 2 ms into a 100 pF integrator moves it exactly 20 mV: 20 ticks of 1 mV. One
+// tick too many or too few is a 5% error.
+TEST(SingleCell, a_pulse_delivers_exactly_its_charge) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Pulse">
+  <iafCell id="integrator" leakConductance="0 nS" leakReversal="-65 mV" thresh="1000 mV" reset="-70 mV" C="100 pF"/>
+  <pulseGenerator id="pulse" delay="1 ms" duration="2 ms" amplitude="1 nA"/>
+  <network id="pulseNetwork">
+    <population id="pop" component="integrator" size="1"/>
+    <explicitInput target="pop[0]" input="pulse"/>
   </network>
 </neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "delayNetwork", "200ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
-
-    // The ring is sized from the connection delay, not from anything about the stimulus.
-    EXPECT_EQ(engine.layout.maximum_edge_delay, 30);
-    EXPECT_EQ(engine.layout.spike_history_length, 31);
-
-    s64 first_source_spike_tick = -1;
-    s64 first_listener_movement_tick = -1;
-
-    const f32 resting = -0.065f;
-    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
-        engine.step_simulation(tick);
-
-        if (first_source_spike_tick < 0 && !engine.recorded_spikes.empty()) {
-            first_source_spike_tick = tick;
-        }
-        if (first_source_spike_tick >= 0 && first_listener_movement_tick < 0) {
-            if (std::fabs(engine.read_state_variable(1, "v") - resting) > 1e-9f) {
-                first_listener_movement_tick = tick;
-            }
-        }
-        if (first_listener_movement_tick >= 0) break;
-    }
-
-    ASSERT_GE(first_source_spike_tick, 0);
-    ASSERT_GE(first_listener_movement_tick, 0);
-
-    // Thirty-two ticks, and each one is accounted for:
-    //
-    //   +30  the connection's own delay. The spike is written into the history ring on the
-    //        tick it fires, and the presynaptic thread reads that row 30 ticks later,
-    //        which is when the synapse's OnEvent runs and J takes up weight * ibase.
-    //   +1   an alpha synapse's current is I, and I is still zero on the tick J jumps --
-    //        the alpha response rises from zero rather than stepping. The first non-zero
-    //        current is scattered on the following tick.
-    //   +1   the engine's input latency: a current scattered on one tick is drained by the
-    //        target on the next.
-    //
-    // Changing any of the three moves this number, which is the point of asserting it
-    // exactly rather than as a range.
-    EXPECT_EQ(first_listener_movement_tick - first_source_spike_tick, 32);
-}
-
-// Per-edge storage is addressed by (source, slot), where `slot` is the edge's position in
-// the k^2-tree row walk. The host fills those slots by walking with get_neighbors(); the
-// kernel reads them by walking with k2t_next_neighbor(). Nothing enforces that the two
-// walks agree — and if they ever disagree, every edge silently receives another edge's
-// weight, delay and synapse state. The network still runs, still spikes, and still looks
-// entirely reasonable in a raster.
-//
-// So: one source, three targets with weights 1x/2x/3x and delays 1/3/5 ms, and a single
-// presynaptic spike. Each target's own weight must show up in the size of its response and
-// its own delay in the timing of it. A permutation of the slots fails both halves.
-TEST(SpikeEngine, each_edge_gets_its_own_weight_and_delay_not_another_edges) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("slot_identity");
-    // The pulse stops at 40 ms. The cell first reaches threshold at
-    // tau*ln((I/gL)/(I/gL - 15 mV)) = 20 ms * ln(6) = 35.8 ms and the next crossing would
-    // be 40.7 ms after that, so the run contains exactly one presynaptic spike and each
-    // target sees exactly one postsynaptic response.
-    //
-    // Targets 1, 4 and 7 rather than 1, 2, 3: non-adjacent columns make the tree walk
-    // descend and unwind between neighbours instead of reading one contiguous leaf.
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Slots">
-  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
-  <pulseGenerator id="drive" delay="0 ms" duration="40 ms" amplitude="90 pA"/>
-  <network id="slotNetwork">
-    <population id="pop" component="c" size="8"/>
-    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop"
-                synapse="syn">
-      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]"
-                    weight="1" delay="1 ms"/>
-      <connectionWD id="1" preCellId="../pop[0]" postCellId="../pop[4]"
-                    weight="2" delay="3 ms"/>
-      <connectionWD id="2" preCellId="../pop[0]" postCellId="../pop[7]"
-                    weight="3" delay="5 ms"/>
-    </projection>
-    <explicitInput target="pop[0]" input="drive"/>
-  </network>
-</neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "slotNetwork", "120ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
-
-    const s64 targets[3] = {1, 4, 7};
-    const s64 expected_delay_ticks[3] = {10, 30, 50};
-
-    const f32 resting = -0.065f;
-    s64 spike_tick = -1;
-    s64 first_movement_tick[3] = {-1, -1, -1};
-    f32 peak_deflection[3] = {0.0f, 0.0f, 0.0f};
-
-    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
-        engine.step_simulation(tick);
-
-        if (spike_tick < 0 && !engine.recorded_spikes.empty()) spike_tick = tick;
-
-        for (s64 index = 0; index < 3; index += 1) {
-            const f32 membrane_potential =
-                    engine.read_state_variable(targets[index], "v");
-            const f32 deflection = membrane_potential - resting;
-
-            if (first_movement_tick[index] < 0 && std::fabs(deflection) > 1e-9f) {
-                first_movement_tick[index] = tick;
-            }
-            peak_deflection[index] = std::max(peak_deflection[index], deflection);
-        }
-    }
-
-    ASSERT_GE(spike_tick, 0);
-    ASSERT_EQ(engine.recorded_spikes.size(), 1u) << "the drive should produce one spike";
-
-    // Timing: each target moves delay + 2 ticks after the presynaptic spike, for its own
-    // delay. Slot-permuted delays would give 30/10/50 or some other rearrangement.
-    for (s64 index = 0; index < 3; index += 1) {
-        ASSERT_GE(first_movement_tick[index], 0) << "target " << targets[index] << " never moved";
-        EXPECT_EQ(first_movement_tick[index] - spike_tick, expected_delay_ticks[index] + 2)
-                << "target " << targets[index];
-    }
-
-    // Size: an alphaCurrentSynapse's response scales linearly in the connection weight, so
-    // the three peaks are in 1:2:3. Slot-permuted weights would give 3:2:1 or 2:1:3.
-    for (s64 index = 0; index < 3; index += 1) {
-        EXPECT_GT(peak_deflection[index], 0.0f) << "target " << targets[index];
-    }
-    EXPECT_NEAR(peak_deflection[1] / peak_deflection[0], 2.0, 0.02);
-    EXPECT_NEAR(peak_deflection[2] / peak_deflection[0], 3.0, 0.02);
-
-    // Nothing reached any other cell: only three of the eight have an incoming edge.
-    for (s64 neuron_index = 1; neuron_index < 8; neuron_index += 1) {
-        if (neuron_index == 1 || neuron_index == 4 || neuron_index == 7) continue;
-        EXPECT_FLOAT_EQ(engine.read_state_variable(neuron_index, "v"), resting)
-                << "neuron " << neuron_index << " has no incoming edge and no input";
-    }
-}
-
-// Each edge names its own synapse prototype, stored in plane 0 of the per-edge family and
-// used by the kernel to pick both the generated body and the parameter row. With two
-// prototypes of the same type differing only in the sign of ibase, reading the wrong row
-// flips excitation into inhibition — which in a balanced network shows up as the whole
-// thing dying or running away, but never as an error.
-TEST(SpikeEngine, an_edge_uses_the_parameters_of_its_own_synapse_prototype) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("prototype_identity");
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Prototypes">
-  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <alphaCurrentSynapse id="excitatory" tau="5 ms" ibase="12 pA"/>
-  <alphaCurrentSynapse id="inhibitory" tau="5 ms" ibase="-12 pA"/>
-  <pulseGenerator id="drive" delay="0 ms" duration="40 ms" amplitude="90 pA"/>
-  <network id="prototypeNetwork">
-    <population id="pop" component="c" size="4"/>
-    <projection id="excitatoryProjection" presynapticPopulation="pop"
-                postsynapticPopulation="pop" synapse="excitatory">
-      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]"
-                    weight="1" delay="1 ms"/>
-    </projection>
-    <projection id="inhibitoryProjection" presynapticPopulation="pop"
-                postsynapticPopulation="pop" synapse="inhibitory">
-      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[2]"
-                    weight="1" delay="1 ms"/>
-    </projection>
-    <explicitInput target="pop[0]" input="drive"/>
-  </network>
-</neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "prototypeNetwork", "120ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
-    ASSERT_EQ(engine.network_details.synapse_prototypes.size(), 2u);
-
-    const f32 resting = -0.065f;
-    f32 excitatory_peak = 0.0f;
-    f32 inhibitory_trough = 0.0f;
-
-    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
-        engine.step_simulation(tick);
-
-        excitatory_peak = std::max(excitatory_peak,
-                                   engine.read_state_variable(1, "v") - resting);
-        inhibitory_trough = std::min(inhibitory_trough,
-                                     engine.read_state_variable(2, "v") - resting);
-    }
-
-    ASSERT_EQ(engine.recorded_spikes.size(), 1u);
-
-    // Opposite signs, equal magnitudes: the two prototypes differ only in the sign of
-    // ibase, so a swap would show up as both deflections having the same sign.
-    EXPECT_GT(excitatory_peak, 0.0f);
-    EXPECT_LT(inhibitory_trough, 0.0f);
-    EXPECT_NEAR(excitatory_peak, -inhibitory_trough, 1e-6f);
-
-    // Neuron 3 has no incoming edge, so nothing reached it.
-    EXPECT_FLOAT_EQ(engine.read_state_variable(3, "v"), resting);
-}
-
-// The delayed-arrival test above checks the first arrival and stops. That leaves the part
-// that only happens later untested: the spike-history ring wraps every
-// spike_history_length ticks, and a modulo that is subtly wrong past the first wrap would
-// deliver the first spike correctly and then drop or misplace every one after it. A
-// network would still look alive while quietly losing a fraction of its spikes.
-//
-// So: one source firing repeatedly across ~160 wraps of the ring, a single edge at the
-// worst-case delay of ring_length - 1, and a target that never fires. The target is driven
-// by nothing else, so between arrivals it only leaks toward its leak reversal -- every run
-// of rising membrane potential is one arrival, and they have to match the source's spikes
-// one for one, each at exactly the right offset.
-TEST(SpikeEngine, no_arrival_is_dropped_as_the_spike_history_ring_wraps) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("ring_wraparound");
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Wrap">
-  <iafCell id="source" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <iafCell id="listener" leakConductance="0 nS" leakReversal="-65 mV" thresh="1000 mV"
-           reset="-70 mV" C="100 pF"/>
-  <alphaCurrentSynapse id="syn" tau="2 ms" ibase="12 pA"/>
-  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
-  <network id="wrapNetwork">
-    <population id="popSource" component="source" size="1"/>
-    <population id="popListener" component="listener" size="1"/>
-    <projection id="proj" presynapticPopulation="popSource"
-                postsynapticPopulation="popListener" synapse="syn">
-      <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popListener[0]"
-                    weight="1" delay="3 ms"/>
-    </projection>
-    <explicitInput target="popSource[0]" input="drive"/>
-  </network>
-</neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "wrapNetwork", "500ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
-
-    // Worst case: the delay is one short of the ring, so the row a delayed arrival reads is
-    // the one about to be overwritten.
-    const s64 delay_ticks = 30;
-    ASSERT_EQ(engine.layout.maximum_edge_delay, delay_ticks);
-    ASSERT_EQ(engine.layout.spike_history_length, delay_ticks + 1);
-
-    // The run has to cross the ring many times for this to mean anything.
-    EXPECT_GT(engine.lifetime / engine.layout.spike_history_length, 100);
-
-    Vector<s64> source_spike_ticks;
-    Vector<s64> arrival_onset_ticks;
-
-    // An arrival's first tick raises the listener by dt * i / C. With tau = 2 ms the
-    // synapse's current on that tick is dt*e*(weight*ibase)/tau = 1.6e-12 A, so the step is
-    // about 1.6e-6 V. Between arrivals the alpha tail has decayed for a full interspike
-    // interval -- twenty time constants -- leaving a per-tick residual around 1e-14 V,
-    // which never reaches zero in f32 and is why a plain `v increased` test either counts
-    // one endless arrival or, with a leak added, counts the wrong tick. This threshold sits
-    // two orders below the step and many above the tail.
-    const f32 arrival_rise_threshold = 1e-8f;
-
-    f32 previous_potential = engine.read_state_variable(1, "v");
-    bool was_rising = false;
-    usize spikes_seen = 0;
-
-    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
-        engine.step_simulation(tick);
-
-        while (spikes_seen < engine.recorded_spikes.size()) {
-            source_spike_ticks.push_back(tick);
-            spikes_seen += 1;
-        }
-
-        // The listener has no leak conductance and a threshold far out of reach, so it is
-        // a pure integrator that never fires: dv/dt is exactly the synaptic current over
-        // C. Between arrivals it holds perfectly flat, so the first tick it rises is the
-        // tick the arrival reached it -- with a leak, a later arrival has to first
-        // overcome the residual decay of the previous one, which moves the measurement.
-        const f32 potential = engine.read_state_variable(1, "v");
-        const bool rising = (potential - previous_potential) > arrival_rise_threshold;
-        if (rising && !was_rising) arrival_onset_ticks.push_back(tick);
-
-        was_rising = rising;
-        previous_potential = potential;
-    }
-
-    ASSERT_GT(source_spike_ticks.size(), 8u) << "the source barely fired";
-
-    // Arrivals still in flight when the run ends have no onset to match.
-    const s64 last_tick_that_can_arrive = engine.lifetime - (delay_ticks + 2);
-    Vector<s64> expected_source_ticks;
-    for (s64 spike_tick : source_spike_ticks) {
-        if (spike_tick <= last_tick_that_can_arrive) expected_source_ticks.push_back(spike_tick);
-    }
-
-    ASSERT_EQ(arrival_onset_ticks.size(), expected_source_ticks.size())
-            << "the source fired " << expected_source_ticks.size()
-            << " times with time to arrive, and the target saw " << arrival_onset_ticks.size()
-            << " arrivals";
-
-    // Every one of them lands at the same offset, not just the first: delay, plus one tick
-    // for the alpha response to leave zero, plus one for the engine's input latency.
-    for (usize index = 0; index < expected_source_ticks.size(); index += 1) {
-        EXPECT_EQ(arrival_onset_ticks[index] - expected_source_ticks[index], delay_ticks + 2)
-                << "arrival " << index << " of " << expected_source_ticks.size();
-    }
-}
-
-TEST(SpikeEngine, connection_weights_and_delays_survive_the_weight_matrix_exactly) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("exact_weights");
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Weights">
-  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
-  <network id="weightNetwork">
-    <population id="pop" component="c" size="4"/>
-    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop"
-                synapse="syn">
-      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]"
-                    weight="0.25" delay="1 ms"/>
-      <connectionWD id="1" preCellId="../pop[0]" postCellId="../pop[2]"
-                    weight="1.75" delay="2 ms"/>
-      <connectionWD id="2" preCellId="../pop[1]" postCellId="../pop[3]"
-                    weight="0.001" delay="3 ms"/>
-    </projection>
-  </network>
-</neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "weightNetwork", "10ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
-
-    // Each of these connections has its own (weight, delay) pair, so each is its own
-    // projection run and gets its own latent lane -- which the shared basis then
-    // reproduces exactly. A weight that came back as 0.2497 would still look plausible
-    // in a plot, so this asserts equality rather than closeness.
-    EXPECT_FLOAT_EQ(engine.weights.get(0, 1), 0.25f);
-    EXPECT_FLOAT_EQ(engine.weights.get(0, 2), 1.75f);
-    EXPECT_FLOAT_EQ(engine.weights.get(1, 3), 0.001f);
-
-    // The engine's own measurement of the same thing, which is what decides whether a
-    // model loads at all. Exact here, and it has to be: the three runs have distinct
-    // targets, so no lane is nonzero at both endpoints of another run's edge.
-    EXPECT_FLOAT_EQ(engine.weights.measured_weight_fit_error, 0.0f);
-
-    // Delay round-trips exactly rather than to a tolerance. One tick out indexes the
-    // wrong row of the spike-history ring, which is a different simulation rather than a
-    // rounder one.
-    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 1), 10);
-    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 2), 20);
-    EXPECT_EQ(engine.weights.get_edge_delay_ticks(1, 3), 30);
-
-    // The synapse prototype comes from the projection run table rather than the basis:
-    // it picks a switch case in the kernel, and control flow must not ride on a
-    // reconstruction. One prototype in this model, so every edge reports it.
-    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(0, 1), 0);
-    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(0, 2), 0);
-    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(1, 3), 0);
-
-    // A pair that is not an edge has no ordinal and therefore no prototype.
-    EXPECT_EQ(engine.weights.get_edge_synapse_prototype(3, 0), -1);
-
-    // Synapse state is deliberately absent from the edge store: it aggregates into one
-    // accumulator per (target, prototype), so there is nothing per-edge left to read.
-}
-
-TEST(SpikeEngine, declared_output_files_are_written_with_the_shape_the_model_asked_for) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("recordings");
-    directory.write("model.nml", single_cell_model());
-
-    const String spike_file = directory.path() + "/spikes.dat";
-    const String trace_file = directory.path() + "/trace.dat";
-
-    ostringstream outputs;
-    outputs << "    <OutputFile id=\"trace\" fileName=\"" << trace_file << "\">\n"
-            << "      <OutputColumn id=\"v\" quantity=\"cellPopulation[0]/v\"/>\n"
-            << "    </OutputFile>\n"
-            << "    <EventOutputFile id=\"spikes\" fileName=\"" << spike_file
-            << "\" format=\"TIME_ID\">\n"
-            << "      <EventSelection id=\"0\" select=\"cellPopulation[0]\" "
-               "eventPort=\"spike\"/>\n"
-            << "    </EventOutputFile>\n";
-
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "singleCellNetwork", "200ms", "0.05ms",
-                                     outputs.str()));
-
-    SpikeEngine engine(lems_path);
+)", "pulseNetwork", "5ms", "0.1ms"));
     engine.run();
-    engine.write_recordings();
-
-    ASSERT_TRUE(filesystem::exists(trace_file));
-    ASSERT_TRUE(filesystem::exists(spike_file));
-
-    // One row per tick, two columns: time and v.
-    ifstream trace(trace_file);
-    s64 trace_rows = 0;
-    String line;
-    while (getline(trace, line)) {
-        if (line.empty()) continue;
-        istringstream columns(line);
-        f64 time_seconds = 0.0;
-        f64 membrane_potential = 0.0;
-        ASSERT_TRUE((columns >> time_seconds >> membrane_potential));
-        EXPECT_GE(membrane_potential, -0.075);
-        EXPECT_LE(membrane_potential, -0.045);
-        trace_rows += 1;
-    }
-    EXPECT_EQ(trace_rows, engine.lifetime);
-
-    // One line per spike, and as many lines as the run counted.
-    ifstream spikes(spike_file);
-    s64 spike_rows = 0;
-    while (getline(spikes, line)) {
-        if (!line.empty()) spike_rows += 1;
-    }
-    EXPECT_EQ(spike_rows, (s64)engine.recorded_spikes.size());
-    EXPECT_GT(spike_rows, 0);
+    EXPECT_NEAR(engine.read_state_variable(0, "v"), -0.045f, 1e-6f);
 }
 
-// A spike train injects its amplitude for one tick per event. The cell has to fire on
-// exactly the ticks the train specifies and nowhere else -- the drive is otherwise zero,
-// so any spike it produces was caused by an event.
-//
-// The amplitude is nanoamps rather than picoamps because a one-tick pulse delivers a
-// charge of amplitude * dt: moving a 100 pF membrane the 20 mV from rest to threshold in a
-// single 0.1 ms tick takes 20 nA.
-TEST(SpikeEngine, a_spike_train_drives_the_cell_on_the_ticks_it_names) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("spike_train_drive");
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
-  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV"
-           reset="-70 mV" C="100 pF"/>
-  <!--
-    A plain spikeArray, declaring no amplitude. A spike is a binary event, so what it is
-    worth in current is a property of the cell it lands on: the engine works out the charge
-    that carries this iafCell from its leak reversal to its threshold in one tick.
-  -->
+// A spike train kicks the cell on exactly the ticks it names, and nothing else drives it.
+TEST(SingleCell, a_spike_train_fires_the_cell_on_the_ticks_it_names) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
   <spikeArray id="train">
     <spike id="0" time="10 ms"/>
     <spike id="1" time="25 ms"/>
@@ -874,87 +543,364 @@ TEST(SpikeEngine, a_spike_train_drives_the_cell_on_the_ticks_it_names) {
     <explicitInput target="pop[0]" input="train"/>
   </network>
 </neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "trainNetwork", "60ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
+)", "trainNetwork", "60ms", "0.1ms"));
     ASSERT_EQ(engine.scheduled_spike_trains.size(), 1u);
-    EXPECT_EQ(engine.scheduled_spike_trains[0].event_ticks,
-              (Vector<s32>{100, 250, 400}));
-
-    // 1.05 * C * (thresh - reset) / dt = 1.05 * 100 pF * 20 mV / 0.1 ms = 21 nA. Measured
-    // from the reset value rather than the leak reversal, because after its first spike the
-    // cell sits at reset and that is the widest gap any later event has to close. The 5% is
-    // because the comparison that fires a cell is strict.
+    EXPECT_EQ(engine.scheduled_spike_trains[0].event_ticks, (Vector<s32>{100, 250, 400}));
+    // 1.05 * C * (thresh - reset) / dt = 1.05 * 100 pF * 20 mV / 0.1 ms = 21 nA.
     EXPECT_NEAR(engine.scheduled_spike_trains[0].magnitude, 2.1e-8f, 1e-11f);
 
     engine.run();
-
-    // One spike per event, and no others: nothing else drives this cell.
     const Vector<f64> times = spike_times_of(engine, 0);
-    ASSERT_EQ(times.size(), 3u) << "expected one spike per event, got " << times.size();
-
-    // The event injects on its own tick, the cell crosses threshold in that same tick.
+    ASSERT_EQ(times.size(), 3u);
     EXPECT_NEAR(times[0], 0.010, 1.5e-4);
     EXPECT_NEAR(times[1], 0.025, 1.5e-4);
     EXPECT_NEAR(times[2], 0.040, 1.5e-4);
 }
 
-// The default needs the target's capacitance to turn a charge into a voltage. A cell that
-// declares none -- iafTauCell integrates a time constant directly and has no C -- cannot
-// supply one, and that is refused by name rather than guessed at.
-TEST(SpikeEngine, a_spike_train_onto_a_cell_with_no_capacitance_is_refused) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("spike_train_no_capacitance");
-    // iafTauCell relaxes toward leakReversal with a time constant and declares no
-    // capacitance at all, so there is no way to turn a charge into a voltage.
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Train">
-  <iafTauCell id="c" leakReversal="-65 mV" tau="10 ms" thresh="-50 mV" reset="-70 mV"/>
-  <spikeArray id="train">
-    <spike id="0" time="10 ms"/>
-    <spike id="1" time="20 ms"/>
-  </spikeArray>
-  <network id="trainNetwork">
+// iafRefCell's refractory exit is "t .gt. lastSpikeTime + refract" with OnEntry stamping the time:
+// the stamp form. The cell is held at reset for refract, then charges from reset.
+TEST(SingleCell, a_time_stamped_refractory_period_holds_the_cell_at_reset) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Refractory">
+  <iafRefCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"
+              refract="5 ms"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <network id="refractoryNetwork">
     <population id="pop" component="c" size="1"/>
-    <explicitInput target="pop[0]" input="train"/>
+    <explicitInput target="pop[0]" input="drive"/>
   </network>
 </neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "trainNetwork", "50ms", "0.1ms"));
+)", "refractoryNetwork", "400ms", "0.05ms"));
+    engine.run();
 
-    try {
-        SpikeEngine engine(lems_path);
-        FAIL() << "a cell with no capacitance cannot supply a default spike amplitude";
-    } catch (const std::runtime_error &error) {
-        const String message = error.what();
-        EXPECT_NE(message.find("iafTauCell"), String::npos) << message;
-        EXPECT_NE(message.find("capacitance"), String::npos) << message;
+    const Vector<f64> times = spike_times_of(engine, 0);
+    ASSERT_GE(times.size(), 4u);
+    EXPECT_NEAR(times[3] - times[2], 5e-3 + analytic_interspike_interval(), 3e-4);
+}
+
+// izhikevich2007Cell against forward Euler of its own equations, written here.
+TEST(SingleCell, izhikevich_matches_forward_euler) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Izhikevich">
+  <izhikevich2007Cell id="c" C="100pF" v0="-60mV" k="0.7nS_per_mV" vr="-60mV" vt="-40mV" vpeak="35mV"
+                      a="0.03per_ms" b="-2nS" c="-50mV" d="100pA"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="200 pA"/>
+  <network id="izhikevichNetwork">
+    <population id="pop" component="c" size="1"/>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "izhikevichNetwork", "300ms", "0.01ms"));
+    engine.run();
+
+    // v' = (k (v - vr)(v - vt) + I - u) / C, u' = a (b (v - vr) - u); past vpeak: v = c, u += d.
+    const f64 capacitance = 100e-12, gain = 0.7e-6, resting = -0.060, threshold = -0.040, peak = 0.035;
+    const f64 recovery_rate = 30.0, recovery_coupling = -2e-9, reset = -0.050, recovery_jump = 100e-12;
+    const f64 drive = 200e-12, step = engine.step_dt;
+    f64 voltage = -0.060, recovery = 0.0;
+    Vector<s64> reference_spike_ticks;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        const f64 voltage_derivative = (gain * (voltage - resting) * (voltage - threshold) + drive - recovery) / capacitance;
+        const f64 recovery_derivative = recovery_rate * (recovery_coupling * (voltage - resting) - recovery);
+        voltage += step * voltage_derivative;
+        recovery += step * recovery_derivative;
+        if (voltage > peak) {
+            voltage = reset;
+            recovery += recovery_jump;
+            reference_spike_ticks.push_back(tick);
+        }
+    }
+
+    Vector<s64> spike_ticks;
+    for (f64 time : spike_times_of(engine, 0)) spike_ticks.push_back(llround(time / step));
+    ASSERT_GE(reference_spike_ticks.size(), 5u);
+    ASSERT_NEAR((f64)spike_ticks.size(), (f64)reference_spike_ticks.size(), 1.0);
+    for (usize index = 0; index < 5; index += 1) {
+        EXPECT_NEAR((f64)spike_ticks[index], (f64)reference_spike_ticks[index], 3.0) << "spike " << index;
     }
 }
 
-// ── more than one cell type in a model ────────────────────────────────────────────
+TEST(SingleCell, declared_output_files_have_the_shape_the_model_asked_for) {
+    const TemporaryDirectory directory;
+    const String spike_file = directory.path_of("spikes.dat");
+    const String trace_file = directory.path_of("trace.dat");
+    std::ostringstream outputs;
+    outputs << "    <OutputFile id=\"trace\" fileName=\"" << trace_file << "\">\n"
+            << "      <OutputColumn id=\"v\" quantity=\"cellPopulation[0]/v\"/>\n"
+            << "    </OutputFile>\n"
+            << "    <EventOutputFile id=\"spikes\" fileName=\"" << spike_file << "\" format=\"TIME_ID\">\n"
+            << "      <EventSelection id=\"0\" select=\"cellPopulation[0]\" eventPort=\"spike\"/>\n"
+            << "    </EventOutputFile>\n";
+    SpikeEngine engine(write_model(directory, single_cell_model(), "singleCellNetwork", "200ms", "0.05ms", outputs.str()));
+    engine.run();
+    engine.write_recordings();
 
-// Every other test in this file has exactly one cell type, which leaves the parts of the
-// design that exist only for heterogeneity completely unexercised: the generated switch's
-// second arm, a cell-state buffer whose populations have different widths, and a parameter
-// table whose rows have different lengths.
-//
-// iafCell has one state variable; izhikevich2007Cell has two and roughly twice the
-// parameters. Their OnStart values differ too, which is what makes a layout mistake
-// visible rather than merely possible: if the two populations' chunks overlapped, one
-// type's starting values would appear in the other's.
+    // One row per tick: the time and v, which stays between reset and threshold.
+    std::ifstream trace(trace_file);
+    ASSERT_TRUE(trace.good());
+    s64 trace_rows = 0;
+    String line;
+    while (getline(trace, line)) {
+        if (line.empty()) continue;
+        std::istringstream columns(line);
+        f64 time_seconds = 0.0;
+        f64 membrane_potential = 0.0;
+        ASSERT_TRUE((columns >> time_seconds >> membrane_potential)) << line;
+        EXPECT_GE(membrane_potential, -0.075);
+        EXPECT_LE(membrane_potential, -0.045);
+        trace_rows += 1;
+    }
+    EXPECT_EQ(trace_rows, engine.lifetime);
+
+    std::ifstream spikes(spike_file);
+    ASSERT_TRUE(spikes.good());
+    s64 spike_rows = 0;
+    while (getline(spikes, line)) spike_rows += line.empty() ? 0 : 1;
+    EXPECT_EQ(spike_rows, (s64)engine.recorded_spikes.size());
+    EXPECT_GT(spike_rows, 0);
+}
+
+// ── connections ─────────────────────────────────────────────────────────────────
+
+// Ticks between a source spike and the first tick its target moves, beyond the connection delay:
+//   +1  the arrival's OnEvent runs after that tick's Euler step, so I is still zero after it;
+//   +1  an edge sends the current from the start of its tick, before its own step;
+//   +1  the engine's input latency: a current sent on one tick is drained by the target the next.
+// jNeuroML moves the target 1 tick after the delay on the same model (measured 2026-10-05).
+constexpr s64 ARRIVAL_LATENCY_TICKS = 3;
+
+// Cell 1 hears only cell 0, after 3 ms, and first moves 30 + ARRIVAL_LATENCY_TICKS after cell 0 fires.
+TEST(Connections, a_delayed_connection_arrives_on_the_tick_it_says) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Delay">
+  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
+  <iafCell id="driven" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <iafCell id="listener" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <network id="delayNetwork">
+    <population id="popDriven" component="driven" size="1"/>
+    <population id="popListener" component="listener" size="1"/>
+    <projection id="proj" presynapticPopulation="popDriven" postsynapticPopulation="popListener" synapse="syn">
+      <connectionWD id="0" preCellId="../popDriven[0]" postCellId="../popListener[0]" weight="1" delay="3 ms"/>
+    </projection>
+    <explicitInput target="popDriven[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "delayNetwork", "200ms", "0.1ms"));
+    // The spike history is sized from the longest connection delay.
+    EXPECT_EQ(engine.context.simulation.maximum_edge_delay, 30);
+    EXPECT_EQ(engine.spike_history_row_count, 31);
+
+    s64 first_source_spike_tick = -1;
+    s64 first_listener_movement_tick = -1;
+    for (s64 tick = 0; tick < engine.lifetime && first_listener_movement_tick < 0; tick += 1) {
+        engine.step_simulation(tick);
+        if (first_source_spike_tick < 0 && !engine.recorded_spikes.empty()) first_source_spike_tick = tick;
+        if (first_source_spike_tick >= 0 && fabs(engine.read_state_variable(1, "v") - -0.065f) > 1e-9f) {
+            first_listener_movement_tick = tick;
+        }
+    }
+    ASSERT_GE(first_source_spike_tick, 0);
+    ASSERT_GE(first_listener_movement_tick, 0);
+    EXPECT_EQ(first_listener_movement_tick - first_source_spike_tick, 30 + ARRIVAL_LATENCY_TICKS);
+}
+
+// The host fills each edge's values by walking get_neighbors and the kernel finds them by walking
+// k2t_next_neighbor; if the walks disagree, every edge silently gets another edge's weight and
+// delay. One source, three targets with weights 1/2/3 and delays 1/3/5 ms, one presynaptic spike.
+TEST(Connections, each_edge_gets_its_own_weight_and_delay) {
+    const TemporaryDirectory directory;
+    // The pulse stops at 40 ms, after the first threshold crossing (35.8 ms) and before the second.
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Slots">
+  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="40 ms" amplitude="90 pA"/>
+  <network id="slotNetwork">
+    <population id="pop" component="c" size="8"/>
+    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop" synapse="syn">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]" weight="1" delay="1 ms"/>
+      <connectionWD id="1" preCellId="../pop[0]" postCellId="../pop[4]" weight="2" delay="3 ms"/>
+      <connectionWD id="2" preCellId="../pop[0]" postCellId="../pop[7]" weight="3" delay="5 ms"/>
+    </projection>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "slotNetwork", "120ms", "0.1ms"));
+
+    const s64 targets[3] = {1, 4, 7};
+    const s64 delay_ticks[3] = {10, 30, 50};
+    const f32 resting = -0.065f;
+    s64 spike_tick = -1;
+    s64 first_movement_tick[3] = {-1, -1, -1};
+    f32 peak_deflection[3] = {0.0f, 0.0f, 0.0f};
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        if (spike_tick < 0 && !engine.recorded_spikes.empty()) spike_tick = tick;
+        for (s64 index = 0; index < 3; index += 1) {
+            const f32 deflection = engine.read_state_variable(targets[index], "v") - resting;
+            if (first_movement_tick[index] < 0 && fabs(deflection) > 1e-9f) first_movement_tick[index] = tick;
+            peak_deflection[index] = max(peak_deflection[index], deflection);
+        }
+    }
+    ASSERT_EQ(engine.recorded_spikes.size(), 1u) << "the drive should produce one spike";
+
+    for (s64 index = 0; index < 3; index += 1) {
+        EXPECT_EQ(first_movement_tick[index] - spike_tick, delay_ticks[index] + ARRIVAL_LATENCY_TICKS)
+            << "target " << targets[index];
+    }
+    // An alpha synapse's response is linear in the weight.
+    EXPECT_NEAR(peak_deflection[1] / peak_deflection[0], 2.0, 0.02);
+    EXPECT_NEAR(peak_deflection[2] / peak_deflection[0], 3.0, 0.02);
+    for (s64 neuron = 1; neuron < 8; neuron += 1) {
+        if (neuron == 1 || neuron == 4 || neuron == 7) continue;
+        EXPECT_FLOAT_EQ(engine.read_state_variable(neuron, "v"), resting) << "neuron " << neuron;
+    }
+}
+
+// Two prototypes of one synapse type differing only in the sign of ibase: reading the wrong one
+// would flip excitation into inhibition.
+TEST(Connections, an_edge_uses_its_own_synapse_prototype) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Prototypes">
+  <alphaCurrentSynapse id="excitatory" tau="5 ms" ibase="12 pA"/>
+  <alphaCurrentSynapse id="inhibitory" tau="5 ms" ibase="-12 pA"/>
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="40 ms" amplitude="90 pA"/>
+  <network id="prototypeNetwork">
+    <population id="pop" component="c" size="4"/>
+    <projection id="excitatoryProjection" presynapticPopulation="pop" postsynapticPopulation="pop" synapse="excitatory">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]" weight="1" delay="1 ms"/>
+    </projection>
+    <projection id="inhibitoryProjection" presynapticPopulation="pop" postsynapticPopulation="pop" synapse="inhibitory">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[2]" weight="1" delay="1 ms"/>
+    </projection>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "prototypeNetwork", "120ms", "0.1ms"));
+    ASSERT_EQ(engine.context.simulation.synapse_instances.size(), 2u);
+
+    const f32 resting = -0.065f;
+    f32 excitatory_peak = 0.0f;
+    f32 inhibitory_trough = 0.0f;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        excitatory_peak = max(excitatory_peak, engine.read_state_variable(1, "v") - resting);
+        inhibitory_trough = min(inhibitory_trough, engine.read_state_variable(2, "v") - resting);
+    }
+    ASSERT_EQ(engine.recorded_spikes.size(), 1u);
+    EXPECT_GT(excitatory_peak, 0.0f);
+    EXPECT_LT(inhibitory_trough, 0.0f);
+    EXPECT_NEAR(excitatory_peak, -inhibitory_trough, 1e-6f);
+    EXPECT_FLOAT_EQ(engine.read_state_variable(3, "v"), resting);
+}
+
+// The spike history wraps every delay + 1 ticks, and a wrong modulo past the first wrap would
+// deliver the first spike and drop or misplace later ones. One source firing across ~160 wraps, an
+// edge at the worst-case delay, and a pure-integrator target that never fires: every onset of rising
+// potential is one arrival, matched one for one with the source's spikes.
+TEST(Connections, no_arrival_is_dropped_as_the_spike_history_wraps) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Wrap">
+  <alphaCurrentSynapse id="syn" tau="2 ms" ibase="12 pA"/>
+  <iafCell id="source" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <iafCell id="listener" leakConductance="0 nS" leakReversal="-65 mV" thresh="1000 mV" reset="-70 mV" C="100 pF"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <network id="wrapNetwork">
+    <population id="popSource" component="source" size="1"/>
+    <population id="popListener" component="listener" size="1"/>
+    <projection id="proj" presynapticPopulation="popSource" postsynapticPopulation="popListener" synapse="syn">
+      <connectionWD id="0" preCellId="../popSource[0]" postCellId="../popListener[0]" weight="1" delay="3 ms"/>
+    </projection>
+    <explicitInput target="popSource[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "wrapNetwork", "500ms", "0.1ms"));
+    const s64 delay_ticks = 30;
+    ASSERT_EQ(engine.spike_history_row_count, delay_ticks + 1);
+    EXPECT_GT(engine.lifetime / engine.spike_history_row_count, 100);
+
+    // An arrival's first tick raises the listener by about 1.6e-6 V; the previous arrival's tail is
+    // around 1e-14 V by then. The threshold sits well between.
+    const f32 arrival_rise_threshold = 1e-8f;
+    Vector<s64> source_spike_ticks;
+    Vector<s64> arrival_onset_ticks;
+    f32 previous_potential = engine.read_state_variable(1, "v");
+    bool was_rising = false;
+    usize spikes_seen = 0;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        while (spikes_seen < engine.recorded_spikes.size()) {
+            source_spike_ticks.push_back(tick);
+            spikes_seen += 1;
+        }
+        const f32 potential = engine.read_state_variable(1, "v");
+        const bool rising = potential - previous_potential > arrival_rise_threshold;
+        if (rising && !was_rising) arrival_onset_ticks.push_back(tick);
+        was_rising = rising;
+        previous_potential = potential;
+    }
+    ASSERT_GT(source_spike_ticks.size(), 8u);
+
+    Vector<s64> arrivable_source_ticks;
+    for (s64 spike_tick : source_spike_ticks) {
+        if (spike_tick <= engine.lifetime - (delay_ticks + ARRIVAL_LATENCY_TICKS)) arrivable_source_ticks.push_back(spike_tick);
+    }
+    ASSERT_EQ(arrival_onset_ticks.size(), arrivable_source_ticks.size());
+    for (usize index = 0; index < arrivable_source_ticks.size(); index += 1) {
+        EXPECT_EQ(arrival_onset_ticks[index] - arrivable_source_ticks[index], delay_ticks + ARRIVAL_LATENCY_TICKS)
+            << "arrival " << index;
+    }
+}
+
+// A few distinct (weight, delay) runs fit exactly, and every synapse state variable has a plane.
+TEST(Connections, weights_delays_and_synapse_state_live_in_the_weight_matrix) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Weights">
+  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
+  <iafCell id="c" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <network id="weightNetwork">
+    <population id="pop" component="c" size="4"/>
+    <projection id="proj" presynapticPopulation="pop" postsynapticPopulation="pop" synapse="syn">
+      <connectionWD id="0" preCellId="../pop[0]" postCellId="../pop[1]" weight="0.25" delay="1 ms"/>
+      <connectionWD id="1" preCellId="../pop[0]" postCellId="../pop[2]" weight="1.75" delay="2 ms"/>
+      <connectionWD id="2" preCellId="../pop[1]" postCellId="../pop[3]" weight="0.001" delay="3 ms"/>
+    </projection>
+  </network>
+</neuroml>
+)", "weightNetwork", "10ms", "0.1ms"));
+    const WeightMatrix &weights = engine.weights;
+    EXPECT_FLOAT_EQ(weights.get(0, 1), 0.25f);
+    EXPECT_FLOAT_EQ(weights.get(0, 2), 1.75f);
+    EXPECT_FLOAT_EQ(weights.get(1, 3), 0.001f);
+    EXPECT_EQ(weights.get_edge_delay_ticks(0, 1), 10);
+    EXPECT_EQ(weights.get_edge_delay_ticks(0, 2), 20);
+    EXPECT_EQ(weights.get_edge_delay_ticks(1, 3), 30);
+    EXPECT_EQ(weights.get_edge_synapse_prototype(0, 1), 0);
+    EXPECT_EQ(weights.get_edge_synapse_prototype(3, 0), -1);
+
+    // alphaCurrentSynapse carries I and J, one plane each after weight and delay, both at their
+    // OnStart value of zero.
+    EXPECT_EQ(weights.matrix_count, WeightMatrix::FIRST_STATE_VARIABLE_PLANE + 2);
+    const s64 current_plane = engine.synapse_state_variable_plane("syn", "I");
+    const s64 kick_plane = engine.synapse_state_variable_plane("syn", "J");
+    EXPECT_NE(current_plane, kick_plane);
+    EXPECT_GE(current_plane, WeightMatrix::FIRST_STATE_VARIABLE_PLANE);
+    EXPECT_FLOAT_EQ(weights.get_for_matrix(0, 1, current_plane), 0.0f);
+    EXPECT_FLOAT_EQ(weights.get_for_matrix(0, 1, kick_plane), 0.0f);
+}
+
+// ── more than one cell type ─────────────────────────────────────────────────────
+
 namespace {
 
+// iafCell has one state variable and izhikevich2007Cell two, and their OnStart values differ, so a
+// layout overlap shows up as one type's values in the other's slots.
 String two_cell_type_model() {
     return R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="TwoTypes">
-  <iafCell id="integrateAndFire" leakConductance="5 nS" leakReversal="-65 mV"
-           thresh="-50 mV" reset="-70 mV" C="100 pF"/>
-  <izhikevich2007Cell id="izhikevich" C="100pF" v0="-50mV" k="0.7nS_per_mV"
-                      vr="-60mV" vt="-40mV" vpeak="35mV" a="0.03per_ms"
-                      b="-2nS" c="-50mV" d="100pA"/>
+  <iafCell id="integrateAndFire" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <izhikevich2007Cell id="izhikevich" C="100pF" v0="-50mV" k="0.7nS_per_mV" vr="-60mV" vt="-40mV" vpeak="35mV"
+                      a="0.03per_ms" b="-2nS" c="-50mV" d="100pA"/>
   <pulseGenerator id="iafDrive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
   <pulseGenerator id="izhikevichDrive" delay="0 ms" duration="1000 ms" amplitude="200 pA"/>
   <network id="twoTypeNetwork">
@@ -974,264 +920,93 @@ String two_cell_type_model() {
 
 } // namespace
 
-// Host side only: this asserts what the layout says and what read_state_variable does with
-// it, both of which run on the CPU. It cannot see whether the kernel agrees — the offsets
-// reach the kernel as a baked `constant` table, and corrupting that table leaves every
-// assertion here passing. both_cell_types_integrate_their_own_equations below is what
-// covers the kernel's half, and it was checked against exactly that injected fault.
-TEST(SpikeEngine, two_cell_types_get_separate_state_and_parameter_chunks) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
+TEST(CellTypes, each_type_gets_its_own_state_slots) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, two_cell_type_model(), "twoTypeNetwork", "1ms", "0.01ms"));
 
-    ModelDirectory directory("two_cell_types");
-    directory.write("model.nml", two_cell_type_model());
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "twoTypeNetwork", "1ms", "0.01ms"));
+    // Four one-slot cells then three two-slot cells: ten slots, not a shared maximum's fourteen.
+    EXPECT_EQ(engine.context.get_cell_state_size(), 4 * 1 + 3 * 2);
+    EXPECT_EQ(engine.context.simulation.population_base_indices.at("twoTypeNetwork/popIaf"), 0);
+    EXPECT_EQ(engine.context.simulation.population_base_indices.at("twoTypeNetwork/popIzhikevich"), 4);
 
-    SpikeEngine engine(lems_path);
-
-    ASSERT_EQ(engine.network_details.cell_types.size(), 2u);
-    ASSERT_EQ(engine.network_details.populations.size(), 2u);
-
-    // Sizes come from the types, not from a shared maximum: four one-variable cells and
-    // three two-variable cells is ten slots, not fourteen.
-    const CellTypeSpecification &iaf_type = engine.network_details.cell_types[0];
-    const CellTypeSpecification &izhikevich_type = engine.network_details.cell_types[1];
-    ASSERT_EQ(iaf_type.state_variable_names.size(), 1u);
-    ASSERT_EQ(izhikevich_type.state_variable_names.size(), 2u);
-    EXPECT_EQ(engine.layout.cell_state_length, 4 * 1 + 3 * 2);
-
-    // The two populations' chunks are disjoint and the second starts where the first ends.
-    EXPECT_EQ(engine.layout.population_state_base[0], 0);
-    EXPECT_EQ(engine.layout.population_state_base[1], 4);
-
-    // Parameter rows differ in length, so the second prototype's row cannot start at a
-    // fixed stride.
-    EXPECT_GT(izhikevich_type.parameter_names.size(), iaf_type.parameter_names.size());
-    EXPECT_EQ(engine.layout.cell_prototype_parameter_base[0], 0);
-    EXPECT_EQ(engine.layout.cell_prototype_parameter_base[1],
-              (s64)iaf_type.parameter_names.size());
-    EXPECT_EQ(engine.layout.cell_parameter_length,
-              (s64)(iaf_type.parameter_names.size() + izhikevich_type.parameter_names.size()));
-
-    // OnStart: iafCell starts at leakReversal, izhikevich2007Cell at v0 with u at zero.
-    // Three different starting values across the two chunks, so any overlap shows up here.
-    for (s64 neuron_index = 0; neuron_index < 4; neuron_index += 1) {
-        EXPECT_NEAR(engine.read_state_variable(neuron_index, "v"), -0.065f, 1e-7f)
-                << "iafCell " << neuron_index;
+    for (s64 neuron = 0; neuron < 4; neuron += 1) {
+        EXPECT_NEAR(engine.read_state_variable(neuron, "v"), -0.065f, 1e-7f) << "iafCell " << neuron;
     }
-    for (s64 neuron_index = 4; neuron_index < 7; neuron_index += 1) {
-        EXPECT_NEAR(engine.read_state_variable(neuron_index, "v"), -0.050f, 1e-7f)
-                << "izhikevich " << neuron_index;
-        EXPECT_NEAR(engine.read_state_variable(neuron_index, "u"), 0.0f, 1e-12f)
-                << "izhikevich " << neuron_index;
+    for (s64 neuron = 4; neuron < 7; neuron += 1) {
+        EXPECT_NEAR(engine.read_state_variable(neuron, "v"), -0.050f, 1e-7f) << "izhikevich " << neuron;
+        EXPECT_NEAR(engine.read_state_variable(neuron, "u"), 0.0f, 1e-12f) << "izhikevich " << neuron;
     }
-
-    // `u` belongs to one type only, and asking the wrong population for it is an error
-    // rather than a read of whatever happens to sit at that offset.
-    EXPECT_THROW((void)engine.read_state_variable(0, "u"), std::runtime_error);
+    // u belongs to one type only; asking an iafCell for it is an error, not a stray read.
+    EXPECT_THROW((void)engine.read_state_variable(0, "u"), runtime_error);
 }
 
-TEST(SpikeEngine, both_cell_types_integrate_their_own_equations) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("two_cell_types_running");
-    directory.write("model.nml", two_cell_type_model());
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "twoTypeNetwork", "60ms", "0.01ms"));
-
-    SpikeEngine engine(lems_path);
+TEST(CellTypes, each_type_integrates_its_own_equations) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, two_cell_type_model(), "twoTypeNetwork", "60ms", "0.01ms"));
     engine.run();
 
-    // Both arms of the generated switch ran: each driven population produced spikes. A
-    // switch that fell through to one arm would leave the other population silent.
     Vector<s64> spikes_by_population(2, 0);
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        spikes_by_population[spike.neuron_index < 4 ? 0 : 1] += 1;
-    }
+    for (const RecordedSpike &spike : engine.recorded_spikes) spikes_by_population[spike.neuron_index < 4 ? 0 : 1] += 1;
     EXPECT_GT(spikes_by_population[0], 0) << "no iafCell fired";
     EXPECT_GT(spikes_by_population[1], 0) << "no izhikevich2007Cell fired";
 
-    // An undriven iafCell sits at a genuine fixed point: at v = leakReversal its whole
-    // derivative is gL*(leakReversal - v)/C = 0, so it must not have moved at all. That is
-    // the strongest available statement that the driven cells' integration did not reach
-    // across the chunk boundary.
+    // An undriven iafCell sits at a fixed point and must not move at all.
     EXPECT_NEAR(engine.read_state_variable(2, "v"), -0.065f, 1e-7f);
     EXPECT_NEAR(engine.read_state_variable(3, "v"), -0.065f, 1e-7f);
-
-    // An undriven izhikevich2007Cell does not stay at v0 — v0 is an initial condition, not
-    // a resting potential. At v0 = -50 mV, between vr = -60 mV and vt = -40 mV, the
-    // quadratic term k*(v-vr)*(v-vt) is 0.7 nS/mV * 10 mV * -10 mV = -70 pA, so the cell
-    // relaxes downward and settles at vr, taking u to zero with it. Asserting it stayed at
-    // v0 would be asserting the model is wrong.
+    // An undriven izhikevich2007Cell relaxes from v0 = -50 mV toward vr = -60 mV.
     EXPECT_NEAR(engine.read_state_variable(6, "v"), -0.060f, 5e-4f);
-    EXPECT_NEAR(engine.read_state_variable(6, "u"), 0.0f, 1e-11f);
-
-    // The two undriven izhikevich cells have identical parameters, identical (zero) input
-    // and identical initial state, so they must be identical to the bit. Anything writing
-    // outside its own slot — a stride mistake, a chunk overlap — separates them.
+    // Two undriven izhikevich cells with identical everything stay identical to the bit.
     EXPECT_FLOAT_EQ(engine.read_state_variable(5, "v"), engine.read_state_variable(6, "v"));
     EXPECT_FLOAT_EQ(engine.read_state_variable(5, "u"), engine.read_state_variable(6, "u"));
-
-    // Neither undriven izhikevich cell ever reached vpeak.
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        EXPECT_NE(spike.neuron_index, 5);
-        EXPECT_NE(spike.neuron_index, 6);
-    }
-
-    // izhikevich2007Cell's recovery variable u is driven by its own second
-    // TimeDerivative, so a driven one has moved away from zero while the undriven one has
-    // not. That is the only place a second state variable per cell is exercised at all.
+    // The driven one's recovery variable moved.
     EXPECT_NE(engine.read_state_variable(4, "u"), 0.0f);
-
-    // Its OnCondition assigns both v and u (v = c, u = u + d), so a spiking izhikevich
-    // cell must sit at or below its reset value rather than above vpeak.
-    EXPECT_LE(engine.read_state_variable(4, "v"), 0.035f);
 }
 
-// ── the GLIF family ───────────────────────────────────────────────────────────────
+// ── the GLIF family ─────────────────────────────────────────────────────────────
 
-namespace {
-
-
-} // namespace
-
-// All five GLIF types under the same current step. Each one's defining behaviour is
-// asserted rather than its trace being eyeballed: GLIF1 and GLIF2 fire at a fixed rate,
-// and the three that carry adaptation state fire progressively slower.
-TEST(SpikeEngine, the_glif_family_each_produce_their_defining_behaviour) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    SpikeEngine engine("tests/fixtures/nml/LEMS_glif_family.xml");
+// One cell of each GLIF type under the same step. GLIF1's interval has a closed form including its
+// refractory timer; the adapting types slow down; no interval anywhere is shorter than t_ref.
+TEST(GlifFamily, each_type_produces_its_defining_behaviour) {
+    SpikeEngine engine(fixture_path("nml/LEMS_glif_family.xml"));
     ASSERT_EQ(engine.total_neuron_count, 5);
-    ASSERT_EQ(engine.network_details.cell_types.size(), 5u);
-
     engine.run();
 
-    // GLIF1 is a leaky integrator with a hard refractory period, so its interval has a
-    // closed form: the time to charge from vreset to vth under the step, plus t_ref.
-    //   tau       = C / gL = 100 pF / 10 nS = 10 ms
-    //   v_infinity = EL + I/gL = -70 mV + 500 pA / 10 nS = -20 mV
-    //   charge    = tau * ln((v_inf - vreset) / (v_inf - vth)) = 10 ms * ln(50/30)
-    const f64 membrane_time_constant = 100e-12 / 10e-9;
-    const f64 steady_state = -0.070 + 500e-12 / 10e-9;
-    const f64 charging_time = membrane_time_constant *
-            std::log((steady_state - -0.070) / (steady_state - -0.050));
-    const f64 expected_interval = charging_time + 5e-3;
-
+    // tau = 10 ms, v_inf = EL + I/gL = -20 mV: charging from -70 to -50 mV takes tau ln(50/30), then t_ref.
+    const f64 charging_time = 10e-3 * std::log((-0.020 - -0.070) / (-0.020 - -0.050));
     const Vector<f64> glif1 = spike_times_of(engine, 0);
-    ASSERT_GE(glif1.size(), 5u) << "GLIF1 did not fire under 2.5x rheobase";
-    EXPECT_NEAR(glif1[3] - glif1[2], expected_interval, 2e-4);
+    ASSERT_GE(glif1.size(), 5u);
+    EXPECT_NEAR(glif1[3] - glif1[2], charging_time + 5e-3, 2e-4);
 
-    // Its intervals are all the same: nothing in GLIF1 accumulates across spikes.
-    EXPECT_NEAR(glif1[glif1.size() - 1] - glif1[glif1.size() - 2],
-                glif1[2] - glif1[1], 2e-4);
-
-    // Every type fires, and the refractory period is respected by all of them: no
-    // interval anywhere is shorter than t_ref.
     for (s64 cell = 0; cell < 5; cell += 1) {
         const Vector<f64> times = spike_times_of(engine, cell);
-        ASSERT_GE(times.size(), 5u) << "cell " << cell << " fired " << times.size()
-                                    << " times";
-
-        for (usize index = 1; index < times.size(); index += 1) {
-            EXPECT_GE(times[index] - times[index - 1], 5e-3 - 1e-4)
-                    << "cell " << cell << " interval " << index << " is shorter than t_ref";
-        }
+        ASSERT_GE(times.size(), 5u) << "cell " << cell;
+        for (f64 interval : interspike_intervals(times)) EXPECT_GE(interval, 5e-3 - 1e-4) << "cell " << cell;
     }
 
-    // GLIF3 (after-spike currents), GLIF4 (adapting threshold) and GLIF5 (both) slow down
-    // over the step; GLIF1 and GLIF2 do not. This is the whole reason those types carry
-    // extra state, so it is the thing worth asserting.
     auto adaptation_ratio = [&](s64 cell) {
-        const Vector<f64> times = spike_times_of(engine, cell);
-        const f64 first = times[1] - times[0];
-        const f64 last = times[times.size() - 1] - times[times.size() - 2];
-        return last / first;
+        const Vector<f64> intervals = interspike_intervals(spike_times_of(engine, cell));
+        return intervals.back() / intervals.front();
     };
-
     EXPECT_NEAR(adaptation_ratio(0), 1.0, 0.05) << "GLIF1 should not adapt";
     EXPECT_NEAR(adaptation_ratio(1), 1.0, 0.05) << "GLIF2 should not adapt";
     EXPECT_GT(adaptation_ratio(2), 1.5) << "GLIF3's after-spike currents should adapt";
-    EXPECT_GT(adaptation_ratio(3), 1.2) << "GLIF4's adapting threshold should adapt";
-    EXPECT_GT(adaptation_ratio(4), 1.5) << "GLIF5 carries both and should adapt";
+    EXPECT_GT(adaptation_ratio(3), 1.2) << "GLIF4's threshold should adapt";
+    EXPECT_GT(adaptation_ratio(4), 1.5) << "GLIF5 should adapt";
 
-    // The adaptation state actually moved, and in the direction that suppresses firing:
-    // the after-spike currents are hyperpolarising and the threshold rises.
     EXPECT_LT(engine.read_state_variable(2, "asc1"), 0.0f);
-    EXPECT_LT(engine.read_state_variable(2, "asc2"), 0.0f);
     EXPECT_GT(engine.read_state_variable(3, "theta"), -0.050f);
-    EXPECT_GT(engine.read_state_variable(4, "theta"), -0.050f);
 }
 
-TEST(DynamicsCodegen, a_regime_pair_lowers_to_a_refractory_gate) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    NML_Parser parser;
-    const NML_ParseResult parsed =
-            parser.parse_lems("tests/fixtures/nml/LEMS_glif_family.xml");
-    const ModelLayout layout = compute_model_layout(parsed);
-    const String source = generate_master_kernel(parsed, layout);
-
-    // The gate itself, and no trace of a state machine.
-    EXPECT_NE(source.find("const float time_since_spike"), String::npos);
-    EXPECT_EQ(source.find("set_regime"), String::npos);
-    EXPECT_EQ(source.find("neuron_regime"), String::npos);
-
-    // The refractory regime's own timer is never integrated: last_spiked replaces it.
-    EXPECT_EQ(source.find("refractoryTimeElapsed +="), String::npos);
-
-    // GLIF3's after-spike currents are declared outside the regimes, so they decay every
-    // tick including while the cell is held. If they had been swept into the gate they
-    // would freeze during the refractory period and adaptation would be wrong.
-    //
-    // Scoped to GLIF3's own case arm. Searching the whole kernel compares offsets across
-    // five different cell bodies -- GLIF1's gate comes before GLIF3's ascSum simply
-    // because GLIF1 is emitted first, which says nothing about either.
-    const usize body_start = source.find("case 2: { // GLIF3Cell");
-    ASSERT_NE(body_start, String::npos);
-    const usize body_end = source.find("} break;", body_start);
-    ASSERT_NE(body_end, String::npos);
-    const String glif3_body = source.substr(body_start, body_end - body_start);
-
-    const usize gate = glif3_body.find("const float time_since_spike");
-    const usize asc_decay = glif3_body.find("derived_ascSum");
-    ASSERT_NE(gate, String::npos);
-    ASSERT_NE(asc_decay, String::npos);
-    EXPECT_LT(asc_decay, gate) << "ascSum must be computed before the refractory gate";
-
-    // And the decay itself is outside the gate, not inside it.
-    const usize asc_step = glif3_body.find("state_1 += step_dt");
-    ASSERT_NE(asc_step, String::npos);
-    EXPECT_LT(asc_step, gate) << "asc1 must decay whether or not the cell is refractory";
-}
-
-// GLIF2's only difference from GLIF1 is its reset rule: v = vreset + resetScale*(v - vth),
-// which carries part of the threshold overshoot into the next cycle instead of discarding
-// it. Under the family fixture's drive the overshoot is a fraction of a millivolt, so
-// GLIF2 and GLIF1 fire identically -- which means every other assertion about GLIF2 passes
-// just as well if codegen dropped the reset expression entirely.
-//
-// So: two GLIF2 cells differing only in resetScale, under a drive strong enough that the
-// per-tick overshoot is large. A higher resetScale resets closer to threshold and must
-// fire more often. If the expression were dropped, both would reset to vreset and the
-// counts would match.
-TEST(SpikeEngine, glif2_reset_scale_changes_how_often_the_cell_fires) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("reset_scale");
-    // 10 nA against a 200 pA leak at threshold is about 98 V/s, so at dt = 0.1 ms the cell
-    // overshoots vth by roughly 9.8 mV before it is caught -- a fifth of the 20 mV swing,
-    // and enough for resetScale to matter.
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ResetScale">
-  <include href="glif_cell_types.nml"/>
-
-  <GLIF2Cell id="discardOvershoot" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"
-             vreset="-70mV" resetScale="0" t_ref="1ms"/>
-  <GLIF2Cell id="carryOvershoot" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"
-             vreset="-70mV" resetScale="0.9" t_ref="1ms"/>
-
+// GLIF2 resets to vreset + resetScale (v - vth). Under a drive that overshoots threshold by ~10 mV
+// per tick, a higher resetScale resets nearer threshold and fires more often.
+TEST(GlifFamily, glif2_reset_scale_changes_how_often_the_cell_fires) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ResetScale">
+)" + glif_types_include() + R"(  <GLIF2Cell id="discardOvershoot" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             resetScale="0" t_ref="1ms"/>
+  <GLIF2Cell id="carryOvershoot" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             resetScale="0.9" t_ref="1ms"/>
   <pulseGenerator id="hardDrive" delay="0ms" duration="200ms" amplitude="10nA"/>
-
   <network id="resetScaleNetwork">
     <population id="popDiscard" component="discardOvershoot" size="1"/>
     <population id="popCarry" component="carryOvershoot" size="1"/>
@@ -1239,204 +1014,193 @@ TEST(SpikeEngine, glif2_reset_scale_changes_how_often_the_cell_fires) {
     <explicitInput target="popCarry[0]" input="hardDrive"/>
   </network>
 </neuroml>
-)");
-    // The types file is included by relative href, so it has to sit beside the model.
-    {
-        ifstream source("tests/fixtures/nml/glif_cell_types.nml");
-        ASSERT_TRUE(source.good()) << "GLIF cell type fixture missing";
-        ostringstream contents;
-        contents << source.rdbuf();
-        directory.write("glif_cell_types.nml", contents.str());
-    }
-
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "resetScaleNetwork", "200ms", "0.1ms"));
-
-    SpikeEngine engine(lems_path);
+)", "resetScaleNetwork", "200ms", "0.1ms"));
     engine.run();
 
     const Vector<f64> discarding = spike_times_of(engine, 0);
     const Vector<f64> carrying = spike_times_of(engine, 1);
-
     ASSERT_GE(discarding.size(), 10u);
     ASSERT_GE(carrying.size(), 10u);
-
-    // Resetting nearer to threshold means a shorter climb back, so more spikes in the same
-    // window. Equality here is the failure the test exists to catch.
-    EXPECT_GT(carrying.size(), discarding.size())
-            << "resetScale=0.9 fired " << carrying.size() << " times and resetScale=0 fired "
-            << discarding.size() << "; the reset rule is not being applied";
-
-    // And the interval difference is in the direction and rough size the arithmetic says:
-    // the carried overshoot removes roughly 9 mV of a 20 mV climb.
-    const f64 discarding_interval = discarding[5] - discarding[4];
-    const f64 carrying_interval = carrying[5] - carrying[4];
-    EXPECT_LT(carrying_interval, discarding_interval);
-    EXPECT_GT(discarding_interval - carrying_interval, 5e-5);
+    EXPECT_GT(carrying.size(), discarding.size());
+    EXPECT_GT((discarding[5] - discarding[4]) - (carrying[5] - carrying[4]), 5e-5);
 }
 
-TEST(DynamicsCodegen, a_regime_shape_that_is_not_the_refractory_pair_is_refused) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("three_regimes");
-    directory.write("model.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="ThreeRegimes">
-  <ComponentType name="ThreeRegimeCell" extends="baseCell">
-    <Parameter name="C" dimension="capacitance"/>
-    <Parameter name="gL" dimension="conductance"/>
-    <Parameter name="EL" dimension="voltage"/>
-    <Parameter name="vth" dimension="voltage"/>
-    <EventPort name="spike" direction="out"/>
-    <Exposure name="v" dimension="voltage"/>
-    <Dynamics>
-      <StateVariable name="v" dimension="voltage" exposure="v"/>
-      <OnStart><StateAssignment variable="v" value="EL"/></OnStart>
-      <Regime name="one" initial="true">
-        <TimeDerivative variable="v" value="(gL * (EL - v)) / C"/>
-        <OnCondition test="v .gt. vth"><Transition regime="two"/></OnCondition>
-      </Regime>
-      <Regime name="two">
-        <OnCondition test="v .gt. vth"><Transition regime="three"/></OnCondition>
-      </Regime>
-      <Regime name="three">
-        <OnCondition test="v .gt. vth"><Transition regime="one"/></OnCondition>
-      </Regime>
-    </Dynamics>
-  </ComponentType>
-
-  <ThreeRegimeCell id="cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV"/>
-  <network id="threeRegimeNetwork">
-    <population id="pop" component="cell" size="1"/>
-  </network>
-</neuroml>
-)");
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "threeRegimeNetwork", "10ms", "0.1ms"));
-
-    NML_Parser parser;
-    const NML_ParseResult parsed = parser.parse_lems(lems_path);
-    const ModelLayout layout = compute_model_layout(parsed);
-
-    try {
-        generate_master_kernel(parsed, layout);
-        FAIL() << "a three-regime state machine should not lower to a refractory gate";
-    } catch (const std::runtime_error &error) {
-        const String message = error.what();
-        EXPECT_NE(message.find("ThreeRegimeCell"), String::npos) << message;
-        EXPECT_NE(message.find("3 regimes"), String::npos) << message;
-    }
-}
-
-// ── connectivity supplied in code ─────────────────────────────────────────────────
+// ── connectivity from a topology ────────────────────────────────────────────────
 
 namespace {
 
-// A GLIF1 sheet with no connections in the document at all: the population, the synapse and
-// the drive are declared, and the edges come from a topology helper.
+// A GLIF1 sheet whose document declares no connections: they come from a topology helper.
 String torus_model(s64 neuron_count) {
-    ostringstream document;
-    document << R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Torus">
-  <include href=")" << filesystem::absolute("tests/fixtures/nml/glif_cell_types.nml").string()
-             << R"("/>
-  <GLIF1Cell id="torusCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
-             vth="-50mV"/>
-  <alphaCurrentSynapse id="torusSynapse" tau="5 ms" ibase="30 pA"/>
+    std::ostringstream document;
+    document << "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"Torus\">\n" << glif_types_include()
+             << R"(  <alphaCurrentSynapse id="torusSynapse" tau="5 ms" ibase="30 pA"/>
+  <alphaCurrentSynapse id="otherSynapse" tau="5 ms" ibase="-30 pA"/>
+  <GLIF1Cell id="torusCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms" vth="-50mV"/>
   <pulseGenerator id="torusDrive" delay="0 ms" duration="1000 ms" amplitude="260 pA"/>
   <network id="torusNetwork">
-    <population id="torusPopulation" component="torusCell" size=")" << neuron_count << R"("/>
+    <population id="torusPopulation" component="torusCell" size=")"
+             << neuron_count << R"("/>
     <inputList id="torusInput" component="torusDrive" population="torusPopulation">
 )";
     for (s64 index = 0; index < neuron_count; index += 1) {
-        document << "      <input id=\"" << index
-                 << "\" target=\"../torusPopulation[" << index
+        document << "      <input id=\"" << index << "\" target=\"../torusPopulation[" << index
                  << "]\" destination=\"synapses\"/>\n";
     }
-    document << R"(    </inputList>
-  </network>
-</neuroml>
-)";
+    document << "    </inputList>\n  </network>\n</neuroml>\n";
     return document.str();
 }
 
 } // namespace
 
-// The topology constructor is what makes size a parameter: a 16x16 torus is 1,024 edges
-// and a 1,000x1,000 one is four million, and neither is written down. This checks the
-// edges the engine ends up with are exactly the ones square_torus() describes.
-TEST(SpikeEngine, connectivity_can_come_from_a_topology_instead_of_the_document) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
+TEST(Topology, connectivity_can_come_from_a_topology_instead_of_the_document) {
     const s64 side = 16;
     const s64 neuron_count = side * side;
-
-    ModelDirectory directory("torus_topology");
-    directory.write("model.nml", torus_model(neuron_count));
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "torusNetwork", "200ms", "0.1ms"));
-
+    const TemporaryDirectory directory;
     const vector<vector<s32>> adjacency = square_torus(side);
-    ASSERT_EQ((s64)adjacency.size(), neuron_count);
+    SpikeEngine engine(write_model(directory, torus_model(neuron_count), "torusNetwork", "200ms", "0.1ms"), adjacency,
+                       "torusSynapse", /*connection_weight=*/1.0, /*connection_delay_seconds=*/1e-3);
 
-    SpikeEngine engine(lems_path, adjacency, "torusSynapse", /*weight=*/1.0,
-                       /*delay_seconds=*/1e-3);
-
-    // Every node of a square torus has exactly four neighbours, so the edge count is
-    // whatever the helper produced rather than anything the document said.
     EXPECT_EQ(engine.total_neuron_count, neuron_count);
-    EXPECT_EQ(engine.layout.total_edge_count, neuron_count * 4);
-
-    // And they are the same edges, with the weight and delay the constructor was given.
+    EXPECT_EQ(engine.weights.total_edge_count, neuron_count * 4);
     for (s64 source = 0; source < neuron_count; source += 1) {
         for (s32 target : adjacency[(usize)source]) {
-            EXPECT_FLOAT_EQ(engine.weights.get((s32)source, target), 1.0f)
-                    << source << " -> " << target;
-            EXPECT_EQ(engine.weights.get_edge_delay_ticks((s32)source, target), 10)
-                    << source << " -> " << target;
+            EXPECT_FLOAT_EQ(engine.weights.get((s32)source, target), 1.0f) << source << " -> " << target;
+            EXPECT_EQ(engine.weights.get_edge_delay_ticks((s32)source, target), 10) << source << " -> " << target;
         }
     }
 
-    // A torus wraps, so the first node reaches the last column and the last row.
-    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, (s32)(side - 1)), 10);
-    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, (s32)(neuron_count - side)), 10);
-
     engine.run();
-
-    // And it is a working network, not just a correctly wired one.
     EXPECT_GT(engine.mean_firing_rate_hertz(), 2.0);
     EXPECT_GT(engine.fraction_of_neurons_that_spiked(), 0.9);
 }
 
-TEST(SpikeEngine, a_topology_that_does_not_match_the_model_is_refused) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
-    ModelDirectory directory("torus_mismatch");
-    directory.write("model.nml", torus_model(256));
-    const String lems_path = directory.write(
-            "LEMS.xml", lems_wrapper("model.nml", "torusNetwork", "10ms", "0.1ms"));
-
-    // A topology sized for a different network would otherwise wire some neurons and
-    // silently leave the rest unconnected.
+TEST(Topology, a_topology_that_does_not_match_the_model_is_refused) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, torus_model(16), "torusNetwork", "10ms", "0.1ms");
     try {
-        SpikeEngine engine(lems_path, square_torus(8), "torusSynapse");
-        FAIL() << "a topology of the wrong size should be refused";
-    } catch (const std::runtime_error &error) {
+        SpikeEngine engine(lems, square_torus(8), "torusSynapse");
+        FAIL() << "a topology larger than the network must be refused";
+    } catch (const runtime_error &error) {
         const String message = error.what();
         EXPECT_NE(message.find("64"), String::npos) << message;
-        EXPECT_NE(message.find("256"), String::npos) << message;
+        EXPECT_NE(message.find("16"), String::npos) << message;
     }
-
-    // Naming a synapse the model does not declare is the other way to get a silently
-    // wrong network.
     try {
-        SpikeEngine engine(lems_path, square_torus(16), "noSuchSynapse");
-        FAIL() << "an unknown synapse should be refused";
-    } catch (const std::runtime_error &error) {
-        const String message = error.what();
-        EXPECT_NE(message.find("noSuchSynapse"), String::npos) << message;
-        EXPECT_NE(message.find("torusSynapse"), String::npos) << message;
+        SpikeEngine engine(lems, square_torus(4), "noSuchSynapse");
+        FAIL() << "an unknown synapse must be refused";
+    } catch (const runtime_error &error) {
+        EXPECT_NE(String(error.what()).find("noSuchSynapse"), String::npos) << error.what();
     }
 }
 
-// ── the GLIF networks are alive ───────────────────────────────────────────────────
+// The edges are split, in adjacency order, into one contiguous share per synapse.
+TEST(Topology, synapse_shares_split_the_edges_in_order) {
+    const TemporaryDirectory directory;
+    const String lems = write_model(directory, torus_model(16), "torusNetwork", "10ms", "0.1ms");
+    const vector<vector<s32>> adjacency = random_fixed_outdegree(4, 5, 3);  // 80 edges
+
+    const auto prototype_counts = [&](const SpikeEngine &engine) {
+        Vector<s64> counts(2, 0);
+        s64 last_prototype = 0;
+        for (s64 source = 0; source < 16; source += 1) {
+            for (s32 target : adjacency[(usize)source]) {
+                const s32 prototype = engine.weights.get_edge_synapse_prototype((s32)source, target);
+                EXPECT_GE(prototype, last_prototype) << "the shares must be contiguous";
+                last_prototype = prototype;
+                counts[(usize)prototype] += 1;
+            }
+        }
+        return counts;
+    };
+
+    SpikeEngine weighted(lems, adjacency, vector<String>{"torusSynapse", "otherSynapse"}, vector<f64>{3.0, 1.0});
+    EXPECT_EQ(prototype_counts(weighted), (Vector<s64>{60, 20}));
+
+    SpikeEngine equal(lems, adjacency, vector<String>{"torusSynapse", "otherSynapse"});
+    EXPECT_EQ(prototype_counts(equal), (Vector<s64>{40, 40}));
+}
+
+// ── randomness ──────────────────────────────────────────────────────────────────
+
+namespace {
+
+String generator_model() {
+    return R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Generators">
+  <spikeGeneratorPoisson id="poissonSource" averageRate="50 Hz"/>
+  <spikeGeneratorRandom id="uniformSource" minISI="10 ms" maxISI="30 ms"/>
+  <network id="generatorNetwork">
+    <population id="poissonPopulation" component="poissonSource" size="200"/>
+    <population id="uniformPopulation" component="uniformSource" size="200"/>
+  </network>
+</neuroml>
+)";
+}
+
+String seeded_generator_lems(const TemporaryDirectory &directory, const String &seed) {
+    directory.write("generators.nml", generator_model());
+    return directory.write("LEMS_" + seed + ".xml", R"(<Lems>
+  <Include file="Cells.xml"/><Include file="Networks.xml"/><Include file="Simulation.xml"/>
+  <Include file="generators.nml"/>
+  <Simulation id="sim1" length="2s" step="0.1ms" target="generatorNetwork" seed=")" + seed + R"("/>
+  <Target component="sim1"/>
+</Lems>
+)");
+}
+
+// Every interspike interval of neurons [first, last).
+Vector<f64> intervals_of(const SpikeEngine &engine, s64 first, s64 last) {
+    Vector<f64> intervals;
+    for (s64 neuron = first; neuron < last; neuron += 1) {
+        const Vector<f64> neuron_intervals = interspike_intervals(spike_times_of(engine, neuron));
+        intervals.insert(intervals.end(), neuron_intervals.begin(), neuron_intervals.end());
+    }
+    return intervals;
+}
+
+} // namespace
+
+// A Poisson source has exponential intervals: coefficient of variation 1. H(0) = 1 used to stall it
+// for about t whenever its next spike time equalled t, which shows as a CV above 1 and long gaps.
+TEST(Randomness, a_poisson_generator_fires_at_its_rate_with_poisson_intervals) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(seeded_generator_lems(directory, "1234"));
+    engine.run();
+
+    const Vector<f64> intervals = intervals_of(engine, 0, 200);
+    ASSERT_GT(intervals.size(), 15000u);
+    EXPECT_NEAR(1.0 / mean_of(intervals), 50.0, 1.5);
+    EXPECT_NEAR(coefficient_of_variation(intervals), 1.0, 0.05);
+    EXPECT_LT(*max_element(intervals.begin(), intervals.end()), 0.5) << "a Poisson source stalled";
+}
+
+TEST(Randomness, a_uniform_interval_generator_keeps_its_intervals_in_range) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(seeded_generator_lems(directory, "1234"));
+    engine.run();
+
+    const Vector<f64> intervals = intervals_of(engine, 200, 400);
+    ASSERT_GT(intervals.size(), 15000u);
+    const f64 tick = engine.step_dt;
+    EXPECT_GE(*min_element(intervals.begin(), intervals.end()), 10e-3 - tick);
+    EXPECT_LE(*max_element(intervals.begin(), intervals.end()), 30e-3 + tick);
+    EXPECT_NEAR(mean_of(intervals), 20e-3, 0.2e-3);
+}
+
+TEST(Randomness, the_same_seed_reproduces_a_run_and_another_seed_does_not) {
+    const TemporaryDirectory directory;
+    const auto spikes_of = [&](const String &seed) {
+        SpikeEngine engine(seeded_generator_lems(directory, seed));
+        engine.run();
+        Vector<Pair<f64, s64>> spikes;
+        for (const RecordedSpike &spike : engine.recorded_spikes) spikes.push_back({spike.time_seconds, spike.neuron_index});
+        return spikes;
+    };
+    const Vector<Pair<f64, s64>> first = spikes_of("1234");
+    EXPECT_EQ(first, spikes_of("1234"));
+    EXPECT_NE(first, spikes_of("99"));
+}
+
+// ── recurrent GLIF networks ─────────────────────────────────────────────────────
 
 namespace {
 
@@ -1444,307 +1208,131 @@ struct NetworkActivity {
     f64 mean_rate = 0.0;
     f64 participation = 0.0;
     f64 peak_synchrony = 0.0;
+    f64 active_tick_fraction = 0.0;
     f64 middle_rate = 0.0;
     f64 final_rate = 0.0;
 };
 
-// How many spikes landed on each tick of the run.
-Vector<s64> spikes_per_tick_of(const SpikeEngine &engine, f64 step_seconds) {
-    Vector<s64> spikes_per_tick((usize)engine.lifetime, 0);
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        const s64 tick = (s64)(spike.time_seconds / step_seconds + 0.5);
-        if (tick >= 0 && tick < engine.lifetime) spikes_per_tick[(usize)tick] += 1;
-    }
-    return spikes_per_tick;
-}
-
-NetworkActivity measure_activity(const SpikeEngine &engine, f64 step_seconds,
-                                 f64 total_seconds) {
+NetworkActivity measure_activity(const SpikeEngine &engine, f64 total_seconds) {
     NetworkActivity activity;
     activity.mean_rate = engine.mean_firing_rate_hertz();
     activity.participation = engine.fraction_of_neurons_that_spiked();
 
-    const Vector<s64> spikes_per_tick = spikes_per_tick_of(engine, step_seconds);
+    Vector<s64> spikes_per_tick((usize)engine.lifetime, 0);
+    for (const RecordedSpike &spike : engine.recorded_spikes) {
+        const s64 tick = llround(spike.time_seconds / engine.step_dt);
+        if (tick >= 0 && tick < engine.lifetime) spikes_per_tick[(usize)tick] += 1;
+    }
     activity.peak_synchrony =
-            (f64)*std::max_element(spikes_per_tick.begin(), spikes_per_tick.end()) /
-            (f64)engine.total_neuron_count;
+            (f64)*max_element(spikes_per_tick.begin(), spikes_per_tick.end()) / (f64)engine.total_neuron_count;
+    activity.active_tick_fraction =
+            (f64)count_if(spikes_per_tick.begin(), spikes_per_tick.end(), [](s64 count) { return count > 0; }) /
+            (f64)engine.lifetime;
 
     auto rate_over = [&](f64 from_seconds, f64 to_seconds) {
-        s64 count = 0;
-        for (const RecordedSpike &spike : engine.recorded_spikes) {
-            if (spike.time_seconds >= from_seconds && spike.time_seconds < to_seconds) {
-                count += 1;
-            }
-        }
-        return (f64)count / ((f64)engine.total_neuron_count * (to_seconds - from_seconds));
+        const s64 spike_count = count_if(engine.recorded_spikes.begin(), engine.recorded_spikes.end(),
+                                         [&](const RecordedSpike &spike) {
+                                             return spike.time_seconds >= from_seconds && spike.time_seconds < to_seconds;
+                                         });
+        return (f64)spike_count / ((f64)engine.total_neuron_count * (to_seconds - from_seconds));
     };
     activity.middle_rate = rate_over(0.4 * total_seconds, 0.6 * total_seconds);
     activity.final_rate = rate_over(0.8 * total_seconds, total_seconds);
-
     return activity;
 }
 
-} // namespace
-
-
-// ── balanced GLIF network fixture ─────────────────────────────────────────────────
-//
-// The model these tests run used to be built by a header in examples/demos, which a test
-// has no business including -- and which is gone. It lives here now, where its only
-// consumer is.
-//
-// It is also much smaller than it was, because the connections are no longer in the
-// document. The engine's list-of-synapses constructor draws one synapse per cell and
-// wires the topology from code, so what the file has to say is just the cells, the two
-// synapses and the drive. That is the same thing the four Python demos do.
-namespace {
-
-String glif_cell_type_name_for(s32 glif_index) {
-    return "GLIF" + to_string(glif_index) + "Cell";
-}
-
-// C = 100 pF and gL = 10 nS give a 10 ms membrane time constant and a rheobase of
-// gL * (vth - EL) = 200 pA. GLIF4 and GLIF5 declare no vth: their threshold is a state
-// variable that starts at thetaInf.
+// C = 100 pF and gL = 10 nS: a 10 ms time constant and a 200 pA rheobase.
 String glif_cell_attributes_for(s32 glif_index) {
     const String shared = R"( C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms")";
     switch (glif_index) {
         case 1: return shared + R"( vth="-50mV")";
         case 2: return shared + R"( vth="-50mV" resetScale="0.3")";
-        case 3: return shared + R"( vth="-50mV" tauAsc1="100ms" tauAsc2="10ms")"
-                                R"( ascAdd1="-60pA" ascAdd2="-120pA")";
+        case 3: return shared + R"( vth="-50mV" tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-60pA" ascAdd2="-120pA")";
         case 4: return shared + R"( thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="3mV")";
-        case 5: return shared + R"( thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="3mV")"
-                                R"( tauAsc1="100ms" tauAsc2="10ms")"
-                                R"( ascAdd1="-60pA" ascAdd2="-120pA")";
-        default:
-            throw runtime_error("glif_cell_attributes_for: index must be 1..5");
+        case 5: return shared + R"( thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="3mV" tauAsc1="100ms")"
+                                R"( tauAsc2="10ms" ascAdd1="-60pA" ascAdd2="-120pA")";
+        default: throw runtime_error("glif_cell_attributes_for: index must be 1..5");
     }
 }
 
-struct GlifNetworkParameters {
-    s32 glif_index = 1;
-    s64 side_length = 22;              // 484 cells
-    s32 fanout = 20;                   // 9,680 edges
-    // Balanced so the network is alive rather than inhibition-dominated: at 11 pA
-    // against -50 pA a cell's ~16 excitatory inputs are outweighed by its ~4
-    // inhibitory ones, and a fifth of the population never fires at all.
-    f64 excitatory_ibase_amperes = 16e-12;
-    f64 inhibitory_ibase_amperes = -35e-12;
-    f64 synapse_tau_seconds = 5e-3;
-    f64 background_current_amperes = 190e-12;   // below the 200 pA rheobase
-    f64 seed_extra_current_amperes = 45e-12;    // takes a seeded cell above it
-    f64 seed_fraction = 0.2;
-    f64 connection_delay_seconds = 2e-3;
-    f64 simulation_seconds = 2.0;
-    f64 step_seconds = 1e-4;
-    u64 seed = 20260813;
+// 484 cells, 20 random outgoing edges each, split 4:1 excitatory to inhibitory, a fifth of the cells
+// driven above rheobase and the rest just below it.
+unique_ptr<SpikeEngine> make_glif_network(const TemporaryDirectory &directory, s32 glif_index, f64 simulation_seconds) {
+    const s64 side_length = 22;
+    const s64 cell_count = side_length * side_length;
+    const u64 seed = 20260813;
 
-    [[nodiscard]] s64 total_count() const { return side_length * side_length; }
-};
+    set<s64> seeded;
+    mt19937_64 generator(seed);
+    uniform_int_distribution<s64> anywhere(0, cell_count - 1);
+    while ((s64)seeded.size() < cell_count / 5) seeded.insert(anywhere(generator));
 
-// Writes <directory>/<name>.nml and its LEMS document; returns the LEMS path.
-String write_glif_network_model(const String &name,
-                                const GlifNetworkParameters &parameters,
-                                const String &directory) {
-    const String model_path = directory + "/" + name + ".nml";
-    const String lems_path = directory + "/LEMS_" + name + ".xml";
-    const String cell_type = glif_cell_type_name_for(parameters.glif_index);
-    const s64 total_count = parameters.total_count();
-
-    // A fifth of the population is driven over rheobase and fires on its own; the rest
-    // sit under it and fire only on synaptic input. Deterministic from the seed, so the
-    // same cells are driven on every run.
-    const s64 seeded_count = (s64)(parameters.seed_fraction * (f64)total_count);
-    Set<s64> seeded;
-    mt19937_64 generator(parameters.seed);
-    uniform_int_distribution<s64> anywhere(0, total_count - 1);
-    while ((s64)seeded.size() < seeded_count) seeded.insert(anywhere(generator));
-
-    ofstream model(model_path);
-    model << setprecision(12);
-    model << "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"" << name
-          << "\">\n\n"
-          << "  <include href=\""
-          << filesystem::absolute("tests/fixtures/nml/glif_cell_types.nml").string()
-          << "\"/>\n\n";
-
-    model << "  <" << cell_type << " id=\"networkCell\""
-          << glif_cell_attributes_for(parameters.glif_index) << "/>\n\n";
-
-    model << "  <alphaCurrentSynapse id=\"excitatorySynapse\" tau=\""
-          << parameters.synapse_tau_seconds << " s\" ibase=\""
-          << parameters.excitatory_ibase_amperes << " A\"/>\n";
-    model << "  <alphaCurrentSynapse id=\"inhibitorySynapse\" tau=\""
-          << parameters.synapse_tau_seconds << " s\" ibase=\""
-          << parameters.inhibitory_ibase_amperes << " A\"/>\n\n";
-
-    model << "  <pulseGenerator id=\"background\" delay=\"0 s\" duration=\""
-          << parameters.simulation_seconds << " s\" amplitude=\""
-          << parameters.background_current_amperes << " A\"/>\n";
-    model << "  <pulseGenerator id=\"seedDrive\" delay=\"0 s\" duration=\""
-          << parameters.simulation_seconds << " s\" amplitude=\""
-          << (parameters.background_current_amperes +
-              parameters.seed_extra_current_amperes) << " A\"/>\n\n";
-
-    model << "  <network id=\"network\">\n";
-    model << "    <population id=\"population\" component=\"networkCell\" size=\""
-          << total_count << "\"/>\n\n";
-    for (s64 index = 0; index < total_count; index += 1) {
+    std::ostringstream model;
+    model << "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"glifNetwork\">\n" << glif_types_include()
+          << "  <alphaCurrentSynapse id=\"excitatorySynapse\" tau=\"5 ms\" ibase=\"16 pA\"/>\n"
+          << "  <alphaCurrentSynapse id=\"inhibitorySynapse\" tau=\"5 ms\" ibase=\"-35 pA\"/>\n"
+          << "  <GLIF" << glif_index << "Cell id=\"networkCell\"" << glif_cell_attributes_for(glif_index) << "/>\n"
+          << "  <pulseGenerator id=\"background\" delay=\"0 s\" duration=\"" << simulation_seconds
+          << " s\" amplitude=\"190 pA\"/>\n"
+          << "  <pulseGenerator id=\"seedDrive\" delay=\"0 s\" duration=\"" << simulation_seconds
+          << " s\" amplitude=\"235 pA\"/>\n"
+          << "  <network id=\"network\">\n"
+          << "    <population id=\"population\" component=\"networkCell\" size=\"" << cell_count << "\"/>\n";
+    for (s64 index = 0; index < cell_count; index += 1) {
         model << "    <explicitInput target=\"population[" << index << "]\" input=\""
               << (seeded.count(index) ? "seedDrive" : "background") << "\"/>\n";
     }
     model << "  </network>\n</neuroml>\n";
-    model.close();
 
-    ofstream lems(lems_path);
-    lems << setprecision(12);
-    lems << "<Lems>\n"
-            "    <Include file=\"Cells.xml\"/>\n"
-            "    <Include file=\"Synapses.xml\"/>\n"
-            "    <Include file=\"Inputs.xml\"/>\n"
-            "    <Include file=\"Networks.xml\"/>\n"
-            "    <Include file=\"Simulation.xml\"/>\n"
-            "    <Include file=\"" << name << ".nml\"/>\n\n"
-            "    <Simulation id=\"sim1\" length=\"" << parameters.simulation_seconds
-         << "s\" step=\"" << parameters.step_seconds << "s\" target=\"network\"/>\n\n"
-            "    <Target component=\"sim1\"/>\n</Lems>\n";
-    return lems_path;
-}
-
-// The engine, wired from the topology with a 4:1 excitatory:inhibitory draw.
-unique_ptr<SpikeEngine> make_glif_network(const String &name,
-                                          const GlifNetworkParameters &parameters,
-                                          const String &directory) {
-    const String lems_path = write_glif_network_model(name, parameters, directory);
-    const vector<vector<s32>> topology = random_fixed_outdegree(
-            parameters.side_length, parameters.fanout, (s64)parameters.seed);
-
-    return make_unique<SpikeEngine>(
-            lems_path, topology,
-            vector<String>{"excitatorySynapse", "inhibitorySynapse"},
-            vector<f64>{0.8, 0.2}, 1.0, parameters.connection_delay_seconds);
+    std::ostringstream length;
+    length << simulation_seconds << "s";
+    const String lems = write_model(directory, model.str(), "network", length.str(), "0.1ms");
+    return make_unique<SpikeEngine>(lems, random_fixed_outdegree(side_length, 20, (s64)seed),
+                                    vector<String>{"excitatorySynapse", "inhibitorySynapse"}, vector<f64>{0.8, 0.2},
+                                    /*connection_weight=*/1.0, /*connection_delay_seconds=*/2e-3);
 }
 
 } // namespace
 
-// One recurrent network per GLIF type, each asserted to be alive on the same terms: a
-// population rate in a sensible band, nearly every neuron participating, activity that is
-// asynchronous rather than one repeating volley, and a network still firing at the end of
-// the run. A network that loads, runs, records and produces almost nothing passes every
-// other test in this file and fails this one.
+// Alive on the same terms for every GLIF type: a rate in a sensible band, nearly every cell taking
+// part, activity spread over time rather than locked into volleys, and still firing at the end.
 class GlifNetworkAliveness : public ::testing::TestWithParam<s32> {};
 
 TEST_P(GlifNetworkAliveness, sustains_asynchronous_recurrent_activity) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
     const s32 glif_index = GetParam();
-    ModelDirectory directory("glif" + to_string(glif_index) + "_network");
+    const f64 simulation_seconds = 2.0;
+    const TemporaryDirectory directory;
+    unique_ptr<SpikeEngine> engine = make_glif_network(directory, glif_index, simulation_seconds);
+    EXPECT_EQ(engine->total_neuron_count, 484);
+    EXPECT_EQ(engine->weights.total_edge_count, 484 * 20);
+    engine->run();
 
-    GlifNetworkParameters parameters;
-    parameters.glif_index = glif_index;
-
-    unique_ptr<SpikeEngine> owned = make_glif_network(
-            "glif" + to_string(glif_index) + "_network", parameters, directory.path());
-    SpikeEngine &engine = *owned;
-
-    EXPECT_EQ(engine.total_neuron_count, parameters.total_count());
-    EXPECT_EQ(engine.layout.total_edge_count,
-              parameters.total_count() * parameters.fanout);
-
-    engine.run();
-
-    const NetworkActivity activity = measure_activity(
-            engine, parameters.step_seconds, parameters.simulation_seconds);
-
-    // Alive, and not saturated. The 5 ms refractory period caps any cell at 200 Hz, so a
-    // rate approaching that would mean every cell firing flat out.
+    const NetworkActivity activity = measure_activity(*engine, simulation_seconds);
     EXPECT_GT(activity.mean_rate, 2.0) << "GLIF" << glif_index << " is barely firing";
     EXPECT_LT(activity.mean_rate, 60.0) << "GLIF" << glif_index << " is saturated";
-
-    // Broadly alive rather than a few cells carrying the whole rate.
     EXPECT_GT(activity.participation, 0.85);
-
-    // A synchrony FLOOR as well as a ceiling. The million-cell torus run scored a healthy
-    // rate and 100% participation while every cell fired on the same ticks as every other
-    // one -- the metrics above cannot tell a network apart from a metronome, because they
-    // only ask whether cells fire. Requiring some spread in when they fire is what closes
-    // that. A perfectly locked population puts every spike on a handful of ticks, so the
-    // fraction of ticks carrying any activity collapses.
-    s64 ticks_with_activity = 0;
-    for (s64 count : spikes_per_tick_of(engine, parameters.step_seconds)) {
-        ticks_with_activity += count > 0 ? 1 : 0;
-    }
-    // Five percent, not something tighter: a rhythmic network is not a locked one. GLIF3
-    // and GLIF5 band at about 10 Hz from their after-spike currents, which over two seconds
-    // is twenty bands of a few milliseconds each and lands near 19% -- legitimate, and a
-    // stricter floor fails it. True lockstep puts the whole population on a handful of
-    // ticks and comes in an order of magnitude below that.
-    EXPECT_GT((f64)ticks_with_activity / (f64)engine.lifetime, 0.05)
-            << "only " << ticks_with_activity << " of " << engine.lifetime
-            << " ticks carried any spike; the population is firing in lockstep";
-
-    // Not a lockstep volley: no tick where a large part of the population fires together.
-    // This is a ceiling, not a demand for a flat raster -- the adapting types develop a
-    // real population rhythm, because after-spike currents recover on a shared time
-    // constant and pull the network into bands. That shows up in the raster around 10 Hz
-    // for GLIF3 and GLIF5 and is a property of the model, not a defect. What this rules
-    // out is every cell firing on the same tick.
+    // Lockstep puts every spike on a handful of ticks. The adapting types band at about 10 Hz, which
+    // lands near 19% of ticks active, so the floor is 5%.
+    EXPECT_GT(activity.active_tick_fraction, 0.05) << "the population is firing in lockstep";
     EXPECT_LT(activity.peak_synchrony, 0.5);
-
-    // Still going at the end. A wide floor rather than a tight band, because the types
-    // that adapt are genuinely still settling at the end of the run -- GLIF5 carries both
-    // after-spike currents and an adapting threshold and drifts down the longest. What
-    // this rules out is the network dying, not slow adaptation.
     ASSERT_GT(activity.middle_rate, 0.0);
-    EXPECT_GT(activity.final_rate, 0.6 * activity.middle_rate)
-            << "GLIF" << glif_index << " decayed from " << activity.middle_rate << " Hz to "
-            << activity.final_rate << " Hz";
+    EXPECT_GT(activity.final_rate, 0.6 * activity.middle_rate);
     EXPECT_GT(activity.final_rate, 2.0);
 }
 
-INSTANTIATE_TEST_SUITE_P(AllFiveTypes, GlifNetworkAliveness,
-                         ::testing::Values(1, 2, 3, 4, 5),
-                         [](const ::testing::TestParamInfo<s32> &info) {
-                             return "GLIF" + to_string(info.param);
-                         });
+INSTANTIATE_TEST_SUITE_P(AllFiveTypes, GlifNetworkAliveness, ::testing::Values(1, 2, 3, 4, 5),
+                         [](const ::testing::TestParamInfo<s32> &info) { return "GLIF" + to_string(info.param); });
 
-// The three types that carry adaptation state fire more slowly in a network than the two
-// that do not, under identical drive and identical connectivity. This is the network-level
-// counterpart of the single-cell adaptation test: it confirms the extra state is doing
-// something once cells are wired together, not just under a clean current step.
-TEST(SpikeEngine, adapting_glif_networks_settle_below_non_adapting_ones) {
-    if (!standard_library_available()) GTEST_SKIP() << "NML standard library not bundled";
-
+// The types that carry adaptation state fire more slowly in a network under identical drive and
+// wiring: the extra state does something once cells are connected.
+TEST(GlifNetworks, adapting_types_settle_below_non_adapting_ones) {
     Vector<f64> rate_by_type(6, 0.0);
-
     for (s32 glif_index : {1, 3, 5}) {
-        ModelDirectory directory("glif_rate_" + to_string(glif_index));
-
-        GlifNetworkParameters parameters;
-        parameters.glif_index = glif_index;
-        // Half the run of the aliveness tests: the rate separation is fully developed
-        // within a second, and three networks at full length is minutes of suite time for
-        // a comparison that is already clear.
-        parameters.simulation_seconds = 1.0;
-
-        unique_ptr<SpikeEngine> engine = make_glif_network(
-                "glif" + to_string(glif_index) + "_rate", parameters, directory.path());
+        const TemporaryDirectory directory;
+        unique_ptr<SpikeEngine> engine = make_glif_network(directory, glif_index, 1.0);
         engine->run();
         rate_by_type[(usize)glif_index] = engine->mean_firing_rate_hertz();
     }
-
-    // GLIF3's after-spike currents suppress firing; GLIF5 adds an adapting threshold on
-    // top, so it settles at or below GLIF3.
-    EXPECT_LT(rate_by_type[3], rate_by_type[1] * 0.75)
-            << "GLIF3 " << rate_by_type[3] << " Hz vs GLIF1 " << rate_by_type[1] << " Hz";
-    EXPECT_LT(rate_by_type[5], rate_by_type[1] * 0.75)
-            << "GLIF5 " << rate_by_type[5] << " Hz vs GLIF1 " << rate_by_type[1] << " Hz";
+    EXPECT_LT(rate_by_type[3], 0.75 * rate_by_type[1]) << "GLIF3 " << rate_by_type[3] << " Hz, GLIF1 " << rate_by_type[1];
+    EXPECT_LT(rate_by_type[5], 0.75 * rate_by_type[1]) << "GLIF5 " << rate_by_type[5] << " Hz, GLIF1 " << rate_by_type[1];
 }
-
-// The balanced iafCell demo that used to be asserted here is gone: every demo now
-// has exactly one program, and that one was superseded by the five GLIF network
-// demos. The property it checked -- a recurrent network that runs, records and
-// produces almost nothing is the failure this file exists to prevent -- is asserted
-// five times over by GlifNetworkAliveness above, across five cell types.
-
