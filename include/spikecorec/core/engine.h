@@ -77,6 +77,10 @@ namespace spikecorec {
 
         EnginePointer empty_edge_plane;
 
+        // Spikes that reached each cell, for cells with an OnEvent: two rows alternating by
+        // tick parity like network_inputs. One slot when no cell type has an OnEvent.
+        EnginePointer event_arrival_count;  // u32[2][total_neuron_count]
+
         // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
         // asking whether the source spiked `delay` ticks ago, so every spike in flight is
         // remembered, not just the most recent one.

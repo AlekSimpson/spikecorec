@@ -30,7 +30,8 @@ namespace {
 // Names the generated dynamics read from master_step. A LEMS name equal to one of these
 // would be captured by the substitutions, so it is refused.
 const Set<String> ENGINE_NAMES = {
-    "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true", "random_values"};
+    "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true", "random_values",
+    "event_arrivals", "arrival"};
 
 // Names the generated synapse dynamics read from the propagate walk, on top of ENGINE_NAMES.
 const Set<String> SYNAPSE_ENGINE_NAMES = {
@@ -348,6 +349,14 @@ const NML_ComponentInstance &population_cell(const NML_Context &context, const N
 
 namespace {
 
+// True when the type reacts to arriving spikes itself, with an OnEvent in its own dynamics.
+bool has_on_event(const NML_ComponentType &component_type) {
+    for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+        if (entry.source_tag == NML_DeclarationType::OnEvent) return true;
+    }
+    return false;
+}
+
 // The child slots of node that hold uses of names. Declared names, parameters, types,
 // function names and member names are left out.
 Vector<KernelNode **> use_slots(KernelNode *node) {
@@ -411,21 +420,34 @@ Vector<KernelNode **> use_slots(KernelNode *node) {
 
 } // namespace
 
+bool Codegen::cells_receive_events() const {
+    for (const NML_ComponentInstance *population : network_populations(context)) {
+        if (has_on_event(*population_cell(context, *population).component_type)) return true;
+    }
+    return false;
+}
+
 void Codegen::allocate_cell_model_memory() {
+    // Two rows like network_inputs, but only for a model whose cells have an OnEvent; otherwise
+    // one slot, so there is still a buffer to bind.
+    const s64 event_arrival_slots = cells_receive_events() ? 2 * context.simulation.total_neuron_count : 1;
+
     device->partition(sizeof(f32) * context.get_cell_state_size(), EngineDatatype::FLOAT32, data_partitions)            // cell_state
           .partition(sizeof(f32) * 2 * context.simulation.total_neuron_count, EngineDatatype::FLOAT32, data_partitions)    // network_inputs
           .partition(sizeof(u8) * spike_history_length(context) * context.simulation.total_neuron_count,
                      EngineDatatype::UNSIGNED8, data_partitions)                                                           // spike_history
           .partition(sizeof(s64) * context.simulation.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)       // last_spiked
-          .partition(sizeof(f32), EngineDatatype::FLOAT32, data_partitions);                                               // empty_edge_plane
+          .partition(sizeof(f32), EngineDatatype::FLOAT32, data_partitions)                                                // empty_edge_plane
+          .partition(sizeof(u32) * event_arrival_slots, EngineDatatype::UNSIGNED32, data_partitions);                      // event_arrival_count
 
     EnginePointer slab = device->allocate(data_partitions);
     data_partitions.push_back(slab);
 
-    log::logger().debug("Codegen: {} bytes: cell_state {}, network_inputs {}, spike_history {}, last_spiked {}",
+    log::logger().debug("Codegen: {} bytes: cell_state {}, network_inputs {}, spike_history {}, last_spiked {}, "
+                        "event_arrival_count {}",
                         slab.total_bytes, context.get_cell_state_size(), 2 * context.simulation.total_neuron_count,
                         spike_history_length(context) * context.simulation.total_neuron_count,
-                        context.simulation.total_neuron_count);
+                        context.simulation.total_neuron_count, event_arrival_slots);
 }
 
 Codegen::~Codegen() {
@@ -688,11 +710,24 @@ KernelNode *Codegen::translate_kernel_code() {
         throw;
     }
 
-    const s64 spiked_index = find_statement(body, "spiked");
+    s64 spiked_index = find_statement(body, "spiked");
     if (spiked_index < 0) {
         delete dispatch;
         throw runtime_error("translate_kernel_code: master_step declares no 'spiked'");
     }
+
+    // Spikes that reached each cell are counted like network_inputs: two rows by tick parity.
+    // A neuron takes this tick's count from current_row while this tick's arrivals are counted
+    // into next_row.
+    const bool receives_events = cells_receive_events();
+    if (receives_events) {
+        KernelNode *arrival_slot = new_expression("[]", identifier("event_arrival_count"), identifier("input_slot"));
+        insert_statements(body, static_cast<usize>(spiked_index),
+                          {new_declaration(new_type("const s32"), "event_arrivals", new_cast(new_type("s32"), arrival_slot)),
+                           new_assignment(clone(arrival_slot), "=", literal("0"))});
+        spiked_index += 2;
+    }
+
     if (dispatch->children.empty()) {
         delete dispatch;
     } else {
@@ -741,6 +776,18 @@ KernelNode *Codegen::translate_kernel_code() {
             statements.push_back(prototypes);
         }
         insert_statements(walk, static_cast<usize>(arrived_index) + 1, statements);
+
+        if (receives_events) {
+            KernelNode *next_slot = new_expression(
+                    "[]", identifier("event_arrival_count"),
+                    new_expression("+", new_expression("*", identifier("next_row"), identifier("neuron_count")),
+                                   identifier("target")));
+            KernelListNode *count_arrival = new_block();
+            count_arrival->children.push_back(function_call("atomic_increment", {next_slot}));
+            KernelListNode *on_arrival = new_conditional();
+            add_branch(on_arrival, identifier("arrived"), count_arrival);
+            walk->children.push_back(on_arrival);
+        }
     }
 
     // Constant for the whole run, so baked in rather than bound. Last, so the inserted
@@ -952,11 +999,13 @@ void Codegen::check_cell_inputs() const {
         return nullptr;
     };
 
+    // A synapse's spikes also reach a cell with an OnEvent, so that cell takes a synapse even
+    // when it reads no current.
     auto check_attached = [](const NML_ComponentType &cell_type, const NML_ComponentInstance &attached,
-                             const String &role, bool must_expose_input) {
+                             const String &role, bool must_expose_input, bool delivers_arrivals) {
         const String described = role + " '" + attached.id + "' (" + attached.component_type->name + ") into a '" +
                                  cell_type.name + "'";
-        bool reads_input = false;
+        bool reads_input = delivers_arrivals && has_on_event(cell_type);
         for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
             if (entry.select.empty()) continue;
             reads_input = true;
@@ -988,7 +1037,7 @@ void Codegen::check_cell_inputs() const {
 
             const NML_ComponentInstance *synapse = context.find_instance(edge.component_id);
             if (!synapse || !synapse->component_type) continue;
-            check_attached(*cell_type, *synapse, "Synapse", true);
+            check_attached(*cell_type, *synapse, "Synapse", true, true);
         }
     }
 
@@ -1000,7 +1049,7 @@ void Codegen::check_cell_inputs() const {
         for (const InputTarget &target : profile.targets) {
             const NML_ComponentType *cell_type = cell_type_of(context.neuron_index_of(target.neuron_index));
             if (!cell_type || !checked_cell_types.insert(cell_type).second) continue;
-            check_attached(*cell_type, *input, "Input", profile.continuous_current_injection);
+            check_attached(*cell_type, *input, "Input", profile.continuous_current_injection, false);
         }
     }
 }
@@ -1008,9 +1057,10 @@ void Codegen::check_cell_inputs() const {
 // The type's dynamics with LEMS names still in them: per population, translate_component_instance
 // puts each state variable's cell_state slot and each parameter's value in their place.
 //
-// Order: derived variables (by dependency), the refractory flag, every derivative into a
-// temporary, the Euler steps, then the OnConditions. All derivatives read the state from before
-// the step, and all conditions see the state after it.
+// Order: the OnEvents, once per spike that arrived this tick (event_arrivals), derived
+// variables (by dependency), the refractory flag, every derivative into a temporary, the Euler
+// steps, then the OnConditions. All derivatives read the state from before the step, and all
+// conditions see the state after it.
 KernelListNode *Codegen::translate_component_type(const NML_ComponentType &component_type) {
     auto cached = component_type_templates.find(component_type.name);
     if (cached != component_type_templates.end()) return cached->second;
@@ -1034,9 +1084,11 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
     UnorderedMap<String, Vector<const NML_DynamicsExpression *>> derived_entries;
     Vector<const NML_DynamicsExpression *> derivative_entries;
     Vector<EventHandler> handlers;
+    // OnEvents: each runs once per spike that reached the cell this tick, whatever its port.
+    Vector<EventHandler> arrival_handlers;
     UnorderedMap<String, Vector<const NML_DynamicsExpression *>> entry_assignments;
 
-    enum class Group { NONE, HANDLER, ENTRY };
+    enum class Group { NONE, HANDLER, ARRIVAL, ENTRY };
     Group group = Group::NONE;
     for (const NML_DynamicsExpression &entry : component_type.dynamics) {
         switch (entry.source_tag) {
@@ -1065,14 +1117,18 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
                 group = Group::ENTRY;
                 break;
             case NML_DeclarationType::OnEvent:
-                throw unsupported("OnEvent is not supported in cell dynamics");
+                arrival_handlers.push_back({entry.regime_name, "", {}, false, ""});
+                group = Group::ARRIVAL;
+                break;
             case NML_DeclarationType::StateAssignment:
                 if (group == Group::HANDLER) handlers.back().assignments.push_back(&entry);
+                else if (group == Group::ARRIVAL) arrival_handlers.back().assignments.push_back(&entry);
                 else if (group == Group::ENTRY) entry_assignments[entry.regime_name].push_back(&entry);
                 break;
             case NML_DeclarationType::EventOut:
-                if (group != Group::HANDLER) throw unsupported("EventOut is only supported in an OnCondition");
-                handlers.back().emits_spike = true;
+                if (group == Group::HANDLER) handlers.back().emits_spike = true;
+                else if (group == Group::ARRIVAL) arrival_handlers.back().emits_spike = true;
+                else throw unsupported("EventOut is only supported in an OnCondition or an OnEvent");
                 break;
             case NML_DeclarationType::Transition:
                 if (group != Group::HANDLER) throw unsupported("Transition is only supported in an OnCondition");
@@ -1218,18 +1274,60 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
         return identifier("network_input");
     };
     KernelListNode *body = new_block();
-    place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
 
     // refractory = last_spiked >= 0 && (tick - last_spiked) * dt < duration   (<= for a .gt. exit)
+    KernelNode *refractory_declaration = nullptr;
     if (has_refractory) {
         KernelNode *last_spike = new_expression("[]", identifier("last_spiked"), identifier("neuron_index"));
         KernelNode *has_spiked = new_expression(">=", last_spike, literal("0"));
         KernelNode *elapsed = new_expression(
                 "*", new_cast(new_type("f32"), new_expression("-", identifier("tick"), clone(last_spike))), literal(step_dt));
         KernelNode *within_duration = new_expression(refractory_comparison, elapsed, refractory_duration.release());
-        body->children.push_back(new_declaration(
-                new_type("const bool"), "refractory", new_expression("&&", has_spiked, within_duration)));
+        refractory_declaration = new_declaration(
+                new_type("const bool"), "refractory", new_expression("&&", has_spiked, within_duration));
     }
+
+    // The OnEvents come first, once per arrival, so the derived variables and derivatives below
+    // see what they changed. One inside a regime runs only in it, so the refractory flag moves
+    // up ahead of them.
+    if (!arrival_handlers.empty()) {
+        KernelListNode *per_arrival = new_block();
+        bool tests_regime = false;
+        for (const EventHandler &handler : arrival_handlers) {
+            KernelListNode *handler_body = new_block();
+            for (const NML_DynamicsExpression *assignment : handler.assignments) {
+                lems_names.insert(assignment->target);
+                handler_body->children.push_back(
+                        new_assignment(identifier(assignment->target), "=", translate(assignment->expression)));
+            }
+            if (handler.emits_spike) handler_body->children.push_back(new_assignment(identifier("spiked"), "=", identifier("true")));
+
+            if (has_refractory && !handler.regime_name.empty()) {
+                tests_regime = true;
+                KernelNode *in_regime = handler.regime_name == refractory_regime
+                                                ? identifier("refractory")
+                                                : new_unary_expression("!", identifier("refractory"));
+                KernelListNode *gate = new_conditional();
+                add_branch(gate, in_regime, handler_body);
+                per_arrival->children.push_back(gate);
+            } else {
+                per_arrival->children.push_back(handler_body);
+            }
+        }
+        if (tests_regime) {
+            body->children.push_back(refractory_declaration);
+            refractory_declaration = nullptr;
+        }
+
+        KernelListNode *arrival_loop = new_node<ListNode>(KernelNodeType::FOR, "");
+        arrival_loop->children = {new_declaration(new_type("s32"), "arrival", literal("0")),
+                                  new_expression("<", identifier("arrival"), identifier("event_arrivals")),
+                                  new_assignment(identifier("arrival"), "+=", literal("1")), per_arrival};
+        body->children.push_back(arrival_loop);
+    }
+
+    place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
+    if (refractory_declaration) body->children.push_back(refractory_declaration);
 
     // Every derivative from the pre-step state, then every Euler step.
     KernelListNode *gated = new_block();
@@ -1809,6 +1907,16 @@ String Codegen::function_call_to_string(KernelNode *node) {
                    compile_unparenthesized(arguments[1]) + ", memory_order_relaxed)";
         }
         return "atomicAdd(&(" + compile_unparenthesized(arguments[0]) + "), " + compile_unparenthesized(arguments[1]) + ")";
+    }
+
+    // atomic_increment(target): adds 1 to a u32 slot.
+    if (name == "atomic_increment") {
+        if (arguments.size() != 1) throw runtime_error("atomic_increment takes a target");
+        if (backend == KernelBackend::METAL) {
+            return "atomic_fetch_add_explicit((device atomic_uint *)&(" + compile_unparenthesized(arguments[0]) +
+                   "), 1u, memory_order_relaxed)";
+        }
+        return "atomicAdd(&(" + compile_unparenthesized(arguments[0]) + "), 1u)";
     }
 
     static const UnorderedMap<String, String> function_spellings = {{"heaviside", "spikecorec_heaviside"}};

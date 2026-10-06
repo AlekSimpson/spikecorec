@@ -203,8 +203,9 @@ standard or your own:
 
 - **Cells:** point neurons whose `<Dynamics>` is built from state variables with `OnStart`
   values, derived variables (conditional ones included), time derivatives (forward Euler),
-  `OnCondition` blocks that assign state and emit spikes, and optionally an integrating
-  regime paired with a refractory one. `random()` draws a fresh value for each neuron on
+  `OnCondition` blocks that assign state and emit spikes, `OnEvent` blocks that run once for
+  each spike reaching the cell (counted in `event_arrival_count`), and optionally an
+  integrating regime paired with a refractory one. `random()` draws a fresh value for each neuron on
   every call, seeded by the `<Simulation>`'s `seed`, so spike sources such as
   `spikeGeneratorPoisson` run as populations.
 - **Synapses:** current-based. The equations can use the synapse's own state, its
@@ -215,7 +216,7 @@ standard or your own:
 - **Connectivity:** any, from the document or from Python.
 
 Anything else fails at construction rather than simulating incorrectly: synapses that read
-the target cell, `random()` in a synapse, `OnEvent` in a cell, other regime structures, ion
+the target cell, `random()` in a synapse, other regime structures, ion
 channels, concentrations, multicompartment morphologies and kinetic schemes. So does a
 synapse or input that does not provide what its target cell reads, such as a current
 (`pulseGenerator`) into a cell that reads a dimensionless input (`izhikevichCell`). A

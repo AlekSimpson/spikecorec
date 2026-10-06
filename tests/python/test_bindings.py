@@ -191,6 +191,7 @@ def test_state_and_device_buffers_are_copies(tmp_path):
     assert voltages[0] == pytest.approx(engine.read_state_variable(0, "v"))
     assert engine.cell_state.shape == (engine.context.get_cell_state_size(),)
     assert engine.network_inputs.shape == (2, 1)
+    assert engine.event_arrival_count.shape == (0, 1)   # no cell type has an OnEvent
     assert engine.spike_history.shape == (engine.spike_history_row_count, 1)
     assert "master_step" in engine.master_kernel_source
 
@@ -199,6 +200,48 @@ def test_state_and_device_buffers_are_copies(tmp_path):
     assert counts.shape == (1,)              # copies outlive the engine's buffers
     with pytest.raises(RuntimeError):
         _ = engine.cell_state
+
+
+COUNTING_MODEL = """<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="CellEvents">
+  <ComponentType name="countingCell" extends="baseCellMembPot">
+    <EventPort name="in" direction="in"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="received" dimension="none"/>
+      <OnEvent port="in">
+        <StateAssignment variable="received" value="received + 1"/>
+      </OnEvent>
+    </Dynamics>
+  </ComponentType>
+  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
+  <iafCell id="driven" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+  <countingCell id="counter"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <network id="eventNetwork">
+    <population id="sources" component="driven" size="1"/>
+    <population id="targets" component="counter" size="1"/>
+    <projection id="projection" presynapticPopulation="sources" postsynapticPopulation="targets" synapse="syn">
+      <connectionWD id="0" preCellId="../sources[0]" postCellId="../targets[0]" weight="1" delay="1 ms"/>
+    </projection>
+    <explicitInput target="sources[0]" input="drive"/>
+  </network>
+</neuroml>
+"""
+
+
+def test_a_cells_on_event_runs_once_per_arriving_spike(tmp_path):
+    engine = spc.SpikeEngine(write_lems(tmp_path, COUNTING_MODEL, "eventNetwork", "200ms", "0.1ms"))
+    assert engine.event_arrival_count.dtype == np.uint32
+    assert engine.event_arrival_count.shape == (2, 2)
+
+    engine.run()
+    times, neurons = engine.recorded_spikes
+    # Each source spike reaches the counter 1 ms later and is counted on the tick after.
+    delivered = [time for time, neuron in zip(times, neurons)
+                 if neuron == 0 and round(time / engine.step_dt) + 11 < engine.lifetime]
+    assert len(delivered) >= 3
+    assert engine.read_state_variable(1, "received") == len(delivered)
 
 
 def test_written_spikes_match_the_recorded_ones(tmp_path):
