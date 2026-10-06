@@ -253,4 +253,5 @@ spc.set_log_level("warn")    # trace debug info warn err critical off
 
 ```bash
 make test        # the C++ suite
+make test-python # the Python binding tests, with pytest in .venv
 ```
