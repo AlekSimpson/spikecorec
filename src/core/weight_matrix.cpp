@@ -57,6 +57,15 @@ s64 round_up_to_lane_group(s64 value) {
     return ((max<s64>(value, 1) + group - 1) / group) * group;
 }
 
+// 0 for an empty or all-zero sample.
+template <typename Value>
+f64 root_mean_square(const vector<Value> &values) {
+    if (values.empty()) return 0.0;
+    f64 sum_of_squares = 0.0;
+    for (Value value : values) sum_of_squares += (f64)value * (f64)value;
+    return sqrt(sum_of_squares / (f64)values.size());
+}
+
 f32 field_scale_of(const Vector<f32> &targets) {
     if (targets.empty()) return 1.0f;
     f64 sum_of_squares = 0.0;
@@ -1032,7 +1041,6 @@ bool WeightMatrix::fit_plane(
     f32 ridge_regularization
 ) {
     const s64 lane_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
-    const f64 scale = (f64)field_scale_of(targets);
     auto lane_count = [this]() { return rank_float4_stride * LANE_GROUP; };
 
     // Each edge's ends, and each node's edges out and in.
@@ -1076,10 +1084,8 @@ bool WeightMatrix::fit_plane(
         (read_by_another_plane ? shared_lanes : own_lanes).push_back(lane);
     }
 
-    // What the own lanes must hold, in units of the plane's RMS: the target less what the shared
-    // lanes give. Each edge's error counts against max(|value|, RMS), as the tolerance does.
-    vector<f64> residual((usize)total_edge_count);
-    vector<f64> error_scale((usize)total_edge_count);
+    // What the shared lanes give each edge. They stay fixed, so this is known before any lane moves.
+    vector<f64> shared_value((usize)total_edge_count, 0.0);
     {
         const f32 *u_data = U_matrix.get_contents_as<f32>();
         const f32 *v_data = V_matrix.get_contents_as<f32>();
@@ -1088,15 +1094,32 @@ bool WeightMatrix::fit_plane(
         for_each_index_in_parallel(total_edge_count, [&](s64 ordinal) {
             const s64 source_node = edge_source[(usize)ordinal];
             const s64 target_node = edge_target[(usize)ordinal];
-            f64 shared_value = 0.0;
             for (s64 lane : shared_lanes) {
-                shared_value += (f64)u_data[source_node * lanes + lane] * (f64)coefficient_values[lane] *
-                                (f64)v_data[target_node * lanes + lane];
+                shared_value[(usize)ordinal] += (f64)u_data[source_node * lanes + lane] *
+                                                (f64)coefficient_values[lane] * (f64)v_data[target_node * lanes + lane];
             }
-            const f64 target = (f64)targets[(usize)ordinal];
-            residual[(usize)ordinal] = (target - shared_value) / scale;
-            error_scale[(usize)ordinal] = max(fabs(target) / scale, 1.0);
         });
+    }
+
+    // The scale errors are measured against: the plane's RMS. A plane whose every value is zero has
+    // none, and must read exactly zero, so its own lanes are freed; only what shared lanes give is
+    // left to cancel, measured against that.
+    f64 scale = root_mean_square(targets);
+    if (scale == 0.0) {
+        for (s64 lane : own_lanes) coefficient_row(matrix_index)[lane] = 0.0f;
+        own_lanes.clear();
+        scale = root_mean_square(shared_value);
+        if (scale == 0.0) return true;
+    }
+
+    // What the own lanes must hold, in units of the scale: the target less what the shared lanes
+    // give. Each edge's error counts against max(|value|, RMS), as the tolerance does.
+    vector<f64> residual((usize)total_edge_count);
+    vector<f64> error_scale((usize)total_edge_count);
+    for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+        const f64 target = (f64)targets[(usize)ordinal];
+        residual[(usize)ordinal] = (target - shared_value[(usize)ordinal]) / scale;
+        error_scale[(usize)ordinal] = max(fabs(target) / scale, 1.0);
     }
 
     // Own lanes carry the plane's RMS as their coefficient, so U and V hold values in the units the

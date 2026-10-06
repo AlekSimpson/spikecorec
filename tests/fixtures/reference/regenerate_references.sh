@@ -17,10 +17,13 @@ fi
 work_directory="$(mktemp -d)"
 trap 'rm -rf "${work_directory}"' EXIT
 
-for model in pynn_synapses; do
+# pynn_poisson_network.nml itself is written by make_poisson_network.py.
+for model in pynn_synapses pynn_poisson_network; do
     cp "${model_directory}/${model}.nml" "${model_directory}/LEMS_${model}.xml" "${work_directory}/"
     (cd "${work_directory}" && "${jnml_command}" "LEMS_${model}.xml" -nogui > "${model}_jnml.log")
-    cp "${work_directory}/${model}_v.dat" "${work_directory}/${model}_spikes.dat" "${reference_directory}/"
-    echo "wrote ${reference_directory}/${model}_v.dat and ${model}_spikes.dat"
+    for output in "${work_directory}/${model}"_*.dat; do
+        cp "${output}" "${reference_directory}/"
+        echo "wrote ${reference_directory}/$(basename "${output}")"
+    done
 done
 "${jnml_command}" -v 2>/dev/null | head -1 > "${reference_directory}/jnml_version.txt" || true

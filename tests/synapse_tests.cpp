@@ -1,5 +1,7 @@
 // expCurrSynapse and alphaCurrSynapse: against their closed forms on a pure-integrator target, and
-// against jNeuroML on the PyNN cells they were written for.
+// against jNeuroML on the PyNN cells they were written for. Against jNeuroML, a single postsynaptic
+// potential is compared as a waveform, and network activity statistically; spike times are never
+// compared one for one (regression_tests.cpp holds the engine to its own recorded spikes).
 //
 // The integrator is an iafCell with no leak and an unreachable threshold, so its v rises by
 // i * dt / C every tick and the total change is the charge the synapse delivered, divided by C.
@@ -307,16 +309,54 @@ TEST(Reference, pynn_postsynaptic_potentials_match_jneuroml) {
     }
 }
 
-TEST(Reference, pynn_spike_times_match_jneuroml) {
-    const PynnRun engine = run_engine();
-    const PynnRun reference = read_reference(engine.step);
-    for (s64 neuron : {3, 4}) {
-        const Vector<s64> &expected = reference.spike_ticks[(usize)neuron];
-        const Vector<s64> &measured = engine.spike_ticks[(usize)neuron];
-        ASSERT_FALSE(expected.empty()) << "neuron " << neuron;
-        EXPECT_NEAR((f64)measured.size(), (f64)expected.size(), 1.0) << "neuron " << neuron;
-        for (usize index = 0; index < min(expected.size(), measured.size()); index += 1) {
-            EXPECT_NEAR((f64)measured[index], (f64)expected[index], 2.0) << "neuron " << neuron << " spike " << index;
+// A Poisson-driven network against jNeuroML. The two draw their Poisson trains from different
+// generators, so spikes cannot line up one for one; the activity has to be alike in distribution.
+// Per population, the per-neuron rates and the pooled interspike intervals must not differ
+// significantly (two-sample Kolmogorov-Smirnov, alpha 0.001), and the mean rate and interval CV
+// must be close.
+TEST(Reference, pynn_network_activity_matches_jneuroml_statistically) {
+    SpikeEngine engine(fixture_path("nml/LEMS_pynn_poisson_network.xml"));
+    engine.run();
+    const f64 duration = (f64)engine.lifetime * engine.step_dt;
+
+    Vector<Vector<f64>> engine_times((usize)engine.total_neuron_count);
+    for (const RecordedSpike &spike : engine.recorded_spikes) engine_times[(usize)spike.neuron_index].push_back(spike.time_seconds);
+    Vector<Vector<f64>> reference_times((usize)engine.total_neuron_count);
+    std::ifstream spikes(fixture_path("reference/pynn_poisson_network_spikes.dat"));
+    ASSERT_TRUE(spikes.good()) << "run tests/fixtures/reference/regenerate_references.sh";
+    f64 spike_time = 0.0;
+    s64 neuron = 0;
+    while (spikes >> spike_time >> neuron) reference_times[(usize)neuron].push_back(spike_time);
+
+    struct Population {
+        String name;
+        s64 first;
+        s64 last;
+    };
+    for (const Population &population : {Population{"sources", 0, 100}, Population{"expTargets", 100, 150},
+                                         Population{"alphaTargets", 150, 200}}) {
+        Vector<f64> engine_rates, reference_rates, engine_intervals, reference_intervals;
+        for (s64 index = population.first; index < population.last; index += 1) {
+            engine_rates.push_back((f64)engine_times[(usize)index].size() / duration);
+            reference_rates.push_back((f64)reference_times[(usize)index].size() / duration);
+            const Vector<f64> engine_neuron_intervals = interspike_intervals(engine_times[(usize)index]);
+            const Vector<f64> reference_neuron_intervals = interspike_intervals(reference_times[(usize)index]);
+            engine_intervals.insert(engine_intervals.end(), engine_neuron_intervals.begin(), engine_neuron_intervals.end());
+            reference_intervals.insert(reference_intervals.end(), reference_neuron_intervals.begin(),
+                                       reference_neuron_intervals.end());
         }
+        ASSERT_GT(reference_intervals.size(), 1000u) << population.name;
+        ASSERT_GT(engine_intervals.size(), 1000u) << population.name;
+
+        EXPECT_LT(kolmogorov_smirnov_statistic(engine_rates, reference_rates),
+                  kolmogorov_smirnov_critical_value(engine_rates.size(), reference_rates.size(), 0.001))
+            << population.name << ": per-neuron rates";
+        EXPECT_LT(kolmogorov_smirnov_statistic(engine_intervals, reference_intervals),
+                  kolmogorov_smirnov_critical_value(engine_intervals.size(), reference_intervals.size(), 0.001))
+            << population.name << ": interspike intervals";
+        EXPECT_NEAR(mean_of(engine_rates), mean_of(reference_rates), 0.10 * mean_of(reference_rates)) << population.name;
+        EXPECT_NEAR(coefficient_of_variation(engine_intervals), coefficient_of_variation(reference_intervals),
+                    0.15 * coefficient_of_variation(reference_intervals))
+            << population.name;
     }
 }

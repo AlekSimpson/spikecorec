@@ -610,6 +610,8 @@ s64 NML_Context::resolve_path(
     }
 
     if (population == nullptr || component_index < 0) return -1;
+    // An index past the end of its population names no cell.
+    if (component_index >= get_population_size(population)) return -1;
 
     const String cell_id = population->value_or("component");
     const Vector<String> &variable_names = find_instance(cell_id)->component_type->state_variable_names;

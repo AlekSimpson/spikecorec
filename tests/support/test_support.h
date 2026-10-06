@@ -162,4 +162,29 @@ inline f64 coefficient_of_variation(const Vector<f64> &values) {
     return std::sqrt(sum_of_squares / (f64)(values.size() - 1)) / mean;
 }
 
+// The two-sample Kolmogorov-Smirnov statistic: the largest gap between the two samples' empirical
+// cumulative distributions.
+inline f64 kolmogorov_smirnov_statistic(Vector<f64> first, Vector<f64> second) {
+    std::sort(first.begin(), first.end());
+    std::sort(second.begin(), second.end());
+    usize first_index = 0;
+    usize second_index = 0;
+    f64 largest_gap = 0.0;
+    while (first_index < first.size() && second_index < second.size()) {
+        const f64 value = std::min(first[first_index], second[second_index]);
+        while (first_index < first.size() && first[first_index] <= value) first_index += 1;
+        while (second_index < second.size() && second[second_index] <= value) second_index += 1;
+        largest_gap = std::max(largest_gap, std::fabs((f64)first_index / (f64)first.size() -
+                                                      (f64)second_index / (f64)second.size()));
+    }
+    return largest_gap;
+}
+
+// The statistic above which two samples of these sizes differ at significance level `alpha`:
+// c(alpha) * sqrt((n + m) / (n m)), with c(alpha) = sqrt(-ln(alpha / 2) / 2).
+inline f64 kolmogorov_smirnov_critical_value(usize first_size, usize second_size, f64 alpha) {
+    const f64 coefficient = std::sqrt(-std::log(alpha / 2.0) / 2.0);
+    return coefficient * std::sqrt((f64)(first_size + second_size) / ((f64)first_size * (f64)second_size));
+}
+
 } // namespace spikecorec::test_support
