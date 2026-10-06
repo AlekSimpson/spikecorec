@@ -234,6 +234,25 @@ TEST(K2Tree, from_edges_invalid_branching_factor) {
 }
 
 
+// Fewer than two children per node never subdivides, so building such a tree would never finish.
+TEST(K2Tree, a_branching_factor_below_two_is_rejected) {
+    const auto adjacency = k2_reference_adjacency();
+    vector<s32> source_nodes, target_nodes;
+    for (s32 source = 0; source < 8; source += 1) {
+        for (s32 target : adjacency[(usize)source]) {
+            source_nodes.push_back(source);
+            target_nodes.push_back(target);
+        }
+    }
+    for (s32 branching_factor : {0, 1}) {
+        EXPECT_FALSE(K2Tree::from_adjacency_list(shared_backend(), adjacency, 8, branching_factor).has_value())
+            << "branching factor " << branching_factor;
+        EXPECT_FALSE(K2Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
+                                        (s32)source_nodes.size(), 8, branching_factor).has_value())
+            << "branching factor " << branching_factor;
+    }
+}
+
 TEST(K2Tree, random_graphs_answer_every_query_for_every_branching_factor) {
     // Node counts that are powers of no branching factor, so every tree is padded.
     for (s32 branching_factor : {2, 3, 4, 5}) {

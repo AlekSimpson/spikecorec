@@ -464,8 +464,9 @@ optional<K2Tree> K2Tree::from_adjacency_list(
 ) {
     logger().debug("K2Tree::from_adjacency_list: adjacency_list.size={} node_count={} branching_factor={} "
                    "superblock_size={}", adjacency_list.size(), node_count, branching_factor, superblock_size);
-    if (branching_factor > 5 || branching_factor < 0) {
-        logger().warn("K2Tree::from_adjacency_list: rejecting out-of-range branching_factor={} (must be 0-5)",
+    // A tree needs at least two children per node to subdivide; 0 or 1 would never cover the nodes.
+    if (branching_factor < 2 || branching_factor > 5) {
+        logger().warn("K2Tree::from_adjacency_list: rejecting out-of-range branching_factor={} (must be 2-5)",
                       branching_factor);
         return nullopt;
     }
@@ -495,8 +496,9 @@ optional<K2Tree> K2Tree::from_edges(
 ) {
     logger().debug("K2Tree::from_edges: edge_count={} node_count={} branching_factor={} superblock_size={}",
                    edge_count, node_count, branching_factor, superblock_size);
-    if (branching_factor > 5 || branching_factor < 0) {
-        logger().warn("K2Tree::from_edges: rejecting out-of-range branching_factor={} (must be 0-5)",
+    // A tree needs at least two children per node to subdivide; 0 or 1 would never cover the nodes.
+    if (branching_factor < 2 || branching_factor > 5) {
+        logger().warn("K2Tree::from_edges: rejecting out-of-range branching_factor={} (must be 2-5)",
                       branching_factor);
         return nullopt;
     }

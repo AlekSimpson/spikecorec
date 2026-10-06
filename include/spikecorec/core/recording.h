@@ -50,7 +50,7 @@ namespace spikecorec {
         String quantity_path;   // verbatim LEMS path, e.g. "pop1[0]/v"
         String variable_name;   // trailing variable, e.g. "v"; "" for an event selection
         String event_port;      // EventSelection's port, e.g. "spike"; "" for a column
-        s64 neuron_index = -1;  // global neuron index, -1 when the path names no cell
+        s64 neuron_index = -1;
     };
 
     struct RecordingConfig {
