@@ -123,8 +123,15 @@ make test-python   # the Python binding tests in tests/python, with pytest in .v
 ```
 
 `make test TEST_ARGUMENTS=--gtest_filter='WeightMatrix.*'` passes arguments through to the runner.
-Fixtures live in `tests/fixtures`; the jNeuroML reference outputs in `tests/fixtures/reference`
-are regenerated with `tests/fixtures/reference/regenerate_references.sh`.
+Fixtures live in `tests/fixtures`:
+
+- `reference/` holds jNeuroML's outputs, regenerated with `tests/fixtures/reference/regenerate_references.sh`.
+  The engine is compared with them statistically (rate and interval distributions) and by waveform,
+  never spike for spike.
+- `golden/` holds spikes recorded from the engine itself. The regression tests hold every run to
+  them exactly, to catch any change in what the engine computes. After an intended change,
+  re-record them and review the diff:
+  `SPIKECOREC_UPDATE_GOLDEN=1 make test TEST_ARGUMENTS="--gtest_filter=*Regression*"`.
 
 To run a subset after the initial build, invoke the runner directly with `--gtest_filter`:
 

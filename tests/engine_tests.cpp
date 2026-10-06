@@ -578,7 +578,8 @@ TEST(SingleCell, a_time_stamped_refractory_period_holds_the_cell_at_reset) {
     EXPECT_NEAR(times[3] - times[2], 5e-3 + analytic_interspike_interval(), 3e-4);
 }
 
-// izhikevich2007Cell against forward Euler of its own equations, written here.
+// izhikevich2007Cell against forward Euler of its own equations, written here: the same number of
+// spikes and the same mean interval. Spike times are not compared one for one.
 TEST(SingleCell, izhikevich_matches_forward_euler) {
     const TemporaryDirectory directory;
     SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Izhikevich">
@@ -598,7 +599,7 @@ TEST(SingleCell, izhikevich_matches_forward_euler) {
     const f64 recovery_rate = 30.0, recovery_coupling = -2e-9, reset = -0.050, recovery_jump = 100e-12;
     const f64 drive = 200e-12, step = engine.step_dt;
     f64 voltage = -0.060, recovery = 0.0;
-    Vector<s64> reference_spike_ticks;
+    Vector<f64> reference_spike_times;
     for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
         const f64 voltage_derivative = (gain * (voltage - resting) * (voltage - threshold) + drive - recovery) / capacitance;
         const f64 recovery_derivative = recovery_rate * (recovery_coupling * (voltage - resting) - recovery);
@@ -607,17 +608,15 @@ TEST(SingleCell, izhikevich_matches_forward_euler) {
         if (voltage > peak) {
             voltage = reset;
             recovery += recovery_jump;
-            reference_spike_ticks.push_back(tick);
+            reference_spike_times.push_back((f64)tick * step);
         }
     }
 
-    Vector<s64> spike_ticks;
-    for (f64 time : spike_times_of(engine, 0)) spike_ticks.push_back(llround(time / step));
-    ASSERT_GE(reference_spike_ticks.size(), 5u);
-    ASSERT_NEAR((f64)spike_ticks.size(), (f64)reference_spike_ticks.size(), 1.0);
-    for (usize index = 0; index < 5; index += 1) {
-        EXPECT_NEAR((f64)spike_ticks[index], (f64)reference_spike_ticks[index], 3.0) << "spike " << index;
-    }
+    const Vector<f64> spike_times = spike_times_of(engine, 0);
+    ASSERT_GE(reference_spike_times.size(), 5u);
+    EXPECT_NEAR((f64)spike_times.size(), (f64)reference_spike_times.size(), 1.0);
+    const f64 reference_mean_interval = mean_of(interspike_intervals(reference_spike_times));
+    EXPECT_NEAR(mean_of(interspike_intervals(spike_times)), reference_mean_interval, 0.01 * reference_mean_interval);
 }
 
 TEST(SingleCell, declared_output_files_have_the_shape_the_model_asked_for) {

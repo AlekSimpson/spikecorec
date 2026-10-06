@@ -68,6 +68,9 @@ updates is left exactly as it is. S is then emptied.
      target.
    - A lane no plane reads is free to take.
    - So refitting one plane can never change another plane's values.
+   - A plane whose every value is exactly zero (all its synapses at rest) frees its own lanes and
+     reads exactly zero. Its RMS is zero, so there is no scale to hold leftover lanes to; before
+     this rule, a refit at rest kept a stale synapse current.
 2. **Fewer lanes first, for memory.**
    - It warm-starts at the plane's current lanes, then doubles.
    - The sweeps are alternating least squares on only the rows of nodes at either end of a
@@ -249,6 +252,5 @@ proportional to the number of updates. Not measured.
   call costs time proportional to S. The device path through the queue does not.
 - **Parsing large networks is slow.** A 25 MB NeuroML file with 204,800 `connectionWD` elements
   took 19 s on one core.
-- **Tests.** `tests/weight_matrix_tests.cpp` does not compile and uses removed APIs
-  (`fit_rank_budget`, the old rank search). No test covers `fit_plane`, the per-plane lanes, or
-  the exact solve.
+- **Tests.** `tests/weight_matrix_tests.cpp` covers `fit_plane`, the per-plane lanes, the exact solve,
+  the lane-limit warning and S's sizing, and runs in `make test`.
