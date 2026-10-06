@@ -1,4 +1,5 @@
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "spikecorec/core/units.h"
@@ -9,7 +10,13 @@ using namespace spikecorec;
 namespace spikecorec::units {
 
 s64 ms_to_ticks(f64 total_ms, f64 ms_step) {
-    return static_cast<s64>(std::round(total_ms / ms_step));
+    // A zero, negative or non-finite step divides into infinity or NaN, and so can a non-finite
+    // total; converting either to an integer is undefined behaviour, as is a count past s64.
+    if (!isfinite(ms_step) || ms_step <= 0.0) throw invalid_argument("ms_step must be > 0 and finite");
+    if (!isfinite(total_ms) || total_ms < 0.0) throw invalid_argument("total_ms must be >= 0 and finite");
+    const f64 ticks = std::round(total_ms / ms_step);
+    if (ticks >= (f64)numeric_limits<s64>::max()) throw invalid_argument("total_ms / ms_step does not fit in s64");
+    return static_cast<s64>(ticks);
 }
 
 s64 seconds_to_ticks(f64 total_seconds, f64 seconds_step) {

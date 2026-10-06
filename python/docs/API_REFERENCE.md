@@ -514,7 +514,7 @@ for population in nml.network_populations(engine.context):
 | `parse_quantity(value)` | `"-60mV"` → `-0.06`, built-in units only |
 | `split_quantity(value)` | `"-60mV"` → `(-60.0, "mV")` |
 | `unit_suffix_scale(suffix)` | `"mV"` → `1e-3`; unknown suffixes scale by 1 |
-| `seconds_to_ticks(seconds, step_dt)`, `ms_to_ticks(total_ms, ms_step)` | |
+| `seconds_to_ticks(seconds, step_dt)`, `ms_to_ticks(total_ms, ms_step)` | rounded to the nearest tick. Raises `ValueError` when the step is not positive and finite, the duration is negative or not finite, or the tick count does not fit in a 64-bit integer |
 | `ms_to_seconds(ms)`, `seconds_to_ms(seconds)` | |
 | `tick_to_seconds(tick, total_seconds, total_ticks)`, `tick_to_ms(tick, total_ms, total_ticks)` | |
 
