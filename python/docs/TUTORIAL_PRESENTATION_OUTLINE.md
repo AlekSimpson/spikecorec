@@ -111,6 +111,7 @@ Each slide only uses ideas introduced on earlier ones.
   - derived variables, including conditional ones
   - time derivatives, integrated with forward Euler every tick
   - threshold conditions (`OnCondition`) that assign state and emit spikes
+  - spike handlers (`OnEvent`) that run once for each spike reaching the cell
   - optionally a refractory period: an integrating regime and a refractory regime that
     transitions back to it
   - `random()`, a fresh draw for each neuron on every call, seeded by the simulation's seed
@@ -145,8 +146,7 @@ Each slide only uses ideas introduced on earlier ones.
 - Synapses whose current depends on the target cell, such as conductance-based synapses,
   which read its voltage
 - `random()` inside a synapse
-- Spike events delivered into a cell's own dynamics (`OnEvent` in a cell), and regime
-  structures other than the integrating/refractory pair
+- Regime structures other than the integrating/refractory pair
 - Ion channels, concentrations, multicompartment morphologies and kinetic schemes
 - A synapse or input that does not provide what its target cell reads, for example a current
   into a cell whose input is dimensionless

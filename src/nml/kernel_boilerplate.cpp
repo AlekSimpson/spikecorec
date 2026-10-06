@@ -171,6 +171,7 @@ kernel void master_step(
     const device long     *projection_first_edge_ordinal [[ buffer(32) ]],
     const device int      *projection_synapse_prototype  [[ buffer(33) ]],
     const device float    *random_values                 [[ buffer(34) ]],
+    device   uint         *event_arrival_count           [[ buffer(35) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
     const long neuron_index = (long)thread_id;
@@ -490,7 +491,8 @@ extern "C" __global__ void master_step(
     int *pending_delta_count,
     const long long *projection_first_edge_ordinal,
     const int *projection_synapse_prototype,
-    const float *random_values
+    const float *random_values,
+    unsigned int *event_arrival_count
 ) {
     const long long neuron_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (neuron_index >= neuron_count) {

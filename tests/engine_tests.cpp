@@ -889,6 +889,199 @@ TEST(Connections, weights_delays_and_synapse_state_live_in_the_weight_matrix) {
     EXPECT_FLOAT_EQ(weights.get_for_matrix(0, 1, kick_plane), 0.0f);
 }
 
+// ── spikes into a cell's own OnEvent ────────────────────────────────────────────
+
+namespace {
+
+// A presynaptic spike counts as an arrival on the tick its delay ends, and the target runs its
+// OnEvent on the next tick, when it reads that tick's arrival count.
+constexpr s64 EVENT_ARRIVAL_LATENCY_TICKS = 1;
+
+// Driven iafCells (source_count of them, all firing together) connected with a 1 ms delay to one
+// cell per target component. The target types are declared in cell_types.
+String event_cell_model(const String &cell_types, const String &target_components, s64 source_count,
+                        const Vector<String> &target_component_ids) {
+    std::ostringstream document;
+    document << R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="CellEvents">
+)" << cell_types << R"(  <alphaCurrentSynapse id="syn" tau="5 ms" ibase="12 pA"/>
+  <iafCell id="driven" leakConductance="5 nS" leakReversal="-65 mV" thresh="-50 mV" reset="-70 mV" C="100 pF"/>
+)" << target_components << R"(  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="90 pA"/>
+  <network id="eventNetwork">
+    <population id="sources" component="driven" size=")" << source_count << "\"/>\n";
+    for (usize target = 0; target < target_component_ids.size(); target += 1) {
+        document << "    <population id=\"targets" << target << "\" component=\"" << target_component_ids[target]
+                 << "\" size=\"1\"/>\n";
+    }
+    for (usize target = 0; target < target_component_ids.size(); target += 1) {
+        document << "    <projection id=\"projection" << target << "\" presynapticPopulation=\"sources\" "
+                 << "postsynapticPopulation=\"targets" << target << "\" synapse=\"syn\">\n";
+        for (s64 source = 0; source < source_count; source += 1) {
+            document << "      <connectionWD id=\"" << source << "\" preCellId=\"../sources[" << source
+                     << "]\" postCellId=\"../targets" << target << "[0]\" weight=\"1\" delay=\"1 ms\"/>\n";
+        }
+        document << "    </projection>\n";
+    }
+    for (s64 source = 0; source < source_count; source += 1) {
+        document << "    <explicitInput target=\"sources[" << source << "]\" input=\"drive\"/>\n";
+    }
+    document << "  </network>\n</neuroml>\n";
+    return document.str();
+}
+
+// A cell that only counts the spikes reaching it, and optionally relays each one as its own spike.
+String counting_cell_type(bool relays_spikes) {
+    return String(R"(  <ComponentType name="countingCell" extends="baseCellMembPot">
+    <EventPort name="in" direction="in"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="received" dimension="none"/>
+      <OnEvent port="in">
+        <StateAssignment variable="received" value="received + 1"/>
+)") + (relays_spikes ? "        <EventOut port=\"spike\"/>\n" : "") + R"(      </OnEvent>
+    </Dynamics>
+  </ComponentType>
+)";
+}
+
+constexpr s64 DELAY_TICKS = 10;
+
+// Each source spike's tick.
+Vector<s64> spike_ticks_of(const SpikeEngine &engine, s64 neuron_index) {
+    Vector<s64> ticks;
+    for (f64 time : spike_times_of(engine, neuron_index)) ticks.push_back(llround(time / engine.step_dt));
+    return ticks;
+}
+
+} // namespace
+
+TEST(CellEvents, each_arrival_runs_the_on_event_once_on_the_tick_after_its_delay) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory,
+                                   event_cell_model(counting_cell_type(false), "  <countingCell id=\"counter\"/>\n", 1, {"counter"}),
+                                   "eventNetwork", "200ms", "0.1ms"));
+    const s64 counter = 1;
+
+    Vector<s64> count_change_ticks;
+    f32 previous_count = 0.0f;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        const f32 count = engine.read_state_variable(counter, "received");
+        if (count != previous_count) {
+            EXPECT_EQ(count - previous_count, 1.0f) << "tick " << tick;
+            count_change_ticks.push_back(tick);
+        }
+        previous_count = count;
+    }
+
+    Vector<s64> expected_ticks;
+    for (s64 spike_tick : spike_ticks_of(engine, 0)) {
+        const s64 arrival_tick = spike_tick + DELAY_TICKS + EVENT_ARRIVAL_LATENCY_TICKS;
+        if (arrival_tick < engine.lifetime) expected_ticks.push_back(arrival_tick);
+    }
+    ASSERT_GE(expected_ticks.size(), 3u) << "the drive should fire the source several times";
+    EXPECT_EQ(count_change_ticks, expected_ticks);
+    EXPECT_FLOAT_EQ(engine.read_state_variable(counter, "v"), 0.0f);
+}
+
+// Two sources fire on the same tick, so two spikes reach the target together.
+TEST(CellEvents, arrivals_on_the_same_tick_each_run_the_on_event) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory,
+                                   event_cell_model(counting_cell_type(false), "  <countingCell id=\"counter\"/>\n", 2, {"counter"}),
+                                   "eventNetwork", "200ms", "0.1ms"));
+    const s64 counter = 2;
+
+    f32 previous_count = 0.0f;
+    s64 change_count = 0;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        const f32 count = engine.read_state_variable(counter, "received");
+        if (count != previous_count) {
+            EXPECT_EQ(count - previous_count, 2.0f) << "tick " << tick;
+            change_count += 1;
+        }
+        previous_count = count;
+    }
+    ASSERT_EQ(spike_ticks_of(engine, 0), spike_ticks_of(engine, 1)) << "the two sources should fire together";
+    EXPECT_GE(change_count, 3);
+}
+
+TEST(CellEvents, an_event_out_in_an_on_event_relays_each_arrival_as_a_spike) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory,
+                                   event_cell_model(counting_cell_type(true), "  <countingCell id=\"relay\"/>\n", 1, {"relay"}),
+                                   "eventNetwork", "200ms", "0.1ms"));
+    engine.run();
+
+    Vector<s64> expected_ticks;
+    for (s64 spike_tick : spike_ticks_of(engine, 0)) {
+        const s64 arrival_tick = spike_tick + DELAY_TICKS + EVENT_ARRIVAL_LATENCY_TICKS;
+        if (arrival_tick < engine.lifetime) expected_ticks.push_back(arrival_tick);
+    }
+    ASSERT_GE(expected_ticks.size(), 3u);
+    EXPECT_EQ(spike_ticks_of(engine, 1), expected_ticks);
+}
+
+// An OnEvent inside the integrating regime does not run while the cell is refractory. "held"
+// fires on tick 0 and stays refractory for the whole run; "free" never fires.
+TEST(CellEvents, an_on_event_inside_a_regime_runs_only_in_that_regime) {
+    const TemporaryDirectory directory;
+    const String gated_type = R"(  <ComponentType name="gatedCountingCell" extends="baseCellMembPot">
+    <Parameter name="initialPhase" dimension="none"/>
+    <Parameter name="refract" dimension="time"/>
+    <EventPort name="in" direction="in"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="phase" dimension="none"/>
+      <StateVariable name="received" dimension="none"/>
+      <StateVariable name="lastSpikeTime" dimension="time"/>
+      <OnStart>
+        <StateAssignment variable="phase" value="initialPhase"/>
+      </OnStart>
+      <Regime name="integrating" initial="true">
+        <OnCondition test="phase .gt. 1">
+          <StateAssignment variable="phase" value="0"/>
+          <EventOut port="spike"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+        <OnEvent port="in">
+          <StateAssignment variable="received" value="received + 1"/>
+        </OnEvent>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="lastSpikeTime" value="t"/>
+        </OnEntry>
+        <OnCondition test="t .gt. lastSpikeTime + refract">
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+)";
+    SpikeEngine engine(write_model(directory,
+                                   event_cell_model(gated_type,
+                                                    "  <gatedCountingCell id=\"held\" initialPhase=\"2\" refract=\"1000 ms\"/>\n"
+                                                    "  <gatedCountingCell id=\"free\" initialPhase=\"0\" refract=\"1000 ms\"/>\n",
+                                                    1, {"held", "free"}),
+                                   "eventNetwork", "200ms", "0.1ms"));
+    engine.run();
+    const s64 held_cell = 1;
+    const s64 free_cell = 2;
+
+    s64 arrivals = 0;
+    for (s64 spike_tick : spike_ticks_of(engine, 0)) {
+        if (spike_tick + DELAY_TICKS + EVENT_ARRIVAL_LATENCY_TICKS < engine.lifetime) arrivals += 1;
+    }
+    ASSERT_GE(arrivals, 3);
+    EXPECT_EQ(spike_ticks_of(engine, held_cell), Vector<s64>{0});
+    EXPECT_TRUE(spike_ticks_of(engine, free_cell).empty());
+    EXPECT_FLOAT_EQ(engine.read_state_variable(held_cell, "received"), 0.0f);
+    EXPECT_FLOAT_EQ(engine.read_state_variable(free_cell, "received"), (f32)arrivals);
+}
+
 // ── more than one cell type ─────────────────────────────────────────────────────
 
 namespace {

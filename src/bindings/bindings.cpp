@@ -930,6 +930,14 @@ PYBIND11_MODULE(_spikecorec, m) {
             require_alive(self, "network_inputs");
             return device_buffer_to_numpy_rows<f32>(self.network_inputs, 2, self.total_neuron_count);
         }, "[2][total_neuron_count], alternating by tick parity.")
+        .def_property_readonly("event_arrival_count", [](const SpikeEngine &self) {
+            require_alive(self, "event_arrival_count");
+            // Two rows only when some cell type has an OnEvent; otherwise the buffer is a placeholder.
+            const u64 two_rows_bytes = sizeof(u32) * 2 * (u64)self.total_neuron_count;
+            const s64 row_count = self.event_arrival_count.total_bytes >= two_rows_bytes ? 2 : 0;
+            return device_buffer_to_numpy_rows<u32>(self.event_arrival_count, row_count, self.total_neuron_count);
+        }, "[2][total_neuron_count] spikes that reached each cell, alternating by tick parity; "
+           "[0][total_neuron_count] when no cell type has an OnEvent.")
         .def_property_readonly("spike_history", [](const SpikeEngine &self) {
             require_alive(self, "spike_history");
             return device_buffer_to_numpy_rows<u8>(self.spike_history, self.spike_history_row_count,

@@ -192,6 +192,7 @@ Copies of the engine's GPU buffers. Each raises `RuntimeError` after `shutdown()
 |---|---|---|
 | `cell_state` | float32[`context.get_cell_state_size()`] | every cell's state variables; `context.resolve_path("pop[0]/v")` gives an index |
 | `network_inputs` | float32[2][neurons] | synaptic input accumulators, alternating by tick parity |
+| `event_arrival_count` | uint32[2][neurons] | spikes that reached each cell, alternating by tick parity; read by cells with an `OnEvent`. Shape [0][neurons] when no cell type has one |
 | `spike_history` | uint8[`spike_history_row_count`][neurons] | row `tick % rows` holds that tick's spikes |
 | `last_spiked` | int64[neurons] | each neuron's last spike tick, or `NEVER_SPIKED_TICK` |
 | `random_values` | float32[`random_values_count`] | the last tick's uniform draws, refilled before every dispatch |

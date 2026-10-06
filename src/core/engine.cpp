@@ -94,7 +94,8 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     spike_history = compiler.data_partitions[2];
     last_spiked = compiler.data_partitions[3];
     empty_edge_plane = compiler.data_partitions[4];
-    model_pointer = compiler.data_partitions[5];
+    event_arrival_count = compiler.data_partitions[5];
+    model_pointer = compiler.data_partitions[6];
 
     initialize_model_buffers();
     compiler.initialize_cell_state(random_generator);
@@ -173,6 +174,7 @@ void SpikeEngine::initialize_model_buffers() {
     std::memset(network_inputs.get_contents(), 0, network_inputs.total_bytes);
     std::memset(spike_history.get_contents(), 0, spike_history.total_bytes);
     std::memset(empty_edge_plane.get_contents(), 0, empty_edge_plane.total_bytes);
+    std::memset(event_arrival_count.get_contents(), 0, event_arrival_count.total_bytes);
     std::fill_n(last_spiked.get_contents_as<s64>(), total_neuron_count, NEVER_SPIKED_TICK);
 }
 
@@ -321,6 +323,7 @@ void SpikeEngine::register_kernel_arguments() {
         {"projection_first_edge_ordinal", [this] { return resolve_edge_plane(projection_first_edge_ordinal); }},
         {"projection_synapse_prototype",  [this] { return resolve_edge_plane(projection_synapse_prototype); }},
         {"random_values",             [this] { return random_values; }},
+        {"event_arrival_count",       [this] { return event_arrival_count; }},
     };
 
     for (const String &name : kernel_parameter_names) {

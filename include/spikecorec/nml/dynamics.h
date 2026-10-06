@@ -339,13 +339,17 @@ struct Codegen {
     Codegen(const Codegen &other) = delete;
     Codegen &operator=(const Codegen &other) = delete;
 
+    // True when some population's cell type has an OnEvent, so the model needs the
+    // event_arrival_count buffer and the kernel counts arrivals into it.
+    bool cells_receive_events() const;
     void allocate_cell_model_memory();
     // Writes every cell's starting state (OnStart values, otherwise 0) into cell_state. An
     // OnStart that calls random() draws for each neuron from random_generator.
     void initialize_cell_state(RandomGenerator &random_generator);
 
     // Refuses a synapse or input that does not provide the input its target cell reads: an
-    // exposure the cell's select names, in the same dimension. Called before anything is built.
+    // exposure the cell's select names, in the same dimension. A synapse's spikes also count as
+    // input to a cell with an OnEvent. Called before anything is built.
     void check_cell_inputs() const;
 
     KernelNode *create_kernel_root();
