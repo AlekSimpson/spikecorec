@@ -131,8 +131,6 @@ namespace spikecorec {
 
         static constexpr s64 DEFAULT_PLASTICITY_DELTA_CAPACITY = 1 << 16;
 
-        s64 weight_fit_rank_budget = -1;
-
         // Presets for fit_tolerance: the worst relative error the weight matrix may leave on any
         // per-edge value of a synapse, against the larger of the value and its plane's RMS.
         // Tighter costs rank (memory) and fitting time. A delay stays on its exact tick while

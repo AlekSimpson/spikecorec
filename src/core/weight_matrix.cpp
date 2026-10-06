@@ -3,12 +3,15 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "spikecorec/core/weight_matrix.h"
@@ -22,6 +25,32 @@ namespace {
 
 // Bumped when the deltas joined the file: an older file holds no S and cannot be read as one.
 constexpr u32 WEIGHT_MATRIX_SAVE_MAGIC = 0x574D5459;
+
+// Runs body(index) for every index in [0, count) across the machine's cores. Each body must write
+// only what belongs to its own index.
+template <typename Body>
+void for_each_index_in_parallel(s64 count, const Body &body) {
+    constexpr s64 INDICES_PER_CLAIM = 8;
+    const s64 worker_count = min<s64>(max<s64>((s64)thread::hardware_concurrency(), 1),
+                                      (count + INDICES_PER_CLAIM - 1) / INDICES_PER_CLAIM);
+    if (worker_count <= 1) {
+        for (s64 index = 0; index < count; index += 1) body(index);
+        return;
+    }
+
+    atomic<s64> next_index{0};
+    auto work = [&]() {
+        for (s64 first = next_index.fetch_add(INDICES_PER_CLAIM); first < count;
+             first = next_index.fetch_add(INDICES_PER_CLAIM)) {
+            const s64 last = min(first + INDICES_PER_CLAIM, count);
+            for (s64 index = first; index < last; index += 1) body(index);
+        }
+    };
+    vector<thread> workers;
+    for (s64 worker = 1; worker < worker_count; worker += 1) workers.emplace_back(work);
+    work();
+    for (thread &worker : workers) worker.join();
+}
 
 s64 round_up_to_lane_group(s64 value) {
     const s64 group = WeightMatrix::LANE_GROUP;
@@ -100,7 +129,6 @@ WeightMatrix::WeightMatrix(
     bool check_indexing,
     s64 max_neighbor_count,
     s64 weight_seed,
-    s64 fit_rank_budget,
     s64 matrix_count,
     s64 updated_plane_count
 )
@@ -108,7 +136,6 @@ WeightMatrix::WeightMatrix(
     , matrix_count(matrix_count)
     , updated_plane_count(updated_plane_count)
     , sparse_delta_capacity(0)
-    , fit_rank_budget(fit_rank_budget)
     , owning_backend(&backend)
     , node_count((s64)network.size())
     , check_indexing(check_indexing)
@@ -291,7 +318,6 @@ WeightMatrix::WeightMatrix(WeightMatrix &&other) noexcept
     , sparse_delta_capacity(other.sparse_delta_capacity)
     , sparse_delta_entry_count(std::move(other.sparse_delta_entry_count))
     , plasticity_reserve_entries(other.plasticity_reserve_entries)
-    , fit_rank_budget(other.fit_rank_budget)
     , fit_tolerance(other.fit_tolerance)
     , projection_first_edge_ordinal(std::move(other.projection_first_edge_ordinal))
     , projection_edge_count(std::move(other.projection_edge_count))
@@ -339,7 +365,6 @@ WeightMatrix &WeightMatrix::operator=(WeightMatrix &&other) noexcept {
     sparse_delta_entry_count = std::move(other.sparse_delta_entry_count);
     sparse_delta_capacity = other.sparse_delta_capacity;
     plasticity_reserve_entries = other.plasticity_reserve_entries;
-    fit_rank_budget = other.fit_rank_budget;
     fit_tolerance = other.fit_tolerance;
     projection_first_edge_ordinal = std::move(other.projection_first_edge_ordinal);
     projection_edge_count = std::move(other.projection_edge_count);
@@ -762,11 +787,13 @@ void WeightMatrix::declare_projections(
     const Vector<Vector<f32>> targets = targets_from_projections(initial_values);
 
     if (!fit_basis_from_projections(initial_values)) {
-        if (fit_rank_budget > 0) {
-            resize_basis(min<s64>(fit_rank_budget, MAX_RANK_FLOAT4_STRIDE * LANE_GROUP));
-            fit_basis_to_targets(targets, DEFAULT_FIT_RIDGE);
-        } else {
-            search_for_rank_meeting_tolerance(targets);
+        // Every lane free, then every plane fitted on lanes of its own, every edge new.
+        memset(coefficients.get_contents(), 0,
+               (usize)matrix_count * (usize)(rank_float4_stride * LANE_GROUP) * sizeof(f32));
+        Vector<s64> every_edge((usize)total_edge_count);
+        iota(every_edge.begin(), every_edge.end(), (s64)0);
+        for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
+            fit_plane(matrix_index, targets[(usize)matrix_index], every_edge, DEFAULT_FIT_RIDGE);
         }
     }
     measure_fit_error(targets);
@@ -905,265 +932,6 @@ Vector<Vector<f32>> WeightMatrix::targets_from_basis_and_deltas(
     return targets;
 }
 
-bool WeightMatrix::fit_basis_to_targets(
-    const Vector<Vector<f32>> &targets_per_matrix, f32 ridge_regularization
-) {
-    if (total_edge_count == 0 || node_count == 0) return true;
-
-    const s64 lane_count = rank_float4_stride * LANE_GROUP;
-    f32 *u_data = U_matrix.get_contents_as<f32>();
-    f32 *v_data = V_matrix.get_contents_as<f32>();
-
-    vector<s32> edge_source((usize)total_edge_count);
-    vector<s32> edge_target((usize)total_edge_count);
-    {
-        vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
-        for (s64 source_node = 0; source_node < node_count; source_node += 1) {
-            const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
-                                                    max_neighbor_count);
-            for (s64 slot = 0; slot < degree; slot += 1) {
-                const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
-                edge_source[(usize)ordinal] = (s32)source_node;
-                edge_target[(usize)ordinal] = neighbor_buffer[(usize)slot];
-            }
-        }
-    }
-
-    vector<vector<s64>> incoming_edges((usize)node_count);
-    for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
-        incoming_edges[(usize)edge_target[(usize)ordinal]].push_back(ordinal);
-    }
-
-    // Each plane is fitted in units of its own RMS, so every plane counts the same.
-    Vector<f64> matrix_scale((usize)matrix_count, 1.0);
-    for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-        f64 sum_of_squares = 0.0;
-        for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
-            const f64 value = (f64)targets_per_matrix[(usize)matrix_index][(usize)ordinal];
-            sum_of_squares += value * value;
-        }
-        const f64 root_mean_square = sqrt(sum_of_squares / (f64)total_edge_count);
-        matrix_scale[(usize)matrix_index] = (root_mean_square > 0.0) ? root_mean_square : 1.0;
-    }
-
-    Vector<Vector<f64>> normalised_targets((usize)matrix_count, Vector<f64>((usize)total_edge_count));
-    for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-        const f64 scale = matrix_scale[(usize)matrix_index];
-        for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
-            normalised_targets[(usize)matrix_index][(usize)ordinal] =
-                    (f64)targets_per_matrix[(usize)matrix_index][(usize)ordinal] / scale;
-        }
-    }
-
-    // A lane whose U or V column is all zero can never move under alternating least squares:
-    // every step it takes part in multiplies it by zero. The projection fit leaves its spare lanes
-    // like that, so they get random columns here. Each sweep fits the coefficients first, so what
-    // a lane held before the fit does not matter.
-    {
-        mt19937 random_engine(basis_seed + 1);
-        normal_distribution<f32> normal_distribution_unit(0.0f, 1.0f);
-        for (s64 lane = 0; lane < lane_count; lane += 1) {
-            bool u_column_is_zero = true;
-            bool v_column_is_zero = true;
-            for (s64 node_index = 0; node_index < node_count; node_index += 1) {
-                u_column_is_zero = u_column_is_zero && u_data[node_index * lane_count + lane] == 0.0f;
-                v_column_is_zero = v_column_is_zero && v_data[node_index * lane_count + lane] == 0.0f;
-            }
-            if (!u_column_is_zero && !v_column_is_zero) continue;
-            for (s64 node_index = 0; node_index < node_count; node_index += 1) {
-                u_data[node_index * lane_count + lane] = normal_distribution_unit(random_engine);
-                v_data[node_index * lane_count + lane] = normal_distribution_unit(random_engine);
-            }
-        }
-    }
-
-    // Least squares for one row of lane values, from the edges that use it.
-    vector<f64> gram((usize)(lane_count * lane_count));
-    vector<f64> right_hand_side((usize)lane_count);
-    vector<f64> basis_row((usize)lane_count);
-    auto clear_system = [&]() {
-        fill(gram.begin(), gram.end(), 0.0);
-        fill(right_hand_side.begin(), right_hand_side.end(), 0.0);
-    };
-    auto add_to_system = [&](f64 target) {
-        for (s64 row = 0; row < lane_count; row += 1) {
-            right_hand_side[(usize)row] += basis_row[(usize)row] * target;
-            for (s64 column = 0; column <= row; column += 1) {
-                gram[(usize)(row * lane_count + column)] += basis_row[(usize)row] * basis_row[(usize)column];
-            }
-        }
-    };
-    auto solve_system = [&]() {
-        for (s64 row = 0; row < lane_count; row += 1) {
-            for (s64 column = row + 1; column < lane_count; column += 1) {
-                gram[(usize)(row * lane_count + column)] = gram[(usize)(column * lane_count + row)];
-            }
-        }
-        return solve_symmetric_in_place(gram, right_hand_side, lane_count, (f64)ridge_regularization);
-    };
-
-    // Every plane's coefficients, against the current U and V.
-    auto fit_coefficients = [&]() {
-        for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-            clear_system();
-            for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
-                const s64 source_node = edge_source[(usize)ordinal];
-                const s64 target_node = edge_target[(usize)ordinal];
-                for (s64 lane = 0; lane < lane_count; lane += 1) {
-                    basis_row[(usize)lane] = (f64)u_data[source_node * lane_count + lane] *
-                                             (f64)v_data[target_node * lane_count + lane];
-                }
-                add_to_system(normalised_targets[(usize)matrix_index][(usize)ordinal]);
-            }
-            if (solve_system()) {
-                f32 *coefficient_values = coefficient_row(matrix_index);
-                for (s64 lane = 0; lane < lane_count; lane += 1) {
-                    coefficient_values[lane] = (f32)right_hand_side[(usize)lane];
-                }
-            }
-        }
-    };
-
-    // Every plane's worst relative error: against max(|value|, the plane's RMS), which in
-    // normalised units is max(|value|, 1).
-    auto worst_relative_error = [&]() {
-        f64 worst = 0.0;
-        for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-            const f32 *coefficient_values = coefficient_row(matrix_index);
-            for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
-                const s64 source_node = edge_source[(usize)ordinal];
-                const s64 target_node = edge_target[(usize)ordinal];
-                f64 reconstructed = 0.0;
-                for (s64 lane = 0; lane < lane_count; lane += 1) {
-                    reconstructed += (f64)u_data[source_node * lane_count + lane] * (f64)coefficient_values[lane] *
-                                     (f64)v_data[target_node * lane_count + lane];
-                }
-                const f64 error = reconstructed - normalised_targets[(usize)matrix_index][(usize)ordinal];
-                worst = max(worst, fabs(error) / max(fabs(normalised_targets[(usize)matrix_index][(usize)ordinal]), 1.0));
-            }
-        }
-        return worst;
-    };
-
-    fit_coefficients();
-    f64 current_error = worst_relative_error();
-    // The best worst-case error so far after each sweep, for the stall test.
-    vector<f64> best_worst_error = {current_error};
-    s32 sweep_count = 0;
-    while (current_error > (f64)fit_tolerance && sweep_count < MAXIMUM_FIT_SWEEP_COUNT) {
-        for (s64 source_node = 0; source_node < node_count; source_node += 1) {
-            const s64 first = edge_row_offset_host[(usize)source_node];
-            const s64 last = edge_row_offset_host[(usize)source_node + 1];
-            if (first == last) continue;
-
-            clear_system();
-            for (s64 ordinal = first; ordinal < last; ordinal += 1) {
-                const s64 target_node = edge_target[(usize)ordinal];
-                for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-                    const f32 *coefficient_values = coefficient_row(matrix_index);
-                    for (s64 lane = 0; lane < lane_count; lane += 1) {
-                        basis_row[(usize)lane] = (f64)coefficient_values[lane] * (f64)v_data[target_node * lane_count + lane];
-                    }
-                    add_to_system(normalised_targets[(usize)matrix_index][(usize)ordinal]);
-                }
-            }
-            if (solve_system()) {
-                for (s64 lane = 0; lane < lane_count; lane += 1) {
-                    u_data[source_node * lane_count + lane] = (f32)right_hand_side[(usize)lane];
-                }
-            }
-        }
-
-        for (s64 target_node = 0; target_node < node_count; target_node += 1) {
-            const vector<s64> &ordinals = incoming_edges[(usize)target_node];
-            if (ordinals.empty()) continue;
-
-            clear_system();
-            for (s64 ordinal : ordinals) {
-                const s64 source_node = edge_source[(usize)ordinal];
-                for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-                    const f32 *coefficient_values = coefficient_row(matrix_index);
-                    for (s64 lane = 0; lane < lane_count; lane += 1) {
-                        basis_row[(usize)lane] = (f64)coefficient_values[lane] * (f64)u_data[source_node * lane_count + lane];
-                    }
-                    add_to_system(normalised_targets[(usize)matrix_index][(usize)ordinal]);
-                }
-            }
-            if (solve_system()) {
-                for (s64 lane = 0; lane < lane_count; lane += 1) {
-                    v_data[target_node * lane_count + lane] = (f32)right_hand_side[(usize)lane];
-                }
-            }
-        }
-
-        // Last, so the coefficients match this sweep's U and V.
-        fit_coefficients();
-        sweep_count += 1;
-
-        current_error = worst_relative_error();
-        best_worst_error.push_back(min(best_worst_error.back(), current_error));
-        if (sweep_count >= FIT_STALL_WINDOW_SWEEP_COUNT) {
-            const f64 window_start = best_worst_error[(usize)(sweep_count - FIT_STALL_WINDOW_SWEEP_COUNT)];
-            if (best_worst_error.back() > (1.0 - FIT_STALL_IMPROVEMENT) * window_start) break;
-        }
-    }
-    if (sweep_count >= MAXIMUM_FIT_SWEEP_COUNT) {
-        log::logger().warn("fit_basis_to_targets: {} sweeps at rank {} without meeting the tolerance or stalling",
-                           sweep_count, rank);
-    }
-
-    // Back to each plane's own units.
-    for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
-        f32 *coefficient_values = coefficient_row(matrix_index);
-        for (s64 lane = 0; lane < lane_count; lane += 1) {
-            coefficient_values[lane] = (f32)((f64)coefficient_values[lane] * matrix_scale[(usize)matrix_index]);
-        }
-    }
-
-    log::logger().debug("fit_basis_to_targets: rank {} after {} sweeps, worst relative error {:.3e}", rank,
-                        sweep_count, current_error);
-    return current_error <= (f64)fit_tolerance;
-}
-
-s64 WeightMatrix::search_for_rank_meeting_tolerance(const Vector<Vector<f32>> &targets_per_matrix) {
-    const s64 lane_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
-
-    // Doubling until a rank meets the tolerance...
-    s64 failing_rank = 0;
-    s64 passing_rank = -1;
-    for (s64 candidate = LANE_GROUP; candidate <= lane_limit; candidate *= 2) {
-        resize_basis(candidate);
-        if (fit_basis_to_targets(targets_per_matrix, DEFAULT_FIT_RIDGE)) {
-            passing_rank = candidate;
-            break;
-        }
-        failing_rank = candidate;
-    }
-    if (passing_rank < 0) {
-        log::logger().warn("rank search: no rank up to the {}-lane limit meets the {:.0e} tolerance", lane_limit,
-                           fit_tolerance);
-        return rank;
-    }
-
-    // ...then bisecting, in lane groups, down to the smallest that does.
-    while (passing_rank - failing_rank > LANE_GROUP) {
-        const s64 middle_rank = round_up_to_lane_group((failing_rank + passing_rank) / 2);
-        resize_basis(middle_rank);
-        if (fit_basis_to_targets(targets_per_matrix, DEFAULT_FIT_RIDGE)) {
-            passing_rank = middle_rank;
-        } else {
-            failing_rank = middle_rank;
-        }
-    }
-    if (rank != passing_rank) {
-        resize_basis(passing_rank);
-        fit_basis_to_targets(targets_per_matrix, DEFAULT_FIT_RIDGE);
-    }
-
-    log::logger().debug("rank search: rank {} is the smallest that meets the tolerance", passing_rank);
-    return passing_rank;
-}
-
 void WeightMatrix::grow_basis(s64 new_rank) {
     const s64 grown_rank = round_up_to_lane_group(new_rank);
     if (grown_rank <= rank) return;
@@ -1214,28 +982,38 @@ void WeightMatrix::grow_basis(s64 new_rank) {
 }
 
 void WeightMatrix::refit(f32 ridge_regularization) {
-    fold_into_basis(current_deltas(), ridge_regularization);
-}
-
-void WeightMatrix::fold_into_basis(
-    const Vector<Vector<Pair<s64, f32>>> &deltas_per_matrix, f32 ridge_regularization
-) {
     if (total_edge_count == 0) {
         clear_sparse_deltas();
         return;
     }
 
-    // From the current basis; when it stalls short of the tolerance, the values have outgrown
-    // this rank, so lanes are added and the fit continues from where it got to.
+    // Every plane's values now, the basis plus its updates, taken before any plane is refit.
+    // Refitting a plane changes only lanes no other plane reads, so these stay true for the rest.
+    const Vector<Vector<Pair<s64, f32>>> deltas_per_matrix = current_deltas();
     const Vector<Vector<f32>> targets = targets_from_basis_and_deltas(deltas_per_matrix);
-    const s64 lane_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
-    bool meets_tolerance = fit_basis_to_targets(targets, ridge_regularization);
-    while (!meets_tolerance && rank < lane_limit) {
-        grow_basis(min(2 * rank, lane_limit));
-        meets_tolerance = fit_basis_to_targets(targets, ridge_regularization);
+
+    // A plane with no updates already reads what it should, so it is left exactly as it is.
+    bool meets_tolerance = true;
+    for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
+        const Vector<Pair<s64, f32>> &deltas = deltas_per_matrix[(usize)matrix_index];
+        if (deltas.empty()) continue;
+
+        Vector<s64> changed_edge_ordinals;
+        changed_edge_ordinals.reserve(deltas.size());
+        for (const Pair<s64, f32> &delta : deltas) changed_edge_ordinals.push_back(delta.first);
+        meets_tolerance = fit_plane(matrix_index, targets[(usize)matrix_index], changed_edge_ordinals,
+                                    ridge_regularization) && meets_tolerance;
     }
     clear_sparse_deltas();
+
+    // A plane that was not refit keeps the error of the fit that made it.
+    const Vector<f32> previous_fit_error = measured_fit_error;
     measure_fit_error(targets);
+    for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
+        if (deltas_per_matrix[(usize)matrix_index].empty() && (s64)previous_fit_error.size() == matrix_count) {
+            measured_fit_error[(usize)matrix_index] = previous_fit_error[(usize)matrix_index];
+        }
+    }
 
     String error_per_plane;
     for (s64 matrix_index = 0; matrix_index < matrix_count; matrix_index += 1) {
@@ -1244,9 +1022,349 @@ void WeightMatrix::fold_into_basis(
     }
     log::logger().debug("refit: rank {}, worst relative error per plane [{}]", rank, error_per_plane);
     if (!meets_tolerance) {
-        log::logger().warn("refit: even at the {}-lane limit the basis is {:.3e} off, short of the {:.0e} tolerance",
-                           lane_limit, worst_fit_error(), fit_tolerance);
+        log::logger().warn("refit: at rank {} the basis is {:.3e} off, short of the {:.0e} tolerance", rank,
+                           worst_fit_error(), fit_tolerance);
     }
+}
+
+bool WeightMatrix::fit_plane(
+    s64 matrix_index, const Vector<f32> &targets, const Vector<s64> &changed_edge_ordinals,
+    f32 ridge_regularization
+) {
+    const s64 lane_limit = MAX_RANK_FLOAT4_STRIDE * LANE_GROUP;
+    const f64 scale = (f64)field_scale_of(targets);
+    auto lane_count = [this]() { return rank_float4_stride * LANE_GROUP; };
+
+    // Each edge's ends, and each node's edges out and in.
+    vector<s32> edge_source((usize)total_edge_count);
+    vector<s32> edge_target((usize)total_edge_count);
+    vector<vector<s64>> outgoing_edges((usize)node_count);
+    vector<vector<s64>> incoming_edges((usize)node_count);
+    {
+        vector<s32> neighbor_buffer((usize)max<s64>(max_neighbor_count, 1));
+        for (s64 source_node = 0; source_node < node_count; source_node += 1) {
+            const s64 degree = k2tree.get_neighbors((s32)source_node, neighbor_buffer.data(),
+                                                    max_neighbor_count);
+            for (s64 slot = 0; slot < degree; slot += 1) {
+                const s64 ordinal = edge_row_offset_host[(usize)source_node] + slot;
+                const s32 target_node = neighbor_buffer[(usize)slot];
+                edge_source[(usize)ordinal] = (s32)source_node;
+                edge_target[(usize)ordinal] = target_node;
+                outgoing_edges[(usize)source_node].push_back(ordinal);
+                incoming_edges[(usize)target_node].push_back(ordinal);
+            }
+        }
+    }
+
+    // This plane may change only its own lanes: the ones it reads and no other plane does. A lane
+    // another plane also reads stays as it is, and a lane no plane reads is free to take.
+    auto lane_is_read_by = [this](s64 plane, s64 lane) { return coefficient_row(plane)[lane] != 0.0f; };
+    auto lane_is_free = [&](s64 lane) {
+        for (s64 plane = 0; plane < matrix_count; plane += 1) {
+            if (lane_is_read_by(plane, lane)) return false;
+        }
+        return true;
+    };
+    vector<s64> own_lanes;
+    vector<s64> shared_lanes;
+    for (s64 lane = 0; lane < lane_count(); lane += 1) {
+        if (!lane_is_read_by(matrix_index, lane)) continue;
+        bool read_by_another_plane = false;
+        for (s64 plane = 0; plane < matrix_count; plane += 1) {
+            read_by_another_plane = read_by_another_plane || (plane != matrix_index && lane_is_read_by(plane, lane));
+        }
+        (read_by_another_plane ? shared_lanes : own_lanes).push_back(lane);
+    }
+
+    // What the own lanes must hold, in units of the plane's RMS: the target less what the shared
+    // lanes give. Each edge's error counts against max(|value|, RMS), as the tolerance does.
+    vector<f64> residual((usize)total_edge_count);
+    vector<f64> error_scale((usize)total_edge_count);
+    {
+        const f32 *u_data = U_matrix.get_contents_as<f32>();
+        const f32 *v_data = V_matrix.get_contents_as<f32>();
+        const f32 *coefficient_values = coefficient_row(matrix_index);
+        const s64 lanes = lane_count();
+        for_each_index_in_parallel(total_edge_count, [&](s64 ordinal) {
+            const s64 source_node = edge_source[(usize)ordinal];
+            const s64 target_node = edge_target[(usize)ordinal];
+            f64 shared_value = 0.0;
+            for (s64 lane : shared_lanes) {
+                shared_value += (f64)u_data[source_node * lanes + lane] * (f64)coefficient_values[lane] *
+                                (f64)v_data[target_node * lanes + lane];
+            }
+            const f64 target = (f64)targets[(usize)ordinal];
+            residual[(usize)ordinal] = (target - shared_value) / scale;
+            error_scale[(usize)ordinal] = max(fabs(target) / scale, 1.0);
+        });
+    }
+
+    // Own lanes carry the plane's RMS as their coefficient, so U and V hold values in the units the
+    // solves work in. A lane fitted at an earlier RMS is rescaled; the values it gives stay the same.
+    {
+        f32 *u_data = U_matrix.get_contents_as<f32>();
+        f32 *coefficient_values = coefficient_row(matrix_index);
+        const s64 lanes = lane_count();
+        for (s64 lane : own_lanes) {
+            const f32 factor = (f32)((f64)coefficient_values[lane] / scale);
+            for (s64 node_index = 0; node_index < node_count; node_index += 1) {
+                u_data[node_index * lanes + lane] *= factor;
+            }
+            coefficient_values[lane] = (f32)scale;
+        }
+    }
+
+    // The rows the sweeps may move: both ends of every changed edge. An edge touching neither keeps
+    // its value exactly, so the sweeps measure only the edges that touch one.
+    vector<char> source_is_dirty((usize)node_count, 0);
+    vector<char> target_is_dirty((usize)node_count, 0);
+    for (s64 ordinal : changed_edge_ordinals) {
+        source_is_dirty[(usize)edge_source[(usize)ordinal]] = 1;
+        target_is_dirty[(usize)edge_target[(usize)ordinal]] = 1;
+    }
+    vector<s64> dirty_sources;
+    vector<s64> dirty_targets;
+    for (s64 node_index = 0; node_index < node_count; node_index += 1) {
+        if (source_is_dirty[(usize)node_index]) dirty_sources.push_back(node_index);
+        if (target_is_dirty[(usize)node_index]) dirty_targets.push_back(node_index);
+    }
+    vector<s64> touched_edges;
+    for (s64 ordinal = 0; ordinal < total_edge_count; ordinal += 1) {
+        if (source_is_dirty[(usize)edge_source[(usize)ordinal]] || target_is_dirty[(usize)edge_target[(usize)ordinal]]) {
+            touched_edges.push_back(ordinal);
+        }
+    }
+    vector<s64> every_edge((usize)total_edge_count);
+    iota(every_edge.begin(), every_edge.end(), (s64)0);
+
+    // The worst relative error over some edges, from the own lanes as stored.
+    auto worst_relative_error = [&](const vector<s64> &edges) {
+        const f32 *u_data = U_matrix.get_contents_as<f32>();
+        const f32 *v_data = V_matrix.get_contents_as<f32>();
+        const s64 lanes = lane_count();
+        vector<f64> error_of_edge(edges.size(), 0.0);
+        for_each_index_in_parallel((s64)edges.size(), [&](s64 index) {
+            const s64 ordinal = edges[(usize)index];
+            const f32 *u_row = u_data + edge_source[(usize)ordinal] * lanes;
+            const f32 *v_row = v_data + edge_target[(usize)ordinal] * lanes;
+            f64 own_value = 0.0;
+            for (s64 lane : own_lanes) own_value += (f64)u_row[lane] * (f64)v_row[lane];
+            error_of_edge[(usize)index] = fabs(own_value - residual[(usize)ordinal]) / error_scale[(usize)ordinal];
+        });
+        return error_of_edge.empty() ? 0.0 : *max_element(error_of_edge.begin(), error_of_edge.end());
+    };
+
+    // Lanes this plane can come to own: its own, the free ones, and the room left under the limit.
+    auto available_lane_count = [&]() {
+        s64 free_count = 0;
+        for (s64 lane = 0; lane < lane_count(); lane += 1) free_count += lane_is_free(lane) ? 1 : 0;
+        return (s64)own_lanes.size() + free_count + (lane_limit - lane_count());
+    };
+
+    // Gives this plane more lanes, free ones first, then new ones. A lane it takes starts with U
+    // zero, so no value changes until a solve uses it, and V N(0,1).
+    auto take_lanes = [&](s64 count) {
+        vector<s64> taken;
+        for (s64 lane = 0; lane < lane_count() && (s64)taken.size() < count; lane += 1) {
+            if (lane_is_free(lane)) taken.push_back(lane);
+        }
+        const s64 old_lane_count = lane_count();
+        const s64 missing = count - (s64)taken.size();
+        if (missing > 0) {
+            grow_basis(old_lane_count + missing);
+            for (s64 lane = old_lane_count; lane < old_lane_count + missing; lane += 1) taken.push_back(lane);
+        }
+        if (taken.empty()) return;
+
+        mt19937 random_engine(basis_seed + (unsigned)(matrix_index * lane_limit + taken.front()));
+        normal_distribution<f32> normal_distribution_unit(0.0f, 1.0f);
+        f32 *u_data = U_matrix.get_contents_as<f32>();
+        f32 *v_data = V_matrix.get_contents_as<f32>();
+        const s64 lanes = lane_count();
+        for (s64 lane : taken) {
+            for (s64 node_index = 0; node_index < node_count; node_index += 1) {
+                u_data[node_index * lanes + lane] = 0.0f;
+                v_data[node_index * lanes + lane] = normal_distribution_unit(random_engine);
+            }
+            coefficient_row(matrix_index)[lane] = (f32)scale;
+            own_lanes.push_back(lane);
+        }
+    };
+
+    // Weighted least squares for one node's own-lane row, from the edges that use it: each edge
+    // gives the other end's own-lane row, weighted by 1/error_scale^2 so that the squares count
+    // what the tolerance counts.
+    auto solve_row = [&](f32 *solved_row, const vector<s64> &edges, const f32 *other_side,
+                         const vector<s32> &other_end) {
+        const s64 own_count = (s64)own_lanes.size();
+        const s64 lanes = lane_count();
+        vector<f64> gram((usize)(own_count * own_count), 0.0);
+        vector<f64> right_hand_side((usize)own_count, 0.0);
+        vector<f64> other_row((usize)own_count);
+        for (s64 ordinal : edges) {
+            const f32 *other = other_side + other_end[(usize)ordinal] * lanes;
+            for (s64 index = 0; index < own_count; index += 1) other_row[(usize)index] = (f64)other[own_lanes[(usize)index]];
+            const f64 weight = 1.0 / (error_scale[(usize)ordinal] * error_scale[(usize)ordinal]);
+            for (s64 row = 0; row < own_count; row += 1) {
+                right_hand_side[(usize)row] += weight * other_row[(usize)row] * residual[(usize)ordinal];
+                for (s64 column = 0; column <= row; column += 1) {
+                    gram[(usize)(row * own_count + column)] += weight * other_row[(usize)row] * other_row[(usize)column];
+                }
+            }
+        }
+        if (!solve_symmetric_in_place(gram, right_hand_side, own_count, (f64)ridge_regularization)) return;
+        for (s64 index = 0; index < own_count; index += 1) {
+            solved_row[own_lanes[(usize)index]] = (f32)right_hand_side[(usize)index];
+        }
+    };
+
+    // Sweeps at the current own lanes until every touched edge meets the tolerance, or the best
+    // worst-case error stalls. Leaves the rows as they were at the best sweep and returns its error.
+    auto sweep_until_stalled = [&]() {
+        vector<f32> best_rows;
+        auto copy_rows = [&](bool save) {
+            const s64 lanes = lane_count();
+            if (save) best_rows.clear();
+            usize position = 0;
+            auto copy_side = [&](const vector<s64> &nodes, f32 *data) {
+                for (s64 node_index : nodes) {
+                    for (s64 lane : own_lanes) {
+                        if (save) {
+                            best_rows.push_back(data[node_index * lanes + lane]);
+                        } else {
+                            data[node_index * lanes + lane] = best_rows[position];
+                            position += 1;
+                        }
+                    }
+                }
+            };
+            copy_side(dirty_sources, U_matrix.get_contents_as<f32>());
+            copy_side(dirty_targets, V_matrix.get_contents_as<f32>());
+        };
+
+        f64 best_error = worst_relative_error(touched_edges);
+        copy_rows(true);
+        vector<f64> best_error_after_sweep = {best_error};
+        for (s32 sweep = 1; best_error > (f64)fit_tolerance && sweep <= PLANE_FIT_MAXIMUM_SWEEP_COUNT; sweep += 1) {
+            f32 *u_data = U_matrix.get_contents_as<f32>();
+            f32 *v_data = V_matrix.get_contents_as<f32>();
+            const s64 lanes = lane_count();
+            for_each_index_in_parallel((s64)dirty_sources.size(), [&](s64 index) {
+                const s64 node_index = dirty_sources[(usize)index];
+                solve_row(u_data + node_index * lanes, outgoing_edges[(usize)node_index], v_data, edge_target);
+            });
+            for_each_index_in_parallel((s64)dirty_targets.size(), [&](s64 index) {
+                const s64 node_index = dirty_targets[(usize)index];
+                solve_row(v_data + node_index * lanes, incoming_edges[(usize)node_index], u_data, edge_source);
+            });
+
+            const f64 error = worst_relative_error(touched_edges);
+            if (error < best_error) {
+                best_error = error;
+                copy_rows(true);
+            }
+            best_error_after_sweep.push_back(best_error);
+            if (sweep >= PLANE_FIT_STALL_WINDOW_SWEEP_COUNT &&
+                best_error > (1.0 - FIT_STALL_IMPROVEMENT) *
+                             best_error_after_sweep[(usize)(sweep - PLANE_FIT_STALL_WINDOW_SWEEP_COUNT)]) {
+                break;
+            }
+        }
+        copy_rows(false);
+        return best_error;
+    };
+
+    // The guarantee. With at least as many own lanes as any node has edges on one side, plus a lane
+    // group of slack, the other side's rows can be anything in general position -- fresh N(0,1) --
+    // and this side's rows then reproduce every edge exactly: per node, the minimum-norm solution of
+    // its few equations. The side solved is the one whose largest degree is smaller.
+    const bool solve_source_rows = max_neighbor_count <= max_predecessor_count;
+    const s64 exact_lane_count = round_up_to_lane_group(min(max_neighbor_count, max_predecessor_count)) + LANE_GROUP;
+    auto solve_exactly = [&]() {
+        constexpr f64 EXACT_SOLVE_RIDGE_PER_LANE = 1.0e-10;
+        const s64 lanes = lane_count();
+        const s64 own_count = (s64)own_lanes.size();
+        f32 *solved_side = solve_source_rows ? U_matrix.get_contents_as<f32>() : V_matrix.get_contents_as<f32>();
+        f32 *fixed_side = solve_source_rows ? V_matrix.get_contents_as<f32>() : U_matrix.get_contents_as<f32>();
+        const vector<vector<s64>> &edges_of_node = solve_source_rows ? outgoing_edges : incoming_edges;
+        const vector<s32> &other_end = solve_source_rows ? edge_target : edge_source;
+
+        mt19937 random_engine(basis_seed + 7919u * (unsigned)(matrix_index + 1));
+        normal_distribution<f32> normal_distribution_unit(0.0f, 1.0f);
+        for (s64 node_index = 0; node_index < node_count; node_index += 1) {
+            for (s64 lane : own_lanes) fixed_side[node_index * lanes + lane] = normal_distribution_unit(random_engine);
+        }
+
+        for_each_index_in_parallel(node_count, [&](s64 node_index) {
+            const vector<s64> &edges = edges_of_node[(usize)node_index];
+            const s64 edge_count = (s64)edges.size();
+            f32 *solved_row = solved_side + node_index * lanes;
+            for (s64 lane : own_lanes) solved_row[lane] = 0.0f;
+            if (edge_count == 0) return;
+
+            // The other ends' own-lane rows A, one per edge; then y from (A A^T) y = residual, and
+            // the row is A^T y.
+            vector<f64> other_rows((usize)(edge_count * own_count));
+            for (s64 edge_index = 0; edge_index < edge_count; edge_index += 1) {
+                const f32 *other = fixed_side + other_end[(usize)edges[(usize)edge_index]] * lanes;
+                for (s64 index = 0; index < own_count; index += 1) {
+                    other_rows[(usize)(edge_index * own_count + index)] = (f64)other[own_lanes[(usize)index]];
+                }
+            }
+            vector<f64> gram((usize)(edge_count * edge_count));
+            vector<f64> right_hand_side((usize)edge_count);
+            for (s64 row = 0; row < edge_count; row += 1) {
+                right_hand_side[(usize)row] = residual[(usize)edges[(usize)row]];
+                for (s64 column = 0; column <= row; column += 1) {
+                    f64 dot_product = 0.0;
+                    for (s64 index = 0; index < own_count; index += 1) {
+                        dot_product += other_rows[(usize)(row * own_count + index)] *
+                                       other_rows[(usize)(column * own_count + index)];
+                    }
+                    gram[(usize)(row * edge_count + column)] = dot_product;
+                }
+            }
+            if (!solve_symmetric_in_place(gram, right_hand_side, edge_count,
+                                          EXACT_SOLVE_RIDGE_PER_LANE * (f64)own_count)) {
+                return;
+            }
+            for (s64 index = 0; index < own_count; index += 1) {
+                f64 value = 0.0;
+                for (s64 row = 0; row < edge_count; row += 1) {
+                    value += right_hand_side[(usize)row] * other_rows[(usize)(row * own_count + index)];
+                }
+                solved_row[own_lanes[(usize)index]] = (f32)value;
+            }
+        });
+    };
+
+    // Already exact with the lanes it has -- a plane of zeros, say: nothing to fit.
+    if (worst_relative_error(touched_edges) == 0.0) return true;
+
+    // For memory, the fewest own lanes that meet the tolerance: the warm start at the lanes the plane
+    // has, then doubling, stopping short of the exact count while the exact solve is available.
+    const bool exact_is_available = exact_lane_count <= available_lane_count();
+    bool meets_tolerance = false;
+    s64 lane_target = max<s64>((s64)own_lanes.size(), LANE_GROUP);
+    while (!meets_tolerance) {
+        if (exact_is_available && lane_target >= exact_lane_count) break;
+        lane_target = min(lane_target, available_lane_count());
+        if ((s64)own_lanes.size() < lane_target) take_lanes(lane_target - (s64)own_lanes.size());
+        meets_tolerance = sweep_until_stalled() <= (f64)fit_tolerance;
+        if (!exact_is_available && (s64)own_lanes.size() >= available_lane_count()) break;
+        lane_target *= 2;
+    }
+
+    if (!meets_tolerance && exact_is_available) {
+        if ((s64)own_lanes.size() < exact_lane_count) take_lanes(exact_lane_count - (s64)own_lanes.size());
+        solve_exactly();
+        meets_tolerance = worst_relative_error(every_edge) <= (f64)fit_tolerance;
+    }
+
+    log::logger().debug("fit_plane: plane {} on {} own and {} shared lanes, {} changed edges, {} the tolerance",
+                        matrix_index, own_lanes.size(), shared_lanes.size(), changed_edge_ordinals.size(),
+                        meets_tolerance ? "meets" : "misses");
+    return meets_tolerance;
 }
 
 void WeightMatrix::measure_fit_error(const Vector<Vector<f32>> &targets_per_matrix) {

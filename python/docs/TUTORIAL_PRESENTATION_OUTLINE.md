@@ -276,8 +276,8 @@ Each slide only uses ideas introduced on earlier ones.
 - Tighter means more memory and longer fitting
 - Delays stay on their exact tick while tolerance × delay is under half a tick: up to 500
   ticks at the default
-- The engine picks the smallest rank that meets the tolerance; `w.measured_fit_error` reports
-  what each plane actually got
+- Each plane gets the fewest lanes that meet the tolerance, up to its largest degree + 4, where
+  one exact solve always meets it; `w.measured_fit_error` reports what each plane actually got
 - Networks built from a few uniform projections are stored exactly
 
 ### Slide 29: Values that change during a run
@@ -285,7 +285,7 @@ Each slide only uses ideas introduced on earlier ones.
   every read includes
 - When S is full enough, the engine **refits**: it folds S into the factorization and empties S
 - Settings:
-  - `refit_occupancy_threshold_fraction`: 0.75 by default; also sets how large S is kept
+  - `refit_occupancy_threshold_fraction`: 0.2 by default; also sets how large S is kept
   - `minimum_ticks_between_refits`: 1000 by default
   - `refit_every_n_ticks`: off by default
   - `fit_tolerance`

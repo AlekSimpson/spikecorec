@@ -632,8 +632,8 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readonly_static("DEFAULT_FIT_TOLERANCE", &WeightMatrix::DEFAULT_FIT_TOLERANCE)
         .def_readonly_static("DEFAULT_FIT_RIDGE", &WeightMatrix::DEFAULT_FIT_RIDGE)
         .def_readonly_static("FIT_STALL_IMPROVEMENT", &WeightMatrix::FIT_STALL_IMPROVEMENT)
-        .def_readonly_static("FIT_STALL_WINDOW_SWEEP_COUNT", &WeightMatrix::FIT_STALL_WINDOW_SWEEP_COUNT)
-        .def_readonly_static("MAXIMUM_FIT_SWEEP_COUNT", &WeightMatrix::MAXIMUM_FIT_SWEEP_COUNT)
+        .def_readonly_static("PLANE_FIT_STALL_WINDOW_SWEEP_COUNT", &WeightMatrix::PLANE_FIT_STALL_WINDOW_SWEEP_COUNT)
+        .def_readonly_static("PLANE_FIT_MAXIMUM_SWEEP_COUNT", &WeightMatrix::PLANE_FIT_MAXIMUM_SWEEP_COUNT)
         .def_readonly_static("DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION",
                              &WeightMatrix::DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION)
 
@@ -655,8 +655,6 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readwrite("fit_tolerance", &WeightMatrix::fit_tolerance,
                        "The worst relative error a refit may leave on any plane. The engine sets it from "
                        "SpikeEngine.fit_tolerance before each refit it runs.")
-        .def_readonly("fit_rank_budget", &WeightMatrix::fit_rank_budget,
-                      "The fixed rank the construction fit used, or -1 when it searched.")
         .def_readonly("measured_fit_error", &WeightMatrix::measured_fit_error,
                       "Per plane: the worst relative error the last fit left.")
         .def("worst_fit_error", &WeightMatrix::worst_fit_error, "The worst of measured_fit_error.")
@@ -788,8 +786,8 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def("compact_pending_deltas", &WeightMatrix::compact_pending_deltas,
              "Merges what the device queued into S, growing S if a plane would overflow.")
         .def("refit", &WeightMatrix::refit, py::arg("ridge_regularization") = WeightMatrix::DEFAULT_FIT_RIDGE,
-             "Fits the basis to the current values (basis plus S) until every plane meets "
-             "fit_tolerance, adding lanes if it must, then empties S.")
+             "Refits every plane with updates in S to the current values (basis plus S), each on "
+             "lanes of its own, then empties S.")
         .def("is_refit_due", &WeightMatrix::is_refit_due, py::arg("occupancy_threshold_fraction"),
              "True once the fullest plane of S holds updates on that fraction of the edge set.")
         .def("scale_neighbor_weights_to_root_mean_square", &WeightMatrix::scale_neighbor_weights_to_root_mean_square,
@@ -898,8 +896,6 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readwrite("minimum_ticks_between_refits", &SpikeEngine::minimum_ticks_between_refits,
                        "Refits are at least this many ticks apart; S grows in between. 0 allows any spacing.")
         .def_readonly("last_refit_tick", &SpikeEngine::last_refit_tick, "The construction fit counts as tick 0.")
-        .def_readonly("weight_fit_rank_budget", &SpikeEngine::weight_fit_rank_budget,
-                      "The fixed rank the construction fit was asked for, or -1 to search.")
 
         // Plasticity settings.
         .def_readonly_static("DEFAULT_PLASTICITY_DELTA_CAPACITY", &SpikeEngine::DEFAULT_PLASTICITY_DELTA_CAPACITY)

@@ -190,7 +190,7 @@ plane of S holds updates on `refit_occupancy_threshold_fraction` of the edges, t
 refits and empties S. That fraction is also the size S is kept at.
 
 ```python
-engine.refit_occupancy_threshold_fraction = 0.5    # default 0.75; resizes S now
+engine.refit_occupancy_threshold_fraction = 0.5    # default 0.2; resizes S now
 engine.minimum_ticks_between_refits = 2000         # default 1000; S grows in between
 engine.refit_every_n_ticks = 5000                  # default 0, off
 engine.fit_tolerance = spc.SpikeEngine.FIT_TOLERANCE_ACCURATE
