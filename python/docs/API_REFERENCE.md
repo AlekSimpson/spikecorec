@@ -131,12 +131,11 @@ updates are merged, when either trigger fires and the last refit was at least
 | `FIT_TOLERANCE_ACCURATE` | `1e-4` | preset for validation runs and reported results; up to 5 000 ticks |
 | `FIT_TOLERANCE_STANDARD` | `1e-3` | the default; up to 500 ticks |
 | `FIT_TOLERANCE_COMPACT` | `1e-2` | preset for the largest networks, where memory matters most; up to 50 ticks |
-| `refit_occupancy_threshold_fraction` | `0.75` | refit once the fullest plane of S holds updates on this fraction of the edges; `0` disables. Also the size S is kept at per plane, so setting it resizes S |
+| `refit_occupancy_threshold_fraction` | `0.2` | refit once the fullest plane of S holds updates on this fraction of the edges; `0` disables. Also the size S is kept at per plane, so setting it resizes S |
 | `set_refit_occupancy_threshold_fraction(fraction)` | | the same setter as a method |
 | `refit_every_n_ticks` | `0` | also refit every this many ticks; `0` disables |
 | `minimum_ticks_between_refits` | `1000` | refits are at least this far apart; S grows in between if it must. `0` allows any spacing |
 | `last_refit_tick` | | read-only; the construction fit counts as tick 0 |
-| `weight_fit_rank_budget` | `-1` | read-only; the fixed rank the construction fit was asked for, `-1` to search for the smallest that meets `fit_tolerance` |
 
 A tighter tolerance costs rank (memory) and fitting time. A delay stays on its exact tick
 while `tolerance * delay < 0.5` ticks.
@@ -252,7 +251,9 @@ stored as `M_k = U diag(Ck) Vᵀ` over the edges the k²-tree holds: a shared lo
 computations. The basis trades a measured accuracy for storage, within `fit_tolerance`.
 
 Changes during a run go into the **sparse delta matrix S**, one sparse row set per plane.
-Every read adds S. A refit fits the basis to basis + S and empties S.
+Every read adds S. A refit fits each plane that has updates to basis + S, changing only that
+plane's own lanes (lanes no other plane reads), and empties S. A plane without updates is left
+exactly as it is.
 
 ### Planes and constants
 
@@ -264,9 +265,9 @@ Every read adds S. A refit fits the basis to basis + S and empties S.
 | `LANE_GROUP` | `4` | the rank is always a multiple of this |
 | `DEFAULT_FIT_TOLERANCE` | `1e-3` | |
 | `DEFAULT_FIT_RIDGE` | `1e-4` | ridge regularization of a refit |
-| `FIT_STALL_IMPROVEMENT`, `FIT_STALL_WINDOW_SWEEP_COUNT` | `0.05`, `100` | a fit has stalled at its rank when its worst error improved by less than 5% over 100 sweeps |
-| `MAXIMUM_FIT_SWEEP_COUNT` | `2000` | |
-| `DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION` | `0.75` | |
+| `FIT_STALL_IMPROVEMENT`, `PLANE_FIT_STALL_WINDOW_SWEEP_COUNT` | `0.05`, `10` | a plane's fit at one lane count has stalled when its worst error improved by less than 5% over 10 sweeps; it then adds lanes |
+| `PLANE_FIT_MAXIMUM_SWEEP_COUNT` | `100` | sweeps at one lane count at most. Once a plane has its largest degree + 4 lanes, one exact solve replaces the sweeps |
+| `DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION` | `0.2` | |
 
 ### Shape and fit
 
@@ -277,7 +278,6 @@ Every read adds S. A refit fits the basis to basis + S and empties S.
 | `updated_plane_count` | int | planes the kernel updates each tick |
 | `rank`, `rank_float4_stride` | int | lanes in the basis, and lanes / 4 |
 | `fit_tolerance` | float | the tolerance refits run to (read/write; the engine sets it from `SpikeEngine.fit_tolerance` before each refit it runs) |
-| `fit_rank_budget` | int | read-only |
 | `measured_fit_error` | list[float] | per plane, the worst relative error the last fit left |
 | `worst_fit_error()` | float | the worst of those |
 | `check_indexing` | bool | read/write |

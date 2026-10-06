@@ -74,19 +74,17 @@ namespace spikecorec {
 
         static constexpr f32 DEFAULT_FIT_RIDGE = 1.0e-4f;
 
-        // A fit runs sweeps until every plane meets fit_tolerance, or until it has stalled at this
-        // rank: its best worst-case error improved by less than FIT_STALL_IMPROVEMENT over the last
-        // FIT_STALL_WINDOW_SWEEP_COUNT sweeps. Alternating least squares has long slow stretches
-        // that a per-sweep test mistakes for a stall, so the test looks across a window, and at
-        // the error the tolerance is about rather than the total squared error.
+        // fit_plane's sweeps at one lane count, before it adds lanes: until every edge they touch
+        // meets fit_tolerance, until the best worst-case error improved by less than
+        // FIT_STALL_IMPROVEMENT over the last PLANE_FIT_STALL_WINDOW_SWEEP_COUNT sweeps, or at most
+        // PLANE_FIT_MAXIMUM_SWEEP_COUNT. Short, because the exact solve is there when they fail:
+        // they only decide whether fewer lanes will do.
         static constexpr f64 FIT_STALL_IMPROVEMENT = 0.05;
-        static constexpr s32 FIT_STALL_WINDOW_SWEEP_COUNT = 100;
-
-        // A guard, not a budget: a fit that reaches it has failed to stall, and says so.
-        static constexpr s32 MAXIMUM_FIT_SWEEP_COUNT = 2000;
+        static constexpr s32 PLANE_FIT_STALL_WINDOW_SWEEP_COUNT = 10;
+        static constexpr s32 PLANE_FIT_MAXIMUM_SWEEP_COUNT = 100;
 
         // The refit threshold S is sized for until whoever drives the refits says otherwise.
-        static constexpr f32 DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION = 0.75f;
+        static constexpr f32 DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION = 0.20f;
 
         K2Tree k2tree;
 
@@ -155,12 +153,8 @@ namespace spikecorec {
         // Room reserved in S for plasticity's weight updates, on top of the threshold's share.
         s64 plasticity_reserve_entries = 0;
 
-        // A fixed rank for the general fit, or -1 to search for the smallest rank that meets
-        // fit_tolerance.
-        s64 fit_rank_budget = -1;
-
         // The worst relative error a fit may leave on any per-edge value (DEFAULT_FIT_TOLERANCE).
-        // The rank search and a refit add lanes until every plane meets it.
+        // Every fit adds lanes to a plane until it meets it.
         f32 fit_tolerance = DEFAULT_FIT_TOLERANCE;
 
         // ── projection runs (structure of arrays, parallel) ───────────────────────
@@ -214,7 +208,6 @@ namespace spikecorec {
         // rank:               the starting rank; declare_projections chooses the one it fits at
         // max_neighbor_count: -1 derives it from the longest row
         // weight_seed:        seeds the basis before any fit; -1 uses hardware entropy
-        // fit_rank_budget:    a fixed rank for the general fit, or -1 to search
         // matrix_count:       how many per-edge variables a synapse carries
         // updated_plane_count: how many of them the simulation updates each tick
         WeightMatrix(
@@ -224,7 +217,6 @@ namespace spikecorec {
             bool check_indexing = true,
             s64 max_neighbor_count = -1,
             s64 weight_seed = -1,
-            s64 fit_rank_budget = -1,
             s64 matrix_count = FIRST_STATE_VARIABLE_PLANE,
             s64 updated_plane_count = 0
         );
@@ -238,7 +230,7 @@ namespace spikecorec {
         // per-edge interface would invite per-edge storage.
         //
         // Fits the basis to these values -- exactly, one lane per distinct combination, when
-        // they fit in the lanes, otherwise at the smallest rank that meets fit_tolerance -- and
+        // they fit in the lanes, otherwise each plane on lanes of its own (fit_plane) -- and
         // reports what the fit cost in measured_fit_error. S starts empty.
         void declare_projections(
             const Vector<s64> &first_edge_ordinal,
@@ -279,10 +271,9 @@ namespace spikecorec {
         // overflow, so nothing is dropped.
         void compact_pending_deltas();
 
-        // Fits U, V and every Ck to the current values -- the basis plus S -- starting from the
-        // current basis, until every plane meets fit_tolerance, adding lanes when the current
-        // rank stalls short of it. Then empties S. Expensive, which is why it is batched behind
-        // a threshold.
+        // Refits every plane that has updates in S to its current values -- the basis plus S -- and
+        // empties S. A plane changes only its own lanes, so a plane without updates reads exactly
+        // what it did. Expensive, which is why it is batched behind a threshold.
         void refit(f32 ridge_regularization = DEFAULT_FIT_RIDGE);
 
         // True once the fullest plane of S holds updates on occupancy_threshold_fraction of the
@@ -344,10 +335,6 @@ namespace spikecorec {
         // current rank and correction capacity. Called at construction and on every resize.
         void allocate_storage();
 
-        // Fits at ranks 4, 8, 16, ... until one meets fit_tolerance, then bisects down to the
-        // smallest that does. Leaves the basis fitted at it, or at the lane limit when none does.
-        s64 search_for_rank_meeting_tolerance(const Vector<Vector<f32>> &targets_per_matrix);
-
         // Adds lanes, keeping U, V and every Ck as they are. The new lanes get random U and V and
         // zero coefficients, so every value reads the same until the next fit uses them.
         void grow_basis(s64 new_rank);
@@ -373,10 +360,6 @@ namespace spikecorec {
 
         void clear_sparse_deltas();
 
-        // Fits the basis to its own values plus these updates, then empties S.
-        void fold_into_basis(const Vector<Vector<Pair<s64, f32>>> &deltas_per_matrix,
-                             f32 ridge_regularization);
-
         [[nodiscard]] f32 *coefficient_row(s64 matrix_index) const;
 
         // Builds U/V and every coefficient row directly from the projection runs, one lane per
@@ -385,12 +368,13 @@ namespace spikecorec {
         // limit. Returns true when it was used.
         bool fit_basis_from_projections(const Vector<Vector<f32>> &initial_values);
 
-        // Alternating least squares over the edges only, for a basis shared by every plane with
-        // one coefficient row each: M_k = U diag(Ck) V^T. Runs sweeps from the current basis
-        // until every plane meets fit_tolerance or the fit stalls at this rank, and returns
-        // whether it met the tolerance. targets_per_matrix[m][edge_ordinal] is what plane m
-        // should read.
-        bool fit_basis_to_targets(const Vector<Vector<f32>> &targets_per_matrix, f32 ridge_regularization);
+        // Fits one plane to targets (its value at every edge) by changing only its own lanes -- the
+        // ones no other plane reads -- so every other plane reads exactly what it did. Only the
+        // rows of nodes at either end of a changed edge move, until the lanes cannot hold the
+        // values; then one exact solve over every edge. Returns whether every edge meets
+        // fit_tolerance.
+        bool fit_plane(s64 matrix_index, const Vector<f32> &targets, const Vector<s64> &changed_edge_ordinals,
+                       f32 ridge_regularization);
 
         // Per-edge values implied by the projection runs, one row per plane.
         [[nodiscard]] Vector<Vector<f32>> targets_from_projections(const Vector<Vector<f32>> &initial_values) const;

@@ -274,7 +274,7 @@ void SpikeEngine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count)
 
     weights = WeightMatrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/(s64)simulation_seed,
-                           weight_fit_rank_budget, matrix_count, updated_plane_count);
+                           matrix_count, updated_plane_count);
     weights.fit_tolerance = fit_tolerance;
     if (ordinal > 0) weights.declare_projections(first_edge_ordinal, edge_count, synapse_prototype, initial_values);
 
@@ -624,7 +624,7 @@ void SpikeEngine::step_simulation(s64 tick) {
     }
 
     // Updates queued this tick by edges with no entry in S yet; merge them so the next tick
-    // reads them. A merge that would overflow S refits instead.
+    // reads them.
     const bool plasticity_fold_due = hebbian_plasticity_enabled && plasticity_fold_every_n_ticks > 0 &&
                                      (tick + 1) % plasticity_fold_every_n_ticks == 0;
     if (weights.updated_plane_count > 0 || plasticity_fold_due) weights.compact_pending_deltas();
