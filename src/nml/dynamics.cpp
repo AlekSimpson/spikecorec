@@ -5,7 +5,9 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <sstream>
 
 #include "spikecorec/core/backend.h"
@@ -40,6 +42,15 @@ const Set<String> SYNAPSE_ENGINE_NAMES = {
     "sparse_delta_edge_ordinal", "sparse_delta_value", "sparse_delta_capacity", "pending_delta_edge_ordinal",
     "pending_delta_value", "pending_delta_matrix_index", "pending_delta_count", "pending_delta_capacity",
     "projection_first_edge_ordinal", "projection_synapse_prototype", "projection_run_count", "synapse_active_ticks"};
+
+// Names the generated input code declares or reads in master_step. A LEMS name in an input
+// equal to one of these, or starting with INPUT_PART_PREFIX, would be captured, so it is refused.
+const Set<String> INPUT_ENGINE_NAMES = {
+    "cell_state", "neuron_index", "network_input", "tick", "true", "random_values", "input_row_start",
+    "input_entry_prototype", "input_values", "input_spike_counts", "input_entry", "input_base", "input_weight",
+    "input_prototype", "input_kicks", "train_spikes", "arrival"};
+// input_part<k>_<name> holds the value part k's parent reads from it.
+const String INPUT_PART_PREFIX = "input_part";
 
 const String DERIVED_PREFIX = "derived_";
 const String DERIVATIVE_PREFIX = "derivative_";
@@ -83,6 +94,35 @@ KernelNode *literal(const String &text) {
 
 bool starts_with(const String &text, const String &prefix) {
     return text.rfind(prefix, 0) == 0;
+}
+
+KernelListNode *function_call(const String &name, const Vector<KernelNode *> &arguments);
+
+// The time `ticks` ticks span, as an f32 rounded once from the exact value: a correctly rounded
+// division by the steps per second when dt splits a second into a whole number of steps. (ticks
+// times dt in f32 is off by one unit in the last place on about a third of ticks, which moves a
+// comparison like t >= delay by a whole tick.) Otherwise ticks times dt.
+KernelNode *time_of_ticks(KernelNode *ticks, f64 step_dt) {
+    KernelNode *tick_count = new_cast(new_type("f32"), ticks);
+    const f64 steps_per_second = std::round(1.0 / step_dt);
+    if (steps_per_second >= 1.0 && steps_per_second <= 16777216.0 && std::fabs(steps_per_second * step_dt - 1.0) < 1e-12) {
+        return function_call("exact_divide", {tick_count, literal(float_literal(steps_per_second))});
+    }
+    return new_expression("*", tick_count, literal(float_literal(step_dt)));
+}
+
+// A float literal's value, or false when the node is no float literal.
+bool float_literal_value(const KernelNode *node, f64 &value) {
+    if (!node || node->body.syntax_type != KernelNodeType::LITERAL) return false;
+    const String &token = node->body.token;
+    if (token.size() < 2 || token.back() != 'f') return false;
+    try {
+        usize parsed = 0;
+        value = std::stod(token.substr(0, token.size() - 1), &parsed);
+        return parsed == token.size() - 1;
+    } catch (const std::exception &) {
+        return false;
+    }
 }
 
 KernelListNode *function_call(const String &name, const Vector<KernelNode *> &arguments) {
@@ -341,6 +381,84 @@ s64 spike_history_length(const NML_Context &context) {
     return std::max<s64>(2, context.simulation.maximum_edge_delay + 1);
 }
 
+f64 default_kick_amplitude(const NML_Context &context, const NML_ComponentInstance &cell) {
+    constexpr f64 THRESHOLD_OVERSHOOT = 1.05;
+    const NML_ComponentType &cell_type = *cell.component_type;
+    const UnorderedMap<String, f64> values = starting_values(context, cell);
+
+    f64 capacitance = 0.0;
+    for (const NML_ComponentType *type = &cell_type; type; type = type->extends) {
+        for (const NML_Node *element : children_of(type->source_node)) {
+            const NML_Tag &tag = element->body;
+            if (tag.tag_type != NML_DeclarationType::Parameter) continue;
+            if (tag.get_attribute("dimension") != "capacitance") continue;
+            if (cell_type.find_declaration(tag.namespace_key()) != element) continue;
+
+            auto value = values.find(tag.get_attribute("name"));
+            if (value != values.end()) capacitance = value->second;
+        }
+    }
+    if (capacitance <= 0.0) {
+        throw runtime_error("A spike input targets a '" + cell_type.name + "', which declares no parameter of "
+                            "dimension capacitance, so there is no way to work out what one event should inject. "
+                            "Give the input an amplitude");
+    }
+
+    // The spiking OnCondition is the one with an EventOut; its test should read
+    // "membrane > threshold".
+    String spike_test;
+    for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
+        if (entry.source_tag != NML_DeclarationType::EventOut || entry.condition.empty()) continue;
+        spike_test = entry.condition;
+        break;
+    }
+
+    String membrane_name;
+    f64 threshold = 0.0;
+    bool threshold_found = false;
+    if (!spike_test.empty()) {
+        std::unique_ptr<LemsParseNode> test(parse_lems_expression(spike_test, cell_type.name));
+        const auto *comparison = dynamic_cast<const BinaryNode<LemsParseBody> *>(test.get());
+        const String comparison_operator = test->body.token.lexeme;
+        if (comparison && test->body.syntax_type == LemsNodeSubtype::OPERATOR &&
+            (comparison_operator == ">" || comparison_operator == ">=") &&
+            comparison->left->body.syntax_type == LemsNodeSubtype::IDENTIFIER) {
+            membrane_name = comparison->left->body.token.lexeme;
+            try {
+                threshold = evaluate_lems(comparison->right, values, cell_type.name);
+                threshold_found = true;
+            } catch (const std::runtime_error &) {
+                // not foldable to a starting value
+            }
+        }
+    }
+    if (membrane_name.empty()) {
+        throw runtime_error("A spike input targets a '" + cell_type.name + "', whose spike condition is not a "
+                            "comparison this can read, so there is no threshold to aim at. Give the input an amplitude");
+    }
+
+    // The lowest the membrane starts or resets to.
+    f64 resting = values.count(membrane_name) ? values.at(membrane_name) : 0.0;
+    for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
+        if (entry.source_tag != NML_DeclarationType::StateAssignment) continue;
+        if (entry.condition != spike_test || entry.target != membrane_name) continue;
+
+        try {
+            resting = std::min(resting, evaluate_lems(entry.expression, values, cell_type.name));
+        } catch (const std::runtime_error &) {
+            // not foldable; the OnStart value stands
+        }
+    }
+
+    if (!threshold_found || threshold <= resting) {
+        throw runtime_error("A spike input targets a '" + cell_type.name + "', whose threshold resolves to no value "
+                            "above its starting membrane potential, so no finite current would make it fire. Give "
+                            "the input an amplitude");
+    }
+
+    return THRESHOLD_OVERSHOOT * capacitance * (threshold - resting) / context.simulation.step_dt;
+}
+
 const NML_ComponentInstance &population_cell(const NML_Context &context, const NML_ComponentInstance &population) {
     const NML_ComponentInstance *cell = context.find_instance(population.value_or("component"));
     if (!cell || !cell->component_type) {
@@ -422,6 +540,154 @@ Vector<KernelNode **> use_slots(KernelNode *node) {
 
 } // namespace
 
+InputTree Codegen::flatten_input_tree(const NML_ComponentInstance &input) const {
+    InputTree tree;
+    const s64 tick_count = context.simulation.total_tick_count;
+
+    // A With's instance, seen from one part: "this", "parent", a Path attribute naming one of
+    // its parts ("./syn0"), or one of its Child roles.
+    auto resolve_instance = [&](s64 part_index, const String &instance_name) -> s64 {
+        const InputPart &part = tree.parts[(usize)part_index];
+        if (instance_name == "this") return part_index;
+        if (instance_name == "parent") return part.parent;
+        String named = part.instance->value_or(instance_name);
+        if (starts_with(named, "./")) named = named.substr(2);
+        for (s64 candidate = 0; candidate < (s64)tree.parts.size(); candidate += 1) {
+            const InputPart &child = tree.parts[(usize)candidate];
+            if (child.parent != part_index) continue;
+            if (child.instance->id == named || child.role == instance_name) return candidate;
+        }
+        throw runtime_error("Input '" + input.id + "': '" + part.instance->id + "' names '" + instance_name +
+                            "' in its Structure, which is none of its parts");
+    };
+
+    std::function<void(const NML_ComponentInstance &, s64, const String &)> add_part =
+            [&](const NML_ComponentInstance &instance, s64 parent, const String &role) {
+        if (!instance.component_type) throw runtime_error("Input part '" + instance.id + "' has no ComponentType");
+        const s64 index = static_cast<s64>(tree.parts.size());
+        tree.parts.push_back({&instance, parent, role, tree.state_size});
+        tree.state_size += static_cast<s64>(instance.component_type->state_variable_names.size());
+
+        // The Child and Children slots its type declares, as (name, type held).
+        Vector<std::pair<String, String>> slots;
+        for (const NML_ComponentType *type = instance.component_type; type; type = type->extends) {
+            for (const NML_Node *declaration : children_of(type->source_node)) {
+                const NML_Tag &tag = declaration->body;
+                if (tag.tag_type != NML_DeclarationType::Child && tag.tag_type != NML_DeclarationType::Children) continue;
+                slots.push_back({tag.get_attribute("name"), tag.get_attribute("type")});
+            }
+        }
+
+        InputSpikeTrain spike_train;
+        for (const String &child_id : instance.data_order) {
+            const NML_ComponentInstance *child = context.find_instance(child_id);
+            if (!child || !child->component_type) continue;
+            String child_role;
+            for (const auto &[slot_name, slot_type] : slots) {
+                if (!context.is_instance_of(child, slot_type)) continue;
+                child_role = slot_name;
+                break;
+            }
+            if (child_role.empty()) continue;
+
+            if (!context.is_instance_of(child, "spike")) {
+                add_part(*child, index, child_role);
+                continue;
+            }
+            // A spike fires once, at its time; its own Structure sends the event to its parent.
+            if (spike_train.spike_counts.empty()) spike_train.spike_counts.assign((usize)tick_count, 0);
+            const UnorderedMap<String, f64> spike_values = component_parameter_values(context, *child);
+            auto time = spike_values.find("time");
+            if (time == spike_values.end()) throw runtime_error("Spike '" + child->id + "' in '" + instance.id + "' has no time");
+            const s64 tick = units::seconds_to_ticks(time->second, context.simulation.step_dt);
+            if (tick < tick_count) spike_train.spike_counts[(usize)tick] += 1;
+        }
+        if (!spike_train.spike_counts.empty()) {
+            spike_train.receiver = index;
+            tree.spike_trains.push_back(std::move(spike_train));
+        }
+
+        // Its own copy of each component it instantiates.
+        for (const NML_StructureEntry &entry : instance.component_type->structure) {
+            if (entry.source_tag != NML_DeclarationType::ChildInstance) continue;
+            const NML_ComponentInstance *referenced = context.find_instance(instance.value_or(entry.component));
+            if (!referenced) {
+                throw runtime_error("Input part '" + instance.id + "': its " + entry.component + " '" +
+                                    instance.value_or(entry.component) + "' is not declared");
+            }
+            add_part(*referenced, index, entry.component);
+        }
+    };
+    add_part(input, -1, "");
+
+    // Each part's EventConnections, between parts.
+    for (s64 index = 0; index < (s64)tree.parts.size(); index += 1) {
+        UnorderedMap<String, s64> aliases;
+        for (const NML_StructureEntry &entry : tree.parts[(usize)index].instance->component_type->structure) {
+            if (entry.source_tag == NML_DeclarationType::With) aliases[entry.alias] = resolve_instance(index, entry.instance);
+            if (entry.source_tag != NML_DeclarationType::EventConnection) continue;
+            auto source = aliases.find(entry.source);
+            auto target = aliases.find(entry.target);
+            if (source == aliases.end() || target == aliases.end()) {
+                throw runtime_error("Input '" + input.id + "': an EventConnection in '" +
+                                    tree.parts[(usize)index].instance->id + "' names an alias no With declares");
+            }
+            tree.routes.push_back({source->second, target->second});
+        }
+    }
+    return tree;
+}
+
+void Codegen::collect_inputs() {
+    input_prototypes.clear();
+    input_trees.clear();
+    input_spike_train_offsets.clear();
+    input_entries.clear();
+    input_spike_count_size = 0;
+    input_value_stride = 1;
+
+    UnorderedMap<String, s32> prototype_of;
+    for (const SimulationInputConfig &profile : context.simulation.input_profiles) {
+        const NML_ComponentInstance *input = context.find_instance(profile.input_component_id);
+        if (!input || !input->component_type) {
+            throw runtime_error("Input '" + profile.input_component_id + "' is not declared");
+        }
+
+        auto known = prototype_of.find(input->id);
+        s32 prototype = 0;
+        if (known != prototype_of.end()) {
+            prototype = known->second;
+        } else {
+            prototype = static_cast<s32>(input_prototypes.size());
+            prototype_of[input->id] = prototype;
+            input_prototypes.push_back(input);
+            input_trees.push_back(flatten_input_tree(*input));
+
+            Vector<s64> offsets;
+            for (const InputSpikeTrain &train : input_trees.back().spike_trains) {
+                offsets.push_back(input_spike_count_size);
+                input_spike_count_size += static_cast<s64>(train.spike_counts.size());
+            }
+            input_spike_train_offsets.push_back(std::move(offsets));
+            input_value_stride = std::max(input_value_stride, 1 + input_trees.back().state_size);
+        }
+
+        for (const InputTarget &target : profile.targets) {
+            const s64 neuron_index = context.neuron_index_of(target.neuron_index);
+            if (neuron_index < 0) {
+                throw runtime_error("Input '" + input->id + "' targets cell memory index " +
+                                    std::to_string(target.neuron_index) + ", which is in no neuron");
+            }
+            input_entries.push_back({neuron_index, prototype, static_cast<f32>(target.weight)});
+        }
+    }
+    std::stable_sort(input_entries.begin(), input_entries.end(),
+                     [](const InputEntry &first, const InputEntry &second) { return first.neuron_index < second.neuron_index; });
+
+    log::logger().info("Codegen: {} inputs on {} cells, {} floats of input state per cell",
+                       input_prototypes.size(), input_entries.size(), input_value_stride);
+}
+
 bool Codegen::cells_receive_events() const {
     for (const NML_ComponentInstance *population : network_populations(context)) {
         if (has_on_event(*population_cell(context, *population).component_type)) return true;
@@ -434,13 +700,22 @@ void Codegen::allocate_cell_model_memory() {
     // one slot, so there is still a buffer to bind.
     const s64 event_arrival_slots = cells_receive_events() ? 2 * context.simulation.total_neuron_count : 1;
 
+    // Every input buffer has at least one slot, so there is always one to bind.
+    collect_inputs();
+    const s64 entry_count = static_cast<s64>(input_entries.size());
+
     device->partition(sizeof(f32) * context.get_cell_state_size(), EngineDatatype::FLOAT32, data_partitions)            // cell_state
           .partition(sizeof(f32) * 2 * context.simulation.total_neuron_count, EngineDatatype::FLOAT32, data_partitions)    // network_inputs
           .partition(sizeof(u8) * spike_history_length(context) * context.simulation.total_neuron_count,
                      EngineDatatype::UNSIGNED8, data_partitions)                                                           // spike_history
           .partition(sizeof(s64) * context.simulation.total_neuron_count, EngineDatatype::SIGNED64, data_partitions)       // last_spiked
           .partition(sizeof(f32), EngineDatatype::FLOAT32, data_partitions)                                                // empty_edge_plane
-          .partition(sizeof(u32) * event_arrival_slots, EngineDatatype::UNSIGNED32, data_partitions);                      // event_arrival_count
+          .partition(sizeof(u32) * event_arrival_slots, EngineDatatype::UNSIGNED32, data_partitions)                       // event_arrival_count
+          .partition(sizeof(s64) * (context.simulation.total_neuron_count + 1), EngineDatatype::SIGNED64, data_partitions) // input_row_start
+          .partition(sizeof(s32) * std::max<s64>(1, entry_count), EngineDatatype::SIGNED32, data_partitions)               // input_entry_prototype
+          .partition(sizeof(f32) * std::max<s64>(1, entry_count * input_value_stride), EngineDatatype::FLOAT32,
+                     data_partitions)                                                                                      // input_values
+          .partition(sizeof(u8) * std::max<s64>(1, input_spike_count_size), EngineDatatype::UNSIGNED8, data_partitions); // input_spike_counts
 
     EnginePointer slab = device->allocate(data_partitions);
     data_partitions.push_back(slab);
@@ -456,6 +731,68 @@ Codegen::~Codegen() {
     delete root;
     for (auto &[type_name, template_body] : component_type_templates) delete template_body;
     for (auto &[type_name, template_body] : synapse_type_templates) delete template_body;
+}
+
+void Codegen::initialize_input_state(RandomGenerator &random_generator) {
+    if (data_partitions.size() < 10) throw runtime_error("initialize_input_state: input memory is not allocated");
+    s64 *row_start = data_partitions[6].get_contents_as<s64>();
+    s32 *entry_prototype = data_partitions[7].get_contents_as<s32>();
+    f32 *values = data_partitions[8].get_contents_as<f32>();
+    u8 *spike_counts = data_partitions[9].get_contents_as<u8>();
+
+    // Each neuron's entries are input_row_start[n] up to input_row_start[n + 1]; entries are
+    // sorted by neuron.
+    const s64 neuron_count = context.simulation.total_neuron_count;
+    std::fill(row_start, row_start + neuron_count + 1, 0);
+    for (const InputEntry &entry : input_entries) row_start[entry.neuron_index + 1] += 1;
+    for (s64 neuron_index = 0; neuron_index < neuron_count; neuron_index += 1) {
+        row_start[neuron_index + 1] += row_start[neuron_index];
+    }
+
+    // A part starts every entry the same, unless its OnStart calls random(); then each draws its own.
+    auto draws_on_start = [](const NML_ComponentType &component_type) {
+        for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+            if (entry.source_tag != NML_DeclarationType::OnStart) continue;
+            const std::unique_ptr<LemsParseNode> tree(parse_lems_expression(entry.expression, component_type.name));
+            if (calls_function(tree.get(), "random")) return true;
+        }
+        return false;
+    };
+    std::map<std::pair<s32, usize>, Vector<f32>> shared_starting_state;
+    for (usize entry_index = 0; entry_index < input_entries.size(); entry_index += 1) {
+        const InputEntry &entry = input_entries[entry_index];
+        entry_prototype[entry_index] = entry.prototype;
+        f32 *entry_values = values + (s64)entry_index * input_value_stride;
+        entry_values[0] = entry.weight;
+
+        const InputTree &tree = input_trees[(usize)entry.prototype];
+        for (usize part_index = 0; part_index < tree.parts.size(); part_index += 1) {
+            const InputPart &part = tree.parts[part_index];
+            const NML_ComponentType &component_type = *part.instance->component_type;
+            const std::pair<s32, usize> key{entry.prototype, part_index};
+
+            Vector<f32> starting_state;
+            auto shared = shared_starting_state.find(key);
+            if (shared != shared_starting_state.end()) {
+                starting_state = shared->second;
+            } else {
+                const UnorderedMap<String, f64> part_values = starting_values(context, *part.instance, &random_generator);
+                for (const String &name : component_type.state_variable_names) {
+                    starting_state.push_back(static_cast<f32>(part_values.at(name)));
+                }
+                if (!draws_on_start(component_type)) shared_starting_state[key] = starting_state;
+            }
+            std::copy(starting_state.begin(), starting_state.end(), entry_values + 1 + part.first_state_slot);
+        }
+    }
+
+    for (usize prototype = 0; prototype < input_trees.size(); prototype += 1) {
+        const Vector<InputSpikeTrain> &trains = input_trees[prototype].spike_trains;
+        for (usize train = 0; train < trains.size(); train += 1) {
+            std::copy(trains[train].spike_counts.begin(), trains[train].spike_counts.end(),
+                      spike_counts + input_spike_train_offsets[prototype][train]);
+        }
+    }
 }
 
 void Codegen::initialize_cell_state(RandomGenerator &random_generator) {
@@ -633,6 +970,34 @@ void replace_identifier(KernelNode *&node, const String &name, const KernelNode 
     for (KernelNode **slot : use_slots(node)) replace_identifier(*slot, name, replacement);
 }
 
+void fold_constants(KernelNode *&node) {
+    if (!node) return;
+    for (KernelNode **slot : use_slots(node)) fold_constants(*slot);
+    if (node->body.syntax_type != KernelNodeType::EXPRESSION) return;
+
+    const String &expression_operator = node->body.token;
+    f64 result = 0.0;
+    if (const auto *unary = dynamic_cast<const KernelUnaryNode *>(node)) {
+        f64 operand = 0.0;
+        if (expression_operator != "-" || !float_literal_value(unary->child, operand)) return;
+        result = -operand;
+    } else if (const auto *binary = dynamic_cast<const KernelBinaryNode *>(node)) {
+        f64 left = 0.0;
+        f64 right = 0.0;
+        if (!float_literal_value(binary->left, left) || !float_literal_value(binary->right, right)) return;
+        if (expression_operator == "+") result = left + right;
+        else if (expression_operator == "-") result = left - right;
+        else if (expression_operator == "*") result = left * right;
+        else if (expression_operator == "/" && right != 0.0) result = left / right;
+        else return;
+    } else {
+        return;
+    }
+    if (!std::isfinite(result)) return;
+    delete node;
+    node = literal(float_literal(result));
+}
+
 void collect_identifiers(const KernelNode *node, Set<String> &names) {
     if (!node) return;
     if (node->body.syntax_type == KernelNodeType::IDENTIFIER) {
@@ -693,10 +1058,12 @@ KernelNode *Codegen::translate_kernel_code() {
     if (!master_step) throw runtime_error("translate_kernel_code: the boilerplate has no master_step");
     KernelListNode *body = static_cast<KernelListNode *>(master_step->children[3]);
 
-    // One branch per population, over its range of neurons.
+    // One branch per population, over its range of neurons. Its inputs come first, translated
+    // after every cell so the cells' random() slots come first.
     KernelListNode *dispatch = new_conditional();
     s64 first_neuron = 0;
     try {
+        Vector<std::tuple<const NML_ComponentInstance *, s64, KernelListNode *>> population_bodies;
         for (const NML_ComponentInstance *population : network_populations(context)) {
             const s64 population_size = context.get_population_size(population);
             if (population_size == 0) continue;
@@ -705,7 +1072,12 @@ KernelNode *Codegen::translate_kernel_code() {
             KernelNode *test = new_expression("<", identifier("neuron_index"),
                                               literal(std::to_string(first_neuron + population_size)));
             add_branch(dispatch, test, population_body);
+            population_bodies.push_back({population, first_neuron, population_body});
             first_neuron += population_size;
+        }
+        for (const auto &[population, population_first_neuron, population_body] : population_bodies) {
+            KernelListNode *inputs = translate_input_entries(*population, population_first_neuron);
+            if (inputs) insert_statements(population_body, 0, {inputs});
         }
     } catch (...) {
         delete dispatch;
@@ -798,6 +1170,7 @@ KernelNode *Codegen::translate_kernel_code() {
     const std::unique_ptr<KernelNode> history_length(literal(std::to_string(spike_history_length(context))));
     bake_parameter(master_step, "neuron_count", neuron_count.get());
     bake_parameter(master_step, "spike_history_length", history_length.get());
+    fold_constants(master_step->children[3]);
     return root;
 }
 
@@ -1051,7 +1424,9 @@ void Codegen::check_cell_inputs() const {
         for (const InputTarget &target : profile.targets) {
             const NML_ComponentType *cell_type = cell_type_of(context.neuron_index_of(target.neuron_index));
             if (!cell_type || !checked_cell_types.insert(cell_type).second) continue;
-            check_attached(*cell_type, *input, "Input", profile.continuous_current_injection, false);
+            // A spike source's spikes become kicks into the cell's input; every other input delivers
+            // the exposure the cell reads.
+            check_attached(*cell_type, *input, "Input", !context.is_instance_of(input, "baseSpikeSource"), false);
         }
     }
 }
@@ -1283,7 +1658,7 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
     if (has_refractory) {
         auto elapsed_since_spike = [&](KernelNode *now) {
             KernelNode *last_spike = new_expression("[]", identifier("last_spiked"), identifier("neuron_index"));
-            return new_expression("*", new_cast(new_type("f32"), new_expression("-", now, last_spike)), literal(step_dt));
+            return time_of_ticks(new_expression("-", now, last_spike), context.simulation.step_dt);
         };
         KernelNode *has_spiked = new_expression(
                 ">=", new_expression("[]", identifier("last_spiked"), identifier("neuron_index")), literal("0"));
@@ -1437,8 +1812,7 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
         const std::unique_ptr<KernelNode> local(identifier(DERIVED_PREFIX + name));
         replace_identifier(body_node, name, local.get());
     }
-    const std::unique_ptr<KernelNode> tick_time(new_expression(
-            "*", new_cast(new_type("f32"), identifier("tick")), literal(step_dt)));
+    const std::unique_ptr<KernelNode> tick_time(time_of_ticks(identifier("tick"), context.simulation.step_dt));
     replace_identifier(body_node, "t", tick_time.get());
 
     component_type_templates[component_type.name] = body;
@@ -1501,6 +1875,460 @@ KernelListNode *Codegen::translate_component_instance(const NML_ComponentInstanc
         throw;
     }
     return static_cast<KernelListNode *>(body);
+}
+
+// The loop over this neuron's input entries, dispatching each to its prototype's code. Run in the
+// population's branch before the cell's dynamics, so the cell reads what its inputs added to
+// network_input this tick.
+KernelListNode *Codegen::translate_input_entries(const NML_ComponentInstance &population, s64 first_neuron) {
+    const s64 population_size = context.get_population_size(&population);
+    Vector<bool> reaches_population(input_prototypes.size(), false);
+    bool any_entry = false;
+    for (const InputEntry &entry : input_entries) {
+        if (entry.neuron_index < first_neuron || entry.neuron_index >= first_neuron + population_size) continue;
+        reaches_population[(usize)entry.prototype] = true;
+        any_entry = true;
+    }
+    if (!any_entry) return nullptr;
+
+    KernelListNode *dispatch = new_conditional();
+    try {
+        for (usize prototype = 0; prototype < input_prototypes.size(); prototype += 1) {
+            if (!reaches_population[prototype]) continue;
+            add_branch(dispatch, new_expression("==", identifier("input_prototype"), literal(std::to_string(prototype))),
+                       translate_input_prototype(static_cast<s32>(prototype), population, first_neuron));
+        }
+    } catch (...) {
+        delete dispatch;
+        throw;
+    }
+
+    KernelListNode *entry_body = new_block();
+    entry_body->children.push_back(new_declaration(
+            new_type("const s64"), "input_base",
+            new_expression("*", identifier("input_entry"), literal(std::to_string(input_value_stride)))));
+    entry_body->children.push_back(new_declaration(
+            new_type("const f32"), "input_weight", new_expression("[]", identifier("input_values"), identifier("input_base"))));
+    entry_body->children.push_back(new_declaration(
+            new_type("const s32"), "input_prototype",
+            new_expression("[]", identifier("input_entry_prototype"), identifier("input_entry"))));
+    entry_body->children.push_back(dispatch);
+
+    KernelListNode *entry_loop = new_node<ListNode>(KernelNodeType::FOR, "");
+    entry_loop->children = {
+            new_declaration(new_type("s64"), "input_entry",
+                            new_expression("[]", identifier("input_row_start"), identifier("neuron_index"))),
+            new_expression("<", identifier("input_entry"),
+                           new_expression("[]", identifier("input_row_start"),
+                                          new_expression("+", identifier("neuron_index"), literal("1")))),
+            new_assignment(identifier("input_entry"), "+=", literal("1")), entry_body};
+    KernelListNode *block = new_block();
+    block->children.push_back(entry_loop);
+    return block;
+}
+
+// One input's dynamics for the current entry (input_base, input_weight, input_entry), on a cell of
+// the population. Each part keeps its state in the entry's block of input_values. Order:
+//   - each spike train runs its receiver's OnEvents once per spike on this tick;
+//   - every part from the leaves up, so a part reads what its children export: its derived
+//     variables, its derivatives into temporaries, its Euler steps, its OnConditions, then the
+//     values its parent selects from it into input_part<k>_<name>;
+//   - delivery: an input that produces a current adds the exposure the cell reads to
+//     network_input; a spike source adds a kick per spike it emits that no Structure routes on.
+// An EventOut runs the OnEvents of the parts its Structure routes it to, at once.
+KernelListNode *Codegen::translate_input_prototype(s32 prototype, const NML_ComponentInstance &population,
+                                                   s64 first_neuron) {
+    const InputTree &tree = input_trees[(usize)prototype];
+    const NML_ComponentInstance &input = *input_prototypes[(usize)prototype];
+    const NML_ComponentInstance &cell = population_cell(context, population);
+    const NML_ComponentType &cell_type = *cell.component_type;
+    const String step_dt = float_literal(context.simulation.step_dt);
+    const bool spike_source = context.is_instance_of(&input, "baseSpikeSource");
+    auto unsupported = [&input](const String &reason) {
+        return runtime_error("Input '" + input.id + "' (" + input.component_type->name + "): " + reason);
+    };
+    auto part_name = [&tree](s64 part_index) {
+        const InputPart &part = tree.parts[(usize)part_index];
+        return "'" + part.instance->id + "' (" + part.instance->component_type->name + ")";
+    };
+
+    // A state variable of the target cell, in this population's layout.
+    auto cell_slot = [&](const String &variable_name) -> KernelNode * {
+        const Vector<String> &variable_names = cell_type.state_variable_names;
+        auto variable = std::find(variable_names.begin(), variable_names.end(), variable_name);
+        if (variable == variable_names.end()) return nullptr;
+        const s64 variable_count = static_cast<s64>(variable_names.size());
+        const s64 constant_part = context.simulation.population_base_indices.at(population.id) -
+                                  first_neuron * variable_count + static_cast<s64>(variable - variable_names.begin());
+        return new_expression("[]", identifier("cell_state"),
+                              new_expression(constant_part < 0 ? "-" : "+",
+                                             new_expression("*", identifier("neuron_index"),
+                                                            literal(std::to_string(variable_count))),
+                                             literal(std::to_string(std::llabs(constant_part)))));
+    };
+
+    // What the cell reads from its inputs: the exposure its select names.
+    String read_exposure;
+    for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
+        if (entry.select.empty()) continue;
+        read_exposure = entry.select.substr(entry.select.rfind('/') + 1);
+        break;
+    }
+
+    // A select is "role[*]/name" or "role/name".
+    auto select_role = [](const String &select) { return select.substr(0, select.find_first_of("[/")); };
+    auto select_name = [](const String &select) { return select.substr(select.rfind('/') + 1); };
+    auto export_local = [](s64 part_index, const String &name) {
+        return INPUT_PART_PREFIX + std::to_string(part_index) + "_" + name;
+    };
+
+    // The values each part's parent selects from it.
+    Vector<Vector<String>> exports(tree.parts.size());
+    auto add_export = [&](s64 part_index, const String &name) {
+        Vector<String> &names = exports[(usize)part_index];
+        if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+    };
+    for (s64 part_index = 0; part_index < (s64)tree.parts.size(); part_index += 1) {
+        for (const NML_DynamicsExpression &entry : tree.parts[(usize)part_index].instance->component_type->dynamics) {
+            if (entry.select.empty()) continue;
+            for (s64 child = 0; child < (s64)tree.parts.size(); child += 1) {
+                const InputPart &child_part = tree.parts[(usize)child];
+                if (child_part.parent == part_index && child_part.role == select_role(entry.select)) {
+                    add_export(child, select_name(entry.select));
+                }
+            }
+        }
+    }
+    if (!spike_source) {
+        if (read_exposure.empty()) throw unsupported("its target, a '" + cell_type.name + "', reads no input");
+        add_export(0, read_exposure);
+    }
+
+    auto translate = [&](const String &expression, const String &owner_name) {
+        const std::unique_ptr<LemsParseNode> tree_node(parse_lems_expression(expression, owner_name));
+        return translate_expression(tree_node.get());
+    };
+
+    // A part's LEMS names, replaced with what they read for this entry: its state in input_values,
+    // its parameters and properties as values (an input's own weight is the entry's), what it
+    // requires from the target cell, the tick's time, and a random() slot per entry.
+    auto resolve_part_names = [&](KernelNode *node, s64 part_index) {
+        const InputPart &part = tree.parts[(usize)part_index];
+        const NML_ComponentType &component_type = *part.instance->component_type;
+        Set<String> used_names;
+        collect_identifiers(node, used_names);
+
+        const Vector<String> &variable_names = component_type.state_variable_names;
+        for (usize offset = 0; offset < variable_names.size(); offset += 1) {
+            if (!used_names.count(variable_names[offset])) continue;
+            const std::unique_ptr<KernelNode> slot(new_expression(
+                    "[]", identifier("input_values"),
+                    new_expression("+", identifier("input_base"),
+                                   literal(std::to_string(1 + part.first_state_slot + (s64)offset)))));
+            replace_identifier(node, variable_names[offset], slot.get());
+        }
+        for (const auto &[name, value] : component_parameter_values(context, *part.instance)) {
+            if (!used_names.count(name)) continue;
+            const std::unique_ptr<KernelNode> value_literal(literal(float_literal(value)));
+            replace_identifier(node, name, value_literal.get());
+        }
+        for (const NML_ComponentType *type = &component_type; type; type = type->extends) {
+            for (const NML_Node *element : children_of(type->source_node)) {
+                const NML_Tag &tag = element->body;
+                const String name = tag.get_attribute_or("name", "");
+                if (name.empty() || !used_names.count(name)) continue;
+                if (component_type.find_declaration(tag.namespace_key()) != element) continue;
+
+                if (tag.tag_type == NML_DeclarationType::Property) {
+                    std::unique_ptr<KernelNode> value;
+                    if (part_index == 0 && name == "weight") {
+                        value.reset(identifier("input_weight"));
+                    } else {
+                        const String text_value = part.instance->has_value(name) ? part.instance->value_or(name)
+                                                                                : tag.get_attribute_or("defaultValue", "0");
+                        value.reset(literal(float_literal(context.resolve_quantity(text_value))));
+                    }
+                    replace_identifier(node, name, value.get());
+                } else if (tag.tag_type == NML_DeclarationType::Requirement) {
+                    const std::unique_ptr<KernelNode> slot(cell_slot(name));
+                    if (!slot) {
+                        throw unsupported(part_name(part_index) + " needs '" + name + "' from its target, a '" +
+                                          cell_type.name + "', which has no such state variable");
+                    }
+                    replace_identifier(node, name, slot.get());
+                }
+            }
+        }
+        if (used_names.count("t")) {
+            const std::unique_ptr<KernelNode> tick_time(time_of_ticks(identifier("tick"), context.simulation.step_dt));
+            replace_identifier(node, "t", tick_time.get());
+        }
+        for (const String &name : used_names) {
+            if (!starts_with(name, RANDOM_SLOT_PREFIX)) continue;
+            const std::unique_ptr<KernelNode> slot(new_expression(
+                    "+", identifier("input_entry"), literal(std::to_string(random_values_count))));
+            replace_identifier(node, name, slot.get());
+            random_values_count += static_cast<s64>(input_entries.size());
+        }
+    };
+
+    // The LEMS names a part may not use, since the generated code would capture them.
+    auto check_part_names = [&](s64 part_index, const Set<String> &names) {
+        for (const String &name : names) {
+            if (INPUT_ENGINE_NAMES.count(name) || starts_with(name, INPUT_PART_PREFIX) || starts_with(name, DERIVED_PREFIX) ||
+                starts_with(name, DERIVATIVE_PREFIX)) {
+                throw unsupported(part_name(part_index) + " uses the name '" + name + "', which the generated kernel reserves");
+            }
+        }
+    };
+
+    // An EventOut from source: the OnEvents of the parts it is routed to, run at once; for a
+    // spike source's own unrouted spike, a kick.
+    std::function<KernelListNode *(s64, usize)> deliver_event;
+    std::function<KernelListNode *(s64, usize)> on_event_body = [&](s64 part_index, usize depth) {
+        const NML_ComponentType &component_type = *tree.parts[(usize)part_index].instance->component_type;
+        KernelListNode *body = new_block();
+        bool in_event = false;
+        bool emits_spike = false;
+        for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+            switch (entry.source_tag) {
+                case NML_DeclarationType::OnEvent:
+                    in_event = true;
+                    break;
+                case NML_DeclarationType::StateAssignment:
+                    if (in_event) {
+                        body->children.push_back(new_assignment(identifier(entry.target), "=",
+                                                                translate(entry.expression, component_type.name)));
+                    }
+                    break;
+                case NML_DeclarationType::EventOut:
+                    if (in_event) emits_spike = true;
+                    break;
+                case NML_DeclarationType::Transition:
+                    if (in_event) throw unsupported(part_name(part_index) + " has a Transition in an OnEvent");
+                    break;
+                default:
+                    in_event = false;
+                    break;
+            }
+        }
+        Set<String> used_names;
+        collect_identifiers(body, used_names);
+        for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+            if (entry.source_tag != NML_DeclarationType::DerivedVariable && entry.source_tag != NML_DeclarationType::Case) continue;
+            if (used_names.count(entry.target)) {
+                delete body;
+                throw unsupported(part_name(part_index) + " reads derived variable '" + entry.target + "' in an OnEvent");
+            }
+        }
+        check_part_names(part_index, used_names);
+        resolve_part_names(body, part_index);
+        if (emits_spike) {
+            KernelListNode *delivered = deliver_event(part_index, depth + 1);
+            for (KernelNode *statement : delivered->children) body->children.push_back(statement);
+            delivered->children.clear();
+            delete delivered;
+        }
+        return body;
+    };
+    deliver_event = [&](s64 source, usize depth) {
+        if (depth > tree.parts.size()) throw unsupported("its parts route events to each other in a loop");
+        KernelListNode *block = new_block();
+        bool routed = false;
+        for (const InputEventRoute &route : tree.routes) {
+            if (route.source != source) continue;
+            routed = true;
+            block->children.push_back(on_event_body(route.target, depth));
+        }
+        if (!routed && source == 0 && spike_source) {
+            block->children.push_back(new_assignment(identifier("input_kicks"), "+=", literal("1")));
+        }
+        return block;
+    };
+
+    // One part's step for this tick.
+    auto part_step = [&](s64 part_index) -> KernelListNode * {
+        const NML_ComponentType &component_type = *tree.parts[(usize)part_index].instance->component_type;
+        const String &owner_name = component_type.name;
+
+        struct Handler {
+            String test;
+            Vector<const NML_DynamicsExpression *> assignments;
+            bool emits_spike = false;
+        };
+        Vector<String> derived_names;
+        UnorderedMap<String, Vector<const NML_DynamicsExpression *>> derived_entries;
+        Vector<const NML_DynamicsExpression *> derivative_entries;
+        Vector<Handler> handlers;
+        enum class Group { NONE, CONDITION, OTHER };
+        Group group = Group::NONE;
+        for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+            switch (entry.source_tag) {
+                case NML_DeclarationType::DerivedVariable:
+                case NML_DeclarationType::Case:
+                    if (derived_entries.count(entry.target) == 0) derived_names.push_back(entry.target);
+                    derived_entries[entry.target].push_back(&entry);
+                    group = Group::NONE;
+                    break;
+                case NML_DeclarationType::TimeDerivative:
+                    derivative_entries.push_back(&entry);
+                    group = Group::NONE;
+                    break;
+                case NML_DeclarationType::OnCondition:
+                    handlers.push_back({entry.expression, {}, false});
+                    group = Group::CONDITION;
+                    break;
+                case NML_DeclarationType::StateAssignment:
+                    if (group == Group::CONDITION) handlers.back().assignments.push_back(&entry);
+                    break;
+                case NML_DeclarationType::EventOut:
+                    if (group == Group::CONDITION) handlers.back().emits_spike = true;
+                    break;
+                case NML_DeclarationType::Regime:
+                case NML_DeclarationType::OnEntry:
+                case NML_DeclarationType::Transition:
+                    throw unsupported(part_name(part_index) + " has regimes, which an input part cannot");
+                default:
+                    group = Group::OTHER;
+                    break;
+            }
+        }
+
+        Set<String> lems_names;
+        for (const String &name : component_type.state_variable_names) lems_names.insert(name);
+        auto translate_part = [&](const String &expression) {
+            const std::unique_ptr<LemsParseNode> tree_node(parse_lems_expression(expression, owner_name));
+            collect_lems_identifiers(tree_node.get(), lems_names);
+            return translate_expression(tree_node.get());
+        };
+        // A select reads what the matching child parts export: summed for reduce="add".
+        auto selected_value = [&](const NML_DynamicsExpression &entry) -> KernelNode * {
+            const String role = select_role(entry.select);
+            const String name = select_name(entry.select);
+            Vector<s64> children;
+            for (s64 child = 0; child < (s64)tree.parts.size(); child += 1) {
+                if (tree.parts[(usize)child].parent == part_index && tree.parts[(usize)child].role == role) children.push_back(child);
+            }
+            if (entry.reduce == "add") {
+                if (children.empty()) return literal("0.0f");
+                KernelNode *sum = identifier(export_local(children[0], name));
+                for (usize index = 1; index < children.size(); index += 1) {
+                    sum = new_expression("+", sum, identifier(export_local(children[index], name)));
+                }
+                return sum;
+            }
+            if (!entry.reduce.empty() || children.size() != 1) {
+                throw unsupported(part_name(part_index) + " selects '" + entry.select + "', which needs reduce=\"add\" "
+                                  "or exactly one part");
+            }
+            return identifier(export_local(children[0], name));
+        };
+        auto part_unsupported = [&](const String &reason) { return unsupported(part_name(part_index) + ": " + reason); };
+
+        KernelListNode *body = new_block();
+        place_derived_variables(body, derived_names, derived_entries, translate_part, selected_value, part_unsupported,
+                                lems_names);
+
+        Vector<KernelNode *> updates;
+        Set<String> integrated_names;
+        for (const NML_DynamicsExpression *derivative : derivative_entries) {
+            if (!integrated_names.insert(derivative->target).second) {
+                delete body;
+                throw part_unsupported("'" + derivative->target + "' has more than one TimeDerivative");
+            }
+            body->children.push_back(new_declaration(
+                    new_type("const f32"), DERIVATIVE_PREFIX + derivative->target, translate_part(derivative->expression)));
+            updates.push_back(new_assignment(
+                    identifier(derivative->target), "+=",
+                    new_expression("*", literal(step_dt), identifier(DERIVATIVE_PREFIX + derivative->target))));
+        }
+        for (KernelNode *update : updates) body->children.push_back(update);
+
+        for (const Handler &handler : handlers) {
+            KernelListNode *handler_body = new_block();
+            for (const NML_DynamicsExpression *assignment : handler.assignments) {
+                handler_body->children.push_back(
+                        new_assignment(identifier(assignment->target), "=", translate_part(assignment->expression)));
+            }
+            if (handler.emits_spike) handler_body->children.push_back(deliver_event(part_index, 0));
+            KernelListNode *condition = new_conditional();
+            add_branch(condition, translate_part(handler.test), handler_body);
+            body->children.push_back(condition);
+        }
+
+        for (const String &name : exports[(usize)part_index]) {
+            body->children.push_back(new_assignment(identifier(export_local(part_index, name)), "=", identifier(name)));
+            lems_names.insert(name);
+        }
+
+        check_part_names(part_index, lems_names);
+        KernelNode *body_node = body;
+        for (const String &name : derived_names) {
+            const std::unique_ptr<KernelNode> local(identifier(DERIVED_PREFIX + name));
+            replace_identifier(body_node, name, local.get());
+        }
+        resolve_part_names(body, part_index);
+        return body;
+    };
+
+    KernelListNode *block = new_block();
+    try {
+        if (spike_source) block->children.push_back(new_declaration(new_type("s32"), "input_kicks", literal("0")));
+        for (s64 part_index = 0; part_index < (s64)tree.parts.size(); part_index += 1) {
+            for (const String &name : exports[(usize)part_index]) {
+                block->children.push_back(new_declaration(new_type("f32"), export_local(part_index, name), literal("0.0f")));
+            }
+        }
+
+        for (usize train = 0; train < tree.spike_trains.size(); train += 1) {
+            KernelListNode *train_block = new_block();
+            train_block->children.push_back(new_declaration(
+                    new_type("const s32"), "train_spikes",
+                    new_cast(new_type("s32"),
+                             new_expression("[]", identifier("input_spike_counts"),
+                                            new_expression("+", literal(std::to_string(input_spike_train_offsets[(usize)prototype][train])),
+                                                           identifier("tick"))))));
+            KernelListNode *per_spike = on_event_body(tree.spike_trains[train].receiver, 0);
+            KernelListNode *spike_loop = new_node<ListNode>(KernelNodeType::FOR, "");
+            spike_loop->children = {new_declaration(new_type("s32"), "arrival", literal("0")),
+                                    new_expression("<", identifier("arrival"), identifier("train_spikes")),
+                                    new_assignment(identifier("arrival"), "+=", literal("1")), per_spike};
+            train_block->children.push_back(spike_loop);
+            block->children.push_back(train_block);
+        }
+
+        for (s64 part_index = (s64)tree.parts.size() - 1; part_index >= 0; part_index -= 1) {
+            block->children.push_back(part_step(part_index));
+        }
+
+        if (spike_source) {
+            const f64 kick = input.has_value("amplitude") ? context.resolve_quantity(input.value_or("amplitude"))
+                                                          : default_kick_amplitude(context, cell);
+            block->children.push_back(new_assignment(
+                    identifier("network_input"), "+=",
+                    new_expression("*", new_cast(new_type("f32"), identifier("input_kicks")),
+                                   new_expression("*", literal(float_literal(kick)), identifier("input_weight")))));
+        } else {
+            block->children.push_back(new_assignment(identifier("network_input"), "+=", identifier(export_local(0, read_exposure))));
+        }
+    } catch (...) {
+        delete block;
+        throw;
+    }
+
+    // Everything left is an engine name, an input local or a part's own local.
+    Set<String> remaining_names;
+    collect_identifiers(block, remaining_names);
+    for (const String &name : remaining_names) {
+        if (INPUT_ENGINE_NAMES.count(name) || starts_with(name, INPUT_PART_PREFIX) || starts_with(name, DERIVED_PREFIX) ||
+            starts_with(name, DERIVATIVE_PREFIX)) {
+            continue;
+        }
+        delete block;
+        throw unsupported("'" + name + "' is not a state variable, a set parameter, a property, a constant or a derived "
+                          "variable of any of its parts");
+    }
+    return block;
 }
 
 // The synapse's dynamics for the current edge, with LEMS names still in them. Each state
@@ -1652,8 +2480,7 @@ KernelListNode *Codegen::translate_synapse_type(const NML_ComponentType &compone
         const std::unique_ptr<KernelNode> local(identifier(DERIVED_PREFIX + name));
         replace_identifier(body_node, name, local.get());
     }
-    const std::unique_ptr<KernelNode> tick_time(new_expression(
-            "*", new_cast(new_type("f32"), identifier("tick")), literal(step_dt)));
+    const std::unique_ptr<KernelNode> tick_time(time_of_ticks(identifier("tick"), context.simulation.step_dt));
     replace_identifier(body_node, "t", tick_time.get());
 
     synapse_type_templates[component_type.name] = body;
@@ -1957,6 +2784,15 @@ String Codegen::function_call_to_string(KernelNode *node) {
                    compile_unparenthesized(arguments[1]) + ", memory_order_relaxed)";
         }
         return "atomicAdd(&(" + compile_unparenthesized(arguments[0]) + "), " + compile_unparenthesized(arguments[1]) + ")";
+    }
+
+    // exact_divide(numerator, denominator): an IEEE correctly rounded division even under fast math.
+    if (name == "exact_divide") {
+        if (arguments.size() != 2) throw runtime_error("exact_divide takes a numerator and a denominator");
+        const String numerator = compile_unparenthesized(arguments[0]);
+        const String denominator = compile_unparenthesized(arguments[1]);
+        if (backend == KernelBackend::METAL) return "precise::divide(" + numerator + ", " + denominator + ")";
+        return "__fdiv_rn(" + numerator + ", " + denominator + ")";
     }
 
     // atomic_increment(target): adds 1 to a u32 slot.

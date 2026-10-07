@@ -41,6 +41,9 @@ NML_DeclarationType string_to_declaration_type(const String &value) {
         {"EventOut", NML_DeclarationType::EventOut},
         {"Transition", NML_DeclarationType::Transition},
         {"Regime", NML_DeclarationType::Regime},
+        {"ChildInstance", NML_DeclarationType::ChildInstance},
+        {"With", NML_DeclarationType::With},
+        {"EventConnection", NML_DeclarationType::EventConnection},
     };
 
     auto entry = mapping.find(value);

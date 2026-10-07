@@ -55,6 +55,34 @@ void collect_event_actions(const NML_Node *handler, const String &regime_name, c
     }
 }
 
+// Flattens a <Structure> element into structure entries, in document order.
+void collect_structure(const NML_Node *element, Vector<NML_StructureEntry> &structure) {
+    for (const NML_Node *child : children_of(element)) {
+        const NML_Tag &tag = child->body;
+        NML_StructureEntry entry(tag.tag_type);
+
+        switch (tag.tag_type) {
+            case NML_DeclarationType::ChildInstance:
+                entry.component = tag.get_attribute("component");
+                break;
+            case NML_DeclarationType::With:
+                entry.instance = tag.get_attribute("instance");
+                entry.alias = tag.get_attribute("as");
+                break;
+            case NML_DeclarationType::EventConnection:
+                entry.source = tag.get_attribute("from");
+                entry.target = tag.get_attribute("to");
+                entry.receiver = tag.get_attribute_or("receiver", "");
+                entry.source_port = tag.get_attribute_or("sourcePort", "");
+                entry.target_port = tag.get_attribute_or("targetPort", "");
+                break;
+            default:
+                continue;
+        }
+        structure.push_back(std::move(entry));
+    }
+}
+
 // Flattens a <Dynamics> or <Regime> element into dynamics entries, in document order.
 // OnStart assignments are entries of their own (source_tag OnStart); OnCondition, OnEntry
 // and OnEvent are followed by the entries of their actions.
@@ -424,7 +452,8 @@ void NML_Context::parse_component_types() {
         }
     }
 
-    // A type's own <Dynamics> replaces its ancestors'; without one it inherits the nearest.
+    // A type's own <Dynamics> replaces its ancestors'; without one it inherits the nearest. The
+    // same goes for <Structure>.
     for (const String &type_name : type_names) {
         NML_ComponentType &component_type = component_types.at(type_name);
 
@@ -439,6 +468,19 @@ void NML_Context::parse_component_types() {
 
         component_type.dynamics.clear();
         if (dynamics_node) collect_dynamics(dynamics_node, "", component_type.dynamics);
+
+        // Likewise the nearest <Structure>.
+        const NML_Node *structure_node = nullptr;
+        for (const NML_ComponentType *type = &component_type; type && !structure_node; type = type->extends) {
+            for (const NML_Node *child : children_of(type->source_node)) {
+                if (child->body.tag_name != "Structure") continue;
+                structure_node = child;
+                break;
+            }
+        }
+
+        component_type.structure.clear();
+        if (structure_node) collect_structure(structure_node, component_type.structure);
     }
 }
 
@@ -564,7 +606,11 @@ const NML_ComponentInstance *NML_Context::find_instance(const String &instance_i
 
 bool NML_Context::is_instance_of(const NML_ComponentInstance *instance,
                                 const String &type_name) const {
-    return instance && instance->component_type && instance->component_type->name == type_name;
+    if (!instance) return false;
+    for (const NML_ComponentType *type = instance->component_type; type; type = type->extends) {
+        if (type->name == type_name) return true;
+    }
+    return false;
 }
 
 s64 NML_Context::resolve_path(
@@ -790,52 +836,17 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
     // ── inputs ───────────────────────────────────────────────────────────────────
     // The wiring (explicitInput, inputList) names the targets; the input component it
-    // references carries the amplitude, the timing and any spike train.
+    // references is compiled from its own dynamics, so only its id is kept here.
     auto build_input_profile = [&](const String &input_component_id,
                                    Vector<InputTarget> targets) {
         const NML_ComponentInstance *input = find_instance(input_component_id);
-        if (!input) {
+        if (!input || !input->component_type) {
             throw runtime_error("Input wiring references component '" + input_component_id +
                                 "', which no instance declares");
         }
 
         SimulationInputConfig profile;
         profile.input_component_id = input->id;
-
-        if (input->has_value("amplitude")) {
-            profile.amplitude = resolve_quantity(input->value_or("amplitude"));
-        }
-        if (input->has_value("rate")) {
-            profile.rate = resolve_quantity(input->value_or("rate"));
-        }
-        if (input->has_value("delay")) {
-            profile.start_tick = units::seconds_to_ticks(
-                    resolve_quantity(input->value_or("delay")), simulation.step_dt);
-        }
-        if (input->has_value("duration")) {
-            profile.end_tick = profile.start_tick + units::seconds_to_ticks(
-                    resolve_quantity(input->value_or("duration")), simulation.step_dt);
-        }
-
-        // A spikeArray carries its train as <spike time="..."/> children; every target
-        // receives the same train.
-        Vector<s32> spike_ticks;
-        for (const String &spike_id : input->data_order) {
-            const NML_ComponentInstance *spike = find_instance(spike_id);
-            if (!is_instance_of(spike, "spike") || !spike->has_value("time")) continue;
-
-            spike_ticks.push_back(static_cast<s32>(
-                    units::seconds_to_ticks(resolve_quantity(spike->value_or("time")),
-                                            simulation.step_dt)));
-        }
-        std::sort(spike_ticks.begin(), spike_ticks.end());
-        for (InputTarget &target : targets) target.event_ticks = spike_ticks;
-
-        // A component carrying a spike train is an event source whatever else it declares;
-        // only one with no train and an amplitude injects current continuously.
-        profile.continuous_current_injection =
-                spike_ticks.empty() && input->has_value("amplitude");
-
         profile.targets = std::move(targets);
         simulation.input_profiles.push_back(std::move(profile));
     };

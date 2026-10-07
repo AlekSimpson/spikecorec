@@ -212,9 +212,17 @@ standard or your own:
   `spikeGeneratorPoisson` run as populations.
 - **Synapses:** current-based. The equations can use the synapse's own state, its
   parameters and the connection's weight, and can react to arriving spikes with `OnEvent`.
-- **Stimulus:** `pulseGenerator` and `pulseGeneratorDL`, a constant input over a time
-  window, and `spikeArray`, whose spikes are delivered as kicks into the target's input
-  (its `amplitude`, or else one sized from the target's capacitance and threshold).
+- **Stimulus:** every NeuroML input, wired with `explicitInput` or `inputList`, runs on the
+  GPU from its own LEMS dynamics, in its target cell's thread before the cell's own; each
+  target gets its own copy of the input's state:
+  - currents: `pulseGenerator`, `sineGenerator`, `rampGenerator` and `compoundInput`, and
+    their DL variants for cells that read a dimensionless input;
+  - clamps, which read the target's `v`: `voltageClamp` and `voltageClampTriple`;
+  - inputs that drive their own synapse: `timedSynapticInput` (spikes at listed times),
+    `poissonFiringSynapse` and `transientPoissonFiringSynapse`;
+  - spike sources such as `spikeArray`, whose spikes are delivered as kicks into the
+    target's input (its `amplitude`, or else one sized from the target's capacitance and
+    threshold).
 - **Connectivity:** any, from the document or from Python.
 
 Anything else fails at construction rather than simulating incorrectly: synapses that read
@@ -230,15 +238,6 @@ spc.SpikeEngine("LEMS_refused.xml", [[1], []], "conductanceSynapse")
 # RuntimeError: Synapse ComponentType 'expTwoSynapse' ('conductanceSynapse'): 'v' is not
 #               a state variable, a set parameter, a constant, a derived variable or weight
 ```
-
-The exception for now is the other input types. They are accepted, but do not yet behave as
-NeuroML defines them:
-
-- `sineGenerator` and `sineGeneratorDL` run as a constant input at their amplitude.
-- `timedSynapticInput` delivers its spikes as kicks, like `spikeArray`, instead of through
-  its synapse.
-- `rampGenerator`, `compoundInput` (and their DL variants), `poissonFiringSynapse`,
-  `transientPoissonFiringSynapse`, `voltageClamp` and `voltageClampTriple` deliver nothing.
 
 ## Tutorial
 

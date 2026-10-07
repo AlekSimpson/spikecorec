@@ -609,10 +609,16 @@ TEST(SingleCell, a_spike_train_fires_the_cell_on_the_ticks_it_names) {
   </network>
 </neuroml>
 )", "trainNetwork", "60ms", "0.1ms"));
-    ASSERT_EQ(engine.scheduled_spike_trains.size(), 1u);
-    EXPECT_EQ(engine.scheduled_spike_trains[0].event_ticks, (Vector<s32>{100, 250, 400}));
+    // The spikeArray's spikes become a count per tick: 1 on ticks 100, 250 and 400.
+    ASSERT_EQ(engine.input_spike_count_size, engine.lifetime);
+    const u8 *spike_counts = engine.input_spike_counts.get_contents_as<u8>();
+    Vector<s64> spike_ticks;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        if (spike_counts[tick] != 0) spike_ticks.push_back(tick);
+    }
+    EXPECT_EQ(spike_ticks, (Vector<s64>{100, 250, 400}));
     // 1.05 * C * (thresh - reset) / dt = 1.05 * 100 pF * 20 mV / 0.1 ms = 21 nA.
-    EXPECT_NEAR(engine.scheduled_spike_trains[0].magnitude, 2.1e-8f, 1e-11f);
+    EXPECT_NEAR(nml::default_kick_amplitude(engine.context, *engine.context.find_instance("c")), 2.1e-8, 1e-11);
 
     engine.run();
     const Vector<f64> times = spike_times_of(engine, 0);
@@ -1201,6 +1207,242 @@ TEST(CellEvents, an_on_event_inside_a_regime_runs_only_in_that_regime) {
     EXPECT_TRUE(spike_ticks_of(engine, free_cell).empty());
     EXPECT_FLOAT_EQ(engine.read_state_variable(held_cell, "received"), 0.0f);
     EXPECT_FLOAT_EQ(engine.read_state_variable(free_cell, "received"), (f32)arrivals);
+}
+
+// ── inputs, run from their own dynamics ─────────────────────────────────────────
+
+namespace {
+
+// A cell that records the input current it reads on each tick (`current`) and integrates it on its
+// capacitance (`v`, from v0), so what a generator delivers, or how a clamp pulls the membrane,
+// can be read off directly. inputProbeDL records a dimensionless input (`I`) the same way.
+String input_model(const String &declarations, const String &wiring, const String &probe_component = "probe") {
+    return R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Inputs">
+  <ComponentType name="inputProbe" extends="baseCellMembPot">
+    <Parameter name="C" dimension="capacitance"/>
+    <Parameter name="v0" dimension="voltage"/>
+    <Attachments name="synapses" type="basePointCurrent"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="current" dimension="current"/>
+      <DerivedVariable name="iSyn" dimension="current" select="synapses[*]/i" reduce="add"/>
+      <TimeDerivative variable="v" value="iSyn / C"/>
+      <OnStart>
+        <StateAssignment variable="v" value="v0"/>
+      </OnStart>
+      <OnCondition test="t .geq. 0">
+        <StateAssignment variable="current" value="iSyn"/>
+      </OnCondition>
+    </Dynamics>
+  </ComponentType>
+  <ComponentType name="inputProbeDL" extends="baseCellMembPot">
+    <Attachments name="synapses" type="basePointCurrentDL"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="current" dimension="none"/>
+      <DerivedVariable name="ISyn" dimension="none" select="synapses[*]/I" reduce="add"/>
+      <OnCondition test="t .geq. 0">
+        <StateAssignment variable="current" value="ISyn"/>
+      </OnCondition>
+    </Dynamics>
+  </ComponentType>
+  <inputProbe id="probe" C="100pF" v0="-70mV"/>
+  <inputProbeDL id="probeDL"/>
+)" + declarations + R"(  <network id="inputNetwork">
+    <population id="pop" component=")" + probe_component + R"(" size="1"/>
+)" + wiring + R"(  </network>
+</neuroml>
+)";
+}
+
+// The probe's `current` after each tick of the run.
+Vector<f64> recorded_input(SpikeEngine &engine) {
+    Vector<f64> currents;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        currents.push_back(engine.read_state_variable(0, "current"));
+    }
+    return currents;
+}
+
+constexpr f64 LEMS_PI = 3.14159265;  // the value Inputs.xml writes for pi
+
+f64 sine_current(f64 time, f64 delay, f64 duration, f64 amplitude, f64 phase, f64 period) {
+    if (time < delay || time >= delay + duration) return 0.0;
+    return amplitude * std::sin(phase + 2.0 * LEMS_PI * (time - delay) / period);
+}
+
+} // namespace
+
+TEST(Inputs, a_sine_generator_follows_its_formula_inside_its_window) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(
+            "  <sineGenerator id=\"sine\" delay=\"2ms\" phase=\"0.5\" duration=\"10ms\" amplitude=\"1nA\" period=\"4ms\"/>\n",
+            "    <explicitInput target=\"pop[0]\" input=\"sine\"/>\n"),
+            "inputNetwork", "15ms", "0.1ms"));
+    const Vector<f64> currents = recorded_input(engine);
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        const f64 expected = sine_current((f64)tick * engine.step_dt, 0.002, 0.010, 1e-9, 0.5, 0.004);
+        EXPECT_NEAR(currents[(usize)tick], expected, 1e-12) << "tick " << tick;
+    }
+}
+
+TEST(Inputs, a_ramp_generator_ramps_inside_its_window_and_holds_its_baseline_outside) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(
+            "  <rampGenerator id=\"ramp\" delay=\"2ms\" duration=\"5ms\" startAmplitude=\"0.5nA\" "
+            "finishAmplitude=\"2nA\" baselineAmplitude=\"0.1nA\"/>\n",
+            "    <explicitInput target=\"pop[0]\" input=\"ramp\"/>\n"),
+            "inputNetwork", "10ms", "0.1ms"));
+    const Vector<f64> currents = recorded_input(engine);
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        const f64 time = (f64)tick * engine.step_dt;
+        const f64 expected = time < 0.002 || time >= 0.007 ? 0.1e-9 : 0.5e-9 + 1.5e-9 * (time - 0.002) / 0.005;
+        EXPECT_NEAR(currents[(usize)tick], expected, 1e-12) << "tick " << tick;
+    }
+}
+
+// A compound input sums its generators, and an inputW weight scales the whole.
+TEST(Inputs, a_compound_input_sums_its_generators_scaled_by_the_weight) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(R"(  <compoundInput id="compound">
+    <pulseGenerator id="pulse" delay="1ms" duration="4ms" amplitude="1nA"/>
+    <sineGenerator id="sine" delay="2ms" phase="0" duration="6ms" amplitude="0.5nA" period="3ms"/>
+  </compoundInput>
+)", R"(    <inputList id="inputs" population="pop" component="compound">
+      <inputW id="0" target="../pop[0]" destination="synapses" weight="2"/>
+    </inputList>
+)"), "inputNetwork", "10ms", "0.1ms"));
+    const Vector<f64> currents = recorded_input(engine);
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        const f64 time = (f64)tick * engine.step_dt;
+        const f64 pulse = time >= 0.001 && time < 0.005 ? 1e-9 : 0.0;
+        const f64 expected = 2.0 * (pulse + sine_current(time, 0.002, 0.006, 0.5e-9, 0.0, 0.003));
+        EXPECT_NEAR(currents[(usize)tick], expected, 2e-12) << "tick " << tick;
+    }
+}
+
+// The DL variants deliver a dimensionless input to a cell that reads one.
+TEST(Inputs, a_dimensionless_ramp_drives_a_dimensionless_cell) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(
+            "  <rampGeneratorDL id=\"ramp\" delay=\"2ms\" duration=\"5ms\" startAmplitude=\"5\" "
+            "finishAmplitude=\"20\" baselineAmplitude=\"1\"/>\n",
+            "    <explicitInput target=\"pop[0]\" input=\"ramp\"/>\n", "probeDL"),
+            "inputNetwork", "10ms", "0.1ms"));
+    const Vector<f64> currents = recorded_input(engine);
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        const f64 time = (f64)tick * engine.step_dt;
+        const f64 expected = time < 0.002 || time >= 0.007 ? 1.0 : 5.0 + 15.0 * (time - 0.002) / 0.005;
+        EXPECT_NEAR(currents[(usize)tick], expected, 1e-4) << "tick " << tick;
+    }
+}
+
+// A clamp drives (target - v) / R into the cell, so on a bare capacitance v closes on the target
+// by dt / (R C) = 0.1 of the gap each tick, from tick 20 (2 ms) through tick 120 (t > 12 ms ends it).
+TEST(Inputs, a_voltage_clamp_pulls_the_membrane_to_its_target) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(
+            "  <voltageClamp id=\"clamp\" delay=\"2ms\" duration=\"10ms\" targetVoltage=\"-20mV\" "
+            "simpleSeriesResistance=\"10Mohm\"/>\n",
+            "    <explicitInput target=\"pop[0]\" input=\"clamp\"/>\n"),
+            "inputNetwork", "20ms", "0.1ms"));
+    f64 expected = -0.070;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        if (tick >= 20 && tick <= 120) expected += 0.1 * (-0.020 - expected);
+        EXPECT_NEAR(engine.read_state_variable(0, "v"), expected, 2e-6) << "tick " << tick;
+    }
+}
+
+// A triple clamp holds the conditioning voltage before its delay, the testing voltage through its
+// duration and the return voltage after. With R C = 0.2 ms the membrane settles within each phase.
+TEST(Inputs, a_triple_voltage_clamp_holds_three_voltages_in_turn) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(
+            "  <voltageClampTriple id=\"clamp\" active=\"1\" delay=\"5ms\" duration=\"5ms\" conditioningVoltage=\"-60mV\" "
+            "testingVoltage=\"-10mV\" returnVoltage=\"-40mV\" simpleSeriesResistance=\"2Mohm\"/>\n",
+            "    <explicitInput target=\"pop[0]\" input=\"clamp\"/>\n"),
+            "inputNetwork", "15ms", "0.1ms"));
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        if (tick == 49) EXPECT_NEAR(engine.read_state_variable(0, "v"), -0.060, 1e-6);
+        if (tick == 99) EXPECT_NEAR(engine.read_state_variable(0, "v"), -0.010, 1e-6);
+        if (tick == 149) EXPECT_NEAR(engine.read_state_variable(0, "v"), -0.040, 1e-6);
+    }
+}
+
+namespace {
+
+// The ticks the probe's input current rose on: a spike reaching an exponential current synapse.
+Vector<s64> rising_ticks(const Vector<f64> &currents) {
+    Vector<s64> ticks;
+    for (usize tick = 1; tick < currents.size(); tick += 1) {
+        if (currents[tick] > currents[tick - 1] + 1e-15) ticks.push_back((s64)tick);
+    }
+    return ticks;
+}
+
+} // namespace
+
+// A Poisson firing synapse fires its own synapse at its average rate with exponential intervals:
+// about 4000 spikes in 10 s at 400 Hz, so the rate is within 5% and the CV within 0.1 of 1.
+TEST(Inputs, a_poisson_firing_synapse_fires_at_its_rate_with_poisson_intervals) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(R"(  <expCurrSynapse id="fast" tau_syn="1"/>
+  <poissonFiringSynapse id="poisson" averageRate="400Hz" synapse="fast" spikeTarget="./fast"/>
+)", "    <explicitInput target=\"pop[0]\" input=\"poisson\"/>\n"),
+            "inputNetwork", "10s", "0.1ms"));
+    const Vector<s64> spike_ticks = rising_ticks(recorded_input(engine));
+    const f64 duration = (f64)engine.lifetime * engine.step_dt;
+    EXPECT_NEAR((f64)spike_ticks.size() / duration, 400.0, 20.0);
+
+    Vector<f64> spike_times;
+    for (s64 tick : spike_ticks) spike_times.push_back((f64)tick * engine.step_dt);
+    EXPECT_NEAR(coefficient_of_variation(interspike_intervals(spike_times)), 1.0, 0.1);
+}
+
+// A transient one fires only between its delay and the end of its duration.
+TEST(Inputs, a_transient_poisson_firing_synapse_fires_only_in_its_window) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(R"(  <expCurrSynapse id="fast" tau_syn="1"/>
+  <transientPoissonFiringSynapse id="poisson" averageRate="500Hz" delay="100ms" duration="200ms" synapse="fast" spikeTarget="./fast"/>
+)", "    <explicitInput target=\"pop[0]\" input=\"poisson\"/>\n"),
+            "inputNetwork", "500ms", "0.1ms"));
+    const Vector<s64> spike_ticks = rising_ticks(recorded_input(engine));
+    ASSERT_FALSE(spike_ticks.empty());
+    EXPECT_GE(spike_ticks.front(), 1000);
+    EXPECT_LE(spike_ticks.back(), 3000);
+    // 100 expected; 5 standard deviations either way.
+    EXPECT_NEAR((f64)spike_ticks.size(), 100.0, 50.0);
+}
+
+// Each listed spike reaches the input's own synapse on its tick: an exponential current synapse
+// steps by its weight, decays by 1 - dt/tau each tick, and the inputW weight scales its current.
+// Two spikes on one tick step it twice.
+TEST(Inputs, a_timed_synaptic_input_drives_its_own_synapse_at_each_listed_spike) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, input_model(R"(  <expCurrSynapse id="slow" tau_syn="2"/>
+  <timedSynapticInput id="timed" synapse="slow" spikeTarget="./slow">
+    <spike id="0" time="5ms"/>
+    <spike id="1" time="12ms"/>
+    <spike id="2" time="12ms"/>
+    <spike id="3" time="20ms"/>
+  </timedSynapticInput>
+)", R"(    <inputList id="inputs" population="pop" component="timed">
+      <inputW id="0" target="../pop[0]" destination="synapses" weight="0.5"/>
+    </inputList>
+)"), "inputNetwork", "30ms", "0.1ms"));
+    const Vector<f64> currents = recorded_input(engine);
+    const Vector<s64> spike_ticks = {50, 120, 120, 200};
+    f64 synapse_current = 0.0;   // nA
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        for (s64 spike_tick : spike_ticks) {
+            if (spike_tick == tick) synapse_current += 1.0;
+        }
+        EXPECT_NEAR(currents[(usize)tick], 0.5e-9 * synapse_current, 1e-12) << "tick " << tick;
+        synapse_current *= 1.0 - engine.step_dt / 0.002;
+    }
 }
 
 // ── more than one cell type ─────────────────────────────────────────────────────

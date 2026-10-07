@@ -281,6 +281,9 @@ PYBIND11_MODULE(_spikecorec, m) {
         .value("EventOut", NML_DeclarationType::EventOut)
         .value("Transition", NML_DeclarationType::Transition)
         .value("Regime", NML_DeclarationType::Regime)
+        .value("ChildInstance", NML_DeclarationType::ChildInstance)
+        .value("With", NML_DeclarationType::With)
+        .value("EventConnection", NML_DeclarationType::EventConnection)
         .value("NOT_A_TYPE", NML_DeclarationType::NOT_A_TYPE);
 
     py::class_<NML_Tag>(nml_module, "NML_Tag", "One XML element's name and attributes.")
@@ -318,6 +321,23 @@ PYBIND11_MODULE(_spikecorec, m) {
             return "<NML_DynamicsExpression " + self.target + " = " + self.expression + ">";
         });
 
+    py::class_<NML_StructureEntry>(nml_module, "NML_StructureEntry",
+            "One entry of a ComponentType's <Structure>, in source order.")
+        .def_readonly("source_tag", &NML_StructureEntry::source_tag)
+        .def_readonly("component", &NML_StructureEntry::component,
+                      "ChildInstance: the ComponentReference instantiated per instance.")
+        .def_readonly("instance", &NML_StructureEntry::instance, "With: 'this', 'parent', or a Path or child name.")
+        .def_readonly("alias", &NML_StructureEntry::alias, "With: the name it is bound to.")
+        .def_readonly("source", &NML_StructureEntry::source, "EventConnection: the alias in its from=.")
+        .def_readonly("target", &NML_StructureEntry::target, "EventConnection: the alias in its to=.")
+        .def_readonly("receiver", &NML_StructureEntry::receiver)
+        .def_readonly("source_port", &NML_StructureEntry::source_port)
+        .def_readonly("target_port", &NML_StructureEntry::target_port)
+        .def("__repr__", [](const NML_StructureEntry &self) {
+            return "<NML_StructureEntry " + self.component + self.instance + self.source + " " + self.alias +
+                   self.target + ">";
+        });
+
     py::class_<NML_ComponentType>(nml_module, "NML_ComponentType")
         .def_readonly("name", &NML_ComponentType::name)
         .def_property_readonly("extends", [](py::object self) {
@@ -330,6 +350,9 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_property_readonly("dynamics", [](py::object self) {
             return references_in(self.cast<const NML_ComponentType &>().dynamics, self);
         })
+        .def_property_readonly("structure", [](py::object self) {
+            return references_in(self.cast<const NML_ComponentType &>().structure, self);
+        }, "The nearest <Structure> in the extends chain, as NML_StructureEntry items.")
         .def_readonly("state_variable_names", &NML_ComponentType::state_variable_names,
                       "Per-neuron (or, for a synapse, per-edge) state slots in order, inherited ones first.")
         .def("find_declaration", [](py::object self, const String &namespace_key) {
@@ -359,19 +382,13 @@ PYBIND11_MODULE(_spikecorec, m) {
     // ── nml: stimulus and connectivity ────────────────────────────────────────────
     py::class_<InputTarget>(nml_module, "InputTarget")
         .def_readonly("neuron_index", &InputTarget::neuron_index)
-        .def_readonly("weight", &InputTarget::weight, "From <inputW weight=...>; 1.0 when unweighted.")
-        .def_readonly("event_ticks", &InputTarget::event_ticks, "A spike train's ticks; empty for an injector.");
+        .def_readonly("weight", &InputTarget::weight, "From <inputW weight=...>; 1.0 when unweighted.");
 
     py::class_<SimulationInputConfig>(nml_module, "SimulationInputConfig")
         .def_readonly("input_component_id", &SimulationInputConfig::input_component_id)
         .def_property_readonly("targets", [](py::object self) {
             return references_in(self.cast<const SimulationInputConfig &>().targets, self);
-        })
-        .def_readonly("amplitude", &SimulationInputConfig::amplitude)
-        .def_readonly("rate", &SimulationInputConfig::rate)
-        .def_readonly("start_tick", &SimulationInputConfig::start_tick)
-        .def_readonly("end_tick", &SimulationInputConfig::end_tick, "0 runs to the end of the simulation.")
-        .def_readonly("continuous_current_injection", &SimulationInputConfig::continuous_current_injection);
+        });
 
     py::class_<NML_NetworkEdge>(nml_module, "NML_NetworkEdge")
         .def_readonly("component_id", &NML_NetworkEdge::component_id, "The synapse this edge carries.")
@@ -811,12 +828,6 @@ PYBIND11_MODULE(_spikecorec, m) {
     // ── the engine ────────────────────────────────────────────────────────────────
     py::class_<SpikeEngine> engine_class(m, "SpikeEngine");
 
-    py::class_<SpikeEngine::ScheduledSpikeTrain>(engine_class, "ScheduledSpikeTrain")
-        .def_readonly("neuron_index", &SpikeEngine::ScheduledSpikeTrain::neuron_index)
-        .def_readonly("magnitude", &SpikeEngine::ScheduledSpikeTrain::magnitude)
-        .def_readonly("event_ticks", &SpikeEngine::ScheduledSpikeTrain::event_ticks)
-        .def_readonly("cursor", &SpikeEngine::ScheduledSpikeTrain::cursor, "Next event_ticks entry to deliver.");
-
     engine_class
         .def(py::init<const String &, bool, f32>(),
              py::arg("lems_input_file"),
@@ -904,22 +915,27 @@ PYBIND11_MODULE(_spikecorec, m) {
                        "After each refit, with plasticity on, the weights are scaled back to this RMS; "
                        "negative disables.")
 
-        // Stimulus, as collected from the document.
-        .def_property_readonly("continuous_injection_targets", [](const SpikeEngine &self) {
-            return to_numpy(self.continuous_injection_targets.data(), (s64)self.continuous_injection_targets.size());
-        })
-        .def_property_readonly("continuous_injection_amplitudes", [](const SpikeEngine &self) {
-            return to_numpy(self.continuous_injection_amplitudes.data(), (s64)self.continuous_injection_amplitudes.size());
-        })
-        .def_property_readonly("continuous_injection_start_ticks", [](const SpikeEngine &self) {
-            return to_numpy(self.continuous_injection_start_ticks.data(), (s64)self.continuous_injection_start_ticks.size());
-        })
-        .def_property_readonly("continuous_injection_end_ticks", [](const SpikeEngine &self) {
-            return to_numpy(self.continuous_injection_end_ticks.data(), (s64)self.continuous_injection_end_ticks.size());
-        })
-        .def_property_readonly("scheduled_spike_trains", [](py::object self) {
-            return references_in(self.cast<const SpikeEngine &>().scheduled_spike_trains, self);
-        })
+        // Inputs, run by the kernel from their own dynamics.
+        .def_readonly("input_entry_count", &SpikeEngine::input_entry_count, "Inputs times the cells each targets.")
+        .def_readonly("input_value_stride", &SpikeEngine::input_value_stride,
+                      "Floats per entry in input_values: its weight, then the largest input's state.")
+        .def_readonly("input_spike_count_size", &SpikeEngine::input_spike_count_size)
+        .def_property_readonly("input_row_start", [](const SpikeEngine &self) {
+            require_alive(self, "input_row_start");
+            return device_buffer_to_numpy<s64>(self.input_row_start, self.total_neuron_count + 1);
+        }, "[total_neuron_count + 1]; neuron n's entries are input_row_start[n] up to input_row_start[n + 1].")
+        .def_property_readonly("input_entry_prototype", [](const SpikeEngine &self) {
+            require_alive(self, "input_entry_prototype");
+            return device_buffer_to_numpy<s32>(self.input_entry_prototype, self.input_entry_count);
+        }, "Which input each entry runs, in document order of first use.")
+        .def_property_readonly("input_values", [](const SpikeEngine &self) {
+            require_alive(self, "input_values");
+            return device_buffer_to_numpy_rows<f32>(self.input_values, self.input_entry_count, self.input_value_stride);
+        }, "[input_entry_count][input_value_stride]: each entry's weight, then its parts' state.")
+        .def_property_readonly("input_spike_counts", [](const SpikeEngine &self) {
+            require_alive(self, "input_spike_counts");
+            return device_buffer_to_numpy<u8>(self.input_spike_counts, self.input_spike_count_size);
+        }, "Every spike train's spikes per tick, one train after another.")
 
         // Device state, copied out.
         .def_property_readonly("cell_state", [](const SpikeEngine &self) {

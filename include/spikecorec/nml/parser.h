@@ -96,6 +96,7 @@ struct NML_Context {
     void parse_simulation_details(NML_Node *lems_root); // previously extract_neuroml_context
 
     const NML_ComponentInstance *find_instance(const String &instance_id) const;
+    // Whether the instance's ComponentType is type_name or extends it.
     bool is_instance_of(const NML_ComponentInstance *instance, const String &type_name) const;
 
     bool validate_lems_schema(const String &lems_filepath);

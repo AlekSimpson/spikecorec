@@ -17,25 +17,16 @@ union Real {
 };
 
 struct InputTarget {
-    s64 neuron_index = -1;
+    s64 neuron_index = -1;   // the target's cell-memory index, from resolve_path
     f64 weight = 1.0;        // from <inputW weight="..."/>, 1.0 when unweighted
-    Vector<s32> event_ticks; // spike train, empty for a continuous injector
 };
 
+// One input component and the cells it is attached to. Each target gets its own copy of the
+// input, as an explicitInput or inputList gives it in NeuroML; the kernel runs the input's own
+// dynamics (Codegen::flatten_input_tree).
 struct SimulationInputConfig {
     String input_component_id;
-
     Vector<InputTarget> targets;
-
-    f64 amplitude = 0.0;
-    f64 rate = 0.0;
-
-    // input is given while: start_tick <= tick < end_tick; 
-    // end_tick == 0 means runs to the end of the simulation
-    s64 start_tick = 0;
-    s64 end_tick = 0;
-
-    bool continuous_current_injection = false;
 };
 
 struct NML_NetworkEdge {
