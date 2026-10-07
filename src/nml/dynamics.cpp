@@ -43,6 +43,8 @@ const Set<String> SYNAPSE_ENGINE_NAMES = {
 
 const String DERIVED_PREFIX = "derived_";
 const String DERIVATIVE_PREFIX = "derivative_";
+// The refractory regime's own derivatives, which may be of the same variables as the integrating regime's.
+const String REFRACTORY_DERIVATIVE_PREFIX = "refractory_derivative_";
 // rest_<name> stands for a synapse state variable's OnStart value until the instance fills it in.
 const String REST_PREFIX = "rest_";
 // random_slot_<n> stands for random() call n's slot in random_values until the population
@@ -1057,10 +1059,11 @@ void Codegen::check_cell_inputs() const {
 // The type's dynamics with LEMS names still in them: per population, translate_component_instance
 // puts each state variable's cell_state slot and each parameter's value in their place.
 //
-// Order: the OnEvents, once per spike that arrived this tick (event_arrivals), derived
-// variables (by dependency), the refractory flag, every derivative into a temporary, the Euler
-// steps, then the OnConditions. All derivatives read the state from before the step, and all
-// conditions see the state after it.
+// Order: on the tick the cell leaves refractory, the exit's assignments and the integrating
+// regime's OnEntry; the OnEvents, once per spike that arrived this tick (event_arrivals); derived
+// variables (by dependency); the refractory flag; every derivative into a temporary; the Euler
+// steps, each regime's only in that regime; then the OnConditions. All derivatives read the
+// state from before the step, and all conditions see the state after it.
 KernelListNode *Codegen::translate_component_type(const NML_ComponentType &component_type) {
     auto cached = component_type_templates.find(component_type.name);
     if (cached != component_type_templates.end()) return cached->second;
@@ -1139,13 +1142,15 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
         }
     }
 
-    // Regimes: only the integrating / refractory pair, lowered to a test on last_spiked. The
-    // refractory regime's timer, its OnEntry and its Transitions all collapse into that test.
+    // Regimes: the integrating / refractory pair, lowered to a test on last_spiked. The refractory
+    // regime's timer and both Transitions collapse into that test; each OnEntry runs with the
+    // Transition into its regime, and the refractory regime's own dynamics run while the test holds.
     String active_regime;
     String refractory_regime;
     String timer_name;
     std::unique_ptr<KernelNode> refractory_duration;
     String refractory_comparison;
+    const EventHandler *exit_handler = nullptr;
 
     if (regimes.size() > 2) throw unsupported("only an integrating / refractory regime pair is supported");
     if (regimes.size() == 1) active_regime = regimes[0].first;
@@ -1154,14 +1159,18 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
         active_regime = regimes[0].second ? regimes[0].first : regimes[1].first;
         refractory_regime = regimes[0].second ? regimes[1].first : regimes[0].first;
 
+        // The engine's spike is what enters refractory, so a spike from inside it would restart it.
         Vector<const EventHandler *> exits;
         for (const EventHandler &handler : handlers) {
-            if (handler.regime_name == refractory_regime) exits.push_back(&handler);
+            if (handler.regime_name != refractory_regime) continue;
+            if (!handler.transition.empty()) exits.push_back(&handler);
+            else if (handler.emits_spike) throw unsupported("an OnCondition in the refractory regime emits a spike");
         }
-        if (exits.size() != 1 || exits[0]->transition != active_regime || !exits[0]->assignments.empty() ||
-            exits[0]->emits_spike) {
-            throw unsupported("the refractory regime must have exactly one OnCondition, a plain Transition back");
+        if (exits.size() != 1 || exits[0]->transition != active_regime || exits[0]->emits_spike) {
+            throw unsupported("the refractory regime must have exactly one OnCondition that transitions back, "
+                              "without a spike");
         }
+        exit_handler = exits[0];
 
         // The exit test is timer .geq. duration (or .gt.).
         std::unique_ptr<LemsParseNode> exit_test(parse_lems_expression(exits[0]->test, owner_name));
@@ -1175,14 +1184,6 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
         timer_name = comparison->left->body.token.lexeme;
         // The exit is elapsed > duration or elapsed >= duration; refractory is its negation.
         refractory_comparison = comparison_operator == ">" ? "<=" : "<";
-
-        for (const NML_DynamicsExpression *derivative : derivative_entries) {
-            if (derivative->regime_name != refractory_regime) continue;
-            if (derivative->target != timer_name || evaluate_lems(derivative->expression, {}, owner_name) != 1.0) {
-                throw unsupported("'" + derivative->target + "' has a TimeDerivative in the refractory regime; only a "
-                                  "refractory timer may");
-            }
-        }
 
         // The test has to measure the time since the spike that entered the regime, which is what
         // last_spiked holds. Two forms do:
@@ -1226,7 +1227,10 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
             const NML_DynamicsExpression *timer_entry = entry_assignment_of(timer_name);
             bool counts_time = false;
             for (const NML_DynamicsExpression *derivative : derivative_entries) {
-                if (derivative->regime_name == refractory_regime && derivative->target == timer_name) counts_time = true;
+                if (derivative->regime_name == refractory_regime && derivative->target == timer_name &&
+                    evaluate_lems(derivative->expression, {}, owner_name) == 1.0) {
+                    counts_time = true;
+                }
             }
             if (!timer_entry || !counts_time || evaluate_lems(timer_entry->expression, {}, owner_name) != 0.0) {
                 throw unsupported("the refractory timer '" + timer_name +
@@ -1240,8 +1244,6 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
         if (duration_names.count("t") || duration_names.count(timer_name) || duration_names.count(stamp_name)) {
             throw unsupported("the refractory duration cannot depend on time");
         }
-        if (!entry_assignments[active_regime].empty()) throw unsupported("OnEntry is only supported in the refractory regime");
-
         // Entering refractory happens exactly when an active OnCondition transitions into it, so
         // the OnEntry assignments other than the timer's move into those handlers.
         for (EventHandler &handler : handlers) {
@@ -1277,22 +1279,48 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
 
     // refractory = last_spiked >= 0 && (tick - last_spiked) * dt < duration   (<= for a .gt. exit)
     KernelNode *refractory_declaration = nullptr;
+    KernelListNode *leaving_refractory = nullptr;
     if (has_refractory) {
-        KernelNode *last_spike = new_expression("[]", identifier("last_spiked"), identifier("neuron_index"));
-        KernelNode *has_spiked = new_expression(">=", last_spike, literal("0"));
-        KernelNode *elapsed = new_expression(
-                "*", new_cast(new_type("f32"), new_expression("-", identifier("tick"), clone(last_spike))), literal(step_dt));
-        KernelNode *within_duration = new_expression(refractory_comparison, elapsed, refractory_duration.release());
+        auto elapsed_since_spike = [&](KernelNode *now) {
+            KernelNode *last_spike = new_expression("[]", identifier("last_spiked"), identifier("neuron_index"));
+            return new_expression("*", new_cast(new_type("f32"), new_expression("-", now, last_spike)), literal(step_dt));
+        };
+        KernelNode *has_spiked = new_expression(
+                ">=", new_expression("[]", identifier("last_spiked"), identifier("neuron_index")), literal("0"));
+        KernelNode *previous_duration = clone(refractory_duration.get());
+        KernelNode *within_duration =
+                new_expression(refractory_comparison, elapsed_since_spike(identifier("tick")), refractory_duration.release());
         refractory_declaration = new_declaration(
                 new_type("const bool"), "refractory", new_expression("&&", has_spiked, within_duration));
+
+        // Leaving refractory is the tick it stops holding after it held on the tick before. The
+        // exit OnCondition's assignments and the integrating regime's OnEntry run then.
+        Vector<const NML_DynamicsExpression *> exit_assignments = exit_handler->assignments;
+        for (const NML_DynamicsExpression *assignment : entry_assignments[active_regime]) exit_assignments.push_back(assignment);
+        if (exit_assignments.empty()) {
+            delete previous_duration;
+        } else {
+            KernelListNode *exit_body = new_block();
+            for (const NML_DynamicsExpression *assignment : exit_assignments) {
+                lems_names.insert(assignment->target);
+                exit_body->children.push_back(
+                        new_assignment(identifier(assignment->target), "=", translate(assignment->expression)));
+            }
+            KernelNode *previous_tick = new_expression("-", identifier("tick"), literal("1"));
+            KernelNode *held_before = new_expression(refractory_comparison, elapsed_since_spike(previous_tick), previous_duration);
+            KernelNode *leaving = new_expression(
+                    "&&", new_expression("&&", clone(has_spiked), new_unary_expression("!", identifier("refractory"))),
+                    held_before);
+            leaving_refractory = new_conditional();
+            add_branch(leaving_refractory, leaving, exit_body);
+        }
     }
 
-    // The OnEvents come first, once per arrival, so the derived variables and derivatives below
-    // see what they changed. One inside a regime runs only in it, so the refractory flag moves
-    // up ahead of them.
+    // The OnEvents run once per arrival. One inside a regime runs only in it.
+    KernelNode *arrival_loop = nullptr;
+    bool arrivals_test_regime = false;
     if (!arrival_handlers.empty()) {
         KernelListNode *per_arrival = new_block();
-        bool tests_regime = false;
         for (const EventHandler &handler : arrival_handlers) {
             KernelListNode *handler_body = new_block();
             for (const NML_DynamicsExpression *assignment : handler.assignments) {
@@ -1303,7 +1331,7 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
             if (handler.emits_spike) handler_body->children.push_back(new_assignment(identifier("spiked"), "=", identifier("true")));
 
             if (has_refractory && !handler.regime_name.empty()) {
-                tests_regime = true;
+                arrivals_test_regime = true;
                 KernelNode *in_regime = handler.regime_name == refractory_regime
                                                 ? identifier("refractory")
                                                 : new_unary_expression("!", identifier("refractory"));
@@ -1314,45 +1342,55 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
                 per_arrival->children.push_back(handler_body);
             }
         }
-        if (tests_regime) {
-            body->children.push_back(refractory_declaration);
-            refractory_declaration = nullptr;
-        }
-
-        KernelListNode *arrival_loop = new_node<ListNode>(KernelNodeType::FOR, "");
-        arrival_loop->children = {new_declaration(new_type("s32"), "arrival", literal("0")),
-                                  new_expression("<", identifier("arrival"), identifier("event_arrivals")),
-                                  new_assignment(identifier("arrival"), "+=", literal("1")), per_arrival};
-        body->children.push_back(arrival_loop);
+        KernelListNode *loop = new_node<ListNode>(KernelNodeType::FOR, "");
+        loop->children = {new_declaration(new_type("s32"), "arrival", literal("0")),
+                          new_expression("<", identifier("arrival"), identifier("event_arrivals")),
+                          new_assignment(identifier("arrival"), "+=", literal("1")), per_arrival};
+        arrival_loop = loop;
     }
+
+    // Leaving refractory and the OnEvents come first, so the derived variables and derivatives
+    // below see what they changed; the refractory flag moves up ahead of them when they test it.
+    if (leaving_refractory || arrivals_test_regime) {
+        body->children.push_back(refractory_declaration);
+        refractory_declaration = nullptr;
+    }
+    if (leaving_refractory) body->children.push_back(leaving_refractory);
+    if (arrival_loop) body->children.push_back(arrival_loop);
 
     place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
     if (refractory_declaration) body->children.push_back(refractory_declaration);
 
-    // Every derivative from the pre-step state, then every Euler step.
+    // Every derivative from the pre-step state, then every Euler step. The integrating regime's
+    // steps run while the cell is not refractory and the refractory regime's while it is.
     KernelListNode *gated = new_block();
+    KernelListNode *held = new_block();
     Vector<KernelNode *> updates;
     Set<String> integrated_names;
+    Set<String> refractory_integrated_names;
     for (const NML_DynamicsExpression *derivative : derivative_entries) {
-        if (has_refractory && derivative->regime_name == refractory_regime) continue;
-        if (!integrated_names.insert(derivative->target).second) {
+        const bool in_refractory = has_refractory && derivative->regime_name == refractory_regime;
+        // The refractory timer collapses into the refractory test.
+        if (in_refractory && derivative->target == timer_name) continue;
+        if (!(in_refractory ? refractory_integrated_names : integrated_names).insert(derivative->target).second) {
             throw unsupported("'" + derivative->target + "' has more than one TimeDerivative");
         }
         lems_names.insert(derivative->target);
 
-        body->children.push_back(new_declaration(
-                new_type("const f32"), DERIVATIVE_PREFIX + derivative->target, translate(derivative->expression)));
-        KernelNode *update = new_assignment(
-                identifier(derivative->target), "+=",
-                new_expression("*", literal(step_dt), identifier(DERIVATIVE_PREFIX + derivative->target)));
-        (is_gated(derivative->regime_name) ? gated->children : updates).push_back(update);
+        const String temporary = (in_refractory ? REFRACTORY_DERIVATIVE_PREFIX : DERIVATIVE_PREFIX) + derivative->target;
+        body->children.push_back(new_declaration(new_type("const f32"), temporary, translate(derivative->expression)));
+        KernelNode *update = new_assignment(identifier(derivative->target), "+=",
+                                            new_expression("*", literal(step_dt), identifier(temporary)));
+        if (in_refractory) held->children.push_back(update);
+        else (is_gated(derivative->regime_name) ? gated->children : updates).push_back(update);
     }
     for (KernelNode *update : updates) body->children.push_back(update);
 
-    // OnConditions, after every step.
+    // OnConditions, after every step. The refractory exit already ran on leaving.
     Vector<KernelNode *> conditions;
     for (const EventHandler &handler : handlers) {
-        if (has_refractory && handler.regime_name == refractory_regime) continue;
+        const bool in_refractory = has_refractory && handler.regime_name == refractory_regime;
+        if (in_refractory && !handler.transition.empty()) continue;
 
         KernelListNode *handler_body = new_block();
         for (const NML_DynamicsExpression *assignment : handler.assignments) {
@@ -1364,21 +1402,30 @@ KernelListNode *Codegen::translate_component_type(const NML_ComponentType &compo
 
         KernelListNode *condition = new_conditional();
         add_branch(condition, translate(handler.test), handler_body);
-        (is_gated(handler.regime_name) ? gated->children : conditions).push_back(condition);
+        if (in_refractory) held->children.push_back(condition);
+        else (is_gated(handler.regime_name) ? gated->children : conditions).push_back(condition);
     }
 
-    if (gated->children.empty()) {
+    if (gated->children.empty() && held->children.empty()) {
         delete gated;
+        delete held;
     } else {
-        KernelListNode *integrating = new_conditional();
-        add_branch(integrating, new_unary_expression("!", identifier("refractory")), gated);
-        body->children.push_back(integrating);
+        KernelListNode *by_regime = new_conditional();
+        if (gated->children.empty()) {
+            delete gated;
+            add_branch(by_regime, identifier("refractory"), held);
+        } else {
+            add_branch(by_regime, new_unary_expression("!", identifier("refractory")), gated);
+            if (held->children.empty()) delete held;
+            else add_branch(by_regime, nullptr, held);
+        }
+        body->children.push_back(by_regime);
     }
     for (KernelNode *condition : conditions) body->children.push_back(condition);
 
     for (const String &name : lems_names) {
         if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX) ||
-            starts_with(name, RANDOM_SLOT_PREFIX)) {
+            starts_with(name, REFRACTORY_DERIVATIVE_PREFIX) || starts_with(name, RANDOM_SLOT_PREFIX)) {
             delete body;
             throw unsupported("the name '" + name + "' is reserved by the generated kernel");
         }
@@ -1442,7 +1489,10 @@ KernelListNode *Codegen::translate_component_instance(const NML_ComponentInstanc
         Set<String> remaining_names;
         collect_identifiers(body, remaining_names);
         for (const String &name : remaining_names) {
-            if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX)) continue;
+            if (ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) || starts_with(name, DERIVATIVE_PREFIX) ||
+                starts_with(name, REFRACTORY_DERIVATIVE_PREFIX)) {
+                continue;
+            }
             throw runtime_error("ComponentType '" + component_type.name + "' (cell '" + cell.id + "'): '" + name +
                                 "' is not a state variable, a set parameter, a constant or a derived variable");
         }

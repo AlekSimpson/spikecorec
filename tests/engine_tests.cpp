@@ -375,6 +375,71 @@ TEST(GeneratedKernel, a_regime_shape_that_is_not_the_refractory_pair_is_refused)
     }
 }
 
+// Leaving refractory runs the exit OnCondition's assignments and the integrating regime's OnEntry,
+// once, on the first tick the cell is no longer refractory. Its phase climbs at 0.1 per ms, it
+// fires at 1 and is refractory while (tick - spike) * dt <= 2.05 ms, so it leaves 21 ticks after
+// each spike.
+TEST(GeneratedKernel, leaving_refractory_runs_the_exit_and_the_integrating_on_entry) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Leaving">
+  <ComponentType name="leavingCell" extends="baseCellMembPot">
+    <Parameter name="refract" dimension="time"/>
+    <Parameter name="rate" dimension="per_time"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="phase" dimension="none"/>
+      <StateVariable name="exits" dimension="none"/>
+      <StateVariable name="entries" dimension="none"/>
+      <StateVariable name="lastSpikeTime" dimension="time"/>
+      <Regime name="integrating" initial="true">
+        <OnEntry>
+          <StateAssignment variable="entries" value="entries + 1"/>
+        </OnEntry>
+        <TimeDerivative variable="phase" value="rate"/>
+        <OnCondition test="phase .gt. 1">
+          <StateAssignment variable="phase" value="0"/>
+          <EventOut port="spike"/>
+          <Transition regime="refractory"/>
+        </OnCondition>
+      </Regime>
+      <Regime name="refractory">
+        <OnEntry>
+          <StateAssignment variable="lastSpikeTime" value="t"/>
+        </OnEntry>
+        <OnCondition test="t .gt. lastSpikeTime + refract">
+          <StateAssignment variable="exits" value="exits + 1"/>
+          <Transition regime="integrating"/>
+        </OnCondition>
+      </Regime>
+    </Dynamics>
+  </ComponentType>
+  <leavingCell id="cell" refract="2.05ms" rate="0.1per_ms"/>
+  <network id="leavingNetwork"><population id="pop" component="cell" size="1"/></network>
+</neuroml>
+)", "leavingNetwork", "60ms", "0.1ms"));
+
+    Vector<s64> change_ticks;
+    f32 previous_exits = 0.0f;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        const f32 exits = engine.read_state_variable(0, "exits");
+        EXPECT_EQ(engine.read_state_variable(0, "entries"), exits) << "tick " << tick;
+        if (exits != previous_exits) {
+            EXPECT_EQ(exits - previous_exits, 1.0f) << "tick " << tick;
+            change_ticks.push_back(tick);
+        }
+        previous_exits = exits;
+    }
+
+    Vector<s64> expected_ticks;
+    for (f64 time : spike_times_of(engine, 0)) {
+        const s64 leaving_tick = llround(time / engine.step_dt) + 21;
+        if (leaving_tick < engine.lifetime) expected_ticks.push_back(leaving_tick);
+    }
+    ASSERT_GE(expected_ticks.size(), 3u);
+    EXPECT_EQ(change_ticks, expected_ticks);
+}
+
 // A synapse that reads the target's v (conductance-based) is refused, naming what it reads.
 TEST(GeneratedKernel, a_conductance_based_synapse_is_refused_naming_v) {
     const TemporaryDirectory directory;
@@ -617,6 +682,62 @@ TEST(SingleCell, izhikevich_matches_forward_euler) {
     EXPECT_NEAR((f64)spike_times.size(), (f64)reference_spike_times.size(), 1.0);
     const f64 reference_mean_interval = mean_of(interspike_intervals(reference_spike_times));
     EXPECT_NEAR(mean_of(interspike_intervals(spike_times)), reference_mean_interval, 0.01 * reference_mean_interval);
+}
+
+// adExIaFCell's w keeps evolving while the cell is refractory, and its OnEntry resets v and
+// jumps w when it enters refractory.
+TEST(SingleCell, adaptive_exponential_matches_forward_euler) {
+    const TemporaryDirectory directory;
+    SpikeEngine engine(write_model(directory, R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="AdEx">
+  <adExIaFCell id="c" C="281pF" gL="30nS" EL="-70.6mV" VT="-50.4mV" thresh="-40.4mV" reset="-48.5mV"
+               delT="2mV" tauw="144ms" refract="2.05ms" a="4nS" b="0.0805nA"/>
+  <pulseGenerator id="drive" delay="0 ms" duration="1000 ms" amplitude="1 nA"/>
+  <network id="adexNetwork">
+    <population id="pop" component="c" size="1"/>
+    <explicitInput target="pop[0]" input="drive"/>
+  </network>
+</neuroml>
+)", "adexNetwork", "300ms", "0.01ms"));
+    engine.run();
+
+    // Integrating: v' = (-gL (v - EL) + gL delT exp((v - VT) / delT) - w + I) / C and
+    // w' = (a (v - EL) - w) / tauw; past thresh: v = reset, w += b, then refractory for refract,
+    // during which only w evolves.
+    const f64 capacitance = 281e-12, leak = 30e-9, leak_reversal = -0.0706, slope_threshold = -0.0504;
+    const f64 threshold = -0.0404, reset = -0.0485, slope = 0.002, adaptation_time = 0.144;
+    const f64 refractory_period = 0.00205, coupling = 4e-9, adaptation_jump = 0.0805e-9, drive = 1e-9;
+    const f64 step = engine.step_dt;
+    f64 voltage = leak_reversal, adaptation = 0.0;
+    s64 last_spike_tick = -1;
+    Vector<f64> reference_spike_times;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        const bool refractory = last_spike_tick >= 0 && (f64)(tick - last_spike_tick) * step <= refractory_period;
+        const f64 adaptation_derivative = (coupling * (voltage - leak_reversal) - adaptation) / adaptation_time;
+        if (refractory) {
+            adaptation += step * adaptation_derivative;
+            continue;
+        }
+        const f64 voltage_derivative = (-leak * (voltage - leak_reversal) +
+                                        leak * slope * std::exp((voltage - slope_threshold) / slope) - adaptation + drive) /
+                                       capacitance;
+        voltage += step * voltage_derivative;
+        adaptation += step * adaptation_derivative;
+        if (voltage > threshold) {
+            voltage = reset;
+            adaptation += adaptation_jump;
+            last_spike_tick = tick;
+            reference_spike_times.push_back((f64)tick * step);
+        }
+    }
+
+    const Vector<f64> spike_times = spike_times_of(engine, 0);
+    ASSERT_GE(reference_spike_times.size(), 5u);
+    EXPECT_NEAR((f64)spike_times.size(), (f64)reference_spike_times.size(), 1.0);
+    const f64 reference_mean_interval = mean_of(interspike_intervals(reference_spike_times));
+    EXPECT_NEAR(mean_of(interspike_intervals(spike_times)), reference_mean_interval, 0.01 * reference_mean_interval);
+    // Adaptation lengthens the intervals, so the run must not be a regular train.
+    const Vector<f64> intervals = interspike_intervals(spike_times);
+    EXPECT_GT(intervals.back(), intervals.front());
 }
 
 TEST(SingleCell, declared_output_files_have_the_shape_the_model_asked_for) {
