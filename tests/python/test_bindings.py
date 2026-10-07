@@ -133,6 +133,17 @@ def test_component_types_and_their_dynamics():
     assert nml.population_cell(context, populations[0]).component_type.name == "GLIF1Cell"
 
 
+def test_structure_entries(tmp_path):
+    main_file = tmp_path / "root.xml"
+    main_file.write_text("<Lems/>")
+    context = nml.NML_Context()
+    context.parse(str(main_file))
+    connection = context.component_types["spike"].structure[2]
+    assert connection.source_tag == nml.NML_DeclarationType.EventConnection
+    assert (connection.source, connection.target) == ("a", "b")
+    assert context.component_types["timedSynapticInput"].structure[0].component == "synapse"
+
+
 def test_evaluate_lems_and_the_random_generator():
     assert nml.evaluate_lems("log(2.718281828459045)", {}) == pytest.approx(1.0)
     assert nml.evaluate_lems("H(0)", {}) == 0.0
@@ -192,6 +203,12 @@ def test_state_and_device_buffers_are_copies(tmp_path):
     assert engine.cell_state.shape == (engine.context.get_cell_state_size(),)
     assert engine.network_inputs.shape == (2, 1)
     assert engine.event_arrival_count.shape == (0, 1)   # no cell type has an OnEvent
+    # The pulse is one input on one cell: its weight, then its own state (i).
+    assert engine.input_entry_count == 1
+    assert list(engine.input_row_start) == [0, 1]
+    assert list(engine.input_entry_prototype) == [0]
+    assert engine.input_values.shape == (1, engine.input_value_stride)
+    assert engine.input_values[0, 0] == 1.0
     assert engine.spike_history.shape == (engine.spike_history_row_count, 1)
     assert "master_step" in engine.master_kernel_source
 

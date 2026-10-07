@@ -45,6 +45,9 @@ enum class NML_DeclarationType {
     EventOut,
     Transition,
     Regime,
+    ChildInstance,
+    With,
+    EventConnection,
 
     NOT_A_TYPE
 };

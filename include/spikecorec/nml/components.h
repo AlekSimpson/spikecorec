@@ -24,6 +24,8 @@ struct NML_ComponentType {
     const NML_Node *source_node = nullptr;
 
     Vector<NML_DynamicsExpression> dynamics;
+    // The nearest <Structure> in the extends chain, like dynamics.
+    Vector<NML_StructureEntry> structure;
 
     // Per-neuron state slots in order, inherited ones first. Filled by parse_component_types.
     Vector<String> state_variable_names;

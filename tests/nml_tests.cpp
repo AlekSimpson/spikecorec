@@ -5,6 +5,7 @@
 #include "spikecorec/core/recording.h"
 #include "spikecorec/core/types.h"
 #include "spikecorec/core/units.h"
+#include "spikecorec/nml/dynamics.h"
 #include "spikecorec/nml/parser.h"
 #include "support/test_support.h"
 
@@ -579,6 +580,40 @@ TEST(Dynamics, an_on_event_entry_names_its_port) {
     EXPECT_EQ((on_event + 1)->expression, "g + (weight * gbase)");
 }
 
+// <Structure> is read like <Dynamics>: a spike sends its event to its parent, and a
+// timedSynapticInput instantiates its synapse and sends its own events into it.
+TEST(Structure, child_instances_aliases_and_event_connections_are_recorded) {
+    const TemporaryDirectory directory;
+    const String main_file = directory.write("root.xml", "<Lems/>");
+    NML_Context context;
+    parse_model(context, main_file);
+
+    const Vector<NML_StructureEntry> &spike = type_named(context, "spike").structure;
+    ASSERT_EQ(spike.size(), 3u);
+    EXPECT_EQ(spike[0].source_tag, NML_DeclarationType::With);
+    EXPECT_EQ(spike[0].instance, "this");
+    EXPECT_EQ(spike[0].alias, "a");
+    EXPECT_EQ(spike[1].source_tag, NML_DeclarationType::With);
+    EXPECT_EQ(spike[1].instance, "parent");
+    EXPECT_EQ(spike[1].alias, "b");
+    EXPECT_EQ(spike[2].source_tag, NML_DeclarationType::EventConnection);
+    EXPECT_EQ(spike[2].source, "a");
+    EXPECT_EQ(spike[2].target, "b");
+    EXPECT_EQ(spike[2].receiver, "");
+
+    const Vector<NML_StructureEntry> &timed = type_named(context, "timedSynapticInput").structure;
+    ASSERT_EQ(timed.size(), 4u);
+    EXPECT_EQ(timed[0].source_tag, NML_DeclarationType::ChildInstance);
+    EXPECT_EQ(timed[0].component, "synapse");
+    EXPECT_EQ(timed[2].instance, "spikeTarget");
+    EXPECT_EQ(timed[3].source_tag, NML_DeclarationType::EventConnection);
+
+    // A type without its own <Structure> inherits its nearest ancestor's.
+    EXPECT_EQ(type_named(context, "spikeGeneratorRefPoisson").structure.size(),
+              type_named(context, "spikeGeneratorPoisson").structure.size());
+    EXPECT_TRUE(type_named(context, "pulseGenerator").structure.empty());
+}
+
 TEST(Dynamics, conditional_derived_variables_become_one_entry_per_case) {
     const TemporaryDirectory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
@@ -719,18 +754,14 @@ TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
     EXPECT_TRUE(simulation.network_data.list[3].empty());
 }
 
-TEST(Simulation, inputs_resolve_their_targets_and_times) {
+// An input profile keeps the input component and its targets; the input's own dynamics are compiled.
+TEST(Simulation, inputs_resolve_their_targets) {
     const TwoPopulationModel model;
     const Vector<SimulationInputConfig> &profiles = model.context.simulation.input_profiles;
     ASSERT_EQ(profiles.size(), 2u);
 
-    // 10 ms and 10 + 40 ms at 0.01 ms; truncation would give 999 and 4998.
     const SimulationInputConfig &explicit_input = profiles[0];
     EXPECT_EQ(explicit_input.input_component_id, "pg0");
-    EXPECT_TRUE(explicit_input.continuous_current_injection);
-    EXPECT_DOUBLE_EQ(explicit_input.amplitude, 0.5e-9);
-    EXPECT_EQ(explicit_input.start_tick, 1000);
-    EXPECT_EQ(explicit_input.end_tick, 5000);
     ASSERT_EQ(explicit_input.targets.size(), 1u);
     EXPECT_EQ(explicit_input.targets[0].neuron_index, 0);
 
@@ -744,28 +775,120 @@ TEST(Simulation, inputs_resolve_their_targets_and_times) {
     EXPECT_DOUBLE_EQ(input_list.targets[1].weight, 3.0);
 }
 
-TEST(Simulation, a_spike_array_becomes_a_sorted_tick_indexed_train) {
-    const TemporaryDirectory directory;
+// ── input component trees ───────────────────────────────────────────────────────
+
+namespace {
+
+// Parses a one-population network with `declarations` and an explicitInput of input_id onto
+// pop1[0], and returns the input's tree.
+InputTree input_tree_of(NML_Context &context, const TemporaryDirectory &directory, const String &declarations,
+                        const String &input_id) {
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
-        <explicitInput target="pop1[1]" input="train0"/>
-)", R"(    <spikeArray id="train0">
+        <explicitInput target="pop1[0]" input=")" + input_id + R"("/>
+)", declarations));
+    parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
+    const Codegen compiler(context, nullptr);
+    return compiler.flatten_input_tree(*context.find_instance(input_id));
+}
+
+Vector<s64> ticks_with_spikes(const InputSpikeTrain &train) {
+    Vector<s64> ticks;
+    for (usize tick = 0; tick < train.spike_counts.size(); tick += 1) {
+        if (train.spike_counts[tick] != 0) ticks.push_back((s64)tick);
+    }
+    return ticks;
+}
+
+} // namespace
+
+// A spikeArray's spikes become one count per tick of the run, delivered to the spikeArray itself.
+TEST(InputTree, a_spike_array_becomes_a_count_per_tick) {
+    const TemporaryDirectory directory;
+    NML_Context context;
+    const InputTree tree = input_tree_of(context, directory, R"(    <spikeArray id="train0">
         <spike id="0" time="30ms"/>
         <spike id="1" time="10ms"/>
         <spike id="2" time="20ms"/>
     </spikeArray>
-)"));
-    NML_Context context;
-    parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
+)", "train0");
 
-    ASSERT_EQ(context.simulation.input_profiles.size(), 1u);
-    const SimulationInputConfig &train = context.simulation.input_profiles[0];
-    EXPECT_FALSE(train.continuous_current_injection);
-    ASSERT_EQ(train.targets.size(), 1u);
-    EXPECT_EQ(train.targets[0].neuron_index, 1);
-    EXPECT_EQ(train.targets[0].event_ticks, (Vector<s32>{1000, 2000, 3000}));
-    // A spike array has no delay or duration of its own.
-    EXPECT_EQ(train.start_tick, 0);
-    EXPECT_EQ(train.end_tick, 0);
+    ASSERT_EQ(tree.parts.size(), 1u);
+    EXPECT_EQ(tree.parts[0].instance->id, "train0");
+    EXPECT_EQ(tree.state_size, (s64)type_named(context, "spikeArray").state_variable_names.size());
+    EXPECT_TRUE(tree.routes.empty());
+    ASSERT_EQ(tree.spike_trains.size(), 1u);
+    EXPECT_EQ(tree.spike_trains[0].receiver, 0);
+    // 100 ms at 0.01 ms.
+    ASSERT_EQ((s64)tree.spike_trains[0].spike_counts.size(), context.simulation.total_tick_count);
+    EXPECT_EQ(ticks_with_spikes(tree.spike_trains[0]), (Vector<s64>{1000, 2000, 3000}));
+}
+
+// A timedSynapticInput instantiates its own synapse, its spikes go to it, and it sends its own
+// events into the synapse. Two spike times that round to the same tick count twice.
+TEST(InputTree, a_timed_synaptic_input_routes_its_spikes_into_its_own_synapse) {
+    const TemporaryDirectory directory;
+    NML_Context context;
+    const InputTree tree = input_tree_of(context, directory, R"(    <timedSynapticInput id="timed0" synapse="syn0" spikeTarget="./syn0">
+        <spike id="0" time="5ms"/>
+        <spike id="1" time="5.001ms"/>
+        <spike id="2" time="7ms"/>
+    </timedSynapticInput>
+)", "timed0");
+
+    ASSERT_EQ(tree.parts.size(), 2u);
+    EXPECT_EQ(tree.parts[1].instance->id, "syn0");
+    EXPECT_EQ(tree.parts[1].parent, 0);
+    EXPECT_EQ(tree.parts[1].role, "synapse");
+    const s64 own_state = (s64)type_named(context, "timedSynapticInput").state_variable_names.size();
+    EXPECT_EQ(tree.parts[1].first_state_slot, own_state);
+    EXPECT_EQ(tree.state_size, own_state + (s64)type_named(context, "expOneSynapse").state_variable_names.size());
+
+    ASSERT_EQ(tree.spike_trains.size(), 1u);
+    EXPECT_EQ(tree.spike_trains[0].receiver, 0);
+    EXPECT_EQ(ticks_with_spikes(tree.spike_trains[0]), (Vector<s64>{500, 700}));
+    EXPECT_EQ(tree.spike_trains[0].spike_counts[500], 2);
+
+    ASSERT_EQ(tree.routes.size(), 1u);
+    EXPECT_EQ(tree.routes[0].source, 0);
+    EXPECT_EQ(tree.routes[0].target, 1);
+}
+
+TEST(InputTree, a_poisson_firing_synapse_routes_its_spikes_into_its_own_synapse) {
+    const TemporaryDirectory directory;
+    NML_Context context;
+    const InputTree tree = input_tree_of(context, directory, R"(    <poissonFiringSynapse id="poisson0" averageRate="50Hz" synapse="syn0" spikeTarget="./syn0"/>
+)", "poisson0");
+
+    ASSERT_EQ(tree.parts.size(), 2u);
+    EXPECT_EQ(tree.parts[1].role, "synapse");
+    EXPECT_TRUE(tree.spike_trains.empty());
+    ASSERT_EQ(tree.routes.size(), 1u);
+    EXPECT_EQ(tree.routes[0].source, 0);
+    EXPECT_EQ(tree.routes[0].target, 1);
+}
+
+// Each generator in a compoundInput is a part of its own, which the compound sums through its select.
+TEST(InputTree, a_compound_input_holds_each_generator_as_a_part) {
+    const TemporaryDirectory directory;
+    NML_Context context;
+    const InputTree tree = input_tree_of(context, directory, R"(    <compoundInput id="compound0">
+        <pulseGenerator id="pulse" delay="1ms" duration="2ms" amplitude="1nA"/>
+        <sineGenerator id="sine" delay="0ms" phase="0" duration="10ms" amplitude="1nA" period="5ms"/>
+    </compoundInput>
+)", "compound0");
+
+    ASSERT_EQ(tree.parts.size(), 3u);
+    for (usize part = 1; part < 3; part += 1) {
+        EXPECT_EQ(tree.parts[part].parent, 0);
+        EXPECT_EQ(tree.parts[part].role, "currents");
+    }
+    EXPECT_EQ(tree.parts[1].instance->component_type->name, "pulseGenerator");
+    EXPECT_EQ(tree.parts[2].instance->component_type->name, "sineGenerator");
+    // A child fills the Children slot because its type extends the slot's.
+    EXPECT_TRUE(context.is_instance_of(tree.parts[1].instance, "basePointCurrent"));
+    EXPECT_FALSE(context.is_instance_of(tree.parts[1].instance, "baseSpikeSource"));
+    EXPECT_TRUE(tree.routes.empty());
+    EXPECT_TRUE(tree.spike_trains.empty());
 }
 
 // Selections hold the cell-memory index of what they record.

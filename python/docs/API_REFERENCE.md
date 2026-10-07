@@ -197,16 +197,21 @@ Copies of the engine's GPU buffers. Each raises `RuntimeError` after `shutdown()
 | `last_spiked` | int64[neurons] | each neuron's last spike tick, or `NEVER_SPIKED_TICK` |
 | `random_values` | float32[`random_values_count`] | the last tick's uniform draws, refilled before every dispatch |
 
-### Stimulus
+### Inputs
 
-What the engine collected from the document's inputs.
+Every input component (`explicitInput`, `inputList`) runs on the GPU from its own LEMS
+dynamics, in its target cell's thread before the cell's own. An entry is one input on one
+target cell, with its own weight and its own copy of the input's state.
 
-| name | type |
-|---|---|
-| `continuous_injection_targets` | int64[] |
-| `continuous_injection_amplitudes` | float32[] |
-| `continuous_injection_start_ticks`, `continuous_injection_end_ticks` | int64[] |
-| `scheduled_spike_trains` | list[`SpikeEngine.ScheduledSpikeTrain`]: `neuron_index`, `magnitude`, `event_ticks`, `cursor` |
+| name | type | meaning |
+|---|---|---|
+| `input_entry_count` | int | inputs times the cells each one targets |
+| `input_value_stride` | int | floats per entry in `input_values` |
+| `input_spike_count_size` | int | length of `input_spike_counts` |
+| `input_row_start` | int64[neurons + 1] | neuron `n`'s entries are `input_row_start[n]` up to `input_row_start[n + 1]` |
+| `input_entry_prototype` | int32[entries] | which input each entry runs |
+| `input_values` | float32[entries][`input_value_stride`] | each entry's weight, then its parts' state |
+| `input_spike_counts` | uint8[] | each spike train's spikes per tick (`spikeArray`, `timedSynapticInput`) |
 
 ### Results
 
@@ -440,7 +445,8 @@ context.parse("LEMS_model.xml")      # no GPU involved
 ### `NML_ComponentType`
 
 `name`, `extends` (`NML_ComponentType` or `None`), `source_file`, `source_node`
-(`NML_Node`), `dynamics` (list of `NML_DynamicsExpression`), `state_variable_names`
+(`NML_Node`), `dynamics` (list of `NML_DynamicsExpression`), `structure` (list of
+`NML_StructureEntry`, from the nearest `<Structure>` in the `extends` chain), `state_variable_names`
 (inherited first; for a synapse these are its per-edge planes, in order), and
 `find_declaration(namespace_key)`, which searches up the `extends` chain and returns an
 `NML_Node` or `None`.
@@ -455,6 +461,12 @@ context.parse("LEMS_model.xml")      # no GPU involved
 One `<Dynamics>` entry: `source_tag` (`NML_DeclarationType`), `target`, `expression`,
 `regime_name`, `condition`, `select`, `reduce`.
 
+### `NML_StructureEntry`
+
+One `<Structure>` entry: `source_tag` (`ChildInstance`, `With` or `EventConnection`),
+`component` (ChildInstance), `instance` and `alias` (With), `source` and `target` (the
+aliases in its `from=` and `to=`), `receiver`, `source_port` and `target_port` (EventConnection).
+
 ### `NML_Node` and `NML_Tag`
 
 A parsed XML element: `NML_Node.body` is its `NML_Tag` and `NML_Node.children` its element
@@ -468,8 +480,8 @@ children. `NML_Tag` has `tag_name`, `tag_type` (`NML_DeclarationType`), `attribu
 |---|---|
 | `AdjacencyList` | `list` (one list of `NML_NetworkEdge` per source), `in_network(node_index)`, `is_parent(parent, prospective_child)`, `len()`, `edge_arrays()` → dict of parallel arrays `parent`, `child`, `weight`, `delay_ticks`, `component_id` |
 | `NML_NetworkEdge` | `component_id`, `weight`, `delay_ticks`, `parent`, `child` |
-| `SimulationInputConfig` | `input_component_id`, `targets`, `amplitude`, `rate`, `start_tick`, `end_tick` (`0` runs to the end), `continuous_current_injection` |
-| `InputTarget` | `neuron_index`, `weight`, `event_ticks` |
+| `SimulationInputConfig` | `input_component_id`, `targets` |
+| `InputTarget` | `neuron_index` (cell-memory index), `weight` |
 
 ### Functions
 

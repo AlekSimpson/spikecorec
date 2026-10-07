@@ -65,7 +65,7 @@ Each slide only uses ideas introduced on earlier ones.
 ### Slide 7: How a run works: ticks
 - Time advances in steps of `dt`, which the LEMS file sets (e.g. 0.05 ms)
 - Each tick, for every neuron in parallel:
-  - apply stimulus
+  - run the cell's inputs, which add to what the cell reads
   - integrate the cell's equations one step (forward Euler)
   - detect threshold crossings, emit spikes, reset
   - deliver spikes along outgoing connections, after each connection's delay
@@ -133,13 +133,12 @@ Each slide only uses ideas introduced on earlier ones.
 - Connectivity from the NeuroML document, or from Python as an adjacency list
 
 ### Slide 12: Stimulus and recording
-- Stimulus that behaves as NeuroML defines it, wired with `explicitInput` or `inputList`:
-  - `pulseGenerator` / `pulseGeneratorDL`: a constant input over a time window
+- Every NeuroML input, wired with `explicitInput` or `inputList`, compiled from its own
+  LEMS and run on the GPU in its target cell's thread:
+  - pulse, sine, ramp and compound currents (and their DL variants)
+  - voltage clamps, which read the target's membrane potential
+  - `timedSynapticInput` and the Poisson firing synapses, which drive their own synapse
   - `spikeArray`: spikes at listed times, delivered as kicks into the target's input
-- Accepted but not correct yet (being fixed):
-  - `sineGenerator` runs as a constant pulse at its amplitude
-  - `timedSynapticInput` delivers kicks instead of driving its synapse
-  - ramp, compound, Poisson-synapse and voltage-clamp inputs deliver nothing
 - Recording: the document's `OutputFile` (variable traces) and `EventOutputFile` (spikes)
 - Plus engine-side recordings: every spike, and every neuron's membrane potential as a
   `.spire` file (optionally compressed) for video rendering
@@ -153,7 +152,7 @@ Each slide only uses ideas introduced on earlier ones.
 - A synapse or input that does not provide what its target cell reads, for example a current
   into a cell whose input is dimensionless
 - These are refused when the engine is created, with the component and the reason, so
-  they never run silently wrong. The exception today is the input types on slide 12
+  they never run silently wrong
 - Plasticity: the flag exists, but nothing changes weights during a run yet
 - Platform: macOS with Metal runs today. CUDA code is generated, but the launcher that
   runs it is not built yet
@@ -240,7 +239,7 @@ Each slide only uses ideas introduced on earlier ones.
 
 ### Slide 24: Looking at raw engine state
 - Copies of the GPU buffers: `engine.cell_state`, `last_spiked`, `network_inputs`,
-  `spike_history`
+  `spike_history`, and each input's state in `input_values`
 - `context.resolve_path("pop[0]/v")` gives a variable's position in `cell_state`
 - `engine.master_kernel_source`: the exact GPU program generated for your model
 - Useful for debugging a model, and for seeing what "code generation" means
@@ -314,8 +313,6 @@ Each slide only uses ideas introduced on earlier ones.
 - Model constraints: point neurons, current-based synapses, at most an
   integrating/refractory regime pair
 - No synaptic plasticity during a run yet
-- Stimulus: only pulse generators and spike arrays behave as NeuroML defines; sine, ramp,
-  compound, timed-synaptic, Poisson-synapse and voltage-clamp inputs are being fixed
 - Fitting large networks at construction can take minutes; tuning is ongoing
 
 ### Slide 32: Roadmap

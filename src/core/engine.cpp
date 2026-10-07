@@ -95,10 +95,18 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
     last_spiked = compiler.data_partitions[3];
     empty_edge_plane = compiler.data_partitions[4];
     event_arrival_count = compiler.data_partitions[5];
-    model_pointer = compiler.data_partitions[6];
+    input_row_start = compiler.data_partitions[6];
+    input_entry_prototype = compiler.data_partitions[7];
+    input_values = compiler.data_partitions[8];
+    input_spike_counts = compiler.data_partitions[9];
+    model_pointer = compiler.data_partitions[10];
+    input_entry_count = (s64)compiler.input_entries.size();
+    input_value_stride = compiler.input_value_stride;
+    input_spike_count_size = compiler.input_spike_count_size;
 
     initialize_model_buffers();
     compiler.initialize_cell_state(random_generator);
+    compiler.initialize_input_state(random_generator);
 
     build_weight_matrix(compiler.edge_plane_count(), compiler.updated_edge_plane_count());
 
@@ -113,8 +121,6 @@ SpikeEngine::SpikeEngine(const String &lems_input_file,
                      "plasticity deltas yet, so weights will not change");
     }
     weights.resize_delta_capacity(weights.delta_capacity_for_threshold(refit_occupancy_threshold_fraction));
-
-    collect_stimulus();
 
     compiler.translate_kernel_code();
 
@@ -324,6 +330,10 @@ void SpikeEngine::register_kernel_arguments() {
         {"projection_synapse_prototype",  [this] { return resolve_edge_plane(projection_synapse_prototype); }},
         {"random_values",             [this] { return random_values; }},
         {"event_arrival_count",       [this] { return event_arrival_count; }},
+        {"input_row_start",           [this] { return input_row_start; }},
+        {"input_entry_prototype",     [this] { return input_entry_prototype; }},
+        {"input_values",              [this] { return input_values; }},
+        {"input_spike_counts",        [this] { return input_spike_counts; }},
     };
 
     for (const String &name : kernel_parameter_names) {
@@ -363,98 +373,6 @@ s64 SpikeEngine::cell_memory_index_of(s64 neuron_index, const String &variable_n
     return context.simulation.population_base_indices.at(population->id) +
            (neuron_index - first_neuron) * (s64)variable_names.size() +
            (s64)(variable - variable_names.begin());
-}
-
-f64 SpikeEngine::default_spike_amplitude_for(s64 neuron_index) const {
-    constexpr f64 THRESHOLD_OVERSHOOT = 1.05;
-
-    s64 first_neuron = 0;
-    const NML_ComponentInstance *population = population_of_neuron(neuron_index, first_neuron);
-    if (!population) {
-        log::throw_runtime_error(*logger,
-                "SpikeEngine: spike train targets neuron " + to_string(neuron_index) +
-                ", which is outside every population");
-    }
-    const NML_ComponentInstance &cell = population_cell(context, *population);
-    const NML_ComponentType &cell_type = *cell.component_type;
-    const UnorderedMap<String, f64> values = starting_values(context, cell);
-
-    f64 capacitance = 0.0;
-    for (const NML_ComponentType *type = &cell_type; type; type = type->extends) {
-        for (const NML_Node *element : children_of(type->source_node)) {
-            const NML_Tag &tag = element->body;
-            if (tag.tag_type != NML_DeclarationType::Parameter) continue;
-            if (tag.get_attribute("dimension") != "capacitance") continue;
-            if (cell_type.find_declaration(tag.namespace_key()) != element) continue;
-
-            auto value = values.find(tag.get_attribute("name"));
-            if (value != values.end()) capacitance = value->second;
-        }
-    }
-    if (capacitance <= 0.0) {
-        log::throw_runtime_error(*logger,
-                "SpikeEngine: a spike train targets a '" + cell_type.name +
-                "', which declares no parameter of dimension capacitance, so there is "
-                "no way to work out what one event should inject. Give the input an "
-                "amplitude");
-    }
-
-    // The spiking OnCondition is the one with an EventOut; its test should read
-    // "membrane > threshold".
-    String spike_test;
-    for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
-        if (entry.source_tag != NML_DeclarationType::EventOut || entry.condition.empty()) continue;
-        spike_test = entry.condition;
-        break;
-    }
-
-    String membrane_name;
-    f64 threshold = 0.0;
-    bool threshold_found = false;
-    if (!spike_test.empty()) {
-        std::unique_ptr<LemsParseNode> test(parse_lems_expression(spike_test, cell_type.name));
-        const auto *comparison = dynamic_cast<const BinaryNode<LemsParseBody> *>(test.get());
-        const String comparison_operator = test->body.token.lexeme;
-        if (comparison && test->body.syntax_type == LemsNodeSubtype::OPERATOR &&
-            (comparison_operator == ">" || comparison_operator == ">=") &&
-            comparison->left->body.syntax_type == LemsNodeSubtype::IDENTIFIER) {
-            membrane_name = comparison->left->body.token.lexeme;
-            try {
-                threshold = evaluate_lems(comparison->right, values, cell_type.name);
-                threshold_found = true;
-            } catch (const std::runtime_error &) {
-                // not foldable to a starting value
-            }
-        }
-    }
-    if (membrane_name.empty()) {
-        log::throw_runtime_error(*logger,
-                "SpikeEngine: a spike train targets a '" + cell_type.name +
-                "', whose spike condition is not a comparison this can read, so there "
-                "is no threshold to aim at. Give the input an amplitude");
-    }
-
-    // The lowest the membrane starts or resets to.
-    f64 resting = values.count(membrane_name) ? values.at(membrane_name) : 0.0;
-    for (const NML_DynamicsExpression &entry : cell_type.dynamics) {
-        if (entry.source_tag != NML_DeclarationType::StateAssignment) continue;
-        if (entry.condition != spike_test || entry.target != membrane_name) continue;
-
-        try {
-            resting = std::min(resting, evaluate_lems(entry.expression, values, cell_type.name));
-        } catch (const std::runtime_error &) {
-            // not foldable; the OnStart value stands
-        }
-    }
-
-    if (!threshold_found || threshold <= resting) {
-        log::throw_runtime_error(*logger,
-                "SpikeEngine: a spike train targets a '" + cell_type.name +
-                "', whose threshold resolves to no value above its starting membrane "
-                "potential, so no finite current would make it fire. Give the input an amplitude");
-    }
-
-    return THRESHOLD_OVERSHOOT * capacitance * (threshold - resting) / step_dt;
 }
 
 // Replaces the document's connections with adjacency, where adjacency[n] lists neuron n's
@@ -535,68 +453,8 @@ void SpikeEngine::apply_topology(const vector<vector<s32>> &adjacency,
     }
 }
 
-void SpikeEngine::collect_stimulus() {
-    for (const SimulationInputConfig &profile : context.simulation.input_profiles) {
-        for (const InputTarget &target : profile.targets) {
-            // Targets are resolve_path cell-memory indices; network_inputs is per neuron.
-            const s64 target_neuron = context.neuron_index_of(target.neuron_index);
-            if (target_neuron < 0) continue;
-
-            if (profile.continuous_current_injection) {
-                continuous_injection_targets.push_back(target_neuron);
-                continuous_injection_amplitudes.push_back(
-                        (f32)(profile.amplitude * target.weight));
-                continuous_injection_start_ticks.push_back(profile.start_tick);
-                continuous_injection_end_ticks.push_back(
-                        profile.end_tick > profile.start_tick ? profile.end_tick : lifetime);
-                continue;
-            }
-
-            if (target.event_ticks.empty()) continue;
-
-            const f64 amplitude = profile.amplitude != 0.0
-                    ? profile.amplitude
-                    : default_spike_amplitude_for(target_neuron);
-
-            ScheduledSpikeTrain train;
-            train.neuron_index = target_neuron;
-            train.magnitude = (f32)(amplitude * target.weight);
-            train.event_ticks = target.event_ticks;
-            scheduled_spike_trains.push_back(std::move(train));
-        }
-    }
-
-    logger->info("SpikeEngine: stimulus — {} continuous injections, {} spike trains",
-                 continuous_injection_targets.size(), scheduled_spike_trains.size());
-}
-
 SpikeEngine::~SpikeEngine() {
     if (alive) shutdown();
-}
-
-void SpikeEngine::apply_stimulus(s64 tick) {
-    f32 *input_data = static_cast<f32 *>(network_inputs.get_contents());
-    const s64 row_base = (tick % 2) * total_neuron_count;
-
-    for (usize index = 0; index < continuous_injection_targets.size(); index += 1) {
-        if (tick < continuous_injection_start_ticks[index]) continue;
-        if (tick >= continuous_injection_end_ticks[index]) continue;
-
-        input_data[row_base + continuous_injection_targets[index]] +=
-                continuous_injection_amplitudes[index];
-    }
-
-    for (ScheduledSpikeTrain &train : scheduled_spike_trains) {
-        while (train.cursor < train.event_ticks.size() &&
-               (s64)train.event_ticks[train.cursor] < tick) {
-            train.cursor += 1;
-        }
-        while (train.cursor < train.event_ticks.size() &&
-               (s64)train.event_ticks[train.cursor] == tick) {
-            input_data[row_base + train.neuron_index] += train.magnitude;
-            train.cursor += 1;
-        }
-    }
 }
 
 EnginePointer SpikeEngine::resolve_edge_plane(const EnginePointer &plane) const {
@@ -604,8 +462,6 @@ EnginePointer SpikeEngine::resolve_edge_plane(const EnginePointer &plane) const 
 }
 
 void SpikeEngine::step_simulation(s64 tick) {
-    apply_stimulus(tick);
-
     // This tick's draw for every random() slot.
     f32 *random_value_data = random_values.get_contents_as<f32>();
     for (s64 index = 0; index < random_values_count; index += 1) {

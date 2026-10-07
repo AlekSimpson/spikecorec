@@ -96,18 +96,15 @@ namespace spikecorec {
         EnginePointer random_values;      // f32[max(1, random_values_count)]
         s64 random_values_count = 0;
 
-        Vector<s64> continuous_injection_targets;
-        Vector<f32> continuous_injection_amplitudes;
-        Vector<s64> continuous_injection_start_ticks;
-        Vector<s64> continuous_injection_end_ticks;
-
-        struct ScheduledSpikeTrain {
-            s64 neuron_index = -1;
-            f32 magnitude = 0.0f;
-            Vector<s32> event_ticks;
-            usize cursor = 0;
-        };
-        Vector<ScheduledSpikeTrain> scheduled_spike_trains;
+        // Inputs, run by the kernel from their own dynamics (Codegen::translate_input_entries).
+        // An entry is one input on one target cell. Carved from model_pointer.
+        EnginePointer input_row_start;        // s64[total_neuron_count + 1]: neuron n's entries start here
+        EnginePointer input_entry_prototype;  // s32[entries]: which input each entry runs
+        EnginePointer input_values;           // f32[entries][input_value_stride]: its weight, then its state
+        EnginePointer input_spike_counts;     // u8: each spike train's spikes per tick
+        s64 input_entry_count = 0;
+        s64 input_value_stride = 1;
+        s64 input_spike_count_size = 0;
 
         Vector<s64> spike_counts_per_neuron;
         Vector<RecordedSpike> recorded_spikes;
@@ -235,8 +232,6 @@ namespace spikecorec {
         // the first tick.
         void initialize_model_buffers();
 
-        void collect_stimulus();
-
         // Builds the k^2-tree and the weight and delay basis from network_data, with
         // matrix_count planes: weight, delay and one per synapse state variable. Also writes
         // the synapse planes' starting state and the device copy of the projection runs.
@@ -261,17 +256,8 @@ namespace spikecorec {
                             f64 connection_weight,
                             f64 connection_delay_seconds);
 
-        void apply_stimulus(s64 tick);
-
         // `plane`, or empty_edge_plane when the model has no such buffer.
         [[nodiscard]] EnginePointer resolve_edge_plane(const EnginePointer &plane) const;
-
-
-        // The current one event of a spike train injects when the model names no
-        // amplitude: enough charge, in a single tick, to carry this neuron from where it
-        // starts to where it fires. Derived from the target's own declared quantities, so
-        // it follows whatever cell the train is wired to.
-        [[nodiscard]] f64 default_spike_amplitude_for(s64 neuron_index) const;
 
         void record_tick(s64 tick);
     };

@@ -172,6 +172,10 @@ kernel void master_step(
     const device int      *projection_synapse_prototype  [[ buffer(33) ]],
     const device float    *random_values                 [[ buffer(34) ]],
     device   uint         *event_arrival_count           [[ buffer(35) ]],
+    const device long     *input_row_start               [[ buffer(36) ]],
+    const device int      *input_entry_prototype         [[ buffer(37) ]],
+    device   float        *input_values                  [[ buffer(38) ]],
+    const device uchar    *input_spike_counts            [[ buffer(39) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
     const long neuron_index = (long)thread_id;
@@ -184,7 +188,8 @@ kernel void master_step(
     const int current_row = (int)(tick % 2);
     const int next_row = 1 - current_row;
     const long input_slot = current_row * neuron_count + neuron_index;
-    const float network_input = network_inputs[input_slot];
+    // The cell's inputs add to this before its dynamics read it.
+    float network_input = network_inputs[input_slot];
     network_inputs[input_slot] = 0.0f;
 
     // Stages 2-5: the population dispatch goes here.
@@ -492,7 +497,11 @@ extern "C" __global__ void master_step(
     const long long *projection_first_edge_ordinal,
     const int *projection_synapse_prototype,
     const float *random_values,
-    unsigned int *event_arrival_count
+    unsigned int *event_arrival_count,
+    const long long *input_row_start,
+    const int *input_entry_prototype,
+    float *input_values,
+    const unsigned char *input_spike_counts
 ) {
     const long long neuron_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (neuron_index >= neuron_count) {
@@ -504,7 +513,8 @@ extern "C" __global__ void master_step(
     const int current_row = (int)(tick % 2);
     const int next_row = 1 - current_row;
     const long long input_slot = current_row * neuron_count + neuron_index;
-    const float network_input = network_inputs[input_slot];
+    // The cell's inputs add to this before its dynamics read it.
+    float network_input = network_inputs[input_slot];
     network_inputs[input_slot] = 0.0f;
 
     // Stages 2-5: the population dispatch goes here.

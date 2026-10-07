@@ -96,6 +96,9 @@ KernelNode *clone(const KernelNode *node);
 void replace_identifier(KernelNode *&node, const String &name, const KernelNode *replacement);
 // Every name used under node.
 void collect_identifiers(const KernelNode *node, Set<String> &names);
+// Replaces every +, -, * and / of float literals alone, and every negated float literal, with the
+// literal of its value, worked out in double precision: rounded once instead of per operation.
+void fold_constants(KernelNode *&node);
 // Removes the parameter from function and puts value in place of every use of it.
 void bake_parameter(KernelListNode *function, const String &name, const KernelNode *value);
 
@@ -113,6 +116,26 @@ struct NML_DynamicsExpression {
     String reduce;       // DerivedVariable reduce=, with select
 
     NML_DynamicsExpression(NML_DeclarationType source_tag)
+        : source_tag(source_tag) {};
+};
+
+// One entry of a ComponentType's <Structure>, in document order.
+//   ChildInstance:   component names the ComponentReference instantiated once per instance of the type.
+//   With:            instance ("this", "parent", or a Path or child name) is bound to alias.
+//   EventConnection: source and target are the aliases in its from= and to=; receiver and the
+//                    ports are empty when not given.
+struct NML_StructureEntry {
+    NML_DeclarationType source_tag;
+    String component;
+    String instance;
+    String alias;
+    String source;
+    String target;
+    String receiver;
+    String source_port;
+    String target_port;
+
+    NML_StructureEntry(NML_DeclarationType source_tag)
         : source_tag(source_tag) {};
 };
 
@@ -307,6 +330,49 @@ const NML_ComponentInstance &population_cell(const NML_Context &context, const N
 // Rows in the spike_history ring.
 s64 spike_history_length(const NML_Context &context);
 
+// What one spike from a spike-source input adds to a cell's input for one tick when the input
+// gives no amplitude: enough to lift the membrane from the lowest value it starts or resets to,
+// to 5% past its threshold, through the cell's capacitance.
+f64 default_kick_amplitude(const NML_Context &context, const NML_ComponentInstance &cell);
+
+// One part of an input's component tree: the input itself, a child it declares (a Child, or a
+// member of a Children collection), or a component it instantiates with ChildInstance, such as
+// its own copy of the synapse it references. Every entry (one input on one target cell) has its
+// own copy of every part's state.
+struct InputPart {
+    const NML_ComponentInstance *instance = nullptr;
+    s64 parent = -1;            // the part it belongs to; -1 for the input itself
+    String role;                // the parent's Child, Children or ComponentReference name it fills
+    s64 first_state_slot = 0;   // where its state variables start in an entry's state block
+};
+
+// A Children collection of spikes, reduced to how many fire on each tick of the run: 1 on a
+// tick a spike fires, 0 otherwise, 2 or more only when spike times round to the same tick.
+struct InputSpikeTrain {
+    s64 receiver = -1;          // the part their events go to
+    Vector<u8> spike_counts;    // [total_tick_count]
+};
+
+// An EventOut of one part is delivered to the OnEvents of another.
+struct InputEventRoute {
+    s64 source = -1;
+    s64 target = -1;
+};
+
+struct InputTree {
+    Vector<InputPart> parts;    // parts[0] is the input; a parent always comes before its children
+    Vector<InputSpikeTrain> spike_trains;
+    Vector<InputEventRoute> routes;
+    s64 state_size = 0;         // floats of state per entry
+};
+
+// One input on one target cell.
+struct InputEntry {
+    s64 neuron_index = -1;
+    s32 prototype = -1;         // index into Codegen::input_prototypes
+    f32 weight = 1.0f;
+};
+
 struct Codegen {
     const NML_Context &context;
     EngineBackend *device;
@@ -342,6 +408,32 @@ struct Codegen {
     // True when some population's cell type has an OnEvent, so the model needs the
     // event_arrival_count buffer and the kernel counts arrivals into it.
     bool cells_receive_events() const;
+
+    // Inputs. A prototype is one input component, compiled once per population it reaches; an
+    // entry is that input on one target cell, with its own weight and its own copy of the
+    // input's state. Filled by collect_inputs.
+    Vector<const NML_ComponentInstance *> input_prototypes;
+    Vector<InputTree> input_trees;                     // per prototype
+    Vector<Vector<s64>> input_spike_train_offsets;     // per prototype, per spike train: where it starts in input_spike_counts
+    s64 input_spike_count_size = 0;
+    Vector<InputEntry> input_entries;                  // sorted by neuron_index
+    // Floats per entry in input_values: its weight, then the largest prototype's state.
+    s64 input_value_stride = 1;
+
+    // The input's component tree as flat parts, with every Structure EventConnection resolved to a
+    // route between parts. A Children collection of spikes becomes a spike train, not parts.
+    InputTree flatten_input_tree(const NML_ComponentInstance &input) const;
+    // Fills the input prototypes, trees and entries from the document's input profiles.
+    void collect_inputs();
+    // Writes the input buffers: each neuron's entries, each entry's weight and starting state
+    // (OnStart values, otherwise 0), and the spike trains.
+    void initialize_input_state(RandomGenerator &random_generator);
+    // The loop over a neuron's input entries for one population, run before its cell's
+    // dynamics; nullptr when no input reaches the population.
+    KernelListNode *translate_input_entries(const NML_ComponentInstance &population, s64 first_neuron);
+    // One prototype's dynamics for one entry on a cell of the population.
+    KernelListNode *translate_input_prototype(s32 prototype, const NML_ComponentInstance &population, s64 first_neuron);
+
     void allocate_cell_model_memory();
     // Writes every cell's starting state (OnStart values, otherwise 0) into cell_state. An
     // OnStart that calls random() draws for each neuron from random_generator.
