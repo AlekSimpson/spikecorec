@@ -205,7 +205,9 @@ standard or your own:
   values, derived variables (conditional ones included), time derivatives (forward Euler),
   `OnCondition` blocks that assign state and emit spikes, `OnEvent` blocks that run once for
   each spike reaching the cell (counted in `event_arrival_count`), and optionally an
-  integrating regime paired with a refractory one. `random()` draws a fresh value for each neuron on
+  integrating regime paired with a refractory one. The refractory regime can have its own time
+  derivatives and conditions (as `adExIaFCell`'s adaptation current does), and each regime's
+  `OnEntry` runs with the transition into it. `random()` draws a fresh value for each neuron on
   every call, seeded by the `<Simulation>`'s `seed`, so spike sources such as
   `spikeGeneratorPoisson` run as populations.
 - **Synapses:** current-based. The equations can use the synapse's own state, its

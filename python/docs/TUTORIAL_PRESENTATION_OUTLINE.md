@@ -98,6 +98,7 @@ Each slide only uses ideas introduced on earlier ones.
   - with timed refractory periods
   - with adaptation: after-spike currents and threshold adaptation
   - nonlinear integrate-and-fire with a recovery variable, reset when the voltage peaks
+  - adaptive exponential integrate-and-fire (`adExIaFCell`), adapting through its refractory period
   - spike sources with random intervals, such as Poisson generators
   - custom point-neuron models written in LEMS from the same building blocks
 - **Synapses:**
@@ -113,7 +114,8 @@ Each slide only uses ideas introduced on earlier ones.
   - threshold conditions (`OnCondition`) that assign state and emit spikes
   - spike handlers (`OnEvent`) that run once for each spike reaching the cell
   - optionally a refractory period: an integrating regime and a refractory regime that
-    transitions back to it
+    transitions back to it. Either regime can have its own time derivatives, conditions and
+    `OnEntry`
   - `random()`, a fresh draw for each neuron on every call, seeded by the simulation's seed
 - Every name in the equations has to be a state variable, parameter, constant or derived
   variable
