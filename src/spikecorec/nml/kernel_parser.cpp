@@ -490,6 +490,25 @@ Kernel_Node *Kernel_Parser::parse_postfix() {
 // A type name followed by "(" is a constructor call, e.g. float4(...).
 Kernel_Node *Kernel_Parser::parse_primary() {
     if (check(Kind::Number)) return new_node(Kernel_Node_Type::LITERAL, expect(Kind::Number).lexeme);
+
+    // static_cast<type>(value) builds the same cast node as (type)value.
+    if (accept(Kind::Identifier, "static_cast")) {
+        expect(Kind::Operator, "<");
+        Kernel_Node *type = parse_type();
+        Kernel_Node *value = nullptr;
+        try {
+            expect(Kind::Operator, ">");
+            expect(Kind::Punctuation, "(");
+            value = parse_expression();
+            expect(Kind::Punctuation, ")");
+        } catch (...) {
+            delete type;
+            delete value;
+            throw;
+        }
+        return new_cast(type, value);
+    }
+
     if (check(Kind::Identifier)) return new_node(Kernel_Node_Type::IDENTIFIER, expect(Kind::Identifier).lexeme);
     if (check(Kind::Type) && peek(1).kind == Kind::Punctuation && peek(1).lexeme == "(") {
         return new_node(Kernel_Node_Type::IDENTIFIER, expect(Kind::Type).lexeme);

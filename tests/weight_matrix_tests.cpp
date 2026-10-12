@@ -482,7 +482,7 @@ TEST(Weight_Matrix, repeated_weight_updates_stay_fast_and_within_the_tolerance) 
 
         const auto started = Steady_Clock::now();
         matrix.refit();
-        const f64 seconds = Duration<f64>(Steady_Clock::now() - started).count();
+        const f64 seconds = spikecorec::Duration<f64>(Steady_Clock::now() - started).count();
         // 2,400 edges took about 4 ms when measured; the bound only catches a refit gone slow.
         EXPECT_LT(seconds, 2.0) << "cycle " << cycle;
         EXPECT_LE(worst_relative_error(plane_values(matrix, WEIGHT), running_total), matrix.fit_tolerance)
