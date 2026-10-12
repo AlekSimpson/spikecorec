@@ -74,7 +74,7 @@ ifeq ($(HAS_BZ2),yes)
   COMPRESSION_LIBS += $(shell pkg-config --libs bzip2)
 endif
 
-# ── XML parsing (libxml2 — NML/LEMS front-end, ticket #2 [A3]) ───────────────
+# ── XML parsing (libxml2 — NML/LEMS front-end) ───────────────────────────────
 # Parse + XSD-validate NeuroML/LEMS XML (third_party/neuroml2/schema, std_lib).
 # Detected the same way as the compression codecs above, via pkg-config.
 HAS_LIBXML2 := $(shell pkg-config --exists libxml-2.0 && echo yes || echo no)
@@ -84,14 +84,14 @@ ifeq ($(HAS_LIBXML2),yes)
   LIBXML2_LIBS := $(shell pkg-config --libs libxml-2.0)
 endif
 
-# ── NeuroML/LEMS standard-library bundle path (vendored, ticket #3 [A1]) ─────
+# ── NeuroML/LEMS standard-library bundle path (vendored) ─────────────────────
 # Baked in as an absolute path at compile time (via $(abspath), a GNU Make
 # built-in) so NML_StandardLibrary::STANDARD_LIBRARY_PATH resolves correctly
 # no matter what directory the binary is later run from.
 NML_STD_LIB_DIR := $(abspath third_party/neuroml2/std_lib)
 CXXFLAGS        += -DSPIKECOREC_NML_STD_LIB_DIR=\"$(NML_STD_LIB_DIR)\"
 
-# ── NeuroML2 XSD schema path (vendored, ticket #8 [A2]) ──────────────────────
+# ── NeuroML2 XSD schema path (vendored) ──────────────────────────────────────
 NML_SCHEMA_PATH := $(abspath third_party/neuroml2/schema/NeuroML_v2.3.xsd)
 CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 
@@ -290,8 +290,7 @@ examples: examples-$(BACKEND)
 # The examples are backend-agnostic C++ and build against whichever library is present.
 # This target used to name examples/cuda_example.cpp, which has never existed in the tree.
 examples-cuda: check-cuda $(CUDA_LIB)
-	@echo "[spikecorec] the CUDA backend cannot yet run a generated kernel"
-	@echo "             (the kernel codegen emits Metal only) — examples are Metal-only."
+	@echo "[spikecorec] examples are Metal-only: the example build rule links the Metal library."
 	@false
 
 # Every .cpp directly in examples/ is an example; the headers beside them are shared

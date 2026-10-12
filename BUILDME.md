@@ -125,7 +125,8 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
   Builds every `examples/*.cpp` into `build/examples/`.
 
 - `make examples-cuda`
-  Not supported yet: the kernel codegen emits Metal only, so the target stops with a message.
+  Not supported yet: the example build rule links the Metal library only, so the target stops
+  with a message.
 
 ### Utilities
 
