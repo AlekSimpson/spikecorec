@@ -86,7 +86,7 @@ Engine_Backend &Engine_Backend::partition(
         return *this;
     }
 
-    const u64 alignment = std::max<u64>(TYPE_ALIGNMENTS[datatype], PARTITION_ALIGNMENT);
+    const u64 alignment = std::max<u64>(TYPE_ALIGNMENTS.at(datatype), PARTITION_ALIGNMENT);
     const u64 aligned_offset = aligned_partition_offset(static_cast<u64>(last_offset), alignment);
 
     // base_pointer stays null until allocate() runs
@@ -319,7 +319,7 @@ Engine_Backend &Engine_Backend::partition(
         return *this;
     }
 
-    const u64 alignment = std::max<u64>(TYPE_ALIGNMENTS[datatype], PARTITION_ALIGNMENT);
+    const u64 alignment = std::max<u64>(TYPE_ALIGNMENTS.at(datatype), PARTITION_ALIGNMENT);
     const u64 aligned_offset = aligned_partition_offset(static_cast<u64>(last_offset), alignment);
 
     partitions.push_back(Engine_Pointer{nullptr, static_cast<s64>(aligned_offset), bytes, alignment, false});

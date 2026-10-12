@@ -34,7 +34,7 @@ namespace spikecorec {
 
     class Spike_Engine {
     public:
-        log::Shared_Pointer<log::Engine_Logger> logger;
+        Shared_Pointer<log::Engine_Logger> logger;
 
         NML_Context context;
 
