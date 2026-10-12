@@ -154,8 +154,8 @@ Each slide only uses ideas introduced on earlier ones.
 - These are refused when the engine is created, with the component and the reason, so
   they never run silently wrong
 - Plasticity: the flag exists, but nothing changes weights during a run yet
-- Platform: macOS with Metal runs today. CUDA code is generated, but the launcher that
-  runs it is not built yet
+- Platform: macOS with Metal runs today. CUDA code is generated and launched through
+  `Engine_Backend::run_function`, but the CUDA path has not been run on hardware yet
 
 ---
 
@@ -309,7 +309,7 @@ Each slide only uses ideas introduced on earlier ones.
 ## Part 6: Wrapping up
 
 ### Slide 31: Current limitations
-- macOS/Metal only until the CUDA launcher lands
+- macOS/Metal is the only tested platform; the CUDA path has not been run on hardware yet
 - Model constraints: point neurons, current-based synapses, at most an
   integrating/refractory regime pair
 - No synaptic plasticity during a run yet

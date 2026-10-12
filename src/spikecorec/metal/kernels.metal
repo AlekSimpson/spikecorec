@@ -13,10 +13,10 @@ using namespace metal;
 // (or one threadgroup) per source_node — walking the row once and filling all
 // max_neighbor_count slots — would eliminate that redundancy.
 // `coefficients` is the shared-basis Ck vector (rank_float4_stride*4 scalar f32
-// elements — ticket #52/D2): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r].
+// elements): reconstruction is Σ U[i,r]·coefficients[r]·V[j,r].
 // `coefficients_present` says whether to read it at all: the host passes 0 for a
 // null coefficient vector, and the 0 branch below is the pre-shared-basis dot(U,V)
-// statement preserved verbatim, so a null Ck reproduces the pre-#52 numerics
+// statement preserved verbatim, so a null Ck reproduces the pre-shared-basis numerics
 // exactly. The flag is a separate argument rather than a null-pointer test because
 // the host binds a null pointer argument via setBytes, so the address this kernel
 // receives in that case is valid-but-unrelated, never null.

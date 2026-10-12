@@ -144,13 +144,6 @@ EXTRA_LINK_ARGS += _libxml2_libs
 if BACKEND == "cuda":
     CUDA_PATH = os.environ.get("CUDA_PATH", "/usr/local/cuda")
     INC.append(f"{CUDA_PATH}/include")
-    # The kernel codegen emits CUDA source as well as Metal, but the CUDA backend has no
-    # generic launcher to run it with yet (ticket #56) -- an extension built here would
-    # construct an engine whose ticks cannot be dispatched. Fail here instead.
-    raise RuntimeError(
-        "The CUDA backend is not currently buildable: the generated kernel has no CUDA "
-        "launcher yet (ticket #56). Build with SPIKECOREC_BACKEND=metal."
-    )
     # backend.cpp uses the driver API (cuInit/cuCtxCreate/cuModuleLoadData) and
     # NVRTC in addition to the runtime API, so link -lcuda and -lnvrtc too. The
     # driver stub satisfies the link; the real libcuda loads at runtime.
