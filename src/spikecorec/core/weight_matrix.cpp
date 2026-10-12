@@ -1006,7 +1006,7 @@ void Weight_Matrix::grow_basis(s64 new_rank) {
     for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
         f32 *coefficient_values = coefficient_row(matrix_index);
         s64 lane;
-        for (lane = 0; lane < lane_count; ++lane) {
+        for (lane = 0; lane < old_lane_count; ++lane) {
             coefficient_values[lane] = saved_coefficients[static_cast<usize>(matrix_index * old_lane_count + lane)];
         }
         for (; lane < lane_count; ++lane) {
