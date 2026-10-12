@@ -2,11 +2,11 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/recording.h"
-#include "spikecorec/core/types.h"
-#include "spikecorec/core/units.h"
-#include "spikecorec/nml/dynamics.h"
-#include "spikecorec/nml/parser.h"
+#include "recording.h"
+#include "types.h"
+#include "units.h"
+#include "dynamics.h"
+#include "parser.h"
 #include "support/test_support.h"
 
 using namespace std;
@@ -28,20 +28,20 @@ String parse_error(const String &main_filepath) {
     NML_Context context;
     try {
         context.parse(main_filepath);
-    } catch (const runtime_error &error) {
+    } catch (const Runtime_Error &error) {
         return error.what();
     }
     return "";
 }
 
-const NML_ComponentType &type_named(const NML_Context &context, const String &type_name) {
+const NML_Component_Type &type_named(const NML_Context &context, const String &type_name) {
     return context.component_types.at(type_name);
 }
 
 // The dynamics entries of one type that came from one kind of tag.
-Vector<NML_DynamicsExpression> entries_of(const NML_ComponentType &component_type, NML_DeclarationType tag) {
-    Vector<NML_DynamicsExpression> entries;
-    for (const NML_DynamicsExpression &entry : component_type.dynamics) {
+Vector<NML_Dynamics_Expression> entries_of(const NML_Component_Type &component_type, NML_Declaration_Type tag) {
+    Vector<NML_Dynamics_Expression> entries;
+    for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
         if (entry.source_tag == tag) entries.push_back(entry);
     }
     return entries;
@@ -105,11 +105,11 @@ String one_population_network(const String &network_body, const String &declarat
 }
 
 // The two-population model written out and parsed.
-struct TwoPopulationModel {
-    TemporaryDirectory directory;
+struct Two_Population_Model {
+    Temporary_Directory directory;
     NML_Context context;
 
-    TwoPopulationModel() {
+    Two_Population_Model() {
         directory.write("net.nml", two_population_network());
         parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
     }
@@ -118,7 +118,7 @@ struct TwoPopulationModel {
     s64 izhikevich_memory_index(s64 cell, const String &variable) const {
         const Vector<String> &names = type_named(context, "izhikevich2007Cell").state_variable_names;
         const s64 offset = find(names.begin(), names.end(), variable) - names.begin();
-        return context.simulation.population_base_indices.at("net1/pop2") + cell * (s64)names.size() + offset;
+        return context.simulation.population_base_indices.at("net1/pop2") + cell * static_cast<s64>(names.size()) + offset;
     }
 };
 
@@ -127,7 +127,7 @@ struct TwoPopulationModel {
 // ── quantities ──────────────────────────────────────────────────────────────────
 
 TEST(Quantity, a_declared_unit_takes_precedence_over_the_built_in_table) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     // A deliberately non-SI redefinition: if the document's <Unit> is consulted, mV scales by 1000.
     const String main_file = directory.write("units.xml", R"(<Lems>
     <Unit symbol="mV" dimension="voltage" power="3"/>
@@ -145,7 +145,7 @@ TEST(Quantity, a_declared_unit_takes_precedence_over_the_built_in_table) {
 }
 
 TEST(Quantity, standard_library_units_carry_their_scale_power_and_offset) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("units.xml", R"(<Lems>
     <Unit symbol="offsetUnit" dimension="temperature" offset="10"/>
 </Lems>
@@ -163,7 +163,7 @@ TEST(Quantity, standard_library_units_carry_their_scale_power_and_offset) {
 
 // A <Constant> resolves after every document is read, so it may use a unit a later file declares.
 TEST(Quantity, constants_resolve_with_units_declared_in_any_file) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("later_units.xml", R"(<Lems>
     <Unit symbol="doubleUnit" dimension="none" scale="2"/>
 </Lems>
@@ -185,7 +185,7 @@ TEST(Quantity, constants_resolve_with_units_declared_in_any_file) {
 // ── ComponentType resolution ────────────────────────────────────────────────────
 
 TEST(Resolution, a_multi_hop_extends_chain_links_every_ancestor) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="base_a">
         <Parameter name="alpha" dimension="none"/>
@@ -203,7 +203,7 @@ TEST(Resolution, a_multi_hop_extends_chain_links_every_ancestor) {
     NML_Context context;
     parse_model(context, main_file);
 
-    const NML_ComponentType &leaf = type_named(context, "leaf_c");
+    const NML_Component_Type &leaf = type_named(context, "leaf_c");
     ASSERT_NE(leaf.extends, nullptr);
     EXPECT_EQ(leaf.extends->name, "mid_b");
     ASSERT_NE(leaf.extends->extends, nullptr);
@@ -218,7 +218,7 @@ TEST(Resolution, a_multi_hop_extends_chain_links_every_ancestor) {
 }
 
 TEST(Resolution, extends_resolves_forward_references_and_across_files) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("parent.xml", R"(<Lems>
     <ComponentType name="parent_type"><Parameter name="inherited" dimension="none"/></ComponentType>
 </Lems>
@@ -244,7 +244,7 @@ TEST(Resolution, extends_resolves_forward_references_and_across_files) {
 // A subtype's declaration shadows its ancestor's of the same name, and several tags share the
 // variable namespace, so a StateVariable can shadow a Parameter.
 TEST(Resolution, a_redeclared_name_shadows_the_ancestors_declaration) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="parent_type">
         <Parameter name="beta" dimension="voltage"/>
@@ -260,7 +260,7 @@ TEST(Resolution, a_redeclared_name_shadows_the_ancestors_declaration) {
 )");
     NML_Context context;
     parse_model(context, main_file);
-    const NML_ComponentType &child = type_named(context, "child_type");
+    const NML_Component_Type &child = type_named(context, "child_type");
 
     const NML_Node *beta = child.find_declaration("var:beta");
     ASSERT_NE(beta, nullptr);
@@ -268,7 +268,7 @@ TEST(Resolution, a_redeclared_name_shadows_the_ancestors_declaration) {
 
     const NML_Node *tau = child.find_declaration("var:tau");
     ASSERT_NE(tau, nullptr);
-    EXPECT_EQ(tau->body.tag_type, NML_DeclarationType::StateVariable);
+    EXPECT_EQ(tau->body.tag_type, NML_Declaration_Type::StateVariable);
 
     // x is a state variable of the parent but a parameter of the child, so the child has no slot for it.
     EXPECT_EQ(child.state_variable_names, (Vector<String>{"tau"}));
@@ -276,7 +276,7 @@ TEST(Resolution, a_redeclared_name_shadows_the_ancestors_declaration) {
 }
 
 TEST(Resolution, an_extends_cycle_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="type_a" extends="type_b"/>
     <ComponentType name="type_b" extends="type_a"/>
@@ -286,7 +286,7 @@ TEST(Resolution, an_extends_cycle_throws) {
 }
 
 TEST(Resolution, an_unresolved_extends_throws_naming_the_missing_type) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="orphan_type" extends="no_such_type"/>
 </Lems>
@@ -296,7 +296,7 @@ TEST(Resolution, an_unresolved_extends_throws_naming_the_missing_type) {
 
 // A type's own <Dynamics> replaces its ancestors'; without one it inherits the nearest.
 TEST(Resolution, dynamics_come_from_the_nearest_type_that_declares_them) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="parent_type">
         <Dynamics><StateVariable name="x" dimension="none"/><TimeDerivative variable="x" value="1"/></Dynamics>
@@ -310,13 +310,13 @@ TEST(Resolution, dynamics_come_from_the_nearest_type_that_declares_them) {
     NML_Context context;
     parse_model(context, main_file);
 
-    const Vector<NML_DynamicsExpression> replaced =
-            entries_of(type_named(context, "replacing_type"), NML_DeclarationType::TimeDerivative);
+    const Vector<NML_Dynamics_Expression> replaced =
+            entries_of(type_named(context, "replacing_type"), NML_Declaration_Type::TimeDerivative);
     ASSERT_EQ(replaced.size(), 1u);
     EXPECT_EQ(replaced[0].target, "y");
 
-    const Vector<NML_DynamicsExpression> inherited =
-            entries_of(type_named(context, "inheriting_type"), NML_DeclarationType::TimeDerivative);
+    const Vector<NML_Dynamics_Expression> inherited =
+            entries_of(type_named(context, "inheriting_type"), NML_Declaration_Type::TimeDerivative);
     ASSERT_EQ(inherited.size(), 1u);
     EXPECT_EQ(inherited[0].target, "x");
     EXPECT_EQ(inherited[0].expression, "1");
@@ -325,7 +325,7 @@ TEST(Resolution, dynamics_come_from_the_nearest_type_that_declares_them) {
 // ── component instances ─────────────────────────────────────────────────────────
 
 TEST(Instances, only_attributes_the_type_declares_are_bound) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("instances.xml", R"(<Lems>
     <ComponentType name="bound_type">
         <Parameter name="declared" dimension="none"/>
@@ -338,7 +338,7 @@ TEST(Instances, only_attributes_the_type_declares_are_bound) {
     NML_Context context;
     parse_model(context, main_file);
 
-    const NML_ComponentInstance *example = context.find_instance("example");
+    const NML_Component_Instance *example = context.find_instance("example");
     ASSERT_NE(example, nullptr);
     EXPECT_TRUE(context.is_instance_of(example, "bound_type"));
     EXPECT_EQ(example->value_or("declared"), "3");
@@ -350,7 +350,7 @@ TEST(Instances, only_attributes_the_type_declares_are_bound) {
 
 // <Fixed> pins a parameter for every instance of the subtype, over whatever the instance says.
 TEST(Instances, fixed_pins_an_inherited_parameter) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("instances.xml", R"(<Lems>
     <ComponentType name="parent_type">
         <Parameter name="tau" dimension="time"/>
@@ -372,7 +372,7 @@ TEST(Instances, fixed_pins_an_inherited_parameter) {
 }
 
 TEST(Instances, children_are_keyed_by_their_path_and_unnamed_ones_by_type_and_ordinal) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("instances.xml", R"(<Lems>
     <ComponentType name="holder_type"><Children name="members" type="member_type"/></ComponentType>
     <ComponentType name="member_type"/>
@@ -386,7 +386,7 @@ TEST(Instances, children_are_keyed_by_their_path_and_unnamed_ones_by_type_and_or
     NML_Context context;
     parse_model(context, main_file);
 
-    const NML_ComponentInstance *holder = context.find_instance("holder");
+    const NML_Component_Instance *holder = context.find_instance("holder");
     ASSERT_NE(holder, nullptr);
     EXPECT_EQ(holder->data_order,
               (Vector<String>{"holder/named", "holder/member_type0", "holder/member_type1"}));
@@ -395,7 +395,7 @@ TEST(Instances, children_are_keyed_by_their_path_and_unnamed_ones_by_type_and_or
 }
 
 TEST(Instances, a_duplicate_instance_id_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("instances.xml", R"(<Lems>
     <ComponentType name="plain_type"/>
     <plain_type id="same"/>
@@ -407,7 +407,7 @@ TEST(Instances, a_duplicate_instance_id_throws) {
 
 // Real documents carry annotations that map to no ComponentType; they are skipped, not fatal.
 TEST(Instances, tags_with_no_component_type_are_skipped) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <someOtherAnnotation/>
         <population id="pop1" component="cell0" size="2"/>
 )", "    <someUnmodelledAnnotation foo=\"bar\"/>\n"));
@@ -421,7 +421,7 @@ TEST(Instances, tags_with_no_component_type_are_skipped) {
 // ── includes ────────────────────────────────────────────────────────────────────
 
 TEST(Include, resolves_relative_to_the_including_file) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("nested/leaf.xml", R"(<Lems><ComponentType name="leaf_type"/></Lems>)");
     directory.write("nested/branch.xml", R"(<Lems><Include file="leaf.xml"/></Lems>)");
     const String main_file = directory.write("root.xml", R"(<Lems><Include file="nested/branch.xml"/></Lems>)");
@@ -433,7 +433,7 @@ TEST(Include, resolves_relative_to_the_including_file) {
 }
 
 TEST(Include, a_cycle_terminates) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("second.xml", R"(<Lems><Include file="first.xml"/><ComponentType name="second_type"/></Lems>)");
     const String main_file =
             directory.write("first.xml", R"(<Lems><Include file="second.xml"/><ComponentType name="first_type"/></Lems>)");
@@ -447,7 +447,7 @@ TEST(Include, a_cycle_terminates) {
 // "shared.xml" and "./shared.xml" are one file: deduplicating on the raw text would read it twice
 // and report its type as a redefinition.
 TEST(Include, a_diamond_include_reads_the_shared_file_once) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("shared.xml", R"(<Lems><ComponentType name="shared_type"/></Lems>)");
     directory.write("left.xml", R"(<Lems><Include file="shared.xml"/></Lems>)");
     directory.write("right.xml", R"(<Lems><Include file="./shared.xml"/></Lems>)");
@@ -459,7 +459,7 @@ TEST(Include, a_diamond_include_reads_the_shared_file_once) {
 }
 
 TEST(Include, a_type_defined_in_two_files_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("first.xml", R"(<Lems><ComponentType name="clashing_type"/></Lems>)");
     directory.write("second.xml", R"(<Lems><ComponentType name="clashing_type"/></Lems>)");
     const String main_file =
@@ -471,7 +471,7 @@ TEST(Include, a_type_defined_in_two_files_throws) {
 
 // Entries carry their regime, and an event handler's actions carry the handler's condition.
 TEST(Dynamics, regime_entries_carry_their_regime_and_condition) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="regime_cell">
         <Dynamics>
@@ -495,22 +495,22 @@ TEST(Dynamics, regime_entries_carry_their_regime_and_condition) {
 )");
     NML_Context context;
     parse_model(context, main_file);
-    const NML_ComponentType &cell = type_named(context, "regime_cell");
+    const NML_Component_Type &cell = type_named(context, "regime_cell");
 
-    const Vector<NML_DynamicsExpression> regimes = entries_of(cell, NML_DeclarationType::Regime);
+    const Vector<NML_Dynamics_Expression> regimes = entries_of(cell, NML_Declaration_Type::Regime);
     ASSERT_EQ(regimes.size(), 2u);
     EXPECT_EQ(regimes[0].target, "integrating");
     EXPECT_EQ(regimes[0].expression, "true");
     EXPECT_EQ(regimes[1].target, "refractory");
 
-    const Vector<NML_DynamicsExpression> derivatives = entries_of(cell, NML_DeclarationType::TimeDerivative);
+    const Vector<NML_Dynamics_Expression> derivatives = entries_of(cell, NML_Declaration_Type::TimeDerivative);
     ASSERT_EQ(derivatives.size(), 2u);
     EXPECT_EQ(derivatives[0].target, "v");
     EXPECT_EQ(derivatives[0].regime_name, "integrating");
     EXPECT_EQ(derivatives[1].target, "elapsed");
     EXPECT_EQ(derivatives[1].regime_name, "refractory");
 
-    const Vector<NML_DynamicsExpression> assignments = entries_of(cell, NML_DeclarationType::StateAssignment);
+    const Vector<NML_Dynamics_Expression> assignments = entries_of(cell, NML_Declaration_Type::StateAssignment);
     ASSERT_EQ(assignments.size(), 2u);
     EXPECT_EQ(assignments[0].target, "v");
     EXPECT_EQ(assignments[0].expression, "vreset");
@@ -519,12 +519,12 @@ TEST(Dynamics, regime_entries_carry_their_regime_and_condition) {
     EXPECT_EQ(assignments[1].regime_name, "refractory");
     EXPECT_EQ(assignments[1].condition, "");
 
-    const Vector<NML_DynamicsExpression> events = entries_of(cell, NML_DeclarationType::EventOut);
+    const Vector<NML_Dynamics_Expression> events = entries_of(cell, NML_Declaration_Type::EventOut);
     ASSERT_EQ(events.size(), 1u);
     EXPECT_EQ(events[0].target, "spike");
     EXPECT_EQ(events[0].condition, "v .gt. vthresh");
 
-    const Vector<NML_DynamicsExpression> transitions = entries_of(cell, NML_DeclarationType::Transition);
+    const Vector<NML_Dynamics_Expression> transitions = entries_of(cell, NML_Declaration_Type::Transition);
     ASSERT_EQ(transitions.size(), 1u);
     EXPECT_EQ(transitions[0].target, "refractory");
 }
@@ -532,28 +532,28 @@ TEST(Dynamics, regime_entries_carry_their_regime_and_condition) {
 // iafCell writes v in two handlers. The OnStart assignment is an entry of its own; the reset
 // carries the threshold condition. Tagging them alike would reapply OnStart every tick.
 TEST(Dynamics, on_start_is_kept_apart_from_a_conditional_reset) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("root.xml", "<Lems/>");
     NML_Context context;
     parse_model(context, main_file);
-    const NML_ComponentType &iaf = type_named(context, "iafCell");
+    const NML_Component_Type &iaf = type_named(context, "iafCell");
 
-    const Vector<NML_DynamicsExpression> on_start = entries_of(iaf, NML_DeclarationType::OnStart);
+    const Vector<NML_Dynamics_Expression> on_start = entries_of(iaf, NML_Declaration_Type::OnStart);
     ASSERT_EQ(on_start.size(), 1u);
     EXPECT_EQ(on_start[0].target, "v");
     EXPECT_EQ(on_start[0].expression, "leakReversal");
 
-    const Vector<NML_DynamicsExpression> resets = entries_of(iaf, NML_DeclarationType::StateAssignment);
+    const Vector<NML_Dynamics_Expression> resets = entries_of(iaf, NML_Declaration_Type::StateAssignment);
     ASSERT_EQ(resets.size(), 1u);
     EXPECT_EQ(resets[0].target, "v");
     EXPECT_EQ(resets[0].expression, "reset");
     EXPECT_EQ(resets[0].condition, "v .gt. thresh");
 
-    const Vector<NML_DynamicsExpression> derivatives = entries_of(iaf, NML_DeclarationType::TimeDerivative);
+    const Vector<NML_Dynamics_Expression> derivatives = entries_of(iaf, NML_Declaration_Type::TimeDerivative);
     ASSERT_EQ(derivatives.size(), 1u);
     EXPECT_EQ(derivatives[0].expression, "iMemb / C");
 
-    const Vector<NML_DynamicsExpression> derived = entries_of(iaf, NML_DeclarationType::DerivedVariable);
+    const Vector<NML_Dynamics_Expression> derived = entries_of(iaf, NML_Declaration_Type::DerivedVariable);
     ASSERT_EQ(derived.size(), 2u);
     EXPECT_EQ(derived[0].target, "iSyn");
     EXPECT_EQ(derived[0].select, "synapses[*]/i");
@@ -562,20 +562,20 @@ TEST(Dynamics, on_start_is_kept_apart_from_a_conditional_reset) {
 
 // An arrival's assignment follows the OnEvent entry that names its port.
 TEST(Dynamics, an_on_event_entry_names_its_port) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("root.xml", "<Lems/>");
     NML_Context context;
     parse_model(context, main_file);
-    const NML_ComponentType &synapse = type_named(context, "expOneSynapse");
+    const NML_Component_Type &synapse = type_named(context, "expOneSynapse");
 
     const auto on_event = find_if(synapse.dynamics.begin(), synapse.dynamics.end(),
-                                  [](const NML_DynamicsExpression &entry) {
-                                      return entry.source_tag == NML_DeclarationType::OnEvent;
+                                  [](const NML_Dynamics_Expression &entry) {
+                                      return entry.source_tag == NML_Declaration_Type::OnEvent;
                                   });
     ASSERT_NE(on_event, synapse.dynamics.end());
     EXPECT_EQ(on_event->target, "in");
     ASSERT_NE(on_event + 1, synapse.dynamics.end());
-    EXPECT_EQ((on_event + 1)->source_tag, NML_DeclarationType::StateAssignment);
+    EXPECT_EQ((on_event + 1)->source_tag, NML_Declaration_Type::StateAssignment);
     EXPECT_EQ((on_event + 1)->target, "g");
     EXPECT_EQ((on_event + 1)->expression, "g + (weight * gbase)");
 }
@@ -583,30 +583,30 @@ TEST(Dynamics, an_on_event_entry_names_its_port) {
 // <Structure> is read like <Dynamics>: a spike sends its event to its parent, and a
 // timedSynapticInput instantiates its synapse and sends its own events into it.
 TEST(Structure, child_instances_aliases_and_event_connections_are_recorded) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("root.xml", "<Lems/>");
     NML_Context context;
     parse_model(context, main_file);
 
-    const Vector<NML_StructureEntry> &spike = type_named(context, "spike").structure;
+    const Vector<NML_Structure_Entry> &spike = type_named(context, "spike").structure;
     ASSERT_EQ(spike.size(), 3u);
-    EXPECT_EQ(spike[0].source_tag, NML_DeclarationType::With);
+    EXPECT_EQ(spike[0].source_tag, NML_Declaration_Type::With);
     EXPECT_EQ(spike[0].instance, "this");
     EXPECT_EQ(spike[0].alias, "a");
-    EXPECT_EQ(spike[1].source_tag, NML_DeclarationType::With);
+    EXPECT_EQ(spike[1].source_tag, NML_Declaration_Type::With);
     EXPECT_EQ(spike[1].instance, "parent");
     EXPECT_EQ(spike[1].alias, "b");
-    EXPECT_EQ(spike[2].source_tag, NML_DeclarationType::EventConnection);
+    EXPECT_EQ(spike[2].source_tag, NML_Declaration_Type::EventConnection);
     EXPECT_EQ(spike[2].source, "a");
     EXPECT_EQ(spike[2].target, "b");
     EXPECT_EQ(spike[2].receiver, "");
 
-    const Vector<NML_StructureEntry> &timed = type_named(context, "timedSynapticInput").structure;
+    const Vector<NML_Structure_Entry> &timed = type_named(context, "timedSynapticInput").structure;
     ASSERT_EQ(timed.size(), 4u);
-    EXPECT_EQ(timed[0].source_tag, NML_DeclarationType::ChildInstance);
+    EXPECT_EQ(timed[0].source_tag, NML_Declaration_Type::ChildInstance);
     EXPECT_EQ(timed[0].component, "synapse");
     EXPECT_EQ(timed[2].instance, "spikeTarget");
-    EXPECT_EQ(timed[3].source_tag, NML_DeclarationType::EventConnection);
+    EXPECT_EQ(timed[3].source_tag, NML_Declaration_Type::EventConnection);
 
     // A type without its own <Structure> inherits its nearest ancestor's.
     EXPECT_EQ(type_named(context, "spikeGeneratorRefPoisson").structure.size(),
@@ -615,7 +615,7 @@ TEST(Structure, child_instances_aliases_and_event_connections_are_recorded) {
 }
 
 TEST(Dynamics, conditional_derived_variables_become_one_entry_per_case) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("types.xml", R"(<Lems>
     <ComponentType name="case_type">
         <Dynamics>
@@ -631,7 +631,7 @@ TEST(Dynamics, conditional_derived_variables_become_one_entry_per_case) {
     NML_Context context;
     parse_model(context, main_file);
 
-    const Vector<NML_DynamicsExpression> cases = entries_of(type_named(context, "case_type"), NML_DeclarationType::Case);
+    const Vector<NML_Dynamics_Expression> cases = entries_of(type_named(context, "case_type"), NML_Declaration_Type::Case);
     ASSERT_EQ(cases.size(), 2u);
     EXPECT_EQ(cases[0].target, "rectified");
     EXPECT_EQ(cases[0].condition, "x .gt. 0");
@@ -643,7 +643,7 @@ TEST(Dynamics, conditional_derived_variables_become_one_entry_per_case) {
 // Every type in the standard library links its extends chain, and the cells' state variables are
 // what NeuroML declares.
 TEST(Resolution, the_whole_standard_library_resolves) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("root.xml", "<Lems/>");
     NML_Context context;
     ASSERT_NO_THROW(parse_model(context, main_file));
@@ -668,8 +668,8 @@ TEST(Resolution, the_whole_standard_library_resolves) {
 // ── the simulation ──────────────────────────────────────────────────────────────
 
 TEST(Simulation, settings_come_from_the_lems_target) {
-    const TwoPopulationModel model;
-    const NML_Context::NML_SimulationContext &simulation = model.context.simulation;
+    const Two_Population_Model model;
+    const NML_Context::NML_Simulation_Context &simulation = model.context.simulation;
 
     EXPECT_EQ(simulation.simulation_component_id, "sim1");
     EXPECT_EQ(simulation.target_network_id, "net1");
@@ -682,9 +682,9 @@ TEST(Simulation, settings_come_from_the_lems_target) {
 
 // Populations sit in cell memory in document order, each cell taking one slot per state variable.
 TEST(Simulation, populations_are_laid_out_in_document_order) {
-    const TwoPopulationModel model;
+    const Two_Population_Model model;
     const NML_Context &context = model.context;
-    const NML_Context::NML_SimulationContext &simulation = context.simulation;
+    const NML_Context::NML_Simulation_Context &simulation = context.simulation;
 
     EXPECT_EQ(simulation.total_neuron_count, 5);
     ASSERT_EQ(simulation.cell_instances.size(), 2u);
@@ -711,8 +711,8 @@ TEST(Simulation, populations_are_laid_out_in_document_order) {
 
 // Instance values stay as written and resolve to SI when used.
 TEST(Simulation, cell_parameters_resolve_to_si) {
-    const TwoPopulationModel model;
-    const NML_ComponentInstance *cell = model.context.find_instance("cell0");
+    const Two_Population_Model model;
+    const NML_Component_Instance *cell = model.context.find_instance("cell0");
     ASSERT_NE(cell, nullptr);
     EXPECT_EQ(cell->value_or("leakReversal"), "-50mV");
 
@@ -727,8 +727,8 @@ TEST(Simulation, cell_parameters_resolve_to_si) {
 }
 
 TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
-    const TwoPopulationModel model;
-    const NML_Context::NML_SimulationContext &simulation = model.context.simulation;
+    const Two_Population_Model model;
+    const NML_Context::NML_Simulation_Context &simulation = model.context.simulation;
 
     EXPECT_EQ(simulation.total_edge_count, 2);
     ASSERT_EQ(simulation.synapse_instances.size(), 1u);
@@ -736,7 +736,7 @@ TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
 
     // pop1[0] is neuron 0 and pop2[1] is neuron 4; 2 ms at 0.01 ms is 200 ticks, not 199.
     ASSERT_EQ(simulation.network_data.list[0].size(), 1u);
-    const NML_NetworkEdge &weighted = simulation.network_data.list[0][0];
+    const NML_Network_Edge &weighted = simulation.network_data.list[0][0];
     EXPECT_EQ(weighted.child, 4);
     EXPECT_FLOAT_EQ(weighted.weight, 2.5f);
     EXPECT_EQ(weighted.delay_ticks, 200);
@@ -745,7 +745,7 @@ TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
 
     // A plain <connection> states neither weight nor delay.
     ASSERT_EQ(simulation.network_data.list[2].size(), 1u);
-    const NML_NetworkEdge &plain = simulation.network_data.list[2][0];
+    const NML_Network_Edge &plain = simulation.network_data.list[2][0];
     EXPECT_EQ(plain.child, 3);
     EXPECT_FLOAT_EQ(plain.weight, 1.0f);
     EXPECT_EQ(plain.delay_ticks, 0);
@@ -756,18 +756,18 @@ TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
 
 // An input profile keeps the input component and its targets; the input's own dynamics are compiled.
 TEST(Simulation, inputs_resolve_their_targets) {
-    const TwoPopulationModel model;
-    const Vector<SimulationInputConfig> &profiles = model.context.simulation.input_profiles;
+    const Two_Population_Model model;
+    const Vector<Simulation_Input_Config> &profiles = model.context.simulation.input_profiles;
     ASSERT_EQ(profiles.size(), 2u);
 
-    const SimulationInputConfig &explicit_input = profiles[0];
+    const Simulation_Input_Config &explicit_input = profiles[0];
     EXPECT_EQ(explicit_input.input_component_id, "pg0");
     ASSERT_EQ(explicit_input.targets.size(), 1u);
     EXPECT_EQ(explicit_input.targets[0].neuron_index, 0);
 
     // Targets are the cell-memory index of the cell's first slot: pop2 starts at 3, two slots a cell.
     // <input> weighs 1 and <inputW> carries its own weight.
-    const SimulationInputConfig &input_list = profiles[1];
+    const Simulation_Input_Config &input_list = profiles[1];
     ASSERT_EQ(input_list.targets.size(), 2u);
     EXPECT_EQ(input_list.targets[0].neuron_index, 3);
     EXPECT_EQ(input_list.targets[1].neuron_index, 5);
@@ -781,7 +781,7 @@ namespace {
 
 // Parses a one-population network with `declarations` and an explicitInput of input_id onto
 // pop1[0], and returns the input's tree.
-InputTree input_tree_of(NML_Context &context, const TemporaryDirectory &directory, const String &declarations,
+Input_Tree input_tree_of(NML_Context &context, const Temporary_Directory &directory, const String &declarations,
                         const String &input_id) {
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
         <explicitInput target="pop1[0]" input=")" + input_id + R"("/>
@@ -791,10 +791,10 @@ InputTree input_tree_of(NML_Context &context, const TemporaryDirectory &director
     return compiler.flatten_input_tree(*context.find_instance(input_id));
 }
 
-Vector<s64> ticks_with_spikes(const InputSpikeTrain &train) {
+Vector<s64> ticks_with_spikes(const Input_Spike_Train &train) {
     Vector<s64> ticks;
     for (usize tick = 0; tick < train.spike_counts.size(); tick += 1) {
-        if (train.spike_counts[tick] != 0) ticks.push_back((s64)tick);
+        if (train.spike_counts[tick] != 0) ticks.push_back(static_cast<s64>(tick));
     }
     return ticks;
 }
@@ -802,10 +802,10 @@ Vector<s64> ticks_with_spikes(const InputSpikeTrain &train) {
 } // namespace
 
 // A spikeArray's spikes become one count per tick of the run, delivered to the spikeArray itself.
-TEST(InputTree, a_spike_array_becomes_a_count_per_tick) {
-    const TemporaryDirectory directory;
+TEST(Input_Tree, a_spike_array_becomes_a_count_per_tick) {
+    const Temporary_Directory directory;
     NML_Context context;
-    const InputTree tree = input_tree_of(context, directory, R"(    <spikeArray id="train0">
+    const Input_Tree tree = input_tree_of(context, directory, R"(    <spikeArray id="train0">
         <spike id="0" time="30ms"/>
         <spike id="1" time="10ms"/>
         <spike id="2" time="20ms"/>
@@ -814,21 +814,21 @@ TEST(InputTree, a_spike_array_becomes_a_count_per_tick) {
 
     ASSERT_EQ(tree.parts.size(), 1u);
     EXPECT_EQ(tree.parts[0].instance->id, "train0");
-    EXPECT_EQ(tree.state_size, (s64)type_named(context, "spikeArray").state_variable_names.size());
+    EXPECT_EQ(tree.state_size, static_cast<s64>(type_named(context, "spikeArray").state_variable_names.size()));
     EXPECT_TRUE(tree.routes.empty());
     ASSERT_EQ(tree.spike_trains.size(), 1u);
     EXPECT_EQ(tree.spike_trains[0].receiver, 0);
     // 100 ms at 0.01 ms.
-    ASSERT_EQ((s64)tree.spike_trains[0].spike_counts.size(), context.simulation.total_tick_count);
+    ASSERT_EQ(static_cast<s64>(tree.spike_trains[0].spike_counts.size()), context.simulation.total_tick_count);
     EXPECT_EQ(ticks_with_spikes(tree.spike_trains[0]), (Vector<s64>{1000, 2000, 3000}));
 }
 
 // A timedSynapticInput instantiates its own synapse, its spikes go to it, and it sends its own
 // events into the synapse. Two spike times that round to the same tick count twice.
-TEST(InputTree, a_timed_synaptic_input_routes_its_spikes_into_its_own_synapse) {
-    const TemporaryDirectory directory;
+TEST(Input_Tree, a_timed_synaptic_input_routes_its_spikes_into_its_own_synapse) {
+    const Temporary_Directory directory;
     NML_Context context;
-    const InputTree tree = input_tree_of(context, directory, R"(    <timedSynapticInput id="timed0" synapse="syn0" spikeTarget="./syn0">
+    const Input_Tree tree = input_tree_of(context, directory, R"(    <timedSynapticInput id="timed0" synapse="syn0" spikeTarget="./syn0">
         <spike id="0" time="5ms"/>
         <spike id="1" time="5.001ms"/>
         <spike id="2" time="7ms"/>
@@ -839,9 +839,9 @@ TEST(InputTree, a_timed_synaptic_input_routes_its_spikes_into_its_own_synapse) {
     EXPECT_EQ(tree.parts[1].instance->id, "syn0");
     EXPECT_EQ(tree.parts[1].parent, 0);
     EXPECT_EQ(tree.parts[1].role, "synapse");
-    const s64 own_state = (s64)type_named(context, "timedSynapticInput").state_variable_names.size();
+    const s64 own_state = static_cast<s64>(type_named(context, "timedSynapticInput").state_variable_names.size());
     EXPECT_EQ(tree.parts[1].first_state_slot, own_state);
-    EXPECT_EQ(tree.state_size, own_state + (s64)type_named(context, "expOneSynapse").state_variable_names.size());
+    EXPECT_EQ(tree.state_size, own_state + static_cast<s64>(type_named(context, "expOneSynapse").state_variable_names.size()));
 
     ASSERT_EQ(tree.spike_trains.size(), 1u);
     EXPECT_EQ(tree.spike_trains[0].receiver, 0);
@@ -853,10 +853,10 @@ TEST(InputTree, a_timed_synaptic_input_routes_its_spikes_into_its_own_synapse) {
     EXPECT_EQ(tree.routes[0].target, 1);
 }
 
-TEST(InputTree, a_poisson_firing_synapse_routes_its_spikes_into_its_own_synapse) {
-    const TemporaryDirectory directory;
+TEST(Input_Tree, a_poisson_firing_synapse_routes_its_spikes_into_its_own_synapse) {
+    const Temporary_Directory directory;
     NML_Context context;
-    const InputTree tree = input_tree_of(context, directory, R"(    <poissonFiringSynapse id="poisson0" averageRate="50Hz" synapse="syn0" spikeTarget="./syn0"/>
+    const Input_Tree tree = input_tree_of(context, directory, R"(    <poissonFiringSynapse id="poisson0" averageRate="50Hz" synapse="syn0" spikeTarget="./syn0"/>
 )", "poisson0");
 
     ASSERT_EQ(tree.parts.size(), 2u);
@@ -868,10 +868,10 @@ TEST(InputTree, a_poisson_firing_synapse_routes_its_spikes_into_its_own_synapse)
 }
 
 // Each generator in a compoundInput is a part of its own, which the compound sums through its select.
-TEST(InputTree, a_compound_input_holds_each_generator_as_a_part) {
-    const TemporaryDirectory directory;
+TEST(Input_Tree, a_compound_input_holds_each_generator_as_a_part) {
+    const Temporary_Directory directory;
     NML_Context context;
-    const InputTree tree = input_tree_of(context, directory, R"(    <compoundInput id="compound0">
+    const Input_Tree tree = input_tree_of(context, directory, R"(    <compoundInput id="compound0">
         <pulseGenerator id="pulse" delay="1ms" duration="2ms" amplitude="1nA"/>
         <sineGenerator id="sine" delay="0ms" phase="0" duration="10ms" amplitude="1nA" period="5ms"/>
     </compoundInput>
@@ -893,13 +893,13 @@ TEST(InputTree, a_compound_input_holds_each_generator_as_a_part) {
 
 // Selections hold the cell-memory index of what they record.
 TEST(Simulation, recordings_resolve_their_selections) {
-    const TwoPopulationModel model;
-    const Vector<RecordingConfig> &profiles = model.context.simulation.recording_profiles;
+    const Two_Population_Model model;
+    const Vector<Recording_Config> &profiles = model.context.simulation.recording_profiles;
     ASSERT_EQ(profiles.size(), 2u);
 
-    const RecordingConfig &columns = profiles[0];
+    const Recording_Config &columns = profiles[0];
     EXPECT_EQ(columns.output_filenames, (Vector<String>{"out.dat"}));
-    EXPECT_EQ(columns.file_output_format[0], OutputFileFormat::NML_STANDARD);
+    EXPECT_EQ(columns.file_output_format[0], Output_File_Format::NML_STANDARD);
     EXPECT_EQ(columns.recordings_count, 2);
     ASSERT_EQ(columns.selections.size(), 2u);
     EXPECT_EQ(columns.selections[0].quantity_path, "pop1[0]/v");
@@ -907,9 +907,9 @@ TEST(Simulation, recordings_resolve_their_selections) {
     EXPECT_EQ(columns.selections[1].quantity_path, "pop2[1]/v");
     EXPECT_EQ(columns.selections[1].neuron_index, model.izhikevich_memory_index(1, "v"));
 
-    const RecordingConfig &events = profiles[1];
+    const Recording_Config &events = profiles[1];
     EXPECT_EQ(events.output_filenames, (Vector<String>{"spikes.dat"}));
-    EXPECT_EQ(events.file_output_format[0], OutputFileFormat::SPIKE_EVENTS);
+    EXPECT_EQ(events.file_output_format[0], Output_File_Format::SPIKE_EVENTS);
     ASSERT_EQ(events.selections.size(), 1u);
     EXPECT_EQ(events.selections[0].neuron_index, 5);
     EXPECT_EQ(events.selections[0].event_port, "spike");
@@ -918,7 +918,7 @@ TEST(Simulation, recordings_resolve_their_selections) {
 // An excitatory/inhibitory pair built from one cell type, and two projections with one synapse
 // type: each keeps its own instance and values.
 TEST(Simulation, instances_of_one_type_keep_their_own_values) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="sharednet">
     <iafCell id="cellA" leakReversal="-50mV" thresh="-55mV" reset="-70mV" C="0.2nF" leakConductance="0.01uS"/>
     <iafCell id="cellB" leakReversal="-90mV" thresh="-55mV" reset="-70mV" C="0.2nF" leakConductance="0.01uS"/>
@@ -938,7 +938,7 @@ TEST(Simulation, instances_of_one_type_keep_their_own_values) {
 )");
     NML_Context context;
     parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
-    const NML_Context::NML_SimulationContext &simulation = context.simulation;
+    const NML_Context::NML_Simulation_Context &simulation = context.simulation;
 
     ASSERT_EQ(simulation.cell_instances.size(), 2u);
     EXPECT_DOUBLE_EQ(context.resolve_quantity(simulation.cell_instances[0].value_or("leakReversal")), -0.05);
@@ -955,7 +955,7 @@ TEST(Simulation, instances_of_one_type_keep_their_own_values) {
 // A population of type populationList takes its size from its <instance> children, and its cells
 // are addressed as "../pop1/0/cell0".
 TEST(Simulation, a_population_list_is_sized_and_addressed_by_its_instances) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" type="populationList" size="3">
             <instance id="0"><location x="0" y="0" z="0"/></instance>
             <instance id="1"><location x="10" y="0" z="0"/></instance>
@@ -976,7 +976,7 @@ TEST(Simulation, a_population_list_is_sized_and_addressed_by_its_instances) {
 // Two contexts parsing one model agree on everything indices depend on, and a context parsing it
 // twice does not double it.
 TEST(Simulation, parsing_is_deterministic_and_repeatable) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", two_population_network());
     const String main_file = directory.write("LEMS.xml", recorded_simulation("net.nml"));
 
@@ -995,8 +995,8 @@ TEST(Simulation, parsing_is_deterministic_and_repeatable) {
     }
     EXPECT_EQ(first.simulation.population_base_indices, second.simulation.population_base_indices);
     for (s64 neuron = 0; neuron < 5; neuron += 1) {
-        const Vector<NML_NetworkEdge> &first_edges = first.simulation.network_data.list[(usize)neuron];
-        const Vector<NML_NetworkEdge> &second_edges = second.simulation.network_data.list[(usize)neuron];
+        const Vector<NML_Network_Edge> &first_edges = first.simulation.network_data.list[static_cast<usize>(neuron)];
+        const Vector<NML_Network_Edge> &second_edges = second.simulation.network_data.list[static_cast<usize>(neuron)];
         ASSERT_EQ(first_edges.size(), second_edges.size()) << "neuron " << neuron;
         for (usize index = 0; index < first_edges.size(); index += 1) {
             EXPECT_EQ(first_edges[index].child, second_edges[index].child);
@@ -1008,7 +1008,7 @@ TEST(Simulation, parsing_is_deterministic_and_repeatable) {
 // ── errors ──────────────────────────────────────────────────────────────────────
 
 TEST(Errors, a_connection_to_an_unknown_population_throws_naming_it) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
         <projection id="proj1" presynapticPopulation="pop1" postsynapticPopulation="pop1" synapse="syn0">
             <connection id="0" preCellId="../pop1[0]" postCellId="../nosuchpop[0]"/>
@@ -1019,7 +1019,7 @@ TEST(Errors, a_connection_to_an_unknown_population_throws_naming_it) {
 }
 
 TEST(Errors, a_cell_index_past_the_population_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
         <projection id="proj1" presynapticPopulation="pop1" postsynapticPopulation="pop1" synapse="syn0">
             <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[7]"/>
@@ -1030,7 +1030,7 @@ TEST(Errors, a_cell_index_past_the_population_throws) {
 }
 
 TEST(Errors, a_population_of_an_unknown_component_throws_naming_it) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="no_such_cell" size="2"/>
 )"));
     EXPECT_NE(parse_error(directory.write("LEMS.xml", recorded_simulation("net.nml"))).find("no_such_cell"),
@@ -1038,7 +1038,7 @@ TEST(Errors, a_population_of_an_unknown_component_throws_naming_it) {
 }
 
 TEST(Errors, a_projection_through_an_unknown_synapse_throws_naming_it) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
         <projection id="proj1" presynapticPopulation="pop1" postsynapticPopulation="pop1" synapse="no_such_synapse">
             <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[1]"/>
@@ -1049,7 +1049,7 @@ TEST(Errors, a_projection_through_an_unknown_synapse_throws_naming_it) {
 }
 
 TEST(Errors, an_input_to_no_neuron_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
         <explicitInput target="pop1[5]" input="pg0"/>
 )", "    <pulseGenerator id=\"pg0\" delay=\"0ms\" duration=\"10ms\" amplitude=\"1nA\"/>\n"));
@@ -1059,7 +1059,7 @@ TEST(Errors, an_input_to_no_neuron_throws) {
 
 // Every time in the model is divided by the step, so a step of zero is refused at parse time.
 TEST(Errors, a_simulation_without_a_usable_step_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
 )"));
     EXPECT_NE(parse_error(directory.write("LEMS.xml", recorded_simulation("net.nml", "0ms"))).find("no usable step"),
@@ -1067,7 +1067,7 @@ TEST(Errors, a_simulation_without_a_usable_step_throws) {
 }
 
 TEST(Errors, a_target_naming_no_instance_throws) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String main_file = directory.write("LEMS.xml", R"(<Lems><Target component="no_such_simulation"/></Lems>)");
     EXPECT_NE(parse_error(main_file).find("no_such_simulation"), String::npos);
 }
@@ -1075,7 +1075,7 @@ TEST(Errors, a_target_naming_no_instance_throws) {
 // ── schema validation ───────────────────────────────────────────────────────────
 
 TEST(Schema, a_valid_neuroml_document_passes_and_an_unknown_element_fails_naming_it) {
-    const TemporaryDirectory directory;
+    const Temporary_Directory directory;
     const String valid = directory.write("valid.nml", two_population_network());
     const String invalid = directory.write("invalid.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="bad">
     <thisTagDoesNotExistInSchema id="x"/>

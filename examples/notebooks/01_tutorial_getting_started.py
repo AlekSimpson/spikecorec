@@ -37,7 +37,7 @@ MODELS = os.path.join("..", "models")
 # parameters, the stimulus, the timestep and the run length. `run()` executes every tick.
 
 # %%
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_single_cell.xml"))
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_single_cell.xml"))
 engine.run()
 
 spike_times, _ = engine.recorded_spikes
@@ -84,7 +84,7 @@ def run_at_amplitude(amplitude_picoamperes, directory="/tmp/spikecorec_tutorial"
     with open(os.path.join(directory, "LEMS_single_cell.xml"), "w") as lems_file:
         lems_file.write(lems)
 
-    engine = spc.SpikeEngine(os.path.join(directory, "LEMS_single_cell.xml"))
+    engine = spc.Spike_Engine(os.path.join(directory, "LEMS_single_cell.xml"))
     engine.run()
     times, _ = engine.recorded_spikes
     rate = engine.mean_firing_rate_hertz()
@@ -110,7 +110,7 @@ for amplitude in (250, 500, 1000):
 # Three cells in a line, A to B to C:
 
 # %%
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_three_cell_chain.xml"),
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_three_cell_chain.xml"),
                          [[1], [2], []],           # A reaches B, B reaches C
                          "chainSynapse",
                          connection_weight=1.0,
@@ -169,7 +169,7 @@ print(textwrap.dedent("""
 # neighbours with the edges wrapped.
 
 # %%
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
                          spc.square_torus(5),
                          ["excitatorySynapse", "inhibitorySynapse"],
                          synapse_proportions=[0.8, 0.2],
@@ -222,7 +222,7 @@ engine.shutdown()
 recording_path = "/tmp/spikecorec_tutorial/torus_membrane.spire"
 os.makedirs(os.path.dirname(recording_path), exist_ok=True)
 
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
                          spc.square_torus(5),
                          ["excitatorySynapse", "inhibitorySynapse"],
                          synapse_proportions=[0.8, 0.2],
@@ -255,7 +255,7 @@ pyplot.show()
 # - `spike_counts_per_neuron` and `recorded_spikes` for what fired and when
 
 # %%
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
                          spc.square_torus(5),
                          ["excitatorySynapse", "inhibitorySynapse"],
                          synapse_proportions=[0.8, 0.2],
@@ -285,7 +285,7 @@ engine.shutdown()
 # spike-history ring and the refractory gate, so pass a monotonically increasing count.
 
 # %%
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_single_cell.xml"))
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_single_cell.xml"))
 
 trace = []
 for tick in range(engine.lifetime):
@@ -357,7 +357,7 @@ with open(os.path.join(directory, "LEMS_refused.xml"), "w") as lems_file:
 """)
 
 try:
-    engine = spc.SpikeEngine(os.path.join(directory, "LEMS_refused.xml"),
+    engine = spc.Spike_Engine(os.path.join(directory, "LEMS_refused.xml"),
                              [[1], []], "conductanceSynapse")
     print("constructed - this model is supported after all")
 except RuntimeError as refusal:
@@ -399,14 +399,14 @@ print(f"synapse {synapse.id}: {synapse.component_type.name}, "
 # synapse's variable, and `neighbor_weights_for_matrix` reads a plane for every edge.
 
 # %%
-engine = spc.SpikeEngine(os.path.join(MODELS, "LEMS_three_cell_chain.xml"),
+engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_three_cell_chain.xml"),
                          [[1], [2], []], "chainSynapse",
                          connection_weight=1.0, connection_delay_seconds=1e-3)
 weights = engine.weights
 print(f"{weights.matrix_count} planes at rank {weights.rank}, "
       f"worst fit error {weights.worst_fit_error():.1e} (tolerance {engine.fit_tolerance:.0e})")
-print("weights:", weights.neighbor_weights_for_matrix(spc.WeightMatrix.WEIGHT_PLANE))
-print("delays (ticks):", weights.neighbor_weights_for_matrix(spc.WeightMatrix.DELAY_PLANE))
+print("weights:", weights.neighbor_weights_for_matrix(spc.Weight_Matrix.WEIGHT_PLANE))
+print("delays (ticks):", weights.neighbor_weights_for_matrix(spc.Weight_Matrix.DELAY_PLANE))
 for name in engine.context.find_instance("chainSynapse").component_type.state_variable_names:
     plane = engine.synapse_state_variable_plane("chainSynapse", name)
     print(f"{name} (plane {plane}):", weights.neighbor_weights_for_matrix(plane))

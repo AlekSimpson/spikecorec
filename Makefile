@@ -22,8 +22,8 @@ NVCC       := nvcc
 AR         := ar
 
 # Directories
-INC_DIR    := include
-SRC_DIR    := src
+INC_DIR    := src
+SRC_DIR    := src/spikecorec
 BUILD_DIR  := build
 TEST_DIR   := tests
 EX_DIR     := examples
@@ -36,8 +36,11 @@ EX_DIR     := examples
 # That is not a stale-comment problem -- change a struct's layout and half the archive is
 # compiled against the old one, which links cleanly and then crashes at a vectorised load
 # somewhere unrelated. Cheap insurance against a very expensive afternoon.
-CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -MMD -MP -I$(INC_DIR)
-NVCCFLAGS  := -std=c++17 -O2 -I$(INC_DIR) --expt-relaxed-constexpr
+# Headers sit beside their sources and are included by file name alone, so every source
+# directory is an include directory.
+INCLUDE_FLAGS := -I$(INC_DIR) $(addprefix -I$(SRC_DIR)/,core nml cuda metal)
+CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -MMD -MP $(INCLUDE_FLAGS)
+NVCCFLAGS  := -std=c++17 -O2 $(INCLUDE_FLAGS) --expt-relaxed-constexpr
 ARFLAGS    := rcs
 
 # ── Platform detection ───────────────────────────────────────
@@ -50,7 +53,7 @@ HAS_NVCC   := $(shell command -v nvcc 2>/dev/null && echo yes || echo no)
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ───────────────
 # Mirrors the HAS_NVCC pattern: probe via pkg-config, define SPIKECOREC_HAVE_*
 # and append link flags only when found. Missing libraries degrade gracefully —
-# raw .spire always works; SpireWriter/Reader throw a clear runtime_error for
+# raw .spire always works; Spire_Writer/Reader throw a clear runtime_error for
 # compressed variants whose library wasn't available at build time.
 HAS_ZLIB   := $(shell pkg-config --exists zlib   && echo yes || echo no)
 HAS_LZMA   := $(shell pkg-config --exists liblzma && echo yes || echo no)
@@ -96,7 +99,7 @@ CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 # A kernel compiled at runtime by compile_kernel() has no include path, so
 # the kernel codegen reads k2tree_device.metalinc from here and parses it into the
 # kernel it generates. Absolute, for the same reason the two paths above are.
-METAL_DEVICE_DIR := $(abspath src/metal)
+METAL_DEVICE_DIR := $(abspath $(SRC_DIR)/metal)
 CXXFLAGS         += -DSPIKECOREC_METAL_DEVICE_DIR=\"$(METAL_DEVICE_DIR)\"
 
 # ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────

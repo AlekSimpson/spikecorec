@@ -24,7 +24,7 @@ scripts with `.venv/bin/python`, or `source .venv/bin/activate` first.
 ```python
 import spikecorec as spc
 
-engine = spc.SpikeEngine("examples/models/LEMS_single_cell.xml")
+engine = spc.Spike_Engine("examples/models/LEMS_single_cell.xml")
 engine.run()
 
 print(engine.total_neuron_count)             # 1
@@ -43,7 +43,7 @@ instead, one row per neuron, and the document declares only cells, synapses and 
 
 ```python
 # A -> B -> C
-engine = spc.SpikeEngine("examples/models/LEMS_three_cell_chain.xml",
+engine = spc.Spike_Engine("examples/models/LEMS_three_cell_chain.xml",
                          [[1], [2], []],
                          "chainSynapse",
                          connection_weight=1.0,
@@ -71,7 +71,7 @@ only the first synapse and the rest only the second, except a cell at the bounda
 send both.
 
 ```python
-engine = spc.SpikeEngine("examples/models/LEMS_glif1_torus.xml",
+engine = spc.Spike_Engine("examples/models/LEMS_glif1_torus.xml",
                          spc.square_torus(5),
                          ["excitatorySynapse", "inhibitorySynapse"],
                          synapse_proportions=[0.8, 0.2],
@@ -182,7 +182,7 @@ w.measured_fit_error                                       # per plane, what the
 ```
 
 The basis trades a measured accuracy for storage. Fits and refits run until every plane is
-within `engine.fit_tolerance`; `SpikeEngine.FIT_TOLERANCE_PRECISE`, `_ACCURATE`,
+within `engine.fit_tolerance`; `Spike_Engine.FIT_TOLERANCE_PRECISE`, `_ACCURATE`,
 `_STANDARD` (the default, `1e-3`) and `_COMPACT` are presets.
 
 During a run, synapse state changes every tick and the changes go into S. Once the fullest
@@ -193,7 +193,7 @@ refits and empties S. That fraction is also the size S is kept at.
 engine.refit_occupancy_threshold_fraction = 0.5    # default 0.2; resizes S now
 engine.minimum_ticks_between_refits = 2000         # default 1000; S grows in between
 engine.refit_every_n_ticks = 5000                  # default 0, off
-engine.fit_tolerance = spc.SpikeEngine.FIT_TOLERANCE_ACCURATE
+engine.fit_tolerance = spc.Spike_Engine.FIT_TOLERANCE_ACCURATE
 ```
 
 ## What the engine supports and refuses
@@ -234,7 +234,7 @@ conductance-based synapse, for example, reads the target cell's `v`, which a syn
 per-edge code cannot see:
 
 ```python
-spc.SpikeEngine("LEMS_refused.xml", [[1], []], "conductanceSynapse")
+spc.Spike_Engine("LEMS_refused.xml", [[1], []], "conductanceSynapse")
 # RuntimeError: Synapse ComponentType 'expTwoSynapse' ('conductanceSynapse'): 'v' is not
 #               a state variable, a set parameter, a constant, a derived variable or weight
 ```

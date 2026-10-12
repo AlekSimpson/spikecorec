@@ -11,7 +11,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/engine.h"
+#include "engine.h"
 #include "support/test_support.h"
 
 using namespace std;
@@ -20,17 +20,17 @@ using namespace spikecorec::test_support;
 
 namespace {
 
-struct RegressionModel {
+struct Regression_Model {
     String name;           // tests/fixtures/golden/<name>.spikes
     String lems_fixture;   // under tests/fixtures
 };
 
 // Every spike of a run as (tick, neuron), in the order the engine recorded them.
 Vector<Pair<s64, s64>> run_and_collect(const String &lems_path) {
-    SpikeEngine engine(lems_path);
+    Spike_Engine engine(lems_path);
     engine.run();
     Vector<Pair<s64, s64>> spikes;
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
+    for (const Recorded_Spike &spike : engine.recorded_spikes) {
         spikes.push_back({llround(spike.time_seconds / engine.step_dt), spike.neuron_index});
     }
     return spikes;
@@ -38,29 +38,29 @@ Vector<Pair<s64, s64>> run_and_collect(const String &lems_path) {
 
 } // namespace
 
-class Regression : public ::testing::TestWithParam<RegressionModel> {};
+class Regression : public ::testing::TestWithParam<Regression_Model> {};
 
 TEST_P(Regression, spike_times_match_the_recorded_run) {
-    const RegressionModel &model = GetParam();
+    const Regression_Model &model = GetParam();
     const Vector<Pair<s64, s64>> spikes = run_and_collect(fixture_path(model.lems_fixture));
     ASSERT_FALSE(spikes.empty()) << model.name << " produced no spikes";
     const String golden_path = fixture_path("golden/" + model.name + ".spikes");
 
     if (std::getenv("SPIKECOREC_UPDATE_GOLDEN") != nullptr) {
-        std::ofstream golden(golden_path);
+        Output_File_Stream golden(golden_path);
         ASSERT_TRUE(golden.good()) << "cannot write " << golden_path;
         golden << "# tick neuron, recorded from the engine; see tests/regression_tests.cpp\n";
         for (const auto &[tick, neuron] : spikes) golden << tick << " " << neuron << "\n";
         GTEST_SKIP() << "recorded " << spikes.size() << " spikes to " << golden_path;
     }
 
-    std::ifstream golden(golden_path);
+    Input_File_Stream golden(golden_path);
     ASSERT_TRUE(golden.good()) << golden_path << " is missing; record it with SPIKECOREC_UPDATE_GOLDEN=1";
     Vector<Pair<s64, s64>> recorded;
     String line;
     while (getline(golden, line)) {
         if (line.empty() || line[0] == '#') continue;
-        std::istringstream fields(line);
+        Input_String_Stream fields(line);
         s64 tick = 0;
         s64 neuron = 0;
         fields >> tick >> neuron;
@@ -80,7 +80,7 @@ TEST_P(Regression, spike_times_match_the_recorded_run) {
 }
 
 INSTANTIATE_TEST_SUITE_P(RecordedRuns, Regression,
-                         ::testing::Values(RegressionModel{"pynn_synapses", "nml/LEMS_pynn_synapses.xml"},
-                                           RegressionModel{"glif_family", "nml/LEMS_glif_family.xml"},
-                                           RegressionModel{"pynn_poisson_network", "nml/LEMS_pynn_poisson_network.xml"}),
-                         [](const ::testing::TestParamInfo<RegressionModel> &info) { return info.param.name; });
+                         ::testing::Values(Regression_Model{"pynn_synapses", "nml/LEMS_pynn_synapses.xml"},
+                                           Regression_Model{"glif_family", "nml/LEMS_glif_family.xml"},
+                                           Regression_Model{"pynn_poisson_network", "nml/LEMS_pynn_poisson_network.xml"}),
+                         [](const ::testing::TestParamInfo<Regression_Model> &info) { return info.param.name; });

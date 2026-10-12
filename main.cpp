@@ -1,4 +1,4 @@
-#include "include/spikecorec/core/engine.h"
+#include "engine.h"
 
 
 using namespace spikecorec;

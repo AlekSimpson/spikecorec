@@ -1,11 +1,11 @@
-# WeightMatrix: state, problems and limitations
+# Weight_Matrix: state, problems and limitations
 
 State as of 2026-10-05, branch `agent_integration_2`. The refit and construction changes described
 here are in the working tree and not yet committed.
 
 ## What it stores
 
-Every per-edge value of the network's synapses lives in the `WeightMatrix`, one **plane** per
+Every per-edge value of the network's synapses lives in the `Weight_Matrix`, one **plane** per
 variable:
 - plane 0: the weight;
 - plane 1: the delay, in ticks;
@@ -136,8 +136,8 @@ Per edge, with 4 planes, on the 204,800-edge network:
 | | Values | Topology | Update buffer | Total per edge |
 |---|---|---|---|---|
 | Raw values with a CSR index | 16 B | 4 B | none (values update in place) | about 20 B |
-| WeightMatrix at the floor | about 16 B | about 3 B (k²-tree, random wiring) | — | about 19 B |
-| WeightMatrix, measured | 36 B | about 3 B | about 100 B (S at 75% plus the queue) | about 140 B |
+| Weight_Matrix at the floor | about 16 B | about 3 B (k²-tree, random wiring) | — | about 19 B |
+| Weight_Matrix, measured | 36 B | about 3 B | about 100 B (S at 75% plus the queue) | about 140 B |
 
 ### 2. What counts as structure
 

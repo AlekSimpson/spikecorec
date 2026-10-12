@@ -31,14 +31,11 @@ git submodule update --init
 
 ```
 spikecorec/
-├── include/spikecorec/
+├── src/spikecorec/         # headers (.h) live beside their sources; include root is src/
 │   ├── spikecorec.h        # top-level include
-│   ├── core/               # platform-agnostic types & interfaces (.h)
-│   ├── cuda/               # CUDA headers (.cuh)
-│   └── metal/              # Metal headers (.h)
-├── src/
 │   ├── core/               # CPU-side logic: Engine main loop + Metal/CUDA dispatch
-│   ├── cuda/               # CUDA kernels (.cu)
+│   ├── nml/                # NeuroML parsing, resolution and kernel codegen
+│   ├── cuda/               # CUDA kernels (.cu) + headers (.cuh)
 │   ├── metal/              # Metal-cpp host code (.cpp) + GPU shaders (.metal)
 │   └── bindings/           # pybind11 Python bindings
 ├── python/spikecorec/      # Python package
@@ -52,9 +49,9 @@ spikecorec/
 
 ### Architecture
 
-- **`src/core/core.cpp`** is the CPU-side home — `Engine` main loop and Metal/CUDA backend dispatch all live here
-- **`src/metal/`** contains `metal_cpp_impl.cpp` (instantiates metal-cpp once) and `.metal` GPU shader files
-- **`src/cuda/`** contains CUDA kernel definitions
+- **`src/spikecorec/core/core.cpp`** is the CPU-side home — `Engine` main loop and Metal/CUDA backend dispatch all live here
+- **`src/spikecorec/metal/`** contains `metal_cpp_impl.cpp` (instantiates metal-cpp once) and `.metal` GPU shader files
+- **`src/spikecorec/cuda/`** contains CUDA kernel definitions
 - Metal host code uses **metal-cpp** (pure C++, no Objective-C++)
 - Backend selected at compile time via `-DSPIKECOREC_METAL` or `-DSPIKECOREC_CUDA`
 
@@ -106,7 +103,7 @@ It creates `.venv` with uv on first use, installs `pybind11`, `numpy`, `setuptoo
 ```
 
 See **[`python/README.md`](python/README.md)** for full Python API documentation
-and usage examples (`SpikeEngine`, topology generators, `WeightMatrix`, reservoir
+and usage examples (`Spike_Engine`, topology generators, `Weight_Matrix`, reservoir
 features, weight scaling, simulation recording to `.spire` files, etc.).
 
 ---
@@ -122,7 +119,7 @@ make test-cuda     # CUDA backend explicitly
 make test-python   # the Python binding tests in tests/python, with pytest in .venv
 ```
 
-`make test TEST_ARGUMENTS=--gtest_filter='WeightMatrix.*'` passes arguments through to the runner.
+`make test TEST_ARGUMENTS=--gtest_filter='Weight_Matrix.*'` passes arguments through to the runner.
 Fixtures live in `tests/fixtures`:
 
 - `reference/` holds jNeuroML's outputs, regenerated with `tests/fixtures/reference/regenerate_references.sh`.
@@ -137,7 +134,7 @@ To run a subset after the initial build, invoke the runner directly with `--gtes
 
 ```bash
 # All tests in a suite
-./build/test_runner_metal --gtest_filter='K2Tree.*'
+./build/test_runner_metal --gtest_filter='K2_Tree.*'
 
 # A single test
 ./build/test_runner_metal --gtest_filter='SingleCell.a_pulse_delivers_exactly_its_charge'
@@ -155,9 +152,9 @@ See **[`BUILDME.md`](BUILDME.md)** for the full filter reference and suite index
 
 ## Adding GPU kernels
 
-1. Write the GPU kernel in `src/metal/your_kernel.metal` (Metal) or `src/cuda/your_kernel.cu` (CUDA)
-2. Declare the CPU-side dispatch interface in `include/spikecorec/core/backend.h`
-3. Implement the dispatch in `src/core/core.cpp` (inside the appropriate `#ifdef` block)
-4. Call it from `Engine::step()` in `src/core/engine.cpp`
-5. Expose to Python in `src/bindings/bindings.cpp` if needed
+1. Write the GPU kernel in `src/spikecorec/metal/your_kernel.metal` (Metal) or `src/spikecorec/cuda/your_kernel.cu` (CUDA)
+2. Declare the CPU-side dispatch interface in `src/spikecorec/core/backend.h`
+3. Implement the dispatch in `src/spikecorec/core/core.cpp` (inside the appropriate `#ifdef` block)
+4. Call it from `Engine::step()` in `src/spikecorec/core/engine.cpp`
+5. Expose to Python in `src/spikecorec/bindings/bindings.cpp` if needed
 6. Run `make compdb` to keep IDE tooling current
