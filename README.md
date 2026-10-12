@@ -49,7 +49,8 @@ spikecorec/
 
 ### Architecture
 
-- **`src/spikecorec/core/core.cpp`** is the CPU-side home — `Engine` main loop and Metal/CUDA backend dispatch all live here
+- **`src/spikecorec/core/engine.cpp`** is the CPU-side home — the `Spike_Engine` main loop
+- **`src/spikecorec/core/backend.cpp`** implements the Metal/CUDA backend dispatch (`Engine_Backend`)
 - **`src/spikecorec/metal/`** contains `metal_cpp_impl.cpp` (instantiates metal-cpp once) and `.metal` GPU shader files
 - **`src/spikecorec/cuda/`** contains CUDA kernel definitions
 - Metal host code uses **metal-cpp** (pure C++, no Objective-C++)
@@ -102,7 +103,7 @@ It creates `.venv` with uv on first use, installs `pybind11`, `numpy`, `setuptoo
 .venv/bin/python -c "import spikecorec; print(spikecorec.__version__)"
 ```
 
-See **[`python/README.md`](python/README.md)** for full Python API documentation
+See **[`python/docs/README.md`](python/docs/README.md)** for full Python API documentation
 and usage examples (`Spike_Engine`, topology generators, `Weight_Matrix`, reservoir
 features, weight scaling, simulation recording to `.spire` files, etc.).
 
@@ -154,7 +155,7 @@ See **[`BUILDME.md`](BUILDME.md)** for the full filter reference and suite index
 
 1. Write the GPU kernel in `src/spikecorec/metal/your_kernel.metal` (Metal) or `src/spikecorec/cuda/your_kernel.cu` (CUDA)
 2. Declare the CPU-side dispatch interface in `src/spikecorec/core/backend.h`
-3. Implement the dispatch in `src/spikecorec/core/core.cpp` (inside the appropriate `#ifdef` block)
-4. Call it from `Engine::step()` in `src/spikecorec/core/engine.cpp`
+3. Implement the dispatch in `src/spikecorec/core/backend.cpp` (inside the appropriate `#ifdef` block)
+4. Call it from `Spike_Engine::step_simulation()` in `src/spikecorec/core/engine.cpp`
 5. Expose to Python in `src/spikecorec/bindings/bindings.cpp` if needed
 6. Run `make compdb` to keep IDE tooling current

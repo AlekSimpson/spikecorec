@@ -11,8 +11,8 @@ simulate arbitrary LEMS-defined cell/synapse dynamics — see "Current epic" bel
   - `engine.cpp`, `kernels.cuh`, `metal_cpp_impl.cpp` ✓
   - `Engine.cpp`, `MyKernels.cu` ✗
 - Headers use `.h` (not `.hpp`), except CUDA headers which use `.cuh`
-- C++ classes and types use **Camel_Case** — capitalized words joined by underscores (`Engine`, `Context`, `Launch_Config`, `Weight_Matrix`)
-- Functions and variables use **snake_case** (`make_context`, `running_`)
+- C++ classes and types use **Camel_Case** — capitalized words joined by underscores (`Spike_Engine`, `NML_Context`, `Engine_Backend`, `Weight_Matrix`)
+- Functions and variables use **snake_case** (`step_simulation`, `run_function`)
 - Namespaces use **lowercase** (`spikecorec`, `spikecorec::metal`, `spikecorec::cuda`)
 
 ## Project structure
@@ -33,7 +33,8 @@ docs/                 — design docs (the NML codegen architecture + IR spec li
 
 ## Architecture
 
-- `src/spikecorec/core/core.cpp` is the **CPU-side home** — `Engine` main loop + Metal/CUDA backend dispatch implementation all live here
+- `src/spikecorec/core/engine.cpp` is the **CPU-side home** — the `Spike_Engine` main loop
+- `src/spikecorec/core/backend.cpp` implements the Metal/CUDA backend dispatch (`Engine_Backend`)
 - `src/spikecorec/core/backend.h` defines the CPU↔GPU dispatch interface
 - `src/spikecorec/cuda/` and `src/spikecorec/metal/` contain GPU kernel code and the metal-cpp one-time impl file
 - Metal host code uses **metal-cpp** (pure C++, no `.mm` / Objective-C++)
@@ -47,13 +48,13 @@ These are the fixed engine facts any codegen/simulation work must respect:
   1 Deliver · 2 Integrate · 3 Detect · 4 Emit · 5 Reset · 6 Propagate · 7 Plasticity · 8 Record ·
   9 Advance. Stages 1/6/8/9 are engine-owned; 2–5 are the per-cell/synapse dynamics. LEMS events
   (`OnCondition`/`OnEvent`/`EventOut`) are **per-tick conditionals**, not an async scheduler.
-- **Runtime kernel compilation already exists on both backends** via `compile_kernel(source, name)`
+- **Runtime kernel compilation already exists on both backends** via `Engine_Backend::create_function(name, source_code)`
   in `src/spikecorec/core/backend.cpp` (Metal `newLibrary`; CUDA NVRTC → PTX → `cuModuleGetFunction`). Codegen
   output is fundamentally "a device-code string" the engine compiles and runs.
-- **CUDA has no generic kernel launcher.** `metal_dispatch` is already a generic positional-arg
-  launcher; the CUDA side only launches its fixed precompiled kernels. Running a generated master
-  kernel on CUDA needs a `cuda_dispatch(CUfunction, grid, block, void** params)` wrapper — this is
-  ticket **#56 (C4)**.
+- **Generic kernel launcher.** `Engine_Backend::run_function(function, parameters, job_count)` in
+  `src/spikecorec/core/backend.cpp` launches any compiled function with positional arguments on both
+  backends (Metal compute encoder; CUDA `cuLaunchKernel`). The CUDA path has not been run on
+  hardware yet — ticket **#56 (C4)**.
 - **Active-set lazy decay is only valid for LINEAR dynamics.** The active-set optimization advances
   a skipped neuron across many ticks in one closed-form `apply_decay`. That is valid only for
   analytically-integrable (linear) cells (all of GLIF). Nonlinear cells (izhikevich/AdEx/HH) must
@@ -74,7 +75,7 @@ structure makes massive networks tractable.
 connection strengths between neurons in the graph — nothing more. They do not implement
 backpropagation, gradient descent, or any task-level learning algorithm. The `rank`
 parameter controls compression fidelity, not model capacity in any machine-learning
-sense. When you see `gpu_weight_update`, `learning_rate`, or Hebbian update logic in
+sense. When you see `plasticity_learning_rate`, `learning_rate`, or Hebbian update logic in
 the engine, that is local synaptic plasticity (spike-timing-dependent updates to
 individual edge weights) — it is also not task learning; it is a biological simulation
 feature that modifies how compressed weights evolve during a simulation run.

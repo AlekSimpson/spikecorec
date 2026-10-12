@@ -164,7 +164,7 @@ struct Engine_Backend {
 
     bool run_function(Engine_Function &function, Vector<Engine_Pointer> &parameters, s64 job_count);
 
-    Cuda_Backend &partition(u64 bytes, Engine_Datatype datatype, Vector<Engine_Pointer> &partitions);
+    Engine_Backend &partition(u64 bytes, Engine_Datatype datatype, Vector<Engine_Pointer> &partitions);
     Engine_Pointer allocate(Vector<Engine_Pointer> &partitions);
 
     void deallocate_slab(const Engine_Pointer &slab);

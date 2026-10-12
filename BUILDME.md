@@ -100,14 +100,21 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
 
 | Suite | File | What it covers |
 |---|---|---|
-| `Backend` | `engine_tests.cpp` | Type sizes, `GpuPointer` alloc/move |
-| `Spike_Engine` | `engine_tests.cpp`, `recording_tests.cpp` | Construction, step loop, reset, reservoir features, input guards, bifurcation scaling, decay path, spike propagation, plasticity, recording |
+| `Expression`, `Random_Generator`, `Randomness` | `engine_tests.cpp` | LEMS expression evaluation, random distributions, seeded reproducibility |
+| `GeneratedKernel`, `CellTypes`, `CellInputs` | `engine_tests.cpp` | Generated kernel functions, per-type state and equations, refused models |
+| `SingleCell`, `CellEvents`, `Connections`, `Inputs`, `Topology` | `engine_tests.cpp` | Single-cell trajectories, `OnEvent` arrivals, delays and per-edge synapse state, every input category, topology-driven connectivity |
+| `GlifFamily`, `GlifNetworks`, `Glif_Network_Aliveness` | `engine_tests.cpp` | GLIF type behaviour and network activity |
+| `ExpCurrSynapse`, `AlphaCurrSynapse`, `Reference` | `synapse_tests.cpp` | Current-based synapse time courses; statistical comparison with jNeuroML |
+| `Regression` | `regression_tests.cpp` | Spike times against the recorded golden runs |
+| `Quantity`, `Resolution`, `Instances`, `Include`, `Dynamics`, `Structure`, `Simulation`, `Input_Tree`, `Errors`, `Schema` | `nml_tests.cpp` | NeuroML/LEMS parsing, resolution, includes, inputs and error reporting |
+| `Quantity`, `TickConversion`, `TickToTime`, `TimeConversion` | `units_tests.cpp` | Unit parsing and time/tick conversion |
 | `K2_Tree` | `k2tree_tests.cpp` | Adjacency queries, batch ops, bounds, save/load, invalid branching factor |
+| `Weight_Matrix` | `weight_matrix_tests.cpp` | Construction, constant/random weights, stats, scaling, neighbor queries, bounds, update, save/load |
+| `Topologies` | `topology_tests.cpp` | `square_torus`, `small_world_torus`, `random_fixed_outdegree` — basic and edge cases |
 | `SpireCodec` | `recording_tests.cpp` | Raw roundtrip, compression codecs, zero-frame file, header overflow, truncation error |
 | `Async_Spire_Writer` | `recording_tests.cpp` | Backpressure, unbounded queue, no re-entry after error |
 | `Simulation_Recorder` | `recording_tests.cpp` | Frame-size validation |
-| `Topologies` | `topology_tests.cpp` | `square_torus`, `small_world_torus`, `random_fixed_outdegree` — basic and edge cases |
-| `Weight_Matrix` | `weight_matrix_tests.cpp` | Construction, constant/random weights, stats, scaling, neighbor queries, bounds, update, save/load |
+| `Engine_Logger`, `Log_Format`, `Log_Level`, `Rotating_File_Sink` | `log_tests.cpp` | Message formatting, level filtering, file rotation |
 
 ### Examples
 
@@ -115,10 +122,10 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
   Examples for the auto-detected backend.
 
 - `make examples-metal`
-  Builds `build/metal_example` from `examples/metal_example.cpp`.
+  Builds every `examples/*.cpp` into `build/examples/`.
 
 - `make examples-cuda`
-  Builds `build/cuda_example` from `examples/cuda_example.cpp`.
+  Not supported yet: the kernel codegen emits Metal only, so the target stops with a message.
 
 ### Utilities
 
@@ -157,6 +164,6 @@ and `pkg-config` probing, mirroring the Makefile):
 
 ## Known gaps (current tree)
 
-- `make examples-metal` / `make examples-cuda` reference `examples/metal_example.cpp`
-  and `examples/cuda_example.cpp`, which don't exist yet in `examples/` (only
-  `demo_script.py` is present) — these targets currently fail at compile time.
+- `examples/` currently has no `.cpp` programs (it holds `models/`, `notebooks/` and
+  `video_utils.py`), so `make examples-metal` builds nothing; `make examples-cuda` is not
+  supported yet.
