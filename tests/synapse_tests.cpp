@@ -16,7 +16,7 @@
 #include <sstream>
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/engine.h"
+#include "engine.h"
 #include "support/test_support.h"
 
 using namespace std;
@@ -39,7 +39,7 @@ struct Edge {
 // integrators, one per edge, each fed by the generator through `synapse_id`.
 String synapse_model(const String &synapse_declaration, const String &synapse_id, const Vector<Edge> &edges,
                      const String &period) {
-    std::ostringstream document;
+    Output_String_Stream document;
     document << "<neuroml xmlns=\"http://www.neuroml.org/schema/neuroml2\" id=\"SynapseModel\">\n"
              << "  " << synapse_declaration << "\n"
              << "  <iafCell id=\"integrator\" leakConductance=\"0 nS\" leakReversal=\"-65 mV\" thresh=\"1000 mV\""
@@ -61,7 +61,7 @@ String synapse_model(const String &synapse_declaration, const String &synapse_id
 String exp_synapse() { return R"(<expCurrSynapse id="expSynapse" tau_syn="5"/>)"; }
 String alpha_synapse() { return R"(<alphaCurrSynapse id="alphaSynapse" tau_syn="5"/>)"; }
 
-unique_ptr<SpikeEngine> make_engine(const TemporaryDirectory &directory, const String &model, const String &length,
+Unique_Pointer<Spike_Engine> make_engine(const Temporary_Directory &directory, const String &model, const String &length,
                                     const String &step) {
     directory.write("synapse_model.nml", model);
     const String lems = directory.write(
@@ -70,11 +70,11 @@ unique_ptr<SpikeEngine> make_engine(const TemporaryDirectory &directory, const S
                         "  <Include file=\"Simulation.xml\"/>\n  <Include file=\"synapse_model.nml\"/>\n"
                         "  <Simulation id=\"sim1\" length=\"" + length + "\" step=\"" + step +
                         "\" target=\"synapseNetwork\"/>\n  <Target component=\"sim1\"/>\n</Lems>\n");
-    return make_unique<SpikeEngine>(lems);
+    return make_unique<Spike_Engine>(lems);
 }
 
 // Each tick's value of one synapse state variable on the edge into target_neuron.
-Vector<f64> state_per_tick(SpikeEngine &engine, const String &synapse_id, const String &variable, s32 target_neuron) {
+Vector<f64> state_per_tick(Spike_Engine &engine, const String &synapse_id, const String &variable, s32 target_neuron) {
     const s64 plane = engine.synapse_state_variable_plane(synapse_id, variable);
     Vector<f64> values;
     for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
@@ -86,17 +86,17 @@ Vector<f64> state_per_tick(SpikeEngine &engine, const String &synapse_id, const 
 
 s64 first_nonzero_index(const Vector<f64> &values) {
     const auto found = find_if(values.begin(), values.end(), [](f64 value) { return value != 0.0; });
-    return found == values.end() ? -1 : (s64)(found - values.begin());
+    return found == values.end() ? -1 : static_cast<s64>(found - values.begin());
 }
 
 // How far each integrator moved over the run, from where it started.
-Vector<f64> integrator_changes(SpikeEngine &engine, s64 target_count) {
+Vector<f64> integrator_changes(Spike_Engine &engine, s64 target_count) {
     Vector<f64> starts;
     for (s64 neuron = 1; neuron <= target_count; neuron += 1) starts.push_back(engine.read_state_variable(neuron, "v"));
     engine.run();
     Vector<f64> changes;
     for (s64 neuron = 1; neuron <= target_count; neuron += 1) {
-        changes.push_back(engine.read_state_variable(neuron, "v") - starts[(usize)(neuron - 1)]);
+        changes.push_back(engine.read_state_variable(neuron, "v") - starts[static_cast<usize>(neuron - 1)]);
     }
     return changes;
 }
@@ -107,8 +107,8 @@ Vector<f64> integrator_changes(SpikeEngine &engine, s64 target_count) {
 
 // An arrival adds the weight to I; forward Euler then takes I_n = w (1 - dt/tau)^n.
 TEST(ExpCurrSynapse, decays_geometrically_from_its_weight) {
-    const TemporaryDirectory directory;
-    unique_ptr<SpikeEngine> engine =
+    const Temporary_Directory directory;
+    Unique_Pointer<Spike_Engine> engine =
             make_engine(directory, synapse_model(exp_synapse(), "expSynapse", {{2.5, "1 ms"}}, "30 ms"), "59ms", "0.1ms");
     const Vector<f64> current = state_per_tick(*engine, "expSynapse", "I", 1);
 
@@ -116,14 +116,14 @@ TEST(ExpCurrSynapse, decays_geometrically_from_its_weight) {
     ASSERT_GE(arrival, 0) << "the arrival never came";
     const f64 ratio = 1.0 - engine->step_dt / SYNAPSE_TIME_CONSTANT;
     for (s64 elapsed = 0; elapsed <= 100; elapsed += 1) {
-        EXPECT_NEAR(current[(usize)(arrival + elapsed)], 2.5 * pow(ratio, (f64)elapsed), 1e-5 * 2.5) << "tick " << elapsed;
+        EXPECT_NEAR(current[static_cast<usize>(arrival + elapsed)], 2.5 * pow(ratio, static_cast<f64>(elapsed)), 1e-5 * 2.5) << "tick " << elapsed;
     }
 }
 
 // The whole charge is w nA tau, and half of it has arrived tau ln 2 after the current starts.
 TEST(ExpCurrSynapse, delivers_its_charge_with_the_exponential_time_course) {
-    const TemporaryDirectory directory;
-    unique_ptr<SpikeEngine> engine =
+    const Temporary_Directory directory;
+    Unique_Pointer<Spike_Engine> engine =
             make_engine(directory, synapse_model(exp_synapse(), "expSynapse", {{1.0, "1 ms"}}, "100 ms"), "199ms", "0.1ms");
 
     const f64 start = engine->read_state_variable(1, "v");
@@ -140,14 +140,14 @@ TEST(ExpCurrSynapse, delivers_its_charge_with_the_exponential_time_course) {
     const auto half = find_if(change_per_tick.begin(), change_per_tick.end(),
                               [&](f64 change) { return change >= 0.5 * total_change; });
     ASSERT_NE(half, change_per_tick.end());
-    const f64 half_time = (f64)(half - change_per_tick.begin() - onset + 1) * engine->step_dt;
+    const f64 half_time = static_cast<f64>(half - change_per_tick.begin() - onset + 1) * engine->step_dt;
     EXPECT_NEAR(half_time, SYNAPSE_TIME_CONSTANT * std::log(2.0), engine->step_dt);
 }
 
 // The response is linear in the weight, sign included, and successive arrivals add up.
 TEST(ExpCurrSynapse, responses_are_linear_in_the_weight_and_superpose) {
-    const TemporaryDirectory directory;
-    unique_ptr<SpikeEngine> engine = make_engine(
+    const Temporary_Directory directory;
+    Unique_Pointer<Spike_Engine> engine = make_engine(
             directory, synapse_model(exp_synapse(), "expSynapse", {{1.0, "1 ms"}, {2.0, "1 ms"}, {-1.0, "1 ms"}}, "40 ms"),
             "199ms", "0.1ms");
     const Vector<f64> changes = integrator_changes(*engine, 3);
@@ -162,8 +162,8 @@ TEST(ExpCurrSynapse, responses_are_linear_in_the_weight_and_superpose) {
 // Two edges from one source, with their own weights and delays, keep their own state: the later
 // edge is untouched until its own arrival, then follows the same curve scaled by its weight.
 TEST(ExpCurrSynapse, each_edge_keeps_its_own_state) {
-    const TemporaryDirectory directory;
-    unique_ptr<SpikeEngine> engine = make_engine(
+    const Temporary_Directory directory;
+    Unique_Pointer<Spike_Engine> engine = make_engine(
             directory, synapse_model(exp_synapse(), "expSynapse", {{1.0, "1 ms"}, {3.0, "4 ms"}}, "30 ms"), "59ms", "0.1ms");
     const s64 plane = engine->synapse_state_variable_plane("expSynapse", "I");
     Vector<f64> first_edge;
@@ -179,7 +179,7 @@ TEST(ExpCurrSynapse, each_edge_keeps_its_own_state) {
     ASSERT_GE(first_arrival, 0);
     EXPECT_EQ(second_arrival - first_arrival, 30) << "3 ms more delay at 0.1 ms";
     for (s64 elapsed = 0; elapsed <= 100; elapsed += 1) {
-        EXPECT_NEAR(second_edge[(usize)(second_arrival + elapsed)], 3.0 * first_edge[(usize)(first_arrival + elapsed)], 3e-5)
+        EXPECT_NEAR(second_edge[static_cast<usize>(second_arrival + elapsed)], 3.0 * first_edge[static_cast<usize>(first_arrival + elapsed)], 3e-5)
             << "tick " << elapsed;
     }
 }
@@ -188,8 +188,8 @@ TEST(ExpCurrSynapse, each_edge_keeps_its_own_state) {
 
 // A' = -A/tau and I' = (e A - I)/tau: after an arrival adds w to A, I rises to w at t = tau.
 TEST(AlphaCurrSynapse, peaks_at_its_weight_one_time_constant_after_arrival) {
-    const TemporaryDirectory directory;
-    unique_ptr<SpikeEngine> engine = make_engine(
+    const Temporary_Directory directory;
+    Unique_Pointer<Spike_Engine> engine = make_engine(
             directory, synapse_model(alpha_synapse(), "alphaSynapse", {{2.0, "1 ms"}}, "40 ms"), "79ms", "0.025ms");
     const s64 current_plane = engine->synapse_state_variable_plane("alphaSynapse", "I");
     const s64 amplitude_plane = engine->synapse_state_variable_plane("alphaSynapse", "A");
@@ -203,18 +203,18 @@ TEST(AlphaCurrSynapse, peaks_at_its_weight_one_time_constant_after_arrival) {
 
     const s64 arrival = first_nonzero_index(amplitude);
     ASSERT_GE(arrival, 0);
-    EXPECT_NEAR(amplitude[(usize)arrival], 2.0, 2.0 * engine->weights.fit_tolerance);
+    EXPECT_NEAR(amplitude[static_cast<usize>(arrival)], 2.0, 2.0 * engine->weights.fit_tolerance);
     const auto peak = max_element(current.begin(), current.end());
     EXPECT_NEAR(*peak, 2.0, 0.01 * 2.0);
-    const f64 time_to_peak = (f64)(peak - current.begin() - arrival) * engine->step_dt;
+    const f64 time_to_peak = static_cast<f64>(peak - current.begin() - arrival) * engine->step_dt;
     EXPECT_NEAR(time_to_peak, SYNAPSE_TIME_CONSTANT, 0.01 * SYNAPSE_TIME_CONSTANT);
 }
 
 // The alpha function integrates to e w tau; Euler's own recurrence gives exactly the same sum. Sign
 // and size scale with the weight.
 TEST(AlphaCurrSynapse, delivers_e_times_weight_times_time_constant) {
-    const TemporaryDirectory directory;
-    unique_ptr<SpikeEngine> engine = make_engine(
+    const Temporary_Directory directory;
+    Unique_Pointer<Spike_Engine> engine = make_engine(
             directory, synapse_model(alpha_synapse(), "alphaSynapse", {{0.5, "1 ms"}, {-0.5, "1 ms"}}, "100 ms"),
             "199ms", "0.025ms");
     const Vector<f64> changes = integrator_changes(*engine, 2);
@@ -230,35 +230,35 @@ namespace {
 
 // tests/fixtures/nml/LEMS_pynn_synapses.xml: neuron 0 is the spikeGenerator, 1 expPsp, 2 alphaPsp,
 // 3 expSpiking, 4 alphaSpiking. Reference outputs are from regenerate_references.sh.
-struct PynnRun {
+struct Pynn_Run {
     f64 step = 0.0;
     Vector<Vector<f64>> potentials;     // [neuron 1..4][row]; row k is t = k * step
     Vector<Vector<s64>> spike_ticks;    // [neuron 0..4]
 };
 
-PynnRun run_engine() {
-    SpikeEngine engine(fixture_path("nml/LEMS_pynn_synapses.xml"));
-    PynnRun run;
+Pynn_Run run_engine() {
+    Spike_Engine engine(fixture_path("nml/LEMS_pynn_synapses.xml"));
+    Pynn_Run run;
     run.step = engine.step_dt;
     run.potentials.assign(5, {});
-    for (s64 neuron = 1; neuron <= 4; neuron += 1) run.potentials[(usize)neuron].push_back(engine.read_state_variable(neuron, "v"));
+    for (s64 neuron = 1; neuron <= 4; neuron += 1) run.potentials[static_cast<usize>(neuron)].push_back(engine.read_state_variable(neuron, "v"));
     for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
         engine.step_simulation(tick);
         // After tick k the state is at t = (k + 1) * step.
-        for (s64 neuron = 1; neuron <= 4; neuron += 1) run.potentials[(usize)neuron].push_back(engine.read_state_variable(neuron, "v"));
+        for (s64 neuron = 1; neuron <= 4; neuron += 1) run.potentials[static_cast<usize>(neuron)].push_back(engine.read_state_variable(neuron, "v"));
     }
     run.spike_ticks.assign(5, {});
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
-        run.spike_ticks[(usize)spike.neuron_index].push_back(llround(spike.time_seconds / run.step));
+    for (const Recorded_Spike &spike : engine.recorded_spikes) {
+        run.spike_ticks[static_cast<usize>(spike.neuron_index)].push_back(llround(spike.time_seconds / run.step));
     }
     return run;
 }
 
-PynnRun read_reference(f64 step) {
-    PynnRun run;
+Pynn_Run read_reference(f64 step) {
+    Pynn_Run run;
     run.step = step;
     run.potentials.assign(5, {});
-    std::ifstream potentials(fixture_path("reference/pynn_synapses_v.dat"));
+    Input_File_Stream potentials(fixture_path("reference/pynn_synapses_v.dat"));
     EXPECT_TRUE(potentials.good()) << "run tests/fixtures/reference/regenerate_references.sh";
     f64 time = 0.0;
     f64 exp_psp = 0.0, alpha_psp = 0.0, exp_spiking = 0.0, alpha_spiking = 0.0;
@@ -269,30 +269,30 @@ PynnRun read_reference(f64 step) {
         run.potentials[4].push_back(alpha_spiking);
     }
     run.spike_ticks.assign(5, {});
-    std::ifstream spikes(fixture_path("reference/pynn_synapses_spikes.dat"));
+    Input_File_Stream spikes(fixture_path("reference/pynn_synapses_spikes.dat"));
     f64 spike_time = 0.0;
     s64 neuron = 0;
-    while (spikes >> spike_time >> neuron) run.spike_ticks[(usize)neuron].push_back(llround(spike_time / step));
+    while (spikes >> spike_time >> neuron) run.spike_ticks[static_cast<usize>(neuron)].push_back(llround(spike_time / step));
     return run;
 }
 
-struct PostsynapticPotential {
+struct Postsynaptic_Potential {
     f64 height = 0.0;
     s64 peak_row = 0;
 };
 
 // The first postsynaptic potential: its height above rest and the row it peaks on, looking no
 // further than the next presynaptic spike.
-PostsynapticPotential first_potential(const Vector<f64> &trace, s64 last_row) {
+Postsynaptic_Potential first_potential(const Vector<f64> &trace, s64 last_row) {
     const auto peak = max_element(trace.begin(), trace.begin() + last_row);
-    return {*peak - trace.front(), (s64)(peak - trace.begin())};
+    return {*peak - trace.front(), static_cast<s64>(peak - trace.begin())};
 }
 
 } // namespace
 
 TEST(Reference, pynn_postsynaptic_potentials_match_jneuroml) {
-    const PynnRun engine = run_engine();
-    const PynnRun reference = read_reference(engine.step);
+    const Pynn_Run engine = run_engine();
+    const Pynn_Run reference = read_reference(engine.step);
     ASSERT_FALSE(reference.potentials[1].empty());
     ASSERT_FALSE(reference.spike_ticks[0].empty());
 
@@ -300,11 +300,11 @@ TEST(Reference, pynn_postsynaptic_potentials_match_jneuroml) {
     const s64 presynaptic_tick = reference.spike_ticks[0][0];
     const s64 last_row = reference.spike_ticks[0][1];
     for (s64 neuron : {1, 2}) {
-        const PostsynapticPotential expected = first_potential(reference.potentials[(usize)neuron], last_row);
-        const PostsynapticPotential measured = first_potential(engine.potentials[(usize)neuron], last_row);
+        const Postsynaptic_Potential expected = first_potential(reference.potentials[static_cast<usize>(neuron)], last_row);
+        const Postsynaptic_Potential measured = first_potential(engine.potentials[static_cast<usize>(neuron)], last_row);
         EXPECT_NEAR(measured.height, expected.height, 0.01 * expected.height) << "neuron " << neuron;
-        EXPECT_NEAR((f64)(measured.peak_row - presynaptic_tick), (f64)(expected.peak_row - presynaptic_tick),
-                    0.01 * (f64)(expected.peak_row - presynaptic_tick))
+        EXPECT_NEAR(static_cast<f64>(measured.peak_row - presynaptic_tick), static_cast<f64>(expected.peak_row - presynaptic_tick),
+                    0.01 * static_cast<f64>(expected.peak_row - presynaptic_tick))
             << "neuron " << neuron << ": time to peak after the presynaptic spike";
     }
 }
@@ -315,18 +315,18 @@ TEST(Reference, pynn_postsynaptic_potentials_match_jneuroml) {
 // significantly (two-sample Kolmogorov-Smirnov, alpha 0.001), and the mean rate and interval CV
 // must be close.
 TEST(Reference, pynn_network_activity_matches_jneuroml_statistically) {
-    SpikeEngine engine(fixture_path("nml/LEMS_pynn_poisson_network.xml"));
+    Spike_Engine engine(fixture_path("nml/LEMS_pynn_poisson_network.xml"));
     engine.run();
-    const f64 duration = (f64)engine.lifetime * engine.step_dt;
+    const f64 duration = static_cast<f64>(engine.lifetime) * engine.step_dt;
 
-    Vector<Vector<f64>> engine_times((usize)engine.total_neuron_count);
-    for (const RecordedSpike &spike : engine.recorded_spikes) engine_times[(usize)spike.neuron_index].push_back(spike.time_seconds);
-    Vector<Vector<f64>> reference_times((usize)engine.total_neuron_count);
-    std::ifstream spikes(fixture_path("reference/pynn_poisson_network_spikes.dat"));
+    Vector<Vector<f64>> engine_times(static_cast<usize>(engine.total_neuron_count));
+    for (const Recorded_Spike &spike : engine.recorded_spikes) engine_times[static_cast<usize>(spike.neuron_index)].push_back(spike.time_seconds);
+    Vector<Vector<f64>> reference_times(static_cast<usize>(engine.total_neuron_count));
+    Input_File_Stream spikes(fixture_path("reference/pynn_poisson_network_spikes.dat"));
     ASSERT_TRUE(spikes.good()) << "run tests/fixtures/reference/regenerate_references.sh";
     f64 spike_time = 0.0;
     s64 neuron = 0;
-    while (spikes >> spike_time >> neuron) reference_times[(usize)neuron].push_back(spike_time);
+    while (spikes >> spike_time >> neuron) reference_times[static_cast<usize>(neuron)].push_back(spike_time);
 
     struct Population {
         String name;
@@ -337,10 +337,10 @@ TEST(Reference, pynn_network_activity_matches_jneuroml_statistically) {
                                          Population{"alphaTargets", 150, 200}}) {
         Vector<f64> engine_rates, reference_rates, engine_intervals, reference_intervals;
         for (s64 index = population.first; index < population.last; index += 1) {
-            engine_rates.push_back((f64)engine_times[(usize)index].size() / duration);
-            reference_rates.push_back((f64)reference_times[(usize)index].size() / duration);
-            const Vector<f64> engine_neuron_intervals = interspike_intervals(engine_times[(usize)index]);
-            const Vector<f64> reference_neuron_intervals = interspike_intervals(reference_times[(usize)index]);
+            engine_rates.push_back(static_cast<f64>(engine_times[static_cast<usize>(index)].size()) / duration);
+            reference_rates.push_back(static_cast<f64>(reference_times[static_cast<usize>(index)].size()) / duration);
+            const Vector<f64> engine_neuron_intervals = interspike_intervals(engine_times[static_cast<usize>(index)]);
+            const Vector<f64> reference_neuron_intervals = interspike_intervals(reference_times[static_cast<usize>(index)]);
             engine_intervals.insert(engine_intervals.end(), engine_neuron_intervals.begin(), engine_neuron_intervals.end());
             reference_intervals.insert(reference_intervals.end(), reference_neuron_intervals.begin(),
                                        reference_neuron_intervals.end());

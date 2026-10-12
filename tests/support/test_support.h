@@ -13,13 +13,12 @@
 #include <sstream>
 #include <string>
 #include <gtest/gtest.h>
-#include <spdlog/sinks/ostream_sink.h>
 
-#include "spikecorec/core/backend.h"
-#include "spikecorec/core/engine.h"
-#include "spikecorec/core/log.h"
-#include "spikecorec/core/types.h"
-#include "spikecorec/nml/parser.h"
+#include "backend.h"
+#include "engine.h"
+#include "log.h"
+#include "types.h"
+#include "parser.h"
 
 #ifndef SPIKECOREC_TEST_FIXTURE_DIR
 #error "SPIKECOREC_TEST_FIXTURE_DIR must name tests/fixtures; the Makefile defines it"
@@ -30,8 +29,8 @@ namespace spikecorec::test_support {
 // One backend for the whole runner. Every k^2-tree and weight matrix carves its own slab out of
 // it and releases that slab when it dies, so sharing the backend is not sharing storage; it only
 // avoids standing up a device per test.
-inline EngineBackend &shared_backend() {
-    static EngineBackend backend;
+inline Engine_Backend &shared_backend() {
+    static Engine_Backend backend;
     return backend;
 }
 
@@ -48,9 +47,9 @@ inline bool standard_library_available() {
 
 // A directory of the current test's own, removed with the object. It sits under a root named
 // after this process, so test runners that overlap on one machine never share a file.
-class TemporaryDirectory {
+class Temporary_Directory {
 public:
-    TemporaryDirectory() {
+    Temporary_Directory() {
         const ::testing::TestInfo *test = ::testing::UnitTest::GetInstance()->current_test_info();
         const String test_name = test ? String(test->test_suite_name()) + "." + test->name() : "outside_a_test";
         root = std::filesystem::temp_directory_path() / ("spikecorec_tests_" + std::to_string(getpid())) / test_name;
@@ -58,19 +57,19 @@ public:
         std::filesystem::create_directories(root);
     }
 
-    ~TemporaryDirectory() {
-        std::error_code ignored;
+    ~Temporary_Directory() {
+        Error_Code ignored;
         std::filesystem::remove_all(root, ignored);
     }
 
-    TemporaryDirectory(const TemporaryDirectory &) = delete;
-    TemporaryDirectory &operator=(const TemporaryDirectory &) = delete;
+    Temporary_Directory(const Temporary_Directory &) = delete;
+    Temporary_Directory &operator=(const Temporary_Directory &) = delete;
 
     // Writes a file, creating any directories on the way, and returns its absolute path.
     String write(const String &relative_path, const String &contents) const {
-        const std::filesystem::path destination = root / relative_path;
+        const Path destination = root / relative_path;
         std::filesystem::create_directories(destination.parent_path());
-        std::ofstream file(destination);
+        Output_File_Stream file(destination);
         file << contents;
         return destination.string();
     }
@@ -80,25 +79,25 @@ public:
     [[nodiscard]] String path() const { return root.string(); }
 
 private:
-    std::filesystem::path root;
+    Path root;
 };
 
 // Everything the engine logs while the object lives, kept in memory so a test can check that a
 // warning was given without reading the log file.
-class CapturedLog {
+class Captured_Log {
 public:
-    CapturedLog() : sink(std::make_shared<spdlog::sinks::ostream_sink_mt>(text)) {
+    Captured_Log() : sink(std::make_shared<log::Ostream_Sink>(text)) {
         sink->set_pattern("[%l] %v");
         log::logger().sinks().push_back(sink);
     }
 
-    ~CapturedLog() {
-        std::vector<log::SinkPointer> &sinks = log::logger().sinks();
+    ~Captured_Log() {
+        Vector<log::Sink_Pointer> &sinks = log::logger().sinks();
         sinks.erase(std::remove(sinks.begin(), sinks.end(), sink), sinks.end());
     }
 
-    CapturedLog(const CapturedLog &) = delete;
-    CapturedLog &operator=(const CapturedLog &) = delete;
+    Captured_Log(const Captured_Log &) = delete;
+    Captured_Log &operator=(const Captured_Log &) = delete;
 
     [[nodiscard]] bool contains(const String &fragment) {
         log::logger().flush();
@@ -106,15 +105,15 @@ public:
     }
 
 private:
-    std::ostringstream text;
-    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink;
+    Output_String_Stream text;
+    Shared_Pointer<log::Ostream_Sink> sink;
 };
 
 // A LEMS document that includes the NeuroML core types and model_file and simulates network_id.
 // simulation_children goes inside <Simulation>: output files, for instance.
 inline String lems_document(const String &model_file, const String &network_id, const String &length,
                             const String &step, const String &simulation_children = "") {
-    std::ostringstream document;
+    Output_String_Stream document;
     document << "<Lems>\n"
              << "  <Include file=\"Cells.xml\"/>\n"
              << "  <Include file=\"Synapses.xml\"/>\n"
@@ -132,9 +131,9 @@ inline String lems_document(const String &model_file, const String &network_id, 
 }
 
 // One neuron's spike times, in order.
-inline Vector<f64> spike_times_of(const SpikeEngine &engine, s64 neuron_index) {
+inline Vector<f64> spike_times_of(const Spike_Engine &engine, s64 neuron_index) {
     Vector<f64> times;
-    for (const RecordedSpike &spike : engine.recorded_spikes) {
+    for (const Recorded_Spike &spike : engine.recorded_spikes) {
         if (spike.neuron_index == neuron_index) times.push_back(spike.time_seconds);
     }
     return times;
@@ -150,7 +149,7 @@ inline Vector<f64> interspike_intervals(const Vector<f64> &spike_times) {
 
 inline f64 mean_of(const Vector<f64> &values) {
     if (values.empty()) return 0.0;
-    return std::accumulate(values.begin(), values.end(), 0.0) / (f64)values.size();
+    return std::accumulate(values.begin(), values.end(), 0.0) / static_cast<f64>(values.size());
 }
 
 // Standard deviation over mean: 0 for a perfectly regular spike train, about 1 for a Poisson one.
@@ -159,7 +158,7 @@ inline f64 coefficient_of_variation(const Vector<f64> &values) {
     if (values.size() < 2 || mean == 0.0) return 0.0;
     f64 sum_of_squares = 0.0;
     for (f64 value : values) sum_of_squares += (value - mean) * (value - mean);
-    return std::sqrt(sum_of_squares / (f64)(values.size() - 1)) / mean;
+    return std::sqrt(sum_of_squares / static_cast<f64>(values.size() - 1)) / mean;
 }
 
 // The two-sample Kolmogorov-Smirnov statistic: the largest gap between the two samples' empirical
@@ -174,8 +173,8 @@ inline f64 kolmogorov_smirnov_statistic(Vector<f64> first, Vector<f64> second) {
         const f64 value = std::min(first[first_index], second[second_index]);
         while (first_index < first.size() && first[first_index] <= value) first_index += 1;
         while (second_index < second.size() && second[second_index] <= value) second_index += 1;
-        largest_gap = std::max(largest_gap, std::fabs((f64)first_index / (f64)first.size() -
-                                                      (f64)second_index / (f64)second.size()));
+        largest_gap = std::max(largest_gap, std::fabs(static_cast<f64>(first_index) / static_cast<f64>(first.size()) -
+                                                      static_cast<f64>(second_index) / static_cast<f64>(second.size())));
     }
     return largest_gap;
 }
@@ -184,7 +183,7 @@ inline f64 kolmogorov_smirnov_statistic(Vector<f64> first, Vector<f64> second) {
 // c(alpha) * sqrt((n + m) / (n m)), with c(alpha) = sqrt(-ln(alpha / 2) / 2).
 inline f64 kolmogorov_smirnov_critical_value(usize first_size, usize second_size, f64 alpha) {
     const f64 coefficient = std::sqrt(-std::log(alpha / 2.0) / 2.0);
-    return coefficient * std::sqrt((f64)(first_size + second_size) / ((f64)first_size * (f64)second_size));
+    return coefficient * std::sqrt(static_cast<f64>(first_size + second_size) / (static_cast<f64>(first_size) * static_cast<f64>(second_size)));
 }
 
 } // namespace spikecorec::test_support

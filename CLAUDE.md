@@ -11,18 +11,19 @@ simulate arbitrary LEMS-defined cell/synapse dynamics — see "Current epic" bel
   - `engine.cpp`, `kernels.cuh`, `metal_cpp_impl.cpp` ✓
   - `Engine.cpp`, `MyKernels.cu` ✗
 - Headers use `.h` (not `.hpp`), except CUDA headers which use `.cuh`
-- C++ classes and types use **PascalCase** (`Engine`, `Context`, `LaunchConfig`)
+- C++ classes and types use **Camel_Case** — capitalized words joined by underscores (`Engine`, `Context`, `Launch_Config`, `Weight_Matrix`)
 - Functions and variables use **snake_case** (`make_context`, `running_`)
 - Namespaces use **lowercase** (`spikecorec`, `spikecorec::metal`, `spikecorec::cuda`)
 
 ## Project structure
 
 ```
-include/spikecorec/   — public headers (.hpp, .cuh)
-src/core/             — CPU-side logic: main loop, Engine, orchestration
-src/cuda/             — CUDA kernels (.cu) + backend interface implementation
-src/metal/            — Metal-cpp host code (.cpp) + GPU shader source (.metal)
-src/bindings/         — pybind11 Python bindings
+src/spikecorec/       — include root is `src/`; headers (.h, .cuh) live beside their sources
+src/spikecorec/core/      — CPU-side logic: main loop, Engine, orchestration
+src/spikecorec/nml/       — NeuroML parsing, resolution and kernel codegen
+src/spikecorec/cuda/      — CUDA kernels (.cu) + backend interface implementation
+src/spikecorec/metal/     — Metal-cpp host code (.cpp) + GPU shader source (.metal)
+src/spikecorec/bindings/  — pybind11 Python bindings
 python/spikecorec/    — Python package
 tests/                — C++ tests
 examples/             — example programs
@@ -32,9 +33,9 @@ docs/                 — design docs (the NML codegen architecture + IR spec li
 
 ## Architecture
 
-- `src/core/core.cpp` is the **CPU-side home** — `Engine` main loop + Metal/CUDA backend dispatch implementation all live here
-- `include/spikecorec/core/backend.h` defines the CPU↔GPU dispatch interface
-- `src/cuda/` and `src/metal/` contain GPU kernel code and the metal-cpp one-time impl file
+- `src/spikecorec/core/core.cpp` is the **CPU-side home** — `Engine` main loop + Metal/CUDA backend dispatch implementation all live here
+- `src/spikecorec/core/backend.h` defines the CPU↔GPU dispatch interface
+- `src/spikecorec/cuda/` and `src/spikecorec/metal/` contain GPU kernel code and the metal-cpp one-time impl file
 - Metal host code uses **metal-cpp** (pure C++, no `.mm` / Objective-C++)
 - Backend is selected at compile time via `-DSPIKECOREC_METAL` or `-DSPIKECOREC_CUDA`
 
@@ -47,7 +48,7 @@ These are the fixed engine facts any codegen/simulation work must respect:
   9 Advance. Stages 1/6/8/9 are engine-owned; 2–5 are the per-cell/synapse dynamics. LEMS events
   (`OnCondition`/`OnEvent`/`EventOut`) are **per-tick conditionals**, not an async scheduler.
 - **Runtime kernel compilation already exists on both backends** via `compile_kernel(source, name)`
-  in `src/core/backend.cpp` (Metal `newLibrary`; CUDA NVRTC → PTX → `cuModuleGetFunction`). Codegen
+  in `src/spikecorec/core/backend.cpp` (Metal `newLibrary`; CUDA NVRTC → PTX → `cuModuleGetFunction`). Codegen
   output is fundamentally "a device-code string" the engine compiles and runs.
 - **CUDA has no generic kernel launcher.** `metal_dispatch` is already a generic positional-arg
   launcher; the CUDA side only launches its fixed precompiled kernels. Running a generated master
@@ -63,7 +64,7 @@ These are the fixed engine facts any codegen/simulation work must respect:
 
 ## CRITICAL: U/V factorization is a memory optimization, NOT learning
 
-The `WeightMatrix` stores adjacency weights as a low-rank factorization `W ≈ U * Vᵀ`
+The `Weight_Matrix` stores adjacency weights as a low-rank factorization `W ≈ U * Vᵀ`
 (rank controlled by the `rank` constructor parameter). **This is purely a memory
 compression scheme.** Large spiking networks would require terabytes of RAM to store
 a full dense weight matrix; the U/V factorization combined with the k²-tree adjacency
@@ -130,7 +131,7 @@ build-order graph). Tickets carry `[CODE]` title prefixes and are labeled `codeg
 ├── #4  [B1] IR representation          → #50 [B2] cell lowering · #51 [B3] synapse lowering ·
 │                                          #55 [C1] IR→GPU source · #5 [C2] .alloc allocator ·
 │                                          #6 [C3] master-kernel assembly · #56 [C4] cuda_dispatch
-├── #52 [D2] shared-basis WeightMatrix  → #53 [D3] sparse Sk + loadedge/accedge · #54 [D4] refit · #57 [D1] aggregated accumulators
+├── #52 [D2] shared-basis Weight_Matrix  → #53 [D3] sparse Sk + loadedge/accedge · #54 [D4] refit · #57 [D1] aggregated accumulators
 ├── #61 [H1] Phase-1 validation & wiring→ #58 [E1] stimulus · #59 [E2] recording · #60 [X1] diagnostics
 ├── #67 [H2] Phase 2                    → #62 [F1] active-set×nonlinear · #63 [F2] nonlinear cells ·
 │                                          #64 [F3] delay ring · #65 [F4] on-device gens+heterogeneity · #66 [F5] plasticity wiring

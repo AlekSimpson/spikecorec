@@ -124,8 +124,8 @@ def test_component_types_and_their_dynamics():
     assert iaf.find_declaration("var:no_such_name") is None
 
     tags = [entry.source_tag for entry in iaf.dynamics]
-    assert nml.NML_DeclarationType.TimeDerivative in tags
-    reset = next(entry for entry in iaf.dynamics if entry.source_tag == nml.NML_DeclarationType.StateAssignment)
+    assert nml.NML_Declaration_Type.TimeDerivative in tags
+    reset = next(entry for entry in iaf.dynamics if entry.source_tag == nml.NML_Declaration_Type.StateAssignment)
     assert (reset.target, reset.expression, reset.condition) == ("v", "reset", "v .gt. thresh")
 
     populations = nml.network_populations(context)
@@ -139,7 +139,7 @@ def test_structure_entries(tmp_path):
     context = nml.NML_Context()
     context.parse(str(main_file))
     connection = context.component_types["spike"].structure[2]
-    assert connection.source_tag == nml.NML_DeclarationType.EventConnection
+    assert connection.source_tag == nml.NML_Declaration_Type.EventConnection
     assert (connection.source, connection.target) == ("a", "b")
     assert context.component_types["timedSynapticInput"].structure[0].component == "synapse"
 
@@ -150,14 +150,14 @@ def test_evaluate_lems_and_the_random_generator():
     assert nml.evaluate_lems("2 ^ 3 ^ 2", {}) == 512.0
     assert nml.evaluate_lems("x .gt. 1", {"x": 2.0}) == 1.0
 
-    generator = nml.RandomGenerator(3)
+    generator = nml.Random_Generator(3)
     draws = [nml.evaluate_lems("random(2)", {}, random_generator=generator) for _ in range(2000)]
     assert all(0.0 < draw < 2.0 for draw in draws)
     assert np.mean(draws) == pytest.approx(1.0, abs=0.06)
     with pytest.raises(RuntimeError):
         nml.evaluate_lems("random(1)", {})
 
-    first, second = nml.RandomGenerator(9), nml.RandomGenerator(9)
+    first, second = nml.Random_Generator(9), nml.Random_Generator(9)
     assert [first.uniform() for _ in range(5)] == [second.uniform() for _ in range(5)]
 
 
@@ -174,10 +174,10 @@ def test_schema_validation(tmp_path):
     assert "thisTagDoesNotExistInSchema" in context.last_schema_validation_errors
 
 
-# ── SpikeEngine ─────────────────────────────────────────────────────────────────
+# ── Spike_Engine ─────────────────────────────────────────────────────────────────
 
 def test_engine_runs_a_single_cell(tmp_path):
-    engine = spc.SpikeEngine(write_lems(tmp_path, SINGLE_CELL_MODEL, "singleCellNetwork", "500ms"))
+    engine = spc.Spike_Engine(write_lems(tmp_path, SINGLE_CELL_MODEL, "singleCellNetwork", "500ms"))
     assert engine.total_neuron_count == 1
     assert engine.lifetime == 10000
     assert engine.read_state_variable(0, "v") == pytest.approx(-0.065, abs=1e-7)
@@ -194,7 +194,7 @@ def test_engine_runs_a_single_cell(tmp_path):
 
 
 def test_state_and_device_buffers_are_copies(tmp_path):
-    engine = spc.SpikeEngine(write_lems(tmp_path, SINGLE_CELL_MODEL, "singleCellNetwork", "20ms"))
+    engine = spc.Spike_Engine(write_lems(tmp_path, SINGLE_CELL_MODEL, "singleCellNetwork", "20ms"))
     for tick in range(100):
         engine.step_simulation(tick)
     voltages = engine.state_variable_array("v")
@@ -248,7 +248,7 @@ COUNTING_MODEL = """<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="
 
 
 def test_a_cells_on_event_runs_once_per_arriving_spike(tmp_path):
-    engine = spc.SpikeEngine(write_lems(tmp_path, COUNTING_MODEL, "eventNetwork", "200ms", "0.1ms"))
+    engine = spc.Spike_Engine(write_lems(tmp_path, COUNTING_MODEL, "eventNetwork", "200ms", "0.1ms"))
     assert engine.event_arrival_count.dtype == np.uint32
     assert engine.event_arrival_count.shape == (2, 2)
 
@@ -265,7 +265,7 @@ def test_written_spikes_match_the_recorded_ones(tmp_path):
     spike_file = tmp_path / "events.dat"
     children = (f'<EventOutputFile id="spikes" fileName="{tmp_path / "declared.dat"}" format="TIME_ID">'
                 '<EventSelection id="0" select="cellPopulation[0]" eventPort="spike"/></EventOutputFile>')
-    engine = spc.SpikeEngine(write_lems(tmp_path, SINGLE_CELL_MODEL, "singleCellNetwork", "200ms", children=children))
+    engine = spc.Spike_Engine(write_lems(tmp_path, SINGLE_CELL_MODEL, "singleCellNetwork", "200ms", children=children))
     engine.run()
     engine.write_spike_file(str(spike_file))
     engine.write_recordings()
@@ -280,7 +280,7 @@ def test_written_spikes_match_the_recorded_ones(tmp_path):
 def test_a_topology_constructor_splits_the_edges_into_shares(tmp_path):
     lems = write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms")
     adjacency = spc.random_fixed_outdegree(4, 5, 3)
-    engine = spc.SpikeEngine(lems, adjacency, ["syn", "otherSyn"], synapse_proportions=[3.0, 1.0],
+    engine = spc.Spike_Engine(lems, adjacency, ["syn", "otherSyn"], synapse_proportions=[3.0, 1.0],
                              connection_weight=2.0, connection_delay_seconds=1e-3)
 
     weights = engine.weights
@@ -292,13 +292,13 @@ def test_a_topology_constructor_splits_the_edges_into_shares(tmp_path):
     assert weights.get_edge_delay_ticks(0, adjacency[0][0]) == 10
 
     with pytest.raises(RuntimeError, match="noSuchSynapse"):
-        spc.SpikeEngine(lems, adjacency, "noSuchSynapse")
+        spc.Spike_Engine(lems, adjacency, "noSuchSynapse")
 
 
-# ── WeightMatrix ────────────────────────────────────────────────────────────────
+# ── Weight_Matrix ────────────────────────────────────────────────────────────────
 
 def test_weight_matrix_reads_every_plane(tmp_path):
-    engine = spc.SpikeEngine(write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms"))
+    engine = spc.Spike_Engine(write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms"))
     weights = engine.weights
 
     assert weights.get(0, 1) == pytest.approx(0.25)
@@ -321,10 +321,10 @@ def test_weight_matrix_reads_every_plane(tmp_path):
 
 
 def test_weight_matrix_updates_and_refits(tmp_path):
-    engine = spc.SpikeEngine(write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms"))
+    engine = spc.Spike_Engine(write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms"))
     weights = engine.weights
-    assert spc.WeightMatrix.DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION == pytest.approx(0.2)
-    assert spc.WeightMatrix.PLANE_FIT_STALL_WINDOW_SWEEP_COUNT == 10
+    assert spc.Weight_Matrix.DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION == pytest.approx(0.2)
+    assert spc.Weight_Matrix.PLANE_FIT_STALL_WINDOW_SWEEP_COUNT == 10
 
     weights.accumulate_edge_delta(weights.WEIGHT_PLANE, 0, 1, 0.5)
     assert weights.get(0, 1) == pytest.approx(0.75)
@@ -344,11 +344,11 @@ def test_weight_matrix_updates_and_refits(tmp_path):
 
 
 def test_refit_settings(tmp_path):
-    engine = spc.SpikeEngine(write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms"))
+    engine = spc.Spike_Engine(write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms"))
     assert engine.refit_occupancy_threshold_fraction == pytest.approx(0.2)
     assert engine.minimum_ticks_between_refits == 1000
-    assert engine.fit_tolerance == pytest.approx(spc.SpikeEngine.FIT_TOLERANCE_STANDARD)
-    assert spc.SpikeEngine.FIT_TOLERANCE_PRECISE < spc.SpikeEngine.FIT_TOLERANCE_STANDARD
+    assert engine.fit_tolerance == pytest.approx(spc.Spike_Engine.FIT_TOLERANCE_STANDARD)
+    assert spc.Spike_Engine.FIT_TOLERANCE_PRECISE < spc.Spike_Engine.FIT_TOLERANCE_STANDARD
 
     engine.set_refit_occupancy_threshold_fraction(0.5)
     assert engine.weights.sparse_delta_capacity == engine.weights.delta_capacity_for_threshold(0.5)
@@ -359,20 +359,20 @@ def test_refit_settings(tmp_path):
 def test_spire_files_round_trip(tmp_path):
     frames = np.arange(12, dtype=np.float32).reshape(4, 3)
     raw_path = str(tmp_path / "raw.spire")
-    writer = spc.SpireWriter(raw_path, 3)
+    writer = spc.Spire_Writer(raw_path, 3)
     for frame in frames:
         writer.write_frame(frame)
     del writer
     assert np.array_equal(spc.read_spire_recording(raw_path), frames)
 
-    reader = spc.SpireReader(raw_path)
+    reader = spc.Spire_Reader(raw_path)
     assert reader.neuron_count == 3
     assert np.array_equal(reader.read_frame(), frames[0])
 
     compressed_path = str(tmp_path / "frames.spire.gz")
-    recorder = spc.SimulationRecorder(compressed_path, 3)
+    recorder = spc.Simulation_Recorder(compressed_path, 3)
     for frame in frames:
         recorder.record_frame(frame)
     recorder.finish()
     assert np.array_equal(spc.read_spire_recording(compressed_path), frames)
-    assert spc.resolve_spire_compression(compressed_path)[0] == spc.SpireCompression.Gzip
+    assert spc.resolve_spire_compression(compressed_path)[0] == spc.Spire_Compression.Gzip

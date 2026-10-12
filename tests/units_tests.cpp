@@ -3,8 +3,8 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/types.h"
-#include "spikecorec/core/units.h"
+#include "types.h"
+#include "units.h"
 
 using namespace std;
 using namespace spikecorec;
@@ -12,8 +12,8 @@ using namespace spikecorec::units;
 
 namespace {
 
-constexpr f64 NOT_A_NUMBER = numeric_limits<f64>::quiet_NaN();
-constexpr f64 INFINITE = numeric_limits<f64>::infinity();
+constexpr f64 NOT_A_NUMBER = Numeric_Limits<f64>::quiet_NaN();
+constexpr f64 INFINITE = Numeric_Limits<f64>::infinity();
 
 } // namespace
 
@@ -43,21 +43,21 @@ TEST(TickConversion, a_zero_duration_is_zero_ticks) {
 
 TEST(TickConversion, a_step_that_is_not_positive_and_finite_throws) {
     for (f64 step : {0.0, -0.1, NOT_A_NUMBER, INFINITE}) {
-        EXPECT_THROW(ms_to_ticks(10.0, step), invalid_argument) << "step " << step;
-        EXPECT_THROW(seconds_to_ticks(1.0, step), invalid_argument) << "step " << step;
+        EXPECT_THROW(ms_to_ticks(10.0, step), Invalid_Argument) << "step " << step;
+        EXPECT_THROW(seconds_to_ticks(1.0, step), Invalid_Argument) << "step " << step;
     }
 }
 
 TEST(TickConversion, a_duration_that_is_negative_or_not_finite_throws) {
     for (f64 duration : {-1.0, NOT_A_NUMBER, INFINITE}) {
-        EXPECT_THROW(ms_to_ticks(duration, 0.1), invalid_argument) << "duration " << duration;
-        EXPECT_THROW(seconds_to_ticks(duration, 1e-4), invalid_argument) << "duration " << duration;
+        EXPECT_THROW(ms_to_ticks(duration, 0.1), Invalid_Argument) << "duration " << duration;
+        EXPECT_THROW(seconds_to_ticks(duration, 1e-4), Invalid_Argument) << "duration " << duration;
     }
 }
 
 TEST(TickConversion, a_tick_count_past_s64_throws) {
-    EXPECT_THROW(ms_to_ticks(1e300, 1e-300), invalid_argument);
-    EXPECT_THROW(seconds_to_ticks(1e300, 1e-30), invalid_argument);
+    EXPECT_THROW(ms_to_ticks(1e300, 1e-300), Invalid_Argument);
+    EXPECT_THROW(seconds_to_ticks(1e300, 1e-30), Invalid_Argument);
 }
 
 // ── milliseconds and seconds ────────────────────────────────────────────────────
@@ -69,8 +69,8 @@ TEST(TimeConversion, milliseconds_and_seconds_are_inverse) {
         EXPECT_DOUBLE_EQ(ms_to_seconds(seconds_to_ms(value)), value);
         EXPECT_DOUBLE_EQ(seconds_to_ms(ms_to_seconds(value)), value);
     }
-    EXPECT_THROW(ms_to_seconds(-1.0), invalid_argument);
-    EXPECT_THROW(seconds_to_ms(-1e-3), invalid_argument);
+    EXPECT_THROW(ms_to_seconds(-1.0), Invalid_Argument);
+    EXPECT_THROW(seconds_to_ms(-1e-3), Invalid_Argument);
 }
 
 // ── ticks to times ──────────────────────────────────────────────────────────────
@@ -80,18 +80,18 @@ TEST(TickToTime, spaces_ticks_evenly_over_the_duration) {
     EXPECT_DOUBLE_EQ(tick_to_ms(20000, 1000.0, 40000), 500.0);
     EXPECT_DOUBLE_EQ(tick_to_ms(40000, 1000.0, 40000), 1000.0);
     for (s64 tick : {0, 1, 123, 999}) {
-        EXPECT_NEAR(tick_to_ms(tick, 1000.0, 1000), (f64)tick, 1e-9);
-        EXPECT_NEAR(tick_to_seconds(tick, 1.0, 1000), (f64)tick * 1e-3, 1e-12);
+        EXPECT_NEAR(tick_to_ms(tick, 1000.0, 1000), static_cast<f64>(tick), 1e-9);
+        EXPECT_NEAR(tick_to_seconds(tick, 1.0, 1000), static_cast<f64>(tick) * 1e-3, 1e-12);
     }
 }
 
 TEST(TickToTime, invalid_arguments_throw) {
-    EXPECT_THROW(tick_to_ms(0, 1000.0, 0), invalid_argument);
-    EXPECT_THROW(tick_to_ms(-1, 1000.0, 1000), invalid_argument);
-    EXPECT_THROW(tick_to_ms(0, 0.0, 1000), invalid_argument);
-    EXPECT_THROW(tick_to_seconds(0, 1.0, 0), invalid_argument);
-    EXPECT_THROW(tick_to_seconds(-1, 1.0, 1000), invalid_argument);
-    EXPECT_THROW(tick_to_seconds(0, -1.0, 1000), invalid_argument);
+    EXPECT_THROW(tick_to_ms(0, 1000.0, 0), Invalid_Argument);
+    EXPECT_THROW(tick_to_ms(-1, 1000.0, 1000), Invalid_Argument);
+    EXPECT_THROW(tick_to_ms(0, 0.0, 1000), Invalid_Argument);
+    EXPECT_THROW(tick_to_seconds(0, 1.0, 0), Invalid_Argument);
+    EXPECT_THROW(tick_to_seconds(-1, 1.0, 1000), Invalid_Argument);
+    EXPECT_THROW(tick_to_seconds(0, -1.0, 1000), Invalid_Argument);
 }
 
 // ── quantities ──────────────────────────────────────────────────────────────────

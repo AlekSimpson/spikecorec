@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "spikecorec/core/backend.h"
+#include "backend.h"
 
 using namespace spikecorec;
 

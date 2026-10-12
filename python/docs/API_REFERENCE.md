@@ -48,17 +48,17 @@ spc.square_torus(3)[0]      # [1, 2, 3, 6]
 
 ---
 
-## `SpikeEngine`
+## `Spike_Engine`
 
 ### Constructors
 
 ```python
-SpikeEngine(lems_input_file, enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD)
+Spike_Engine(lems_input_file, enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD)
 ```
 Everything comes from the document, connectivity included.
 
 ```python
-SpikeEngine(lems_input_file, adjacency, synapse_component_id,
+Spike_Engine(lems_input_file, adjacency, synapse_component_id,
             connection_weight=1.0, connection_delay_seconds=0.0,
             enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD)
 ```
@@ -67,7 +67,7 @@ targets. Every edge carries the named synapse, `connection_weight` and
 `connection_delay_seconds`.
 
 ```python
-SpikeEngine(lems_input_file, adjacency, synapse_component_ids, synapse_proportions=[],
+Spike_Engine(lems_input_file, adjacency, synapse_component_ids, synapse_proportions=[],
             connection_weight=1.0, connection_delay_seconds=0.0,
             enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD)
 ```
@@ -86,7 +86,7 @@ uses dynamics the engine does not simulate (it names the ComponentType and why).
 updates yet, so it changes nothing; the engine logs a warning saying so.
 
 ```python
-engine = spc.SpikeEngine("LEMS_torus.xml", spc.square_torus(5),
+engine = spc.Spike_Engine("LEMS_torus.xml", spc.square_torus(5),
                          ["excitatorySynapse", "inhibitorySynapse"],
                          synapse_proportions=[0.8, 0.2],
                          connection_delay_seconds=1e-3)
@@ -97,12 +97,12 @@ engine = spc.SpikeEngine("LEMS_torus.xml", spc.square_torus(5),
 | name | type | meaning |
 |---|---|---|
 | `context` | `nml.NML_Context` | the parsed model, by reference. Don't call `parse()` or `reset()` on it |
-| `weights` | `WeightMatrix` | every per-edge value, by reference |
+| `weights` | `Weight_Matrix` | every per-edge value, by reference |
 | `total_neuron_count` | int | neurons across all populations |
 | `lifetime` | int | ticks in the run |
 | `step_dt` | float | seconds per tick |
 | `simulation_seed` | int | the document's seed, `0` when it names none |
-| `random_generator` | `nml.RandomGenerator` | draws every `random()` the run calls, seeded with `simulation_seed`, by reference |
+| `random_generator` | `nml.Random_Generator` | draws every `random()` the run calls, seeded with `simulation_seed`, by reference |
 | `random_values_count` | int | slots in `random_values`: one per `random()` call per neuron that runs it |
 | `spike_history_row_count` | int | rows in the spike-history ring |
 | `alive` | bool | constructed and not shut down |
@@ -120,7 +120,7 @@ engine = spc.SpikeEngine("LEMS_torus.xml", spc.square_torus(5),
 ### Weight-matrix fit and refit settings
 
 The weight matrix is fitted once at construction and refit during a run. A refit folds the
-updates in S (see `WeightMatrix`) into the basis and empties S. Refits happen after a tick's
+updates in S (see `Weight_Matrix`) into the basis and empties S. Refits happen after a tick's
 updates are merged, when either trigger fires and the last refit was at least
 `minimum_ticks_between_refits` ago.
 
@@ -141,7 +141,7 @@ A tighter tolerance costs rank (memory) and fitting time. A delay stays on its e
 while `tolerance * delay < 0.5` ticks.
 
 ```python
-engine.fit_tolerance = spc.SpikeEngine.FIT_TOLERANCE_ACCURATE   # for every later refit
+engine.fit_tolerance = spc.Spike_Engine.FIT_TOLERANCE_ACCURATE   # for every later refit
 engine.refit_occupancy_threshold_fraction = 0.5                 # S resized to half the edges per plane
 engine.minimum_ticks_between_refits = 2000
 ```
@@ -219,7 +219,7 @@ target cell, with its own weight and its own copy of the input's state.
 |---|---|---|
 | `spike_counts_per_neuron` | int64[neurons] | spikes per neuron so far |
 | `recorded_spikes` | (float64[], int64[]) | `(time_seconds, neuron_index)`, parallel arrays over every spike so far |
-| `traced_selections` | list[`RecordingSelection`] | the document's `OutputColumn`s, one per column of `recorded_traces` |
+| `traced_selections` | list[`Recording_Selection`] | the document's `OutputColumn`s, one per column of `recorded_traces` |
 | `recorded_trace_times` | float64[] | seconds |
 | `recorded_traces` | float32[ticks][selections] | |
 | `mean_firing_rate_hertz()` | float | spikes per neuron per second |
@@ -248,7 +248,7 @@ Releases the GPU buffers. The destructor calls it too.
 
 ---
 
-## `WeightMatrix`
+## `Weight_Matrix`
 
 Reached as `engine.weights`. Every per-edge value of the network's synapses (its weight,
 its delay in ticks, and each of its LEMS state variables) is one **plane**. Planes are
@@ -267,7 +267,7 @@ exactly as it is.
 |---|---|---|
 | `WEIGHT_PLANE` | `0` | |
 | `DELAY_PLANE` | `1` | in ticks |
-| `FIRST_STATE_VARIABLE_PLANE` | `2` | the synapse type's StateVariables follow, in order; see `SpikeEngine.synapse_state_variable_plane` |
+| `FIRST_STATE_VARIABLE_PLANE` | `2` | the synapse type's StateVariables follow, in order; see `Spike_Engine.synapse_state_variable_plane` |
 | `LANE_GROUP` | `4` | the rank is always a multiple of this |
 | `DEFAULT_FIT_TOLERANCE` | `1e-3` | |
 | `DEFAULT_FIT_RIDGE` | `1e-4` | ridge regularization of a refit |
@@ -283,11 +283,11 @@ exactly as it is.
 | `matrix_count` | int | planes: weight, delay, then the largest synapse type's state variables |
 | `updated_plane_count` | int | planes the kernel updates each tick |
 | `rank`, `rank_float4_stride` | int | lanes in the basis, and lanes / 4 |
-| `fit_tolerance` | float | the tolerance refits run to (read/write; the engine sets it from `SpikeEngine.fit_tolerance` before each refit it runs) |
+| `fit_tolerance` | float | the tolerance refits run to (read/write; the engine sets it from `Spike_Engine.fit_tolerance` before each refit it runs) |
 | `measured_fit_error` | list[float] | per plane, the worst relative error the last fit left |
 | `worst_fit_error()` | float | the worst of those |
 | `check_indexing` | bool | read/write |
-| `k2tree` | `K2Tree` | by reference |
+| `k2tree` | `K2_Tree` | by reference |
 
 ### The basis, copied out
 
@@ -312,7 +312,7 @@ exactly as it is.
 | `get_predecessors(node_index)` | int32[]: every source of an edge into node_index |
 | `neighbor_weights()` | float32[total_edge_count]: the weight plane, by ordinal |
 | `neighbor_weights_for_matrix(matrix_index)` | float32[total_edge_count]: any plane, by ordinal |
-| `neighbor_weight_stats()` | `WeightStats` of the weight plane |
+| `neighbor_weight_stats()` | `Weight_Stats` of the weight plane |
 | `check_index_inbounds(source, target)`, `check_index_inbounds(node_index)` | bool |
 
 ```python
@@ -354,7 +354,7 @@ Merges the updates the kernel queued into S, growing S if a plane would overflow
 Fits the basis to basis + S, starting from the current basis, until every plane meets
 `fit_tolerance`, adding lanes when the current rank cannot. Then empties S.
 
-#### `scale_neighbor_weights_to_root_mean_square(target_root_mean_square, epsilon=1e-12) -> ScaleResult`
+#### `scale_neighbor_weights_to_root_mean_square(target_root_mean_square, epsilon=1e-12) -> Scale_Result`
 Scales the weight plane (its coefficient row and its updates) to a target RMS.
 
 ```python
@@ -369,14 +369,14 @@ w.sparse_delta_entry_count       # [0, 0, 0, 0]
 The basis and S; the k²-tree is not saved, so a load goes into a matrix over the same
 network, and must match its node and plane counts.
 
-### `WeightStats` and `ScaleResult`
+### `Weight_Stats` and `Scale_Result`
 
-`WeightStats`: `mean`, `standard_deviation`, `root_mean_square`, `min_value`,
-`max_value`. `ScaleResult`: `target_root_mean_square`, `scale_factor`, `before`, `after`.
+`Weight_Stats`: `mean`, `standard_deviation`, `root_mean_square`, `min_value`,
+`max_value`. `Scale_Result`: `target_root_mean_square`, `scale_factor`, `before`, `after`.
 
 ---
 
-## `K2Tree`
+## `K2_Tree`
 
 Reached as `engine.weights.k2tree`: which (source, target) pairs are edges.
 
@@ -410,22 +410,22 @@ context.parse("LEMS_model.xml")      # no GPU involved
 | `parse(main_filepath)` | parses the document, everything it includes and the standard library it names |
 | `reset()` | empties the context |
 | `validate_lems_schema(lems_filepath)` | XSD-validates a NeuroML document (a LEMS root passes unchecked); errors in `last_schema_validation_errors` |
-| `simulation` | `NML_SimulationContext` |
-| `component_types` | dict[str, `NML_ComponentType`], the standard library's included |
-| `component_instances` | dict[str, `NML_ComponentInstance`], keyed by full path such as `"network/cells"` |
-| `model_units` | dict[str, `units.UnitDefinition`] |
+| `simulation` | `NML_Simulation_Context` |
+| `component_types` | dict[str, `NML_Component_Type`], the standard library's included |
+| `component_instances` | dict[str, `NML_Component_Instance`], keyed by full path such as `"network/cells"` |
+| `model_units` | dict[str, `units.Unit_Definition`] |
 | `model_constants` | dict[str, float], SI |
 | `document_roots`, `main_document_root` | the parsed XML trees (`NML_Node`) |
 | `document_filepaths`, `target_component_id` | |
 | `STANDARD_LIBRARY_PATH`, `NML_SCHEMA_PATH` | baked in at build time |
-| `find_instance(instance_id)` | `NML_ComponentInstance` or `None` |
+| `find_instance(instance_id)` | `NML_Component_Instance` or `None` |
 | `is_instance_of(instance, type_name)` | whether its type is `type_name` or extends it |
 | `resolve_quantity(value)` | `"-60mV"` → `-0.06`, with the document's own units |
 | `resolve_path(path, current=None)` | a LEMS path relative to the target network, such as `"cells[0]/v"`, → its `cell_state` index, or `-1` |
 | `neuron_index_of(cell_memory_index)` | the neuron whose cell holds that index, or `-1` |
 | `get_cell_state_size()`, `get_population_size(population)`, `get_cell_variable_count(cell_instance_index)` | |
 
-### `NML_SimulationContext`
+### `NML_Simulation_Context`
 
 | name | meaning |
 |---|---|
@@ -436,32 +436,32 @@ context.parse("LEMS_model.xml")      # no GPU involved
 | `random_seed` | int or `None` |
 | `population_base_indices` | dict: population path → where its cells start in `cell_state` |
 | `global_constants` | dict[str, float] |
-| `cell_instances` | list[`NML_ComponentInstance`] |
-| `synapse_instances` | list[`NML_ComponentInstance`], in prototype order: an edge's prototype is its index here |
-| `network_data` | `AdjacencyList` |
-| `input_profiles` | list[`SimulationInputConfig`] |
-| `recording_profiles` | list[`RecordingConfig`] |
+| `cell_instances` | list[`NML_Component_Instance`] |
+| `synapse_instances` | list[`NML_Component_Instance`], in prototype order: an edge's prototype is its index here |
+| `network_data` | `Adjacency_List` |
+| `input_profiles` | list[`Simulation_Input_Config`] |
+| `recording_profiles` | list[`Recording_Config`] |
 
-### `NML_ComponentType`
+### `NML_Component_Type`
 
-`name`, `extends` (`NML_ComponentType` or `None`), `source_file`, `source_node`
-(`NML_Node`), `dynamics` (list of `NML_DynamicsExpression`), `structure` (list of
-`NML_StructureEntry`, from the nearest `<Structure>` in the `extends` chain), `state_variable_names`
+`name`, `extends` (`NML_Component_Type` or `None`), `source_file`, `source_node`
+(`NML_Node`), `dynamics` (list of `NML_Dynamics_Expression`), `structure` (list of
+`NML_Structure_Entry`, from the nearest `<Structure>` in the `extends` chain), `state_variable_names`
 (inherited first; for a synapse these are its per-edge planes, in order), and
 `find_declaration(namespace_key)`, which searches up the `extends` chain and returns an
 `NML_Node` or `None`.
 
-### `NML_ComponentInstance`
+### `NML_Component_Instance`
 
 `id`, `instance_data` (attributes, verbatim), `data_order` (child ids, in source order),
 `parent_instance`, `component_type`, `has_value(key)`, `value_or(key, fallback="")`.
 
-### `NML_DynamicsExpression`
+### `NML_Dynamics_Expression`
 
-One `<Dynamics>` entry: `source_tag` (`NML_DeclarationType`), `target`, `expression`,
+One `<Dynamics>` entry: `source_tag` (`NML_Declaration_Type`), `target`, `expression`,
 `regime_name`, `condition`, `select`, `reduce`.
 
-### `NML_StructureEntry`
+### `NML_Structure_Entry`
 
 One `<Structure>` entry: `source_tag` (`ChildInstance`, `With` or `EventConnection`),
 `component` (ChildInstance), `instance` and `alias` (With), `source` and `target` (the
@@ -470,7 +470,7 @@ aliases in its `from=` and `to=`), `receiver`, `source_port` and `target_port` (
 ### `NML_Node` and `NML_Tag`
 
 A parsed XML element: `NML_Node.body` is its `NML_Tag` and `NML_Node.children` its element
-children. `NML_Tag` has `tag_name`, `tag_type` (`NML_DeclarationType`), `attributes`,
+children. `NML_Tag` has `tag_name`, `tag_type` (`NML_Declaration_Type`), `attributes`,
 `has_attribute(name)`, `get_attribute(name)`, `get_attribute_or(name, fallback)`,
 `namespace_key()` and `is_declaration_type()`.
 
@@ -478,10 +478,10 @@ children. `NML_Tag` has `tag_name`, `tag_type` (`NML_DeclarationType`), `attribu
 
 | class | members |
 |---|---|
-| `AdjacencyList` | `list` (one list of `NML_NetworkEdge` per source), `in_network(node_index)`, `is_parent(parent, prospective_child)`, `len()`, `edge_arrays()` → dict of parallel arrays `parent`, `child`, `weight`, `delay_ticks`, `component_id` |
-| `NML_NetworkEdge` | `component_id`, `weight`, `delay_ticks`, `parent`, `child` |
-| `SimulationInputConfig` | `input_component_id`, `targets` |
-| `InputTarget` | `neuron_index` (cell-memory index), `weight` |
+| `Adjacency_List` | `list` (one list of `NML_Network_Edge` per source), `in_network(node_index)`, `is_parent(parent, prospective_child)`, `len()`, `edge_arrays()` → dict of parallel arrays `parent`, `child`, `weight`, `delay_ticks`, `component_id` |
+| `NML_Network_Edge` | `component_id`, `weight`, `delay_ticks`, `parent`, `child` |
+| `Simulation_Input_Config` | `input_component_id`, `targets` |
+| `Input_Target` | `neuron_index` (cell-memory index), `weight` |
 
 ### Functions
 
@@ -493,13 +493,13 @@ children. `NML_Tag` has `tag_name`, `tag_type` (`NML_DeclarationType`), `attribu
 | `starting_values(context, cell, random_generator=None)` | the same plus each state variable's starting value (OnStart, else 0); an OnStart that calls `random()` draws from `random_generator` |
 | `spike_history_length(context)` | rows in the engine's spike-history ring |
 | `evaluate_lems(expression, values, owner_name="python", random_generator=None)` | a LEMS expression's value; every name it reads must be in `values`, and `random()` draws from `random_generator` |
-| `tokenize_lems(expression, owner_name="python")` | list of `LemsExpressionToken` (`lexeme`, `kind`: `LemsExpressionToken.Kind`) |
-| `output_format_for_filename(filename)` | `OutputFileFormat` |
+| `tokenize_lems(expression, owner_name="python")` | list of `Lems_Expression_Token` (`lexeme`, `kind`: `Lems_Expression_Token.Kind`) |
+| `output_format_for_filename(filename)` | `Output_File_Format` |
 
-### `RandomGenerator`
+### `Random_Generator`
 
 Random values from built-in distributions, from one `std::mt19937_64` engine.
-`RandomGenerator(seed=0)`.
+`Random_Generator(seed=0)`.
 
 | method | result |
 |---|---|
@@ -508,7 +508,7 @@ Random values from built-in distributions, from one `std::mt19937_64` engine.
 | `exponential(rate)` | exponential with that rate |
 | `poisson(mean)` | Poisson count |
 
-`NML_DeclarationType` enumerates the LEMS declaration tags (`Parameter`, `StateVariable`,
+`NML_Declaration_Type` enumerates the LEMS declaration tags (`Parameter`, `StateVariable`,
 `TimeDerivative`, `OnEvent`, ..., `NOT_A_TYPE`).
 
 ```python
@@ -523,7 +523,7 @@ for population in nml.network_populations(engine.context):
 
 | name | meaning |
 |---|---|
-| `UnitDefinition` | `scale`, `offset`: SI value = written value * scale + offset |
+| `Unit_Definition` | `scale`, `offset`: SI value = written value * scale + offset |
 | `parse_quantity(value)` | `"-60mV"` → `-0.06`, built-in units only |
 | `split_quantity(value)` | `"-60mV"` → `(-60.0, "mV")` |
 | `unit_suffix_scale(suffix)` | `"mV"` → `1e-3`; unknown suffixes scale by 1 |
@@ -542,14 +542,14 @@ A 4-byte big-endian neuron count, then native float32 frames, optionally compres
 | name | meaning |
 |---|---|
 | `read_spire_recording(filename)` | float32[frames][neurons]; compression from the extension |
-| `SpireWriter(filename, neuron_count)` | uncompressed writer: `write_frame(array)` (length must be `neuron_count`), `neuron_count` |
-| `SpireReader(filename)` | uncompressed reader: `read_frame()` → array or `None` at the end, `neuron_count` |
-| `SimulationRecorder(filename, neuron_count, compression="auto", compression_level=None, compression_async=False, queue_max=8, chunk_bytes=4194304)` | buffered, optionally compressed writer: `record_frame(array)`, `finish()`, `neuron_count` |
-| `SpireCompression` | `None_`, `Gzip`, `Xz`, `Bz2` |
-| `resolve_spire_compression(filename, requested="auto")` | `(SpireCompression, filename)`; `"auto"` reads the extension (`.gz`, `.xz`, `.bz2`) |
+| `Spire_Writer(filename, neuron_count)` | uncompressed writer: `write_frame(array)` (length must be `neuron_count`), `neuron_count` |
+| `Spire_Reader(filename)` | uncompressed reader: `read_frame()` → array or `None` at the end, `neuron_count` |
+| `Simulation_Recorder(filename, neuron_count, compression="auto", compression_level=None, compression_async=False, queue_max=8, chunk_bytes=4194304)` | buffered, optionally compressed writer: `record_frame(array)`, `finish()`, `neuron_count` |
+| `Spire_Compression` | `None_`, `Gzip`, `Xz`, `Bz2` |
+| `resolve_spire_compression(filename, requested="auto")` | `(Spire_Compression, filename)`; `"auto"` reads the extension (`.gz`, `.xz`, `.bz2`) |
 
 ```python
-recorder = spc.SimulationRecorder("out.spire.xz", engine.total_neuron_count)
+recorder = spc.Simulation_Recorder("out.spire.xz", engine.total_neuron_count)
 for tick in range(engine.lifetime):
     engine.step_simulation(tick)
     if tick % 5 == 0:
@@ -563,23 +563,23 @@ What the parser read from the document's `OutputFile` / `EventOutputFile` elemen
 
 | class | members |
 |---|---|
-| `RecordingConfig` | `output_filenames`, `file_output_format`, `selections`, `recordings_count`, `DEFAULT_MAX_LOG_BYTES` |
-| `RecordingSelection` | `quantity_path` (e.g. `"pop1[0]/v"`), `variable_name`, `event_port`, `neuron_index` |
-| `OutputFileFormat` | `SPIRE`, `SPIREGZIP`, `SPIREBZ2`, `SPIREXZ`, `SPIKE_EVENTS`, `NML_STANDARD` |
+| `Recording_Config` | `output_filenames`, `file_output_format`, `selections`, `recordings_count`, `DEFAULT_MAX_LOG_BYTES` |
+| `Recording_Selection` | `quantity_path` (e.g. `"pop1[0]/v"`), `variable_name`, `event_port`, `neuron_index` |
+| `Output_File_Format` | `SPIRE`, `SPIREGZIP`, `SPIREBZ2`, `SPIREXZ`, `SPIKE_EVENTS`, `NML_STANDARD` |
 
 ---
 
 ## Not exposed
 
-- **The GPU backend, raw device pointers and the kernel code generator** (`EngineBackend`,
-  `EnginePointer`, `Codegen`, the kernel AST and its parser). They need the engine's GPU
-  context. The generated kernel is readable as `SpikeEngine.master_kernel_source`.
-- **Constructing a `WeightMatrix` or `K2Tree` from Python, or
-  `WeightMatrix.declare_projections`.** Both need the GPU backend, and re-declaring an
+- **The GPU backend, raw device pointers and the kernel code generator** (`Engine_Backend`,
+  `Engine_Pointer`, `Codegen`, the kernel AST and its parser). They need the engine's GPU
+  context. The generated kernel is readable as `Spike_Engine.master_kernel_source`.
+- **Constructing a `Weight_Matrix` or `K2_Tree` from Python, or
+  `Weight_Matrix.declare_projections`.** Both need the GPU backend, and re-declaring an
   engine's matrix would leave the kernel's copy of the projection runs stale.
 - **The parser's internal stages** (`parse_component_types`, `create_component_instance`
   and the rest), which `parse()` runs in order. On their own they leave a half-built context.
-- **The `.spire` byte-stream plumbing** (`SpireSink`, `SpireSource`, `AsyncSpireWriter`), which
-  `SimulationRecorder` wraps.
+- **The `.spire` byte-stream plumbing** (`Spire_Sink`, `Spire_Source`, `Async_Spire_Writer`), which
+  `Simulation_Recorder` wraps.
 - **`plasticity_learning_rate`, `plasticity_l2_regularization` and
   `plasticity_iterations`.** Nothing in the engine reads them yet.

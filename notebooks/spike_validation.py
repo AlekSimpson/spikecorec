@@ -7,7 +7,7 @@ per-neuron spike times (last_spiked) and the recorded membrane-potential trace
 to confirm the network produced spikes (rather than sitting at its resting
 potential the whole time).
 """
-from spikecorec import SpikeEngine
+from spikecorec import Spike_Engine
 import spikecorec as spc
 import numpy as np
 import os
@@ -18,7 +18,7 @@ side_length = 4
 lifetime = 10
 
 network = spc.small_world_torus(side_length, seed=seed)
-engine = SpikeEngine(
+engine = Spike_Engine(
     network,
     [side_length, side_length],
     rank=1,

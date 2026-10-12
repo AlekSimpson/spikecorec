@@ -169,7 +169,7 @@ Each slide only uses ideas introduced on earlier ones.
 - Docs: `python/docs/README.md` (guide) and `python/docs/API_REFERENCE.md` (every name)
 
 ### Slide 15: Your first simulation
-- `engine = spc.SpikeEngine("examples/models/LEMS_single_cell.xml")`
+- `engine = spc.Spike_Engine("examples/models/LEMS_single_cell.xml")`
 - `engine.run()` runs every tick the document declares
 - `engine.mean_firing_rate_hertz()`, `engine.read_state_variable(0, "v")` (volts)
 - `engine.shutdown()` frees the GPU memory
@@ -191,7 +191,7 @@ Each slide only uses ideas introduced on earlier ones.
 
 ### Slide 18: Networks from Python
 - Writing one XML element per connection does not scale; pass an adjacency list instead
-- `SpikeEngine(lems_file, adjacency, "chainSynapse", connection_weight=1.0, connection_delay_seconds=1e-3)`
+- `Spike_Engine(lems_file, adjacency, "chainSynapse", connection_weight=1.0, connection_delay_seconds=1e-3)`
 - `adjacency[source]` lists that neuron's targets; the document only declares cells, synapses
   and stimulus
 - Three-cell chain A→B→C: first spikes at 20.0, 26.6 and 33.2 ms
@@ -225,7 +225,7 @@ Each slide only uses ideas introduced on earlier ones.
 - `engine.write_spike_file("spikes.dat")` writes `time<TAB>neuron` lines
 - `spc.read_spire_recording(path)` returns a `(frames, neurons)` array
 - `examples/video_utils.py`: `render_membrane_video(...)` makes an mp4 with traces
-- For custom loops: `spc.SimulationRecorder`, `SpireWriter` and `SpireReader`
+- For custom loops: `spc.Simulation_Recorder`, `Spire_Writer` and `Spire_Reader`
 
 ### Slide 23: Inspecting the model: `spikecorec.nml`
 - `engine.context` is the parsed model the engine was built from
@@ -272,7 +272,7 @@ Each slide only uses ideas introduced on earlier ones.
 
 ### Slide 28: How accurate is the compression?
 - The fit is made to a stated tolerance: the worst relative error allowed on any value
-- Presets on `SpikeEngine`: `FIT_TOLERANCE_PRECISE` (1e-5), `ACCURATE` (1e-4), `STANDARD`
+- Presets on `Spike_Engine`: `FIT_TOLERANCE_PRECISE` (1e-5), `ACCURATE` (1e-4), `STANDARD`
   (1e-3, the default), `COMPACT` (1e-2)
 - Tighter means more memory and longer fitting
 - Delays stay on their exact tick while tolerance × delay is under half a tick: up to 500

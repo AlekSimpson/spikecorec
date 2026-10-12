@@ -77,21 +77,21 @@ builds a single test runner binary and immediately executes it. The recipe fails
 and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple):
 
     # All tests in a suite
-    ./build/test_runner_metal --gtest_filter='K2Tree.*'
-    ./build/test_runner_metal --gtest_filter='WeightMatrix.*'
-    ./build/test_runner_metal --gtest_filter='SpikeEngine.*'
+    ./build/test_runner_metal --gtest_filter='K2_Tree.*'
+    ./build/test_runner_metal --gtest_filter='Weight_Matrix.*'
+    ./build/test_runner_metal --gtest_filter='Spike_Engine.*'
 
     # One specific test
-    ./build/test_runner_metal --gtest_filter='SpikeEngine.spike_fanout'
+    ./build/test_runner_metal --gtest_filter='Spike_Engine.spike_fanout'
 
     # Multiple suites
-    ./build/test_runner_metal --gtest_filter='K2Tree.*:WeightMatrix.*'
+    ./build/test_runner_metal --gtest_filter='K2_Tree.*:Weight_Matrix.*'
 
     # Wildcard on test name across all suites
     ./build/test_runner_metal --gtest_filter='*.save_load'
 
     # Negate — run everything except one suite
-    ./build/test_runner_metal --gtest_filter='-AsyncSpireWriter.*'
+    ./build/test_runner_metal --gtest_filter='-Async_Spire_Writer.*'
 
     # List all test names without running them
     ./build/test_runner_metal --gtest_list_tests
@@ -101,13 +101,13 @@ and use `--gtest_filter=SUITE.TEST` (shell-glob patterns, `:` separates multiple
 | Suite | File | What it covers |
 |---|---|---|
 | `Backend` | `engine_tests.cpp` | Type sizes, `GpuPointer` alloc/move |
-| `SpikeEngine` | `engine_tests.cpp`, `recording_tests.cpp` | Construction, step loop, reset, reservoir features, input guards, bifurcation scaling, decay path, spike propagation, plasticity, recording |
-| `K2Tree` | `k2tree_tests.cpp` | Adjacency queries, batch ops, bounds, save/load, invalid branching factor |
+| `Spike_Engine` | `engine_tests.cpp`, `recording_tests.cpp` | Construction, step loop, reset, reservoir features, input guards, bifurcation scaling, decay path, spike propagation, plasticity, recording |
+| `K2_Tree` | `k2tree_tests.cpp` | Adjacency queries, batch ops, bounds, save/load, invalid branching factor |
 | `SpireCodec` | `recording_tests.cpp` | Raw roundtrip, compression codecs, zero-frame file, header overflow, truncation error |
-| `AsyncSpireWriter` | `recording_tests.cpp` | Backpressure, unbounded queue, no re-entry after error |
-| `SimulationRecorder` | `recording_tests.cpp` | Frame-size validation |
+| `Async_Spire_Writer` | `recording_tests.cpp` | Backpressure, unbounded queue, no re-entry after error |
+| `Simulation_Recorder` | `recording_tests.cpp` | Frame-size validation |
 | `Topologies` | `topology_tests.cpp` | `square_torus`, `small_world_torus`, `random_fixed_outdegree` — basic and edge cases |
-| `WeightMatrix` | `weight_matrix_tests.cpp` | Construction, constant/random weights, stats, scaling, neighbor queries, bounds, update, save/load |
+| `Weight_Matrix` | `weight_matrix_tests.cpp` | Construction, constant/random weights, stats, scaling, neighbor queries, bounds, update, save/load |
 
 ### Examples
 

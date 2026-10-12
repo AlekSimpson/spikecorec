@@ -72,31 +72,32 @@ if BACKEND not in ("cuda", "metal"):
     raise ValueError(f"SPIKECOREC_BACKEND must be 'cuda' or 'metal', got '{BACKEND}'")
 
 # ── Common settings ──────────────────────────────────────────
-INC = ["include", pybind11.get_include(), "third_party/spdlog/include"]
+INC = ["src", "src/spikecorec/core", "src/spikecorec/nml", "src/spikecorec/cuda", "src/spikecorec/metal",
+       pybind11.get_include(), "third_party/spdlog/include"]
 SRCS = [
-    "src/bindings/bindings.cpp",
-    "src/core/backend.cpp",
-    "src/core/engine.cpp",
-    "src/core/k2tree.cpp",
-    "src/core/log.cpp",
-    "src/core/recording.cpp",
-    "src/core/topologies.cpp",
-    "src/core/types.cpp",
-    "src/core/units.cpp",
-    "src/core/weight_matrix.cpp",
+    "src/spikecorec/bindings/bindings.cpp",
+    "src/spikecorec/core/backend.cpp",
+    "src/spikecorec/core/engine.cpp",
+    "src/spikecorec/core/k2tree.cpp",
+    "src/spikecorec/core/log.cpp",
+    "src/spikecorec/core/recording.cpp",
+    "src/spikecorec/core/topologies.cpp",
+    "src/spikecorec/core/types.cpp",
+    "src/spikecorec/core/units.cpp",
+    "src/spikecorec/core/weight_matrix.cpp",
     # engine.cpp calls into the NML front-end and the kernel codegen, so both have to be
     # in the extension or it fails to link.
-    "src/nml/components.cpp",
-    "src/nml/dynamics.cpp",
-    "src/nml/kernel_boilerplate.cpp",
-    "src/nml/kernel_parser.cpp",
-    "src/nml/kernel_tokenizer.cpp",
-    "src/nml/lems_parser.cpp",
-    "src/nml/lems_tokenizer.cpp",
-    "src/nml/node.cpp",
-    "src/nml/parser.cpp",
-    "src/nml/random_generator.cpp",
-    "src/nml/utilities.cpp",
+    "src/spikecorec/nml/components.cpp",
+    "src/spikecorec/nml/dynamics.cpp",
+    "src/spikecorec/nml/kernel_boilerplate.cpp",
+    "src/spikecorec/nml/kernel_parser.cpp",
+    "src/spikecorec/nml/kernel_tokenizer.cpp",
+    "src/spikecorec/nml/lems_parser.cpp",
+    "src/spikecorec/nml/lems_tokenizer.cpp",
+    "src/spikecorec/nml/node.cpp",
+    "src/spikecorec/nml/parser.cpp",
+    "src/spikecorec/nml/random_generator.cpp",
+    "src/spikecorec/nml/utilities.cpp",
 ]
 EXTRA_COMPILE_ARGS = ["-std=c++17", "-O2"]
 EXTRA_LINK_ARGS = []
@@ -105,7 +106,7 @@ DEFINE_MACROS = [("SPDLOG_ACTIVE_LEVEL", "SPDLOG_LEVEL_TRACE")]  # spdlog is hea
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ──────────────
 # Mirrors the Makefile's HAS_ZLIB/HAS_LZMA/HAS_BZ2 probing: query pkg-config
 # for cflags/libs and define SPIKECOREC_HAVE_* only when found. Missing
-# libraries degrade gracefully — SpireWriter/Reader throw a clear
+# libraries degrade gracefully — Spire_Writer/Reader throw a clear
 # runtime_error for compressed variants whose library wasn't available here.
 for _macro, _package in (
     ("SPIKECOREC_HAVE_ZLIB", "zlib"),
@@ -161,7 +162,7 @@ if BACKEND == "cuda":
 elif BACKEND == "metal":
     if not _is_mac:
         raise RuntimeError("Metal backend requires macOS.")
-    SRCS.append("src/metal/metal_cpp_impl.cpp")
+    SRCS.append("src/spikecorec/metal/metal_cpp_impl.cpp")
     INC.append("third_party/metal-cpp")
     EXTRA_LINK_ARGS += [
         "-framework", "Metal",
@@ -175,7 +176,7 @@ elif BACKEND == "metal":
 # compile-time defines rather than as a search: the NeuroML standard library, without
 # which every document resolves to zero known ComponentTypes and so to zero neurons; the
 # NeuroML XSD, which validate_lems_schema checks a NeuroML document against; and
-# src/metal, whose k2tree_device.metalinc is parsed into every generated kernel.
+# src/spikecorec/metal, whose k2tree_device.metalinc is parsed into every generated kernel.
 #
 # The Makefile passes all three, and an extension built without them is not obviously
 # broken: it imports and constructs cleanly, then reports that the model declares no
@@ -190,7 +191,7 @@ DEFINE_MACROS.append(
 if BACKEND == "metal":
     DEFINE_MACROS.append(
         ("SPIKECOREC_METAL_DEVICE_DIR",
-         '"' + os.path.join(_source_root, "src", "metal") + '"'))
+         '"' + os.path.join(_source_root, "src", "spikecorec", "metal") + '"'))
 
 # ── Extension ────────────────────────────────────────────────
 ext = Extension(

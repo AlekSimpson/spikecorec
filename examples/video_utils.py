@@ -4,7 +4,7 @@ This is the one module a demo imports. Everything else a demo needs is written o
 the demo's own function, so each one reads top to bottom without following a call into
 another file.
 
-A .spire file is what SpikeEngine.record_membrane_video() writes: a 4-byte big-endian
+A .spire file is what Spike_Engine.record_membrane_video() writes: a 4-byte big-endian
 neuron count, then one frame per recorded tick, each frame being `neuron_count` native
 float32 membrane potentials. render_membrane_video() turns that into an animation of the
 population as a grid, one cell per neuron, with membrane traces and a spike raster
