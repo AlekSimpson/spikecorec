@@ -86,7 +86,6 @@ static const Unordered_Map<Engine_Datatype, u64> TYPE_ALIGNMENTS = {
 
 #ifdef SPIKECOREC_METAL
 
-// @note:
 
 struct Engine_Backend {
     // Metal wants a 256-byte offset for a buffer bound to a `constant` kernel parameter,

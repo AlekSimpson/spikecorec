@@ -271,6 +271,77 @@ that is 128 MB.
 Every connection carries the planes of the largest synapse type in the model. In
 `pynn_poisson_network`, the `expCurrSynapse` connections carry a fourth plane they never use.
 
+## E. Outside the tick loop
+
+Items 30–32 were added on 2026-10-12 by the resilience review (`docs/resilience_review.md`), at
+commit `04d1b3d`. Unlike the items above, they were measured.
+
+### 30. Per-neuron lookups rescan the network (medium)
+
+Several host helpers look up a neuron's population or memory index by rescanning the network's
+children. `get_population_size` also recounts a population's `<instance>` children on every call.
+Each lookup is O(N), and they are called once per neuron or once per input target, so the helpers
+are O(N²):
+- `state_variable_array`;
+- the setup for `record_membrane_video`;
+- engine construction.
+
+The documented `Simulation_Recorder` example calls `state_variable_array` every 5 ticks. At 4000
+cells one call costs about 60 ticks of GPU time.
+
+- **Location:**
+  - `src/spikecorec/core/engine.cpp:346-376` (`population_of_neuron`, `cell_memory_index_of`);
+  - `src/spikecorec/nml/dynamics.cpp:366-376` (`network_populations`);
+  - `src/spikecorec/nml/parser.cpp:1065-1091` (`neuron_index_of`, `get_population_size`), called
+    per input target at `dynamics.cpp:676`.
+- **Measured:** times in ms; ticks stay at about 2.7 ms throughout.
+
+  | Model | Measured | 500 | 1000 | 2000 | 4000 cells |
+  |---|---|---|---|---|---|
+  | One `explicitInput` per cell | `state_variable_array` | 2.4 | 10 | 43 | 181 |
+  | | Construction | 39 | 68 | 185 | 666 |
+  | `populationList` population | `state_variable_array` | 1.7 | 7.7 | 35 | 158 |
+  | Plain population | `state_variable_array` | 0.1–0.3 | | | |
+
+  `parse()` alone is also quadratic in the number of `explicitInput`s: 0.28 s at 4000 inputs and
+  2.6 s at 12,000. That cause was not traced.
+
+### 31. The projection scan is quadratic in the number of connections (medium)
+
+`fit_basis_from_projections` runs a linear `find` over every distinct value combination seen so
+far, once per projection run. That is O(runs × distinct). The 256-lane check runs only after the
+whole scan. With per-connection values (one run per connection, as `build_weight_matrix`
+produces), it therefore makes about E²/2 vector comparisons before giving up.
+
+- **Location:** `src/spikecorec/core/weight_matrix.cpp:858-870`.
+- **Measured:**
+
+  | Connections | Scan time | Share of `declare_projections` |
+  |---|---|---|
+  | 10,240 | 0.025 s | 14% |
+  | 40,960 | 0.31 s | 49% |
+  | 163,840 | 5.6 s | 86% |
+
+  For the last row, the fit itself took 0.86 s. Extrapolated to the 204,800-connection benchmark,
+  the scan takes about 9 s. That is the construction time `docs/weight_matrix_status.md`
+  (limitation 6) attributes to the fewer-lanes sweeps.
+
+### 32. The k²-tree build briefly uses about 60× the finished tree's memory (medium)
+
+`K2_Tree::from_adjacency_list` keeps an `Unordered_Map<u64, s32>` entry per non-empty block per
+level. It also stores every tree bit as an `s32` in a growing vector before packing. Peak memory
+during the build is about 400–530 bytes per connection, against 6–8 bytes per connection in the
+finished tree. This caps the size of network that can be built at all.
+
+- **Location:** `src/spikecorec/core/k2tree.cpp:187-225`.
+- **Measured** (`random_fixed_outdegree`, out-degree 10):
+
+  | Connections | Build time | Finished tree | Peak memory growth |
+  |---|---|---|---|
+  | 100k | 0.025 s | 0.5 MB | 34 MB |
+  | 1M | 0.7 s | 7.5 MB | 395 MB |
+  | 2.5M | 2.9 s | 21 MB | 1328 MB |
+
 ## Where to start
 
 - **Kernel:** items 1, 2, 3, 4 and 7, done together. That is: fetch each connection's data once,
