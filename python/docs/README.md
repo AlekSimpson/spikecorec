@@ -141,13 +141,14 @@ for tick in range(engine.lifetime):
         trace.append(engine.read_state_variable(0, "v"))
 ```
 
-Pass a monotonically increasing tick; the engine uses it for the spike-history ring and
-the refractory gate. Reading state copies from the GPU, so sample, don't read every tick.
+Ticks run one at a time, in order from 0: the tick must be `engine.ticks_stepped`, or
+`step_simulation` raises. Reading state copies from the GPU, so sample, don't read every tick.
 
 ## The parsed model
 
-`engine.context` is the model the engine was built from. `nml.NML_Context` parses one on
-its own, with no GPU.
+`engine.context` is the model the engine was built from; its per-edge list
+(`simulation.network_data`) is released once the engine is built, since `engine.weights` holds
+every edge. `nml.NML_Context` parses a model on its own, with no GPU.
 
 ```python
 from spikecorec import nml
@@ -181,13 +182,18 @@ w.neighbor_weights_for_matrix(plane)                       # the synapse's I on 
 w.measured_fit_error                                       # per plane, what the fit cost
 ```
 
-The basis trades a measured accuracy for storage. Fits and refits run until every plane is
-within `engine.fit_tolerance`; `Spike_Engine.FIT_TOLERANCE_PRECISE`, `_ACCURATE`,
-`_STANDARD` (the default, `1e-3`) and `_COMPACT` are presets.
+The basis trades accuracy for memory. At construction each plane gets a fixed number of
+lanes, the fewest that hold its values within `engine.fit_tolerance` plus some room for change,
+so a wider tolerance means fewer lanes and less memory. Planes that start at zero (synapse
+state) are sized from a short calibration that spikes every neuron once.
+`Spike_Engine.FIT_TOLERANCE_PRECISE`, `_ACCURATE`, `_STANDARD` (the default, `1e-3`) and
+`_COMPACT` are presets.
 
-During a run, synapse state changes every tick and the changes go into S. Once the fullest
-plane of S holds updates on `refit_occupancy_threshold_fraction` of the edges, the engine
-refits and empties S. That fraction is also the size S is kept at.
+During a run, synapse state changes and the changes go into S. Once the fullest plane of S
+holds updates on `refit_occupancy_threshold_fraction` of the edges, the engine refits and
+empties S. A refit keeps each plane's lanes and is fairly accurate rather than exact: one that
+misses the tolerance logs a warning and the run goes on. S is sized for that fraction of the
+edges in each plane the kernel updates.
 
 ```python
 engine.refit_occupancy_threshold_fraction = 0.5    # default 0.2; resizes S now
@@ -242,8 +248,7 @@ spc.Spike_Engine("LEMS_refused.xml", [[1], []], "conductanceSynapse")
 ## Tutorial
 
 `examples/notebooks/01_tutorial_getting_started.py` is the tutorial in jupytext format:
-`jupytext --to ipynb 01_tutorial_getting_started.py`. `examples/notebooks/demo.ipynb`
-renders videos of four models.
+`jupytext --to ipynb 01_tutorial_getting_started.py`.
 
 ## Logging
 

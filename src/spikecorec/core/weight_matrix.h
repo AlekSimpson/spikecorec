@@ -14,8 +14,9 @@ using namespace std;
 
 namespace spikecorec {
 
-    // The lane limit, in float4s (256 lanes). Nothing that runs needs it; see the lane-limit
-    // footnote in docs/resilience_review.md.
+    // The lane limit, in float4s (256 lanes). It once sized fixed arrays in kernels that are now
+    // gone, and nothing that runs needs it; raising it costs memory (U and V each grow by
+    // node_count * lanes * 4 bytes) and fit time.
     #define MAX_RANK_FLOAT4_STRIDE 64
 
     struct Weight_Stats {
@@ -160,15 +161,24 @@ namespace spikecorec {
         // Worst relative error a fit may leave; fits add lanes to a plane until they meet it.
         f32 fit_tolerance = DEFAULT_FIT_TOLERANCE;
 
-        // The candidate declare_runs and refit use.
-        Fit_Method fit_method = Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO;
+        // The candidate refits use: masked alternating least squares by default, since it keeps no
+        // quasi-Newton history, so a refit during a run needs far less scratch.
+        Fit_Method fit_method = Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES;
+
+        // The candidate the lane searches use (declare_runs and calibrate_lane_budget), which set
+        // each plane's lanes and so the runtime footprint: limited-memory BFGS by default, which
+        // holds a plane's values on fewer lanes. They run while the matrix is built, not during a run.
+        Fit_Method lane_search_fit_method = Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO;
 
         // The expected fraction of edges whose values change between refits, from 0 to 1: the
         // estimate of the network's activity that sizes each plane's lane budget. declare_runs gives
         // a plane the fewest lanes that hold its starting values within fit_tolerance, times
-        // (1 + this fraction); a plane that starts at zero gets the largest such count of any
-        // plane, times the same. The budgets never change after that.
-        static constexpr f32 DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION = 0.5f;
+        // (1 + this fraction); a plane that starts at zero gets the same from its calibration values
+        // (calibrate_lane_budget) or, without them, from its first values at its first refit. The
+        // budgets never change after that.
+        // By default the refit threshold: a refit is due once that fraction of the edges hold updates,
+        // so about that many change between refits.
+        static constexpr f32 DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION = DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION;
         f32 expected_active_edge_fraction = DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION;
 
         // ── runs (structure of arrays, parallel) ──────────────────────────────────
@@ -277,6 +287,24 @@ namespace spikecorec {
         // Merges the device's queued updates into S, summing per edge and dropping entries of exactly
         // zero, including those the device zeroed in place. S grows rather than overflow.
         void compact_pending_deltas();
+
+        // ── calibration ─────────────────────────────────────────────────────────
+        // Planes that hold no lanes yet: those that started at zero, waiting for their lane budget.
+        [[nodiscard]] Vector<s64> planes_awaiting_lane_budget() const;
+
+        // One plane's updates in S, as (edge ordinal, delta) by ordinal, and their sum of squares.
+        [[nodiscard]] Vector<Pair<s64, f32>> plane_updates(s64 matrix_index) const;
+        [[nodiscard]] f64 plane_update_sum_of_squares(s64 matrix_index) const;
+
+        // Sets the lane budget of a plane that holds no lanes, from values it is expected to hold
+        // (calibration_values, one per edge): the fewest lanes, searched with lane_search_fit_method,
+        // that hold them within fit_tolerance, times one plus expected_active_edge_fraction, within
+        // what lane_cap leaves after the other planes. The plane keeps the fitted V rows and zero U,
+        // so it reads exactly zero until its first refit, which starts from those rows.
+        void calibrate_lane_budget(s64 matrix_index, const Vector<f32> &calibration_values);
+
+        // Empties S and the queue, dropping every update, and shrinks S to occupancy_threshold_fraction.
+        void discard_updates(f32 occupancy_threshold_fraction);
 
         // Refits each plane that has updates to the basis plus S with fit_method, then empties S.
         // A plane changes only its own lanes, starting from them and moving only the rows at either
@@ -402,11 +430,11 @@ namespace spikecorec {
             Engine_Pointer slab;
         };
 
-        // Each edge's ends and each node's edges out and in, as the fits read them. All u32: the
-        // k^2-tree's 32-bit indices keep the edge count below 2^31.
+        // Each edge's target and each node's edges out and in, as the fits read them; an edge's
+        // source is found from outgoing_offset by binary search, so no array of sources is kept. All
+        // u32: the k^2-tree's 32-bit indices keep the edge count below 2^31.
         struct Fit_Graph {
             Unique_Pointer<Fit_Scratch> storage;
-            Engine_Pointer edge_source;      // [total_edge_count]
             Engine_Pointer edge_target;      // [total_edge_count]
             Engine_Pointer outgoing_offset;  // [node_count + 1]: node n's edges are ordinals [n] up to [n + 1]
             Engine_Pointer incoming_offset;  // [node_count + 1]: node n's incoming edges are incoming_edge[[n] up to [n + 1]]
@@ -497,21 +525,26 @@ namespace spikecorec {
         // keeps the fit with the smallest error. With a required_lane_count above zero it fits at
         // exactly that many lanes instead. The probes work outside the basis, which takes only the
         // chosen lanes.
+        // A lane_limit above zero caps the lanes the search may use.
         Plane_Fit_Result search_fewest_lanes(s64 matrix_index, const Vector<f32> &targets, const Fit_Graph &graph,
                                              f32 ridge_regularization, f32 search_tolerance,
-                                             s64 required_lane_count = 0);
+                                             s64 required_lane_count = 0, s64 lane_limit = 0);
 
         // Refit: fits the plane within its lane budget. From its current lanes, moving only the
         // rows at either end of a changed edge; from fresh rows, moving every row, when its lanes
-        // hold nothing yet (a plane that started at zero).
+        // hold nothing. A plane with no lanes yet (one that started at zero) gets its budget here,
+        // once, from the first values it holds: the fewest lanes that meet fit_tolerance, times one
+        // plus expected_active_edge_fraction, within what lane_cap leaves after the other planes.
         Plane_Fit_Result refit_plane(s64 matrix_index, const Vector<f32> &targets,
                                      const Vector<s64> &changed_edge_ordinals, const Fit_Graph &graph,
                                      f32 ridge_regularization);
 
         // Construction: frees every lane, searches every plane with starting values for its fewest
         // lanes, sets each plane's lane budget (see expected_active_edge_fraction), cuts the largest
-        // budgets first while together they would pass lane_cap, and gives every plane its budget,
-        // fitting again any plane cut below its fewest lanes. Returns whether every plane meets
+        // budgets first while together they would pass lane_cap, and gives every plane with values
+        // its budget, fitting again any plane cut below its fewest lanes. A plane that starts at zero
+        // takes no lanes: it counts for the largest budget in the cut, which keeps room under the
+        // cap, and gets its own budget at its first refit. Returns whether every plane meets
         // fit_tolerance.
         // plane_targets(m) gives plane m's value at every edge; it is called once per use, so only
         // one plane's values are held at a time.

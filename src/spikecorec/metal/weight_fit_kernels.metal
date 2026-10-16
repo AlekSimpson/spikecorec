@@ -3,7 +3,7 @@ using namespace metal;
 
 // Kernels for Weight_Matrix's two candidate fits (masked alternating least squares and limited-
 // memory BFGS). A fit works on one plane's own lanes, copied out of U and V into dense working
-// arrays [node][lane_count]. Edge e runs from edge_source[e] to edge_target[e]; the plane's own
+// arrays [node][lane_count]. Edge e runs from source_of_edge(e) to edge_target[e]; the plane's own
 // lanes must hold residual_target[e] there (NaN for a value no basis can hold), and
 // edge_weight_of(residual_target[e]) scales its squared error.
 //
@@ -31,6 +31,22 @@ inline float edge_weight_of(float target) {
 // The target the lanes are fitted to: a non-finite one counts as zero, with no weight.
 inline float held_target(float target) {
     return is_not_finite(target) ? 0.0f : target;
+}
+
+// The source of an edge: the row whose ordinals hold it, found by binary search of the row
+// offsets, since no array of edge sources is kept.
+inline uint source_of_edge(const device uint *outgoing_offset, uint node_count, uint edge) {
+    uint low = 0;
+    uint high = node_count;
+    while (low + 1 < high) {
+        uint middle = low + (high - low) / 2;
+        if (outgoing_offset[middle] <= edge) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
 }
 
 // The threadgroup's sum of one value per thread; valid in the threadgroup's first thread.
@@ -75,16 +91,17 @@ inline float threadgroup_maximum(float value, threadgroup float *scratch, uint s
 kernel void fit_edge_residual_kernel(
     const device float *working_u             [[ buffer(0) ]],
     const device float *working_v             [[ buffer(1) ]],
-    const device uint  *edge_source           [[ buffer(2) ]],
+    const device uint  *outgoing_offset       [[ buffer(2) ]],
     const device uint  *edge_target           [[ buffer(3) ]],
     const device uint  *touched_edges         [[ buffer(4) ]],
     const device float *residual_target       [[ buffer(5) ]],
     constant uint      &touched_edge_count    [[ buffer(6) ]],
     constant uint      &every_edge_is_touched [[ buffer(7) ]],
     constant uint      &lane_count            [[ buffer(8) ]],
-    device float       *weighted_residual     [[ buffer(9) ]],
-    device float       *group_loss            [[ buffer(10) ]],
-    device float       *group_worst_error     [[ buffer(11) ]],
+    constant uint      &node_count            [[ buffer(9) ]],
+    device float       *weighted_residual     [[ buffer(10) ]],
+    device float       *group_loss            [[ buffer(11) ]],
+    device float       *group_worst_error     [[ buffer(12) ]],
     uint thread_id        [[ thread_position_in_grid ]],
     uint grid_size        [[ threads_per_grid ]],
     uint group_id         [[ threadgroup_position_in_grid ]],
@@ -97,7 +114,8 @@ kernel void fit_edge_residual_kernel(
     float worst_error = 0.0f;
     for (uint index = thread_id; index < touched_edge_count; index += grid_size) {
         uint edge = (every_edge_is_touched != 0u) ? index : touched_edges[index];
-        const device float *source_row = working_u + static_cast<ulong>(edge_source[edge]) * lane_count;
+        const device float *source_row =
+            working_u + static_cast<ulong>(source_of_edge(outgoing_offset, node_count, edge)) * lane_count;
         const device float *target_row = working_v + static_cast<ulong>(edge_target[edge]) * lane_count;
         float value = 0.0f;
         for (uint lane = 0; lane < lane_count; ++lane) {
@@ -127,19 +145,27 @@ kernel void fit_edge_residual_kernel(
 }
 
 // ── fit_row_solve ─────────────────────────────────────────────────────────────
-// Masked alternating least squares, one thread per row of one side: the row x minimizing its
-// edges' weighted squared error plus ridge * |x|^2, given the other side's rows. That is the
-// least squares problem [W^(1/2) A; ridge^(1/2) I] x = [W^(1/2) b; 0], with one row of A (the
-// other end's row) and of b (the target) per edge. It is solved by QR: R starts as
-// ridge^(1/2) I, and Givens rotations fold each edge's row into R and Q^T b in turn; then R x =
-// Q^T b by back substitution. QR never forms A^T A, so it keeps its accuracy on the nearly
+// Masked alternating least squares, one SIMD group of FIT_ROW_SOLVE_THREADS_PER_ROW threads per row
+// of one side: the row x minimizing its edges' weighted squared error plus ridge * |x|^2, given the
+// other side's rows. That is the least squares problem [W^(1/2) A; ridge^(1/2) I] x = [W^(1/2) b; 0],
+// with one row of A (the other end's row) and of b (the target) per edge. It is solved by QR: R
+// starts as ridge^(1/2) I, and Givens rotations fold each edge's row into R and Q^T b in turn; then
+// R x = Q^T b by back substitution. QR never forms A^T A, so it keeps its accuracy on the nearly
 // singular rows of structured networks, where f32 normal equations lose it.
 //
-// Row thread_id is rows[first_row + thread_id]; its edges are edge_offset[row] up to
-// edge_offset[row + 1], as ordinals when edges_are_listed is 0 and as positions in edge_list
-// otherwise. R (lane_count^2), Q^T b and the edge row being folded (lane_count each) live in
-// device scratch, element a of thread t at a * row_count + t, so neighbouring threads touch
-// neighbouring floats. A row whose R has a zero on its diagonal is left as it was.
+// Every thread of the group computes each rotation, from the same values, and applies it to its
+// own columns (column c belongs to thread c % FIT_ROW_SOLVE_THREADS_PER_ROW); the back
+// substitution's sums are split the same way. Apple GPUs run SIMD groups of 32 threads, so a group
+// is one row.
+//
+// Row slot s is rows[first_row + s]; its edges are edge_offset[row] up to edge_offset[row + 1], as
+// ordinals when edges_are_listed is 0 and as positions in edge_list otherwise; the other end is the
+// edge's target for the first and its source for the second. Slot s keeps R
+// (lane_count^2, row-major), Q^T b and the edge row being folded (lane_count each) in device
+// scratch at s * lane_count^2 and s * 2 * lane_count. A row whose R has a zero on its diagonal is
+// left as it was.
+constant uint FIT_ROW_SOLVE_THREADS_PER_ROW = 32;
+
 kernel void fit_row_solve_kernel(
     device float       *solved_side         [[ buffer(0) ]],
     const device float *fixed_side          [[ buffer(1) ]],
@@ -149,82 +175,100 @@ kernel void fit_row_solve_kernel(
     const device uint  *edge_offset         [[ buffer(5) ]],
     const device uint  *edge_list           [[ buffer(6) ]],
     constant uint      &edges_are_listed    [[ buffer(7) ]],
-    const device uint  *other_end           [[ buffer(8) ]],
-    const device float *residual_target     [[ buffer(9) ]],
-    constant uint      &lane_count          [[ buffer(10) ]],
-    constant float     &ridge               [[ buffer(11) ]],
-    device float       *triangle_scratch    [[ buffer(12) ]],
-    device float       *vector_scratch      [[ buffer(13) ]],
+    const device uint  *edge_target         [[ buffer(8) ]],
+    const device uint  *outgoing_offset     [[ buffer(9) ]],
+    constant uint      &node_count          [[ buffer(10) ]],
+    const device float *residual_target     [[ buffer(11) ]],
+    constant uint      &lane_count          [[ buffer(12) ]],
+    constant float     &ridge               [[ buffer(13) ]],
+    device float       *triangle_scratch    [[ buffer(14) ]],
+    device float       *vector_scratch      [[ buffer(15) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
-    if (thread_id >= row_count) {
+    uint slot = thread_id / FIT_ROW_SOLVE_THREADS_PER_ROW;
+    uint column_thread = thread_id % FIT_ROW_SOLVE_THREADS_PER_ROW;
+    if (slot >= row_count) {
         return;
     }
-    uint row = rows[first_row + thread_id];
-    ulong stride = static_cast<ulong>(row_count);
-    device float *triangle = triangle_scratch + thread_id;               // R, row-major lane_count x lane_count
-    device float *projected = vector_scratch + thread_id;                // Q^T b
-    device float *edge_row = vector_scratch + static_cast<ulong>(lane_count) * stride + thread_id;
+    uint row = rows[first_row + slot];
+    device float *triangle = triangle_scratch + static_cast<ulong>(slot) * lane_count * lane_count;
+    device float *projected = vector_scratch + static_cast<ulong>(slot) * 2 * lane_count;   // Q^T b
+    device float *edge_row = projected + lane_count;
 
     float root_ridge = sqrt(ridge);
     for (uint first = 0; first < lane_count; ++first) {
-        projected[first * stride] = 0.0f;
-        for (uint second = first; second < lane_count; ++second) {
-            triangle[(static_cast<ulong>(first) * lane_count + second) * stride] = (first == second) ? root_ridge : 0.0f;
+        for (uint second = column_thread; second < lane_count; second += FIT_ROW_SOLVE_THREADS_PER_ROW) {
+            triangle[first * lane_count + second] = (first == second) ? root_ridge : 0.0f;
         }
     }
+    for (uint lane = column_thread; lane < lane_count; lane += FIT_ROW_SOLVE_THREADS_PER_ROW) {
+        projected[lane] = 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_device);
 
     for (uint position = edge_offset[row]; position < edge_offset[row + 1]; ++position) {
         uint edge = (edges_are_listed != 0u) ? edge_list[position] : position;
-        const device float *other_row = fixed_side + static_cast<ulong>(other_end[edge]) * lane_count;
+        uint other_end = (edges_are_listed != 0u) ? source_of_edge(outgoing_offset, node_count, edge) : edge_target[edge];
+        const device float *other_row = fixed_side + static_cast<ulong>(other_end) * lane_count;
         float target = residual_target[edge];
         float root_weight = sqrt(edge_weight_of(target));
-        for (uint lane = 0; lane < lane_count; ++lane) {
-            edge_row[lane * stride] = root_weight * other_row[lane];
+        for (uint lane = column_thread; lane < lane_count; lane += FIT_ROW_SOLVE_THREADS_PER_ROW) {
+            edge_row[lane] = root_weight * other_row[lane];
         }
         float edge_target = root_weight * held_target(target);
+        simdgroup_barrier(mem_flags::mem_device);
 
-        // Rotate the edge's row into R one column at a time, zeroing it.
+        // Rotate the edge's row into R one column at a time, zeroing it. Every thread reads the
+        // pivot's values before thread 0 writes the pivot's diagonal and Q^T b entry.
         for (uint pivot = 0; pivot < lane_count; ++pivot) {
-            float incoming = edge_row[pivot * stride];
+            float incoming = edge_row[pivot];
             if (incoming == 0.0f) {
                 continue;
             }
-            device float *pivot_row = triangle + (static_cast<ulong>(pivot) * lane_count) * stride;
-            float diagonal = pivot_row[pivot * stride];
+            device float *pivot_row = triangle + pivot * lane_count;
+            float diagonal = pivot_row[pivot];
             float radius = sqrt(diagonal * diagonal + incoming * incoming);
             float cosine = diagonal / radius;
             float sine = incoming / radius;
-            pivot_row[pivot * stride] = radius;
-            for (uint column = pivot + 1; column < lane_count; ++column) {
-                float kept = pivot_row[column * stride];
-                float folded = edge_row[column * stride];
-                pivot_row[column * stride] = cosine * kept + sine * folded;
-                edge_row[column * stride] = cosine * folded - sine * kept;
+            for (uint column = pivot + 1 + column_thread; column < lane_count; column += FIT_ROW_SOLVE_THREADS_PER_ROW) {
+                float kept = pivot_row[column];
+                float folded = edge_row[column];
+                pivot_row[column] = cosine * kept + sine * folded;
+                edge_row[column] = cosine * folded - sine * kept;
             }
-            float kept_target = projected[pivot * stride];
-            projected[pivot * stride] = cosine * kept_target + sine * edge_target;
+            float kept_target = projected[pivot];
+            float rotated_target = cosine * kept_target + sine * edge_target;
             edge_target = cosine * edge_target - sine * kept_target;
+            simdgroup_barrier(mem_flags::mem_device);
+            if (column_thread == 0) {
+                pivot_row[pivot] = radius;
+                projected[pivot] = rotated_target;
+            }
+            simdgroup_barrier(mem_flags::mem_device);
         }
     }
 
-    // R x = Q^T b, in place in projected.
+    // R x = Q^T b, in place in projected: each row's sum is split over the group's threads.
     for (uint countdown = lane_count; countdown > 0; --countdown) {
         uint first = countdown - 1;
-        float diagonal = triangle[(static_cast<ulong>(first) * lane_count + first) * stride];
+        float diagonal = triangle[first * lane_count + first];
         if (!(diagonal != 0.0f) || is_not_finite(diagonal)) {
             return;
         }
-        float sum = projected[first * stride];
-        for (uint inner = first + 1; inner < lane_count; ++inner) {
-            sum -= triangle[(static_cast<ulong>(first) * lane_count + inner) * stride] * projected[inner * stride];
+        float partial_sum = 0.0f;
+        for (uint inner = first + 1 + column_thread; inner < lane_count; inner += FIT_ROW_SOLVE_THREADS_PER_ROW) {
+            partial_sum += triangle[first * lane_count + inner] * projected[inner];
         }
-        projected[first * stride] = sum / diagonal;
+        float sum = simd_sum(partial_sum);
+        if (column_thread == 0) {
+            projected[first] = (projected[first] - sum) / diagonal;
+        }
+        simdgroup_barrier(mem_flags::mem_device);
     }
 
     device float *solved_row = solved_side + static_cast<ulong>(row) * lane_count;
-    for (uint lane = 0; lane < lane_count; ++lane) {
-        solved_row[lane] = projected[lane * stride];
+    for (uint lane = column_thread; lane < lane_count; lane += FIT_ROW_SOLVE_THREADS_PER_ROW) {
+        solved_row[lane] = projected[lane];
     }
 }
 
@@ -242,7 +286,7 @@ kernel void fit_row_gradient_kernel(
     const device uint  *outgoing_offset    [[ buffer(5) ]],
     const device uint  *incoming_offset    [[ buffer(6) ]],
     const device uint  *incoming_edge      [[ buffer(7) ]],
-    const device uint  *edge_source        [[ buffer(8) ]],
+    constant uint      &node_count         [[ buffer(8) ]],
     const device uint  *edge_target        [[ buffer(9) ]],
     const device float *weighted_residual  [[ buffer(10) ]],
     constant uint      &lane_count         [[ buffer(11) ]],
@@ -277,7 +321,8 @@ kernel void fit_row_gradient_kernel(
         } else {
             for (uint position = incoming_offset[row]; position < incoming_offset[row + 1]; ++position) {
                 uint edge = incoming_edge[position];
-                sum += weighted_residual[edge] * working_u[static_cast<ulong>(edge_source[edge]) * lane_count + lane];
+                uint source = source_of_edge(outgoing_offset, node_count, edge);
+                sum += weighted_residual[edge] * working_u[static_cast<ulong>(source) * lane_count + lane];
             }
         }
         gradient[index] = sum;

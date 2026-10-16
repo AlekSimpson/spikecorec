@@ -1,7 +1,9 @@
 # Performance review
 
-State as of 2026-10-07, branch `agent_integration_2`, commit `843fb03`. This is a read-only
-review: nothing was changed. It is based on:
+Made on 2026-10-07, branch `agent_integration_2`, commit `843fb03`, as a read-only review, and
+brought up to date on 2026-10-15: items 15, 28 and 31 were fixed and are gone, the others keep
+their numbers, and items 3, 4, 5 and 24 describe the current S and update queue. The measurements are the
+baseline from before any speed work. It is based on:
 - the generated master kernels of nine models;
 - the shared device helpers;
 - the host code that runs each tick;
@@ -52,7 +54,8 @@ What the table shows:
 - **Cells and inputs are cheap.** 10,000 neurons with their inputs but no connections take 0.18 ms per tick.
 - **Connections dominate.** Adding 200,000 connections takes the same 10,000 neurons from 0.18 ms to 4.1 ms per tick.
 - **Cost grows faster than size.** From 10,000 to 100,000 neurons the time per tick rises about 20×, not 10×. Neuron-updates per second fall from 2.5 million to 1.2 million.
-- **Construction is only fast here because every connection has the same weight**, which makes the fit trivial. Varied weights take longer to construct.
+- **Construction times predate the fit rewrite** and every connection had the same weight. With
+  per-connection values, construction now runs lane searches and calibration and takes longer.
 
 ### Models reviewed
 
@@ -89,25 +92,26 @@ The coefficients are also loaded as four scalar reads per lane instead of one ve
 
 ### 3. A binary search for every read and every write (high)
 
-`spikecorec_edge_delta_index` binary-searches the source's row of the plane's sparse update buffer.
-It runs for every `load_edge` and every `accumulate_edge`. The connection loop already visits a
-neuron's connections in the same order as that row is sorted, so a moving position per plane would
-replace every search.
+`spikecorec_edge_delta_index` binary-searches the source's row of the plane in S's pool. It runs
+for every `load_edge` and every `accumulate_edge`. The connection loop already visits a neuron's
+connections in the same order as that row is sorted, so a moving position per plane would replace
+every search.
 
-### 4. One write per state variable, and an indirect `OnEvent` (medium)
+### 4. An indirect `OnEvent` (medium)
 
-Each synapse state variable gets its own `spikecorec_accumulate_edge` per tick, each with its own
-search, and an arrival adds another write to the same plane.
+A plane's changes in one tick (its Euler step or return to rest, plus the `OnEvent` on arrival)
+are summed into one `spikecorec_accumulate_edge`, so each plane is written once per tick. The
+`OnEvent` change itself is still emitted as the new value minus the old one: `(I + weight) - I`.
+That is two extra reads that cancel out, and in 32-bit floats the subtraction loses precision when
+`I` is large. For an assignment of the form `x = x + something`, the change is just `something`.
 
-The `OnEvent` change is emitted as the new value minus the old one: `(I + weight) - I`. That is two
-extra reads that cancel out, and in 32-bit floats the subtraction loses precision when `I` is
-large. For an assignment of the form `x = x + something`, the change is just `something`.
+### 5. Global atomic counters for queued updates (medium)
 
-### 5. One global atomic counter for queued updates (medium)
-
-A connection whose update has no entry in the sparse buffer yet appends to the pending queue. Every
-append, from every thread, goes through the single `pending_delta_count` atomic, so all threads
-contend on one address.
+A connection whose update has no entry in S yet appends to the update queue. Before its walk, each
+neuron with such connections reserves room on one global counter (`pending_delta_control[1]`), and
+every append then goes through another (`pending_delta_control[0]`), so all threads contend on two
+addresses. When the queue is full, the neuron's walk waits for another pass of the tick, which
+costs a dispatch and a merge.
 
 ### 6. Synapse-type lookup per connection per tick (medium)
 
@@ -173,12 +177,6 @@ compiler may not be allowed to keep these in registers, because writes through `
 alias the reads. Loading each state variable into a local once and storing it once at the end
 avoids that.
 
-### 15. `t` recomputed at every use (low–medium)
-
-The time is recomputed with `precise::divide(tick, steps_per_second)` everywhere it appears: up to
-8 times in one Poisson source's handler, and 4 times per pulse input. It could be computed once at
-the top of the kernel.
-
 ### 16. Float division in the refractory test (low)
 
 Each neuron does one division per tick. Comparing `tick − last_spiked` against the duration
@@ -234,11 +232,11 @@ batched into one submission.
 
 ### 24. Merging updates every tick (high)
 
-`Weight_Matrix::compact_pending_deltas` runs every tick whenever synapse state changes. On each run
-it:
-- copies every entry of the sparse update buffer for every plane (`current_deltas`);
-- fully sorts each changed plane;
-- rebuilds that plane's index.
+`Weight_Matrix::compact_pending_deltas` runs after every walk pass of every tick whenever synapse
+state changes. On each run it:
+- copies every entry of S, for every plane (`current_deltas`);
+- fully sorts each plane;
+- rebuilds the whole pool and every plane's row starts.
 
 That is O(S log S) work on the CPU per tick, with S up to about 90% of connections while synapses
 are active. It is the most likely cause of the faster-than-linear growth: 84 ms per tick at
@@ -260,12 +258,6 @@ The argument list is rebuilt through map lookups and function-object calls on ev
 
 ## D. Memory
 
-### 28. Pending queue size (medium)
-
-The pending queue is sized to 2 × connections × updated planes. Each entry is 16 bytes: an `s64`
-ordinal, an `f32` value and an `s32` plane index. At 2 million connections with two state planes
-that is 128 MB.
-
 ### 29. Planes sized for the largest synapse type (low–medium)
 
 Every connection carries the planes of the largest synapse type in the model. In
@@ -273,8 +265,8 @@ Every connection carries the planes of the largest synapse type in the model. In
 
 ## E. Outside the tick loop
 
-Items 30–32 were added on 2026-10-12 by the resilience review (`docs/resilience_review.md`), at
-commit `04d1b3d`. Unlike the items above, they were measured.
+Items 30 and 32 were added on 2026-10-12 by the resilience review, at commit `04d1b3d`. Unlike
+the items above, they were measured.
 
 ### 30. Per-neuron lookups rescan the network (medium)
 
@@ -306,26 +298,6 @@ cells one call costs about 60 ticks of GPU time.
   `parse()` alone is also quadratic in the number of `explicitInput`s: 0.28 s at 4000 inputs and
   2.6 s at 12,000. That cause was not traced.
 
-### 31. The run scan is quadratic in the number of connections (medium)
-
-`fit_basis_from_connections` runs a linear `find` over every distinct value combination seen so
-far, once per run. That is O(runs × distinct). The 256-lane check runs only after the
-whole scan. With per-connection values (one run per connection, as `build_weight_matrix`
-produces), it therefore makes about E²/2 vector comparisons before giving up.
-
-- **Location:** `src/spikecorec/core/weight_matrix.cpp:858-870`.
-- **Measured:**
-
-  | Connections | Scan time | Share of `declare_runs` |
-  |---|---|---|
-  | 10,240 | 0.025 s | 14% |
-  | 40,960 | 0.31 s | 49% |
-  | 163,840 | 5.6 s | 86% |
-
-  For the last row, the fit itself took 0.86 s. Extrapolated to the 204,800-connection benchmark,
-  the scan takes about 9 s. That is the construction time `docs/weight_matrix_status.md`
-  (limitation 6) attributes to the fewer-lanes sweeps.
-
 ### 32. The k²-tree build briefly uses about 60× the finished tree's memory (medium)
 
 `K2_Tree::from_adjacency_list` keeps an `Unordered_Map<u64, s32>` entry per non-empty block per
@@ -349,6 +321,5 @@ finished tree. This caps the size of network that can be built at all.
   - Load `U[source]` once per neuron.
   - Walk the sparse update buffers with moving positions.
   - Compute every plane from one load of `V[target]`.
-  - Write each plane once.
 - **Host:** item 23 for small models and item 24 for large ones.
 - **Layout:** item 13, which affects every kernel.
