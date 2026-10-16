@@ -46,7 +46,11 @@ EX_DIR     := examples
 # directory is an include directory.
 INCLUDE_FLAGS := -I$(INC_DIR) $(addprefix -I$(SRC_DIR)/,core nml cuda metal)
 CXXFLAGS   := -std=c++17 $(OPTIMIZATION_FLAGS) -Wall -Wextra -MMD -MP $(INCLUDE_FLAGS)
-NVCCFLAGS  := -std=c++17 $(OPTIMIZATION_FLAGS) $(INCLUDE_FLAGS) --expt-relaxed-constexpr
+# The precompiled CUDA kernels (src/spikecorec/cuda/*.cu) are built for CUDA_ARCH, by default the
+# GPUs of the machine that builds them (for example sm_121 on a GB10). On a GPU they were not built
+# for they do not load, and the fits run their host versions.
+CUDA_ARCH  ?= native
+NVCCFLAGS  := -std=c++17 $(OPTIMIZATION_FLAGS) -MMD -MP $(INCLUDE_FLAGS) --expt-relaxed-constexpr -arch=$(CUDA_ARCH)
 ifeq ($(DEBUG),1)
   NVCCFLAGS += -G
 endif
@@ -209,7 +213,7 @@ $(BUILD_DIR)/nml/%.o: $(SRC_DIR)/nml/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ── CUDA objects (.cu) ───────────────────────────────────────
-# Matches nothing while src/spikecorec/cuda has no .cu files.
+# The precompiled kernels Engine_Backend::load_precompiled_function finds by name.
 $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
