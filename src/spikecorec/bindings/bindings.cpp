@@ -703,8 +703,11 @@ PYBIND11_MODULE(_spikecorec, m) {
                        "The worst relative error a fit may leave on any plane. The engine sets it "
                        "from Spike_Engine.fit_tolerance before each refit.")
         .def_readwrite("fit_method", &Weight_Matrix::fit_method,
-                       "The candidate fit declare_runs and refit use. The engine sets it from "
-                       "Spike_Engine.fit_method before each refit.")
+                       "The candidate fit refits use. The engine sets it from Spike_Engine.fit_method "
+                       "before each refit.")
+        .def_readwrite("lane_search_fit_method", &Weight_Matrix::lane_search_fit_method,
+                       "The candidate fit the lane searches use (declare_runs and calibrate_lane_budget), "
+                       "which set each plane's lanes.")
         .def_readonly("measured_fit_error", &Weight_Matrix::measured_fit_error,
                       "Per plane: the worst relative error the last fit left.")
         .def_readwrite("expected_active_edge_fraction", &Weight_Matrix::expected_active_edge_fraction,
@@ -841,6 +844,31 @@ PYBIND11_MODULE(_spikecorec, m) {
              "the next refit folds it into the basis. S grows if the plane is full.")
         .def("compact_pending_deltas", &Weight_Matrix::compact_pending_deltas,
              "Merges what the device queued into S, growing S if a plane would overflow.")
+        .def("planes_awaiting_lane_budget", &Weight_Matrix::planes_awaiting_lane_budget,
+             "Planes that hold no lanes yet: those that started at zero.")
+        .def("plane_updates", [](const Weight_Matrix &self, s64 matrix_index) {
+            const Vector<Pair<s64, f32>> updates = self.plane_updates(matrix_index);
+            Vector<s64> ordinals;
+            Vector<f32> deltas;
+            for (const Pair<s64, f32> &update : updates) {
+                ordinals.push_back(update.first);
+                deltas.push_back(update.second);
+            }
+            return py::make_tuple(to_numpy(ordinals.data(), static_cast<s64>(ordinals.size())),
+                                  to_numpy(deltas.data(), static_cast<s64>(deltas.size())));
+        }, py::arg("matrix_index"), "(edge_ordinals, deltas): one plane's updates in S, by ordinal.")
+        .def("plane_update_sum_of_squares", &Weight_Matrix::plane_update_sum_of_squares, py::arg("matrix_index"),
+             "The sum of squares of one plane's updates in S.")
+        .def("calibrate_lane_budget", [](Weight_Matrix &self, s64 matrix_index,
+                                         py::array_t<f32, py::array::c_style | py::array::forcecast> calibration_values) {
+            const Vector<f32> values(calibration_values.data(), calibration_values.data() + calibration_values.size());
+            self.calibrate_lane_budget(matrix_index, values);
+        }, py::arg("matrix_index"), py::arg("calibration_values"),
+             "Sets the lane budget of a plane with no lanes from values it is expected to hold (one per "
+             "edge), searched with lane_search_fit_method; the plane keeps the fitted V rows and reads "
+             "zero until its first refit.")
+        .def("discard_updates", &Weight_Matrix::discard_updates, py::arg("occupancy_threshold_fraction"),
+             "Empties S and the queue, dropping every update, and sizes S for the threshold.")
         .def("refit", &Weight_Matrix::refit, py::arg("ridge_regularization") = Weight_Matrix::DEFAULT_FIT_RIDGE,
              "Refits every plane with updates in S to the current values (basis plus S) with "
              "fit_method, each on lanes of its own at their current count, moving only the rows at "
@@ -874,7 +902,7 @@ PYBIND11_MODULE(_spikecorec, m) {
              py::arg("lems_input_file"),
              py::arg("enable_hebbian_plasticity") = false,
              py::arg("fit_tolerance") = Spike_Engine::FIT_TOLERANCE_STANDARD,
-             py::arg("fit_method") = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+             py::arg("fit_method") = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
              py::arg("expected_active_edge_fraction") = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION,
              "Parses a LEMS document, fills every model buffer, builds the weight matrix from its "
              "connections, and compiles the tick kernel.")
@@ -885,7 +913,7 @@ PYBIND11_MODULE(_spikecorec, m) {
              py::arg("connection_delay_seconds") = 0.0,
              py::arg("enable_hebbian_plasticity") = false,
              py::arg("fit_tolerance") = Spike_Engine::FIT_TOLERANCE_STANDARD,
-             py::arg("fit_method") = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+             py::arg("fit_method") = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
              py::arg("expected_active_edge_fraction") = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION,
              "The same, with adjacency replacing the document's connections: adjacency[source] "
              "lists source's targets, and every edge carries the named synapse, connection_weight "
@@ -900,7 +928,7 @@ PYBIND11_MODULE(_spikecorec, m) {
              py::arg("connection_delay_seconds") = 0.0,
              py::arg("enable_hebbian_plasticity") = false,
              py::arg("fit_tolerance") = Spike_Engine::FIT_TOLERANCE_STANDARD,
-             py::arg("fit_method") = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+             py::arg("fit_method") = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
              py::arg("expected_active_edge_fraction") = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION,
              "The same, with several synapses: the edges are split, in adjacency order, into one "
              "contiguous share per synapse, sized by synapse_proportions (normalised; empty means "
@@ -939,6 +967,11 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readonly("run_count", &Spike_Engine::run_count)
         .def_readonly("deferred_walk_pass_count", &Spike_Engine::deferred_walk_pass_count,
                       "Extra walk passes the run has needed because the update queue was full.")
+        .def_readonly("calibration_tick_count", &Spike_Engine::calibration_tick_count,
+                      "Ticks construction's calibration ran after a spike on every neuron to size the lane "
+                      "budgets of the planes that start at zero; 0 when none needed it.")
+        .def_readonly_static("CALIBRATION_TICK_LIMIT", &Spike_Engine::CALIBRATION_TICK_LIMIT)
+        .def_readonly_static("CALIBRATION_SPIKE_SPREAD_DIVISOR", &Spike_Engine::CALIBRATION_SPIKE_SPREAD_DIVISOR)
 
         // Weight-matrix fit and refit settings.
         .def_readonly_static("FIT_TOLERANCE_PRECISE", &Spike_Engine::FIT_TOLERANCE_PRECISE)

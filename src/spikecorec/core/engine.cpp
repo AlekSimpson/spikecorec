@@ -197,6 +197,8 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
         }
     }
 
+    calibrate_zero_start_planes();
+
     // The weight matrix and the kernel now hold every edge, and nothing reads the parsed per-edge
     // list again; at about 80 bytes an edge it would outweigh the matrix, so it is released.
     context.simulation.network_data = Adjacency_List(0, 0);
@@ -545,6 +547,30 @@ void Spike_Engine::step_simulation(s64 tick) {
                                            : "the next is " + to_string(ticks_stepped)));
     }
 
+    const bool plasticity_fold_due = hebbian_plasticity_enabled && plasticity_fold_every_n_ticks > 0 &&
+                                     (tick + 1) % plasticity_fold_every_n_ticks == 0;
+    dispatch_tick(tick, plasticity_fold_due);
+
+    // Refit between dispatches, so no kernel reads the matrix while it changes.
+    const bool refit_scheduled = refit_every_n_ticks > 0 && (tick + 1) % refit_every_n_ticks == 0;
+    const bool spaced_out = tick - last_refit_tick >= minimum_ticks_between_refits;
+    if (spaced_out && (refit_scheduled || weights.is_refit_due(refit_occupancy_threshold_fraction))) {
+        weights.fit_tolerance = fit_tolerance;
+        weights.fit_method = fit_method;
+        weights.refit();
+        last_refit_tick = tick;
+
+        if (hebbian_plasticity_enabled && plasticity_target_root_mean_square >= 0.0f) {
+            weights.scale_neighbor_weights_to_root_mean_square(plasticity_target_root_mean_square);
+        }
+        // S is empty, so resize it back to the threshold's size.
+        weights.resize_delta_capacity(weights.delta_capacity_for_threshold(refit_occupancy_threshold_fraction));
+    }
+
+    record_tick(tick);
+}
+
+void Spike_Engine::dispatch_tick(s64 tick, bool plasticity_fold_due) {
     // This tick's draw for every random() slot.
     f32 *random_value_data = random_values.get_contents_as<f32>();
     for (s64 index = 0; index < random_values_count; index += 1) {
@@ -568,8 +594,6 @@ void Spike_Engine::step_simulation(s64 tick) {
 
     // Merge the updates queued this tick into S so the next tick reads them. A neuron whose walk
     // the queue could not take walks in another pass of the tick, after a merge made room.
-    const bool plasticity_fold_due = hebbian_plasticity_enabled && plasticity_fold_every_n_ticks > 0 &&
-                                     (tick + 1) % plasticity_fold_every_n_ticks == 0;
     if (weights.updated_plane_count > 0 || plasticity_fold_due) weights.compact_pending_deltas();
     for (s64 deferred = weights.begin_next_walk_pass(); deferred > 0; deferred = weights.begin_next_walk_pass()) {
         if (!gpu.run_function(kernel_function, parameters, deferred)) {
@@ -579,24 +603,77 @@ void Spike_Engine::step_simulation(s64 tick) {
         weights.compact_pending_deltas();
         deferred_walk_pass_count += 1;
     }
+}
 
-    // Refit between dispatches, so no kernel reads the matrix while it changes.
-    const bool refit_scheduled = refit_every_n_ticks > 0 && (tick + 1) % refit_every_n_ticks == 0;
-    const bool spaced_out = tick - last_refit_tick >= minimum_ticks_between_refits;
-    if (spaced_out && (refit_scheduled || weights.is_refit_due(refit_occupancy_threshold_fraction))) {
-        weights.fit_tolerance = fit_tolerance;
-        weights.fit_method = fit_method;
-        weights.refit();
-        last_refit_tick = tick;
+void Spike_Engine::calibrate_zero_start_planes() {
+    if (weights.updated_plane_count == 0) return;
+    const Vector<s64> planes = weights.planes_awaiting_lane_budget();
+    if (planes.empty()) return;
 
-        if (hebbian_plasticity_enabled && plasticity_target_root_mean_square >= 0.0f) {
-            weights.scale_neighbor_weights_to_root_mean_square(plasticity_target_root_mean_square);
+    // Every state a tick changes lives in the model slab, S, the queue and the random generator.
+    const u8 *model_bytes = model_pointer.get_contents_as<u8>();
+    const Vector<u8> saved_model(model_bytes, model_bytes + model_pointer.total_bytes);
+    const Random_Generator saved_random_generator = random_generator;
+
+    // Every neuron spikes once, neuron n at tick (n * CALIBRATION_SPIKE_ORDER_MULTIPLIER) mod the
+    // spread: a fixed shuffle, so a spike's tick does not follow the neuron's place in the network.
+    // Each synapse then runs through its whole response: the spike reaches it after its delay, and
+    // it returns to rest once synapse_active_ticks pass. A spike is written after its tick's
+    // dispatch, which would otherwise overwrite that tick's spike row.
+    constexpr s64 CALIBRATION_SPIKE_ORDER_MULTIPLIER = 7919;
+    const s64 settle_ticks = synapse_active_ticks >= 0 ? std::min<s64>(synapse_active_ticks, CALIBRATION_TICK_LIMIT)
+                                                       : CALIBRATION_TICK_LIMIT;
+    const s64 spike_spread = std::max<s64>(1, settle_ticks / CALIBRATION_SPIKE_SPREAD_DIVISOR);
+    s64 *last_spiked_ticks = last_spiked.get_contents_as<s64>();
+    u8 *spike_rows = spike_history.get_contents_as<u8>();
+    Vector<Vector<s64>> neurons_spiking_at(static_cast<usize>(spike_spread));
+    for (s64 neuron_index = 0; neuron_index < total_neuron_count; neuron_index += 1) {
+        neurons_spiking_at[static_cast<usize>((neuron_index * CALIBRATION_SPIKE_ORDER_MULTIPLIER) % spike_spread)]
+            .push_back(neuron_index);
+    }
+    const auto force_spikes = [&](s64 tick) {
+        if (tick >= spike_spread) return;
+        const s64 row = (tick % spike_history_row_count) * total_neuron_count;
+        for (s64 neuron_index : neurons_spiking_at[static_cast<usize>(tick)]) {
+            last_spiked_ticks[neuron_index] = tick;
+            spike_rows[row + neuron_index] = 1;
         }
-        // S is empty, so resize it back to the threshold's size.
-        weights.resize_delta_capacity(weights.delta_capacity_for_threshold(refit_occupancy_threshold_fraction));
+    };
+    force_spikes(0);
+
+    // The values taken are those at the tick where the planes' updates are largest (by their sum of
+    // squares); a tick is kept when it beats the kept one by 5%, which saves copying S every tick.
+    constexpr f64 KEPT_TICK_IMPROVEMENT = 1.05;
+    const s64 tick_count = spike_spread + settle_ticks;
+    Vector<Vector<Pair<s64, f32>>> kept_updates(planes.size());
+    f64 kept_energy = 0.0;
+    s64 kept_tick = 0;
+    for (s64 tick = 1; tick <= tick_count; tick += 1) {
+        dispatch_tick(tick, false);
+        force_spikes(tick);
+        f64 energy = 0.0;
+        for (s64 plane : planes) energy += weights.plane_update_sum_of_squares(plane);
+        if (energy <= kept_energy * KEPT_TICK_IMPROVEMENT) continue;
+        kept_energy = energy;
+        kept_tick = tick;
+        for (usize index = 0; index < planes.size(); index += 1) kept_updates[index] = weights.plane_updates(planes[index]);
     }
 
-    record_tick(tick);
+    // The planes hold no lanes, so their values are their updates.
+    for (usize index = 0; index < planes.size(); index += 1) {
+        Vector<f32> calibration_values(static_cast<usize>(weights.total_edge_count), 0.0f);
+        for (const Pair<s64, f32> &update : kept_updates[index]) calibration_values[static_cast<usize>(update.first)] = update.second;
+        weights.calibrate_lane_budget(planes[index], calibration_values);
+    }
+
+    std::memcpy(model_pointer.get_contents(), saved_model.data(), saved_model.size());
+    random_generator = saved_random_generator;
+    weights.discard_updates(refit_occupancy_threshold_fraction);
+    deferred_walk_pass_count = 0;
+    calibration_tick_count = tick_count;
+    logger->debug("Spike_Engine: calibrated the lane budgets of {} planes over {} ticks after a spike on every "
+                  "neuron, spread over {} ticks, from the values at tick {}", planes.size(), tick_count, spike_spread,
+                  kept_tick);
 }
 
 void Spike_Engine::set_refit_occupancy_threshold_fraction(f32 fraction) {

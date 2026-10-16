@@ -1,9 +1,9 @@
 # spikecorec — project conventions
 
 spikecorec is a GPU spiking-neural-network **simulation engine** (Metal on macOS, CUDA elsewhere).
-Today it runs a single hardcoded leaky-integrate-and-fire (LIF) cell over a compressed adjacency
-graph. The **current major effort is a NeuroML → GPU codegen path** so the engine can
-simulate arbitrary LEMS-defined cell/synapse dynamics — see "NeuroML → GPU codegen" below.
+It simulates NeuroML/LEMS-defined point-neuron networks: codegen turns a model's cell, input and
+synapse dynamics into one GPU kernel, and the connectivity and every per-connection value are
+stored compressed (k²-tree + low-rank basis) — see "NeuroML → GPU codegen" below.
 
 ## Naming
 
@@ -19,16 +19,15 @@ simulate arbitrary LEMS-defined cell/synapse dynamics — see "NeuroML → GPU c
 
 ```
 src/spikecorec/       — include root is `src/`; headers (.h, .cuh) live beside their sources
-src/spikecorec/core/      — CPU-side logic: main loop, Engine, orchestration
-src/spikecorec/nml/       — NeuroML parsing, resolution and kernel codegen
-src/spikecorec/cuda/      — CUDA kernels (.cu) + backend interface implementation
-src/spikecorec/metal/     — Metal-cpp host code (.cpp) + GPU shader source (.metal)
+src/spikecorec/core/      — CPU-side logic: main loop, Engine, weight matrix, k²-tree, backend dispatch
+src/spikecorec/nml/       — NeuroML parsing, resolution and kernel codegen (Metal and CUDA source)
+src/spikecorec/metal/     — metal-cpp impl file, k²-tree device helpers (.metalinc), fixed kernels (.metal)
 src/spikecorec/bindings/  — pybind11 Python bindings
 python/spikecorec/    — Python package
 tests/                — C++ tests
 examples/             — example programs
 third_party/          — vendored dependencies (metal-cpp submodule)
-docs/                 — design docs (the NML codegen architecture + IR spec live here)
+docs/                 — design notes and reviews
 ```
 
 ## Architecture
@@ -36,7 +35,9 @@ docs/                 — design docs (the NML codegen architecture + IR spec li
 - `src/spikecorec/core/engine.cpp` is the **CPU-side home** — the `Spike_Engine` main loop
 - `src/spikecorec/core/backend.cpp` implements the Metal/CUDA backend dispatch (`Engine_Backend`)
 - `src/spikecorec/core/backend.h` defines the CPU↔GPU dispatch interface
-- `src/spikecorec/cuda/` and `src/spikecorec/metal/` contain GPU kernel code and the metal-cpp one-time impl file
+- `src/spikecorec/nml/` generates the simulation kernel (`master_step`) as Metal or CUDA source;
+  `src/spikecorec/metal/` holds the metal-cpp one-time impl file and the fixed Metal kernels (the
+  weight-matrix fits), each with a host fallback, which is what runs on CUDA
 - Metal host code uses **metal-cpp** (pure C++, no `.mm` / Objective-C++)
 - Backend is selected at compile time via `-DSPIKECOREC_METAL` or `-DSPIKECOREC_CUDA`
 
@@ -55,19 +56,19 @@ These are the fixed engine facts any codegen/simulation work must respect:
   `src/spikecorec/core/backend.cpp` launches any compiled function with positional arguments on both
   backends (Metal compute encoder; CUDA `cuLaunchKernel`). The CUDA path has not been run on
   hardware yet.
-- **Active-set lazy decay is only valid for LINEAR dynamics.** The active-set optimization advances
-  a skipped neuron across many ticks in one closed-form `apply_decay`. That is valid only for
-  analytically-integrable (linear) cells (all of GLIF). Nonlinear cells (izhikevich/AdEx/HH) must
-  integrate exactly one `dt` per active tick and re-enqueue while non-resting.
+- **Every cell integrates exactly one `dt` per tick** (forward Euler). Synapses run only in their
+  source's active window (`synapse_active_ticks` after its spike: the longest delay plus the
+  slowest synapse's settle time) and are set exactly back to rest when it ends.
 - **`network_inputs`** is the per-neuron synaptic input accumulator: a source scatters its weight
   into `network_inputs[target]`; the target drains it at its next step (an implicit ≥1-tick latency).
-  External stimulus is added straight into `membrane_potentials`.
+  Inputs (`explicitInput`/`inputList`) run in the kernel, in their target cell's thread, before the
+  cell's own dynamics.
 
 ## CRITICAL: U/V factorization is a memory optimization, NOT learning
 
 The `Weight_Matrix` stores adjacency weights as a low-rank factorization `W ≈ U * Vᵀ`
-(rank controlled by the `rank` constructor parameter). **This is purely a memory
-compression scheme.** Large spiking networks would require terabytes of RAM to store
+(its rank, the number of lanes, is chosen per plane by the fits within `fit_tolerance`). **This is
+purely a memory compression scheme.** Large spiking networks would require terabytes of RAM to store
 a full dense weight matrix; the U/V factorization combined with the k²-tree adjacency
 structure makes massive networks tractable.
 
@@ -81,31 +82,27 @@ individual edge weights) — it is also not task learning; it is a biological si
 feature that modifies how compressed weights evolve during a simulation run.
 
 The codegen **generalizes** this same compression to per-edge synapse state (a shared U/V
-basis + per-matrix coefficient vectors `Ck` + sparse delta buffers `Sk` + periodic refit). That generalization is **still memory compression, not learning** — the same
-invariant holds.
+basis + per-plane coefficient vectors `Ck` + a sparse update buffer S + periodic refit). That
+generalization is **still memory compression, not learning** — the same invariant holds.
 
 In short: **U/V factorization = memory savings. The engine does not train on tasks.**
 
 ## NeuroML → GPU codegen
 
-Add a NeuroML (NML/LEMS) → GPU kernel codegen path so the engine can simulate arbitrary
-LEMS-defined dynamics instead of the single hardcoded LIF cell.
+The engine simulates LEMS-defined dynamics through a codegen path; nothing is hand-written per
+model.
 
-**Codegen pipeline.** `NML + LEMS + NeuroML2CoreTypes → parse → XSD validate → resolve (units→SI,
-IDref wiring, extends/Fixed flatten) → lower to a flat ModelSpecification → per-ComponentType IR →
-runnable master kernel`. Codegen is **generic**: it emits one small IR program per ComponentType,
-never a hand-written kernel.
+**Codegen pipeline.** `LEMS + included NML + NeuroML2CoreTypes → parse → XSD validate (the main
+file) → resolve (units→SI, paths, extends) → master_step kernel → compile`. The kernel is built as
+a **kernel AST**: the fixed kernel text (`kernel_boilerplate.cpp`, one version for Metal and one
+for CUDA) is parsed into the AST, codegen translates each ComponentType's LEMS dynamics into AST
+nodes and inserts them (cells per population, their inputs, synapses in the connection walk),
+constants fixed for the run are baked in, and the AST is emitted as MSL or CUDA source. It is
+compiled once at construction with `Engine_Backend::create_function`.
 
-**The IR has two sections with different fates:**
-- **`.alloc`** — declares the model-specific engine buffers (`param`/`state`/`accum`/`peredge`/
-  `regime`/`expose`/`require`). **Interpreted by the engine at init** to size/allocate buffers; NOT
-  compiled. Base engine buffers (`network_inputs`, k²-tree, U/V basis, `last_spiked`, active set) are
-  implicit/engine-owned and never appear in `.alloc`.
-- **`.tick`** — stage-tagged single-op instructions over named operands (no registers, no expression
-  grammar). **Template-substituted to MSL/CUDA** and assembled with every other type's `.tick` into
-  **one master kernel** (dispatch per neuron by cell-type boundary), compiled once via
-  `Engine_Backend::create_function` and cached. Governing principle: IR→GPU source is near-direct template
-  substitution — each op maps to one fixed snippet.
+Cell and synapse state is never declared in the kernel: it lives in engine buffers the engine
+allocates at init (cell state per neuron; per-edge synapse state as planes of the weight matrix),
+which the kernel indexes directly.
 
 **Three phases** (each additive):
 - **Phase 1** — GLIF cells (GLIF1–GLIF5 in full) + the full synapse model (current-based,

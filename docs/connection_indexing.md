@@ -58,42 +58,52 @@ value(i→j, k) = Σ_lane  U[i, lane] · C[k, lane] · V[j, lane]
 
 The columns shared by U, V and C are the lanes. The number of lanes is the rank.
 
-## 4. Values that change during a run: S
+## 4. Values that change during a run: S and the queue
 
-Synapse state changes every tick, and the compressed tables cannot be edited for a single
-connection. Changes therefore go into S: for each plane, a list of "connection ordinal → amount
-changed".
+Synapse state changes during a run, and the compressed tables cannot be edited for a single
+connection. Changes therefore go into S, a list of "connection ordinal → amount changed":
+- **Layout:** one pool shared by every plane, plane after plane. Within a plane, entries are
+  grouped by source neuron and sorted by ordinal, so a plane without changes takes no room.
 - **Reading** a value gives the compressed value plus that connection's entry in S, if it has one.
 - **A refit** from time to time folds S back into U, V and C and empties S.
 
-On the GPU, the kernel writes its changes into a pending queue. After each tick the host merges
-that queue into S (`compact_pending_deltas`).
+On the GPU, a thread changes an entry already in S in place. A change to a connection with no
+entry yet goes into the update queue, and after each tick the host merges the queue into S
+(`compact_pending_deltas`). Before walking its connections, a neuron reserves queue room for every
+change it can make; when the queue is full, its walk runs in another pass of the same tick, after
+a merge, so no change is lost.
 
 ## 5. Where each connection came from: runs
 
 Consecutive connections with the same synapse type, weight and delay form one block of ordinals: a
-run. For each run the code stores:
+run. `declare_runs` takes, for each run:
 
-| What is stored | Field |
+| What is given | Field |
 |---|---|
 | Its first ordinal | `run_first_edge_ordinal` |
 | How many connections it has | `run_edge_count` |
 | Its synapse type | `run_synapse_prototype` |
 | Its starting values | the initial values passed to `declare_runs` |
 
-A binary search of `run_first_edge_ordinal` with a connection's ordinal finds its run, and
-from that its synapse type and starting values.
+Once the starting values are fitted, only the synapse type is needed, so neighbouring runs with
+the same type merge into one. A binary search of `run_first_edge_ordinal` with a connection's
+ordinal finds its run, and from that its synapse type.
 
 ## 6. Building it at the start: fitting
 
 The runs give every connection's starting values. U, V and C are then chosen to reproduce them,
-one plane at a time, each on lanes of its own. For each plane, construction fits from scratch at
-1, 2, 4, ... lanes until one is within `fit_tolerance`, then bisects for the fewest lanes that are.
-
-Each fit runs one of two candidates, chosen by `Weight_Matrix::fit_method`: masked alternating
-least squares (`fit_plane_by_masked_alternating_least_squares`, the default) or limited-memory
-BFGS (`fit_plane_by_limited_memory_broyden_fletcher_goldfarb_shanno`). Both minimize the same
-weighted, ridge-regularized squared error over the connections, in f32, on the GPU.
+one plane at a time, each on lanes of its own:
+- **Lane budgets:** each plane gets a fixed number of lanes: the fewest that hold its starting
+  values within `fit_tolerance` (found by fitting at 1, 2, 4, ... lanes, then bisecting), times
+  one plus `expected_active_edge_fraction`. Together they stay below one float per connection per
+  plane.
+- **Planes that start at zero** (synapse state) take no lanes at first. The engine spikes every
+  neuron once, runs until the synapses settle, and sizes their budget from the values they take,
+  then restores the starting state (calibration).
+- **Methods:** the lane searches use limited-memory BFGS, which needs fewer lanes; every refit
+  during the run uses masked alternating least squares, which needs far less scratch memory. Both
+  minimize the same weighted, ridge-regularized squared error over the connections, in f32, on
+  the GPU.
 
 ## 7. One tick on the GPU
 
@@ -101,5 +111,6 @@ Each neuron's thread:
 1. walks its k²-tree row to get its targets in order, counting ordinals as it goes;
 2. for each connection, finds the synapse type from the runs;
 3. reads the weight, delay and synapse state from U, V and C plus S;
-4. updates the synapse state through the pending queue;
-5. when a spike arrives, adds the synapse's current to the target's `network_inputs`.
+4. sums each state variable's change for the tick, and writes it once: in place in S, or through
+   the queue;
+5. adds the synapse's current to the target's `network_inputs`.

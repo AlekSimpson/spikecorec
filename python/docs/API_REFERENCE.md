@@ -54,7 +54,7 @@ spc.square_torus(3)[0]      # [1, 2, 3, 6]
 
 ```python
 Spike_Engine(lems_input_file, enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD,
-            fit_method=Weight_Matrix.Fit_Method.LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+            fit_method=Weight_Matrix.Fit_Method.MASKED_ALTERNATING_LEAST_SQUARES,
             expected_active_edge_fraction=Weight_Matrix.DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION)
 ```
 Everything comes from the document, connectivity included.
@@ -63,7 +63,7 @@ Everything comes from the document, connectivity included.
 Spike_Engine(lems_input_file, adjacency, synapse_component_id,
             connection_weight=1.0, connection_delay_seconds=0.0,
             enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD,
-            fit_method=Weight_Matrix.Fit_Method.LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+            fit_method=Weight_Matrix.Fit_Method.MASKED_ALTERNATING_LEAST_SQUARES,
             expected_active_edge_fraction=Weight_Matrix.DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION)
 ```
 Connectivity from `adjacency` instead, where `adjacency[source]` lists `source`'s
@@ -74,7 +74,7 @@ targets. Every edge carries the named synapse, `connection_weight` and
 Spike_Engine(lems_input_file, adjacency, synapse_component_ids, synapse_proportions=[],
             connection_weight=1.0, connection_delay_seconds=0.0,
             enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD,
-            fit_method=Weight_Matrix.Fit_Method.LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+            fit_method=Weight_Matrix.Fit_Method.MASKED_ALTERNATING_LEAST_SQUARES,
             expected_active_edge_fraction=Weight_Matrix.DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION)
 ```
 Several synapses. The edges are split, in adjacency order, into one contiguous share per
@@ -123,6 +123,7 @@ engine = spc.Spike_Engine("LEMS_torus.xml", spc.square_torus(5),
 | `kernel_parameter_names` | list[str] | the kernel's bound parameters, in binding order |
 | `synapse_active_ticks` | int | ticks after a neuron spikes during which its outgoing synapses run: the longest delay plus the slowest synapse's settle time. `-1` means every synapse runs every tick |
 | `run_count` | int | runs of edges with the same synapse that the kernel looks synapses up in |
+| `calibration_tick_count` | int | ticks construction's calibration ran (see below); 0 when no plane needed it |
 | `deferred_walk_pass_count` | int | extra walk passes the run has needed: a neuron whose edge walk could queue more updates than the queue had room for that tick walks again, after the queue was merged into S |
 
 ### Weight-matrix fit and refit settings
@@ -139,9 +140,9 @@ updates are merged, when either trigger fires and the last refit was at least
 | `FIT_TOLERANCE_ACCURATE` | `1e-4` | preset for validation runs and reported results; up to 5 000 ticks |
 | `FIT_TOLERANCE_STANDARD` | `1e-3` | the default; up to 500 ticks |
 | `FIT_TOLERANCE_COMPACT` | `1e-2` | preset for the largest networks, where memory matters most; up to 50 ticks |
-| `fit_method` | `LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO` | the candidate fit (a `Weight_Matrix.Fit_Method`) the construction fit and every refit use. Read/write; also a constructor argument, for the construction fit |
-| `expected_active_edge_fraction` | `0.5` | the expected fraction of edges whose values change between refits (0 to 1). Each plane's fixed lane budget is its fewest lanes times 1 plus this. Read-only; a constructor argument, since the budgets are set at construction |
-| `refit_occupancy_threshold_fraction` | `0.2` | refit once the fullest plane of S holds updates on this fraction of the edges; `0` disables. Also the size S is kept at per plane, so setting it resizes S |
+| `fit_method` | `MASKED_ALTERNATING_LEAST_SQUARES` | the candidate fit (a `Weight_Matrix.Fit_Method`) every refit uses. The lane searches that set each plane's lanes at construction use `weights.lane_search_fit_method` (limited-memory BFGS by default). Read/write; also a constructor argument |
+| `expected_active_edge_fraction` | `0.2` | the expected fraction of edges whose values change between refits (0 to 1); by default the refit threshold, since a refit is due once that fraction of the edges hold updates. Each plane's fixed lane budget is its fewest lanes times 1 plus this. Read-only; a constructor argument, since the budgets are set at construction |
+| `refit_occupancy_threshold_fraction` | `0.2` | refit once the fullest plane of S holds updates on this fraction of the edges; `0` disables. S is sized for this fraction of the edges in each plane the kernel updates, so setting it resizes S |
 | `set_refit_occupancy_threshold_fraction(fraction)` | | the same setter as a method |
 | `refit_every_n_ticks` | `0` | also refit every this many ticks; `0` disables |
 | `minimum_ticks_between_refits` | `1000` | refits are at least this far apart; S grows in between if it must. `0` allows any spacing |
@@ -152,7 +153,7 @@ while `tolerance * delay < 0.5` ticks.
 
 ```python
 engine.fit_tolerance = spc.Spike_Engine.FIT_TOLERANCE_ACCURATE   # for every later refit
-engine.refit_occupancy_threshold_fraction = 0.5                 # S resized to half the edges per plane
+engine.refit_occupancy_threshold_fraction = 0.5                 # S resized to half the edges per updated plane
 engine.minimum_ticks_between_refits = 2000
 ```
 
@@ -160,7 +161,7 @@ engine.minimum_ticks_between_refits = 2000
 
 | name | default | meaning |
 |---|---|---|
-| `DEFAULT_PLASTICITY_DELTA_CAPACITY` | `65536` | slots per plane of S reserved for plasticity when it is enabled |
+| `DEFAULT_PLASTICITY_DELTA_CAPACITY` | `65536` | slots reserved in S for plasticity when it is enabled |
 | `plasticity_fold_every_n_ticks` | `64` | with plasticity on, merge the queued updates every this many ticks |
 | `plasticity_target_root_mean_square` | | with plasticity on, the weights are scaled back to this RMS after each refit; negative disables |
 
@@ -285,8 +286,21 @@ way. Each plane gets a fixed **lane budget** at construction, and keeps it for t
 - A plane with starting values: the fewest lanes that hold them within `fit_tolerance`, found by
   fitting from scratch at 1, 2, 4, ... lanes and then bisecting, times
   1 + `expected_active_edge_fraction`.
-- A plane whose starting values are all zero is taken to become active: it gets the largest
-  searched count of any plane, times the same.
+- A plane whose starting values are all zero (a synapse's state) takes no lanes in
+  `declare_runs`, and reads exactly zero. It counts for the largest of those budgets when the
+  budgets are cut to the cap, which keeps room for it. The engine then **calibrates** it: it
+  spikes every neuron once, each at its own tick over about one time constant of the slowest
+  synapse (`synapse_active_ticks / CALIBRATION_SPIKE_SPREAD_DIVISOR`, in a fixed order unrelated
+  to the neurons' indices), as in asynchronous activity; runs ticks until the synapses are back at
+  rest (`synapse_active_ticks`, at most `Spike_Engine.CALIBRATION_TICK_LIMIT`); takes the plane's
+  values at the tick where its updates are largest; and gives it a budget from them with
+  `calibrate_lane_budget`. Then it restores every state those ticks changed, so the run starts
+  from the model's own starting state. The plane keeps the fitted V rows with U at zero, so it
+  reads zero until its first refit, which starts from those rows. A matrix used outside an
+  engine, or a plane calibration left without values, gets its budget at its first refit
+  instead, searched with `fit_method`. Every budget is its fewest lanes within `fit_tolerance`,
+  times 1 + `expected_active_edge_fraction`, within what the cap leaves after the other planes,
+  and never changes after that.
 - Together the budgets never pass the cap: the basis (U, V and the coefficients) stays smaller
   than one float per edge per plane, and within the 256-lane kernel limit. When they would, lanes
   come off the largest budget first, and a plane cut below its fewest lanes is fitted again on
@@ -303,12 +317,14 @@ Every read adds S. Kernel threads change an entry already in S in place; an upda
 with no entry goes into the **queue**, which the host merges into S after every tick. Before
 walking its edges, a neuron reserves queue room for every update it can make (one per updated
 plane per edge with no S entry); if the queue cannot take it, its walk waits for another pass of
-the same tick, after a merge. No update is ever dropped. A refit fits each plane that has updates to basis + S within its budget and
-empties S. It starts from the plane's current lanes and moves only the rows at either end of an
-updated edge; lanes that hold nothing yet (a plane that started at zero) start from scratch and
-move every row. A warm refit that misses `fit_tolerance` by more than twice the plane's last error
-is tried again from scratch, and the better fit kept. A refit that misses `fit_tolerance` warns.
-A plane without updates is left exactly as it is.
+the same tick, after a merge. No update is ever dropped.
+
+A refit fits each plane that has updates to basis + S within its budget and empties S. It starts
+from the plane's current lanes and moves only the rows at either end of an updated edge; lanes
+that hold nothing start from their calibrated V rows, or from scratch, and move every row. A warm
+refit that misses `fit_tolerance` by more than twice the plane's last error is tried again from
+scratch, and the better fit kept. A refit that misses `fit_tolerance` warns. A plane without
+updates is left exactly as it is.
 
 Both fits run one of two candidates, chosen by `fit_method`. Both work in f32, on the GPU when
 their Metal kernels load and on the host otherwise (always on CUDA), and both minimize the same
@@ -317,8 +333,8 @@ summed, plus `DEFAULT_FIT_RIDGE` times the squared rows that move.
 
 | `Weight_Matrix.Fit_Method` | |
 |---|---|
-| `MASKED_ALTERNATING_LEAST_SQUARES` | Solves every moved source row given the targets, then every moved target row given the sources, each by QR (Givens rotations), which keeps f32 accurate on the nearly singular rows of structured networks. Each lane is rescaled before each half-sweep so its U and V columns have equal norms, which leaves every value the same |
-| `LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO` | the default. Quasi-Newton over every moved row at once, with a strong Wolfe line search and the two-loop recursion done on the dot products of the stored vectors |
+| `MASKED_ALTERNATING_LEAST_SQUARES` | the default, since it keeps no history and so needs far less scratch during a fit. Solves every moved source row given the targets, then every moved target row given the sources, each by QR (Givens rotations), which keeps f32 accurate on the nearly singular rows of structured networks. Each lane is rescaled before each half-sweep so its U and V columns have equal norms, which leaves every value the same |
+| `LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO` | Quasi-Newton over every moved row at once, often more accurate at the same lane count; it keeps 15 vectors of one value per moved row and lane, with a strong Wolfe line search and the two-loop recursion done on the dot products of the stored vectors |
 
 ### Planes and constants
 
@@ -336,7 +352,7 @@ summed, plus `DEFAULT_FIT_RIDGE` times the squared rows that move.
 | `LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO_HISTORY_LENGTH` | `5` | step and gradient-change pairs the quasi-Newton fit keeps |
 | `WOLFE_SUFFICIENT_DECREASE`, `WOLFE_CURVATURE` | `1e-4`, `0.9` | its line search's strong Wolfe constants |
 | `LINE_SEARCH_MAXIMUM_EVALUATION_COUNT` | `20` | objective evaluations one line search may use |
-| `DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION` | `0.5` | the default of `expected_active_edge_fraction` |
+| `DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION` | `0.2` | the default of `expected_active_edge_fraction`: `DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION` |
 | `DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION` | `0.2` | |
 
 ### Shape and fit
@@ -351,6 +367,7 @@ summed, plus `DEFAULT_FIT_RIDGE` times the squared rows that move.
 | `fit_method` | `Weight_Matrix.Fit_Method` | the candidate fit refits use (read/write; the engine sets it from `Spike_Engine.fit_method` before each refit it runs) |
 | `measured_fit_error` | list[float] | per plane, the worst relative error the last fit left |
 | `expected_active_edge_fraction` | float | the expected fraction of edges whose values change between refits (0 to 1), which sizes the lane budgets when the runs are declared (read/write; set it before `declare_runs`; the engine sets it from its constructor argument) |
+| `lane_search_fit_method` | `Weight_Matrix.Fit_Method` | the candidate fit the lane searches use (`declare_runs`, `calibrate_lane_budget`); limited-memory BFGS by default, which holds a plane's values on fewer lanes (read/write) |
 | `worst_fit_error()` | float | the worst of those |
 | `check_indexing` | bool | read/write |
 | `k2tree` | `K2_Tree` | by reference |
@@ -412,6 +429,15 @@ w.neighbor_weights_for_matrix(w.DELAY_PLANE)      # every delay, in ticks
 #### `accumulate_edge_delta(matrix_index, source_node, target_node, delta) -> None`
 Adds `delta` to one edge in one plane, through S. Reads see it at once; the next refit folds
 it into the basis. S grows if the plane is full.
+
+#### Calibration
+| method | meaning |
+|---|---|
+| `planes_awaiting_lane_budget()` | planes that hold no lanes yet (those that started at zero) |
+| `plane_updates(matrix_index)` | `(edge_ordinals, deltas)`: one plane's updates in S |
+| `plane_update_sum_of_squares(matrix_index)` | the sum of squares of one plane's updates in S |
+| `calibrate_lane_budget(matrix_index, calibration_values)` | sets the lane budget of a plane with no lanes from values it is expected to hold (one per edge), searched with `lane_search_fit_method`; the plane keeps the fitted V rows and reads zero until its first refit |
+| `discard_updates(occupancy_threshold_fraction)` | empties S and the queue and sizes S for the threshold |
 
 #### `compact_pending_deltas() -> None`
 Merges the updates the kernel queued into S, summing each edge's updates and dropping entries of
@@ -646,10 +672,10 @@ What the parser read from the document's `OutputFile` / `EventOutputFile` elemen
 |---|---|
 | `Recording_Config` | `output_filenames`, `file_output_format`, `output_directory` (where a relative filename is written: the LEMS file's directory, or the element's `path` in it), `event_format` (`"TIME_ID"` or `"ID_TIME"`; `""` for an `OutputFile`), `selections`, `recordings_count`, `DEFAULT_MAX_LOG_BYTES` |
 | `Recording_Selection` | `quantity_path` (e.g. `"pop1[0]/v"`), `variable_name` (the state variable a column records), `event_port`, `selection_id` (the element's own id), `neuron_index` |
+| `Output_File_Format` | `SPIRE`, `SPIREGZIP`, `SPIREBZ2`, `SPIREXZ`, `SPIKE_EVENTS`, `NML_STANDARD` |
 
 A selection that names no cell or no state variable of one (a `DerivedVariable`, a synapse)
 parses with `neuron_index` -1, and `Spike_Engine` refuses it.
-| `Output_File_Format` | `SPIRE`, `SPIREGZIP`, `SPIREBZ2`, `SPIREXZ`, `SPIKE_EVENTS`, `NML_STANDARD` |
 
 ---
 

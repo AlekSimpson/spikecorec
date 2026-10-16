@@ -53,6 +53,20 @@ namespace spikecorec {
         s32 rank_float4_stride_argument = 0;
         // Extra walk passes the run has needed because the update queue was full.
         s64 deferred_walk_pass_count = 0;
+
+        // Construction's calibration: planes that start at zero (synapse state) get their lane
+        // budgets from values they take when every neuron spikes once, each at its own tick, as in
+        // asynchronous activity. The engine runs this many ticks, then restores every state the
+        // ticks changed, so the run starts from the model's own starting state. 0 when no plane
+        // needed it.
+        s64 calibration_tick_count = 0;
+        // The most ticks calibration waits for synapses to settle when they never do
+        // (synapse_active_ticks of -1).
+        static constexpr s64 CALIBRATION_TICK_LIMIT = 2000;
+        // Calibration spreads the forced spikes over about one time constant of the slowest
+        // synapse: synapse_active_ticks is about the longest delay plus ln(1 / REST_FRACTION),
+        // about 14, of those time constants, so the spread is a fourteenth of it.
+        static constexpr s64 CALIBRATION_SPIKE_SPREAD_DIVISOR = 14;
         // The tick's time in seconds, computed on the host each tick. f32 on Metal, which has no f64.
 #ifdef SPIKECOREC_CUDA
         f64 simulation_time_argument = 0.0;
@@ -144,7 +158,7 @@ namespace spikecorec {
         f32 fit_tolerance = FIT_TOLERANCE_STANDARD;
 
         // The candidate fit the construction fit and every refit use.
-        Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO;
+        Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES;
 
         // The expected fraction of edges whose values change between refits (0 to 1), which sizes
         // every plane's fixed lane budget at construction; see Weight_Matrix.
@@ -177,7 +191,7 @@ namespace spikecorec {
         explicit Spike_Engine(const String &lems_input_file,
                              bool enable_hebbian_plasticity = false,
                              f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
-                             Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+                             Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
                              f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
         Spike_Engine(const String &lems_input_file,
@@ -187,7 +201,7 @@ namespace spikecorec {
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false,
                     f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
-                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
                     f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
         Spike_Engine(const String &lems_input_file,
@@ -198,7 +212,7 @@ namespace spikecorec {
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false,
                     f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
-                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
                     f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
         ~Spike_Engine();
@@ -269,5 +283,13 @@ namespace spikecorec {
         [[nodiscard]] Engine_Pointer resolve_edge_plane(const Engine_Pointer &plane) const;
 
         void record_tick(s64 tick);
+
+        // One tick's kernel work: draws the random values, dispatches master_step, merges the queue
+        // into S and runs the deferred walk passes. Neither records nor refits.
+        void dispatch_tick(s64 tick, bool plasticity_fold_due);
+
+        // Gives each plane that starts at zero its lane budget from calibration ticks (see
+        // calibration_tick_count), and restores the starting state afterwards.
+        void calibrate_zero_start_planes();
     };
 } // namespace spikecorec
