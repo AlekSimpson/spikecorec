@@ -135,8 +135,8 @@ The data-dependent loop also blocks unrolling. Each thread allocates five walk s
 `MAX_K2TREE_HEIGHT` = 32 ints (640 bytes), although the tree height is 2–4 and known at compile
 time. Arrays that size likely spill from registers to slower thread memory.
 
-Since 2026-10-16 the weight-matrix fits walk the tree the same way (`docs/k2tree_fit_walk.md`), so
-a faster walk speeds up the fits too. Measured in the fit kernels, a walk costs 1.4 ns per
+Since 2026-10-16 the weight-matrix refits walk the tree the same way (`docs/k2tree_fit_walk.md`;
+construction reads a temporary connection list instead), so a faster walk speeds up refits too. Measured in the fit kernels, a walk costs 1.4 ns per
 connection on M1's rows and 4–6 ns on M2's, against about 0.3 ns to read an array. Shrinking the
 stacks to 12 levels changed nothing, and replacing the divisions with shifts (branching factor 4)
 saved 20–25%.
