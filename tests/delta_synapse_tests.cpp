@@ -241,7 +241,7 @@ TEST(Delta_Synapse, keeps_no_state_per_connection) {
     EXPECT_EQ(engine.synapse_active_ticks, tick_of(1.5e-3, engine.step_dt) - 1);
     EXPECT_FALSE(log.contains("does not settle"));
     EXPECT_EQ(engine.network_inputs.total_bytes,
-              sizeof(f32) * static_cast<u64>((Codegen::WEIGHTED_ARRIVAL_SUM_ROW + 1) * engine.total_neuron_count));
+              sizeof(f32) * static_cast<u64>((Codegen::RUNNING_SUM_ROW + 1) * engine.total_neuron_count));
 
     try {
         (void)engine.synapse_state_variable_plane("suprathreshold_delta_synapse", "accumulated_jump");
@@ -334,4 +334,172 @@ TEST(Delta_Synapse, a_stepped_synapse_delivers_the_exposure_its_target_reads) {
     // The geometric sum of x over the ticks after the arrival: weight * jump * tau_decay / dt.
     const f64 expected = 2.0 * 1e-3 * 2e-3 / 10e-3;
     EXPECT_NEAR(engine.read_state_variable(1, "v"), expected, 1e-3 * expected);
+}
+
+// ── tracked totals ──────────────────────────────────────────────────────────────
+//
+// The model A neuron reads its total only as total_jump - applied_jump, and applied_jump is
+// assigned only total_jump, so the kernel keeps their difference, not either lifetime value, which
+// in f32 rounds every jump to its own spacing once it has grown large.
+
+namespace {
+
+// The model A neuron with no threshold, driven by raising and lowering Poisson inputs of 50 mV at
+// 2 kHz each: each input's lifetime total passes 100 V within the second, where f32 spacing is
+// 7.6 µV, while v stays near 0.
+String unbounded_drive_model() {
+    return R"(<Lems>
+  <Target component="drive_simulation"/>
+  <Include file=")" + fixture_path("nml/Brunel2000_ModelA_Components.xml") + R"("/>
+  <iafRefCellDeltaInput id="unbounded_neuron" leak_reversal="0mV" membrane_time_constant="20ms" refractory_period="2ms"
+                        thresh="1000V" reset="0mV"/>
+  <poissonDeltaVoltageInput id="raising_drive" average_rate="2000Hz" jump="50mV"/>
+  <poissonDeltaVoltageInput id="lowering_drive" average_rate="2000Hz" jump="-50mV"/>
+  <network id="drive_network">
+    <population id="neurons" component="unbounded_neuron" size="1"/>
+    <explicitInput target="neurons[0]" input="raising_drive" destination="synapses"/>
+    <explicitInput target="neurons[0]" input="lowering_drive" destination="synapses"/>
+  </network>
+  <Simulation id="drive_simulation" length="1000ms" step="0.1ms" target="drive_network" seed="7"/>
+</Lems>
+)";
+}
+
+// The model A neuron's dynamics with one more DerivedVariable that reads total_jump, which the
+// shift of a tracked total would change, so its total is kept whole. It behaves the same.
+String total_reading_cell_types() {
+    return R"(<Lems>
+  <Include file=")" + fixture_path("nml/Brunel2000_ModelA_ComponentTypes.xml") + R"lems("/>
+  <ComponentType name="iafRefCellDeltaInputReadingTotal" extends="baseIaf">
+    <Parameter name="leak_reversal" dimension="voltage"/>
+    <Parameter name="membrane_time_constant" dimension="time"/>
+    <Parameter name="refractory_period" dimension="time"/>
+    <Attachments name="synapses" type="baseDeltaVoltageSynapse"/>
+    <Exposure name="total_jump_seen" dimension="voltage"/>
+    <Dynamics>
+      <StateVariable name="v" dimension="voltage" exposure="v"/>
+      <StateVariable name="applied_jump" dimension="voltage"/>
+      <StateVariable name="refractory_end_time" dimension="time"/>
+      <DerivedVariable name="total_jump" dimension="voltage" select="synapses[*]/accumulated_jump" reduce="add"/>
+      <DerivedVariable name="total_jump_seen" dimension="voltage" exposure="total_jump_seen" value="total_jump"/>
+      <DerivedVariable name="pending_jump" dimension="voltage" value="total_jump - applied_jump"/>
+      <DerivedVariable name="is_integrating" dimension="none" value="H((t - refractory_end_time) / membrane_time_constant)"/>
+      <TimeDerivative variable="v" value="is_integrating * (leak_reversal - v) / membrane_time_constant"/>
+      <OnStart>
+        <StateAssignment variable="v" value="leak_reversal"/>
+        <StateAssignment variable="applied_jump" value="0"/>
+        <StateAssignment variable="refractory_end_time" value="-1 * refractory_period"/>
+      </OnStart>
+      <OnCondition test="pending_jump .neq. 0">
+        <StateAssignment variable="v" value="v + is_integrating * pending_jump"/>
+        <StateAssignment variable="applied_jump" value="total_jump"/>
+      </OnCondition>
+      <OnCondition test="v .gt. thresh">
+        <EventOut port="spike"/>
+        <StateAssignment variable="v" value="reset"/>
+        <StateAssignment variable="refractory_end_time" value="t + refractory_period"/>
+      </OnCondition>
+    </Dynamics>
+  </ComponentType>
+</Lems>
+)lems";
+}
+
+} // namespace
+
+// Every jump is a whole number of 50 mV, so v after a tick less v before it, leaked by the step's
+// forward Euler, is one too, up to f32 rounding of v itself (v stays within about 1.5 V, where f32
+// spacing is 0.12 µV). Lifetime totals of 100 V would leave up to half their 7.6 µV spacing.
+TEST(Tracked_Total, keeps_every_jump_exact_however_large_the_totals_grow) {
+    Captured_Log log;
+    const Temporary_Directory directory;
+    Spike_Engine engine(directory.write("LEMS.xml", unbounded_drive_model()));
+    EXPECT_TRUE(log.contains("'iafRefCellDeltaInput' reads its total 'total_jump' only less 'applied_jump'"));
+
+    constexpr f64 JUMP = 50e-3;
+    f64 largest_residual = 0.0;
+    s64 jump_ticks = 0;
+    f32 previous_voltage = engine.read_state_variable(0, "v");
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        const f32 voltage = engine.read_state_variable(0, "v");
+        // The kernel's leak step: v += dt * (leak_reversal - v) / tau, in f32.
+        const f32 leaked = previous_voltage + 0.0001f * ((1.0f * (0.0f - previous_voltage)) / 0.02f);
+        const f64 jump = static_cast<f64>(voltage) - static_cast<f64>(leaked);
+        if (std::fabs(jump) > 0.5 * JUMP) {
+            largest_residual = std::max(largest_residual, std::fabs(jump - JUMP * std::round(jump / JUMP)));
+            jump_ticks += 1;
+        }
+        previous_voltage = voltage;
+    }
+    EXPECT_GT(jump_ticks, 1000);
+    EXPECT_LT(largest_residual, 1e-6);
+    // applied_jump reads the total consumed so far: the drives' sum, which stays near 0.
+    EXPECT_LT(std::fabs(engine.read_state_variable(0, "applied_jump")), 10.0);
+}
+
+// A cell type that reads its total anywhere but in total - tracker keeps the lifetime total, and
+// behaves as a tracked one: the same scripted jumps, discarded while refractory, give the same v.
+TEST(Tracked_Total, a_cell_that_reads_its_total_elsewhere_keeps_it_whole_and_behaves_the_same) {
+    Captured_Log log;
+    const Temporary_Directory directory;
+    directory.write("types.xml", total_reading_cell_types());
+    const String lems = directory.write("LEMS.xml", R"(<Lems>
+  <Target component="comparison_simulation"/>
+  <Include file=")" + fixture_path("nml/Brunel2000_ModelA_Components.xml") + R"("/>
+  <Include file="types.xml"/>
+  <iafRefCellDeltaInputReadingTotal id="total_reading_neuron" leak_reversal="0mV" membrane_time_constant="20ms"
+                                    refractory_period="2ms" thresh="20mV" reset="10mV"/>
+  <spikeArray id="excitatory_test_spikes">
+    <spike id="0" time="10ms"/> <spike id="1" time="12ms"/> <spike id="2" time="14ms"/>
+    <spike id="3" time="16ms"/> <spike id="4" time="18ms"/>
+  </spikeArray>
+  <spikeArray id="inhibitory_test_spikes">
+    <spike id="0" time="19.5ms"/> <spike id="1" time="40ms"/>
+  </spikeArray>
+  <iafCell id="spike_source_cell" leakConductance="10nS" leakReversal="-70mV" thresh="-50mV" reset="-70mV" C="200pF"/>
+  <network id="comparison_network">
+    <population id="tracked" component="brunel_model_a_neuron" size="1"/>
+    <population id="whole" component="total_reading_neuron" size="1"/>
+    <population id="excitatory_source" component="spike_source_cell" size="1"/>
+    <population id="inhibitory_source" component="spike_source_cell" size="1"/>
+    <projection id="excitatory_projection" presynapticPopulation="excitatory_source" postsynapticPopulation="tracked"
+                synapse="excitatory_delta_synapse">
+      <connectionWD id="0" preCellId="../excitatory_source[0]" postCellId="../tracked[0]" weight="50" delay="1.5ms"/>
+    </projection>
+    <projection id="excitatory_projection_whole" presynapticPopulation="excitatory_source" postsynapticPopulation="whole"
+                synapse="excitatory_delta_synapse">
+      <connectionWD id="0" preCellId="../excitatory_source[0]" postCellId="../whole[0]" weight="50" delay="1.5ms"/>
+    </projection>
+    <projection id="inhibitory_projection" presynapticPopulation="inhibitory_source" postsynapticPopulation="tracked"
+                synapse="inhibitory_delta_synapse">
+      <connectionWD id="0" preCellId="../inhibitory_source[0]" postCellId="../tracked[0]" weight="30" delay="1.5ms"/>
+    </projection>
+    <projection id="inhibitory_projection_whole" presynapticPopulation="inhibitory_source" postsynapticPopulation="whole"
+                synapse="inhibitory_delta_synapse">
+      <connectionWD id="0" preCellId="../inhibitory_source[0]" postCellId="../whole[0]" weight="30" delay="1.5ms"/>
+    </projection>
+    <explicitInput target="excitatory_source[0]" input="excitatory_test_spikes"/>
+    <explicitInput target="inhibitory_source[0]" input="inhibitory_test_spikes"/>
+  </network>
+  <Simulation id="comparison_simulation" length="60ms" step="0.01ms" target="comparison_network" seed="1"/>
+</Lems>
+)");
+    Spike_Engine engine(lems, false, Spike_Engine::FIT_TOLERANCE_PRECISE);
+    EXPECT_TRUE(log.contains("'iafRefCellDeltaInput' reads its total"));
+    EXPECT_FALSE(log.contains("'iafRefCellDeltaInputReadingTotal' reads its total"));
+
+    f64 largest_difference = 0.0;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        largest_difference = std::max(largest_difference, std::fabs(static_cast<f64>(engine.read_state_variable(0, "v")) -
+                                                                    static_cast<f64>(engine.read_state_variable(1, "v"))));
+    }
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 0), engine.step_dt), ticks_of({19.5e-3}, engine.step_dt));
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 1), engine.step_dt), ticks_of({19.5e-3}, engine.step_dt));
+    // Both apply the same jumps; only f32 rounding of v, near 1 nV here, may differ. applied_jump is
+    // summed differently (consumed amounts against whole totals): each of the 7 consumptions may
+    // round each by half the 1.9 nV spacing at 19 mV.
+    EXPECT_LT(largest_difference, 1e-8);
+    EXPECT_NEAR(engine.read_state_variable(0, "applied_jump"), engine.read_state_variable(1, "applied_jump"), 7 * 1.9e-9);
 }
