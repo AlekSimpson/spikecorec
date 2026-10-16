@@ -63,7 +63,7 @@ def quiet_log():
 
 def test_module_constants():
     assert spc.NEVER_SPIKED_TICK == -1
-    assert spc.MAX_RANK_FLOAT4_STRIDE == 64
+    assert spc.MAX_RANK_FLOAT4_STRIDE == 2048
     assert spc.DEFAULT_BRANCHING_FACTOR == 4
 
 

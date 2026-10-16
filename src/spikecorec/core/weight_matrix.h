@@ -14,10 +14,10 @@ using namespace std;
 
 namespace spikecorec {
 
-    // The lane limit, in float4s (256 lanes). It once sized fixed arrays in kernels that are now
-    // gone, and nothing that runs needs it; raising it costs memory (U and V each grow by
-    // node_count * lanes * 4 bytes) and fit time.
-    #define MAX_RANK_FLOAT4_STRIDE 64
+    // The lane limit, in float4s (8,192 lanes). No kernel sizes an array by it; the limit that
+    // binds is lane_cap's, which keeps the basis smaller than one float per edge per plane. Each
+    // lane costs U and V node_count * 4 bytes each, and fit time.
+    #define MAX_RANK_FLOAT4_STRIDE 2048
 
     struct Weight_Stats {
         f32 mean;
@@ -303,7 +303,7 @@ namespace spikecorec {
         // that hold them within fit_tolerance, times one plus expected_active_edge_fraction, within
         // what lane_cap leaves after the other planes. The plane keeps the fitted V rows and zero U,
         // so it reads exactly zero until its first refit, which starts from those rows. S is left as
-        // it is: the fit holds the nonzero values (8 bytes each) while it runs.
+        // it is: the fit holds a list of the connections and their values (12 bytes each) while it runs.
         void calibrate_lane_budget(s64 matrix_index, const Vector<f32> &calibration_values);
 
         // Empties S and the queue, dropping every update, and shrinks S to occupancy_threshold_fraction.
@@ -445,6 +445,12 @@ namespace spikecorec {
         // set the entries are updates to what the plane's basis holds (a refit reads its S entries
         // this way); otherwise they are the plane's values. storage is set when the entries have a
         // slab of their own rather than being a view of S.
+        //
+        // With lists_every_connection set, the entries are every connection in edge-ordinal order,
+        // zeros included, and incoming_offset and incoming_entry list each node's incoming entries,
+        // sources ascending. The fit kernels then read the connections from these arrays instead of
+        // walking the tree: 12 bytes per connection, for construction only, where fits are an order
+        // of magnitude faster that way. Refits walk.
         struct Fit_Values {
             Unique_Pointer<Fit_Scratch> storage;
             Engine_Pointer row_start;  // s32[node_count + 1]: node n's entries are positions [n] up to [n + 1]
@@ -452,10 +458,15 @@ namespace spikecorec {
             Engine_Pointer value;      // f32 per entry
             s64 entry_count = 0;
             bool adds_to_basis = false;
+            bool lists_every_connection = false;
+            Engine_Pointer incoming_offset;  // s32[node_count + 1], when listed
+            Engine_Pointer incoming_entry;   // u32 per connection, when listed
         };
 
-        // A plane's values from one value per edge ordinal, keeping those that are not zero.
-        [[nodiscard]] Fit_Values plane_values_from(const Function<f32(s64)> &value_of_ordinal) const;
+        // A plane's values from one value per edge ordinal: those that are not zero, or every
+        // connection with list_every_connection set.
+        [[nodiscard]] Fit_Values plane_values_from(const Function<f32(s64)> &value_of_ordinal,
+                                                   bool list_every_connection) const;
 
         // Plane matrix_index's entries in S, as updates to its basis, once key_plane_updates_by_target
         // has keyed them by target node.
@@ -491,6 +502,7 @@ namespace spikecorec {
             u32 lane_count;
             f32 ridge;
             u32 walkers_per_row;
+            u32 connections_listed;
         };
 
         // One plane's fit. The plane's own lanes are copied into dense working arrays, one row per
@@ -532,6 +544,12 @@ namespace spikecorec {
             // How many partials evaluate_edges' last row and column walks wrote, for read_edge_evaluation.
             mutable s64 row_walk_partial_count = 0;
             mutable s64 column_walk_partial_count = 0;
+
+            // fill_fresh_rows' starting rows: each source row's mean target, and each target column's
+            // less the mean of every target. The targets do not change between the probes of a
+            // search, so they are taken once.
+            mutable Vector<f32> fresh_row_mean;
+            mutable Vector<f32> fresh_column_mean;
             Engine_Pointer gradient_first_partials;   // evaluate_gradient: ridge term
             Engine_Pointer gradient_second_partials;  // evaluate_gradient: slope
             Engine_Pointer dot_partials;     // dot_products, MAXIMUM_DOT_PRODUCT_LEFT_SLOT_COUNT rows
@@ -600,8 +618,11 @@ namespace spikecorec {
         // keeps the fit with the smallest error. With a required_lane_count above zero it fits at
         // exactly that many lanes instead. The probes work outside the basis, which takes only the
         // chosen lanes.
-        // A lane_limit above zero caps the lanes the search may use. The search frees the plane's
-        // lanes first, so values that add to the basis must belong to a plane that holds none.
+        // A lane_limit above zero caps the lanes the search may use. The doubling also stops once two
+        // doublings in a row each cut the worst error by less than FIT_STALL_IMPROVEMENT: values that
+        // more lanes barely help (random ones) keep the closest fit instead of running to the cap.
+        // The search frees the plane's lanes first, so values that add to the basis must belong to a
+        // plane that holds none.
         Plane_Fit_Result search_fewest_lanes(s64 matrix_index, const Fit_Values &values, f32 ridge_regularization,
                                              f32 search_tolerance, s64 required_lane_count = 0, s64 lane_limit = 0);
 

@@ -21,7 +21,7 @@ from spikecorec import nml, units
 | name | value | meaning |
 |---|---|---|
 | `NEVER_SPIKED_TICK` | `-1` | `last_spiked` of a neuron that has not fired |
-| `MAX_RANK_FLOAT4_STRIDE` | `64` | the basis holds at most `64 * 4 = 256` lanes |
+| `MAX_RANK_FLOAT4_STRIDE` | `2048` | the basis holds at most `2048 * 4 = 8192` lanes |
 | `DEFAULT_BRANCHING_FACTOR` | `4` | the k²-tree's branching factor |
 | `LOG_PATH` | `"logs/spikecorec.log"` | where the engine's log file goes |
 
@@ -300,7 +300,8 @@ computations. The basis trades a measured accuracy for storage, within `fit_tole
 Every plane owns its lanes: no other plane reads them, and every plane is treated the same
 way. Each plane gets a fixed **lane budget** at construction, and keeps it for the whole run:
 - A plane with starting values: the fewest lanes that hold them within `fit_tolerance`, found by
-  fitting from scratch at 1, 2, 4, ... lanes and then bisecting, times
+  fitting from scratch at 1, 2, 4, ... lanes and then bisecting (the doubling stops early, keeping
+  the closest fit, once two doublings in a row each cut the worst error by less than 5%), times
   1 + `expected_active_edge_fraction`.
 - A plane whose starting values are all zero (a synapse's state) takes no lanes in
   `declare_runs`, and reads exactly zero. It counts for the largest of those budgets when the
@@ -318,7 +319,7 @@ way. Each plane gets a fixed **lane budget** at construction, and keeps it for t
   times 1 + `expected_active_edge_fraction`, within what the cap leaves after the other planes,
   and never changes after that.
 - Together the budgets never pass the cap: the basis (U, V and the coefficients) stays smaller
-  than one float per edge per plane, and within the 256-lane kernel limit. When they would, lanes
+  than one float per edge per plane, and within the 8,192-lane kernel limit. When they would, lanes
   come off the largest budget first, and a plane cut below its fewest lanes is fitted again on
   its budget; it then misses `fit_tolerance` as little as its lanes allow, with a warning. A
   network so small that no basis is smaller than that gets one lane group per four planes.

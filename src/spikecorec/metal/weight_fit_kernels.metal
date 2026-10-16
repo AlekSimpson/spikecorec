@@ -97,6 +97,7 @@ struct Fit_Walk_Constants {
     uint lane_count;         // working lanes
     float ridge;
     uint walkers_per_row;    // a power of two from 1 to FIT_WALK_THREADS_PER_ROW
+    uint connections_listed; // 1: the fit's values list every connection (see Fit_Walk_Buffers)
 };
 
 // The buffers a walking kernel reads, gathered so the helpers below can take them whole.
@@ -112,10 +113,16 @@ struct Fit_Walk_Buffers {
     const device int    *value_row_start; // [node_count + 1]
     const device uint   *value_target;
     const device float  *value;
+    // With connections_listed, the values hold every connection in edge-ordinal order (zeros too),
+    // and node n's incoming connections are the entries incoming_entry[incoming_offset[n]] up to
+    // [n + 1], sources ascending: a fit reads the connections from these instead of walking the tree.
+    const device int    *incoming_offset;
+    const device uint   *incoming_entry;
 };
 
 // One walker's walk along a node's row (its targets) or column (its sources), limited to the
-// walker's share of the other ends, [first, end). A walk keeps the k^2-tree path it is on.
+// walker's share of the other ends, [first, end). A walk keeps the k^2-tree path it is on. With
+// the connections listed it reads its share of the node's list instead, positions [position, end).
 struct Fit_Walk {
     uint row_base[MAX_K2TREE_HEIGHT];
     uint column_base[MAX_K2TREE_HEIGHT];
@@ -127,13 +134,36 @@ struct Fit_Walk {
     bool along_column;
     uint first;
     uint end;
+    bool listed;
+    int position;
+    int listed_end;
+    int entry;      // the entry of the connection fit_walk_next gave last, when listed
 };
 
-// Walker `walker` of a row's walkers_per_row walks the other ends in its share of the nodes. With
-// valid unset the walk is done before it starts.
-inline Fit_Walk fit_walk_begin(constant Fit_Walk_Constants &constants, uint node, bool along_column, uint walker,
-                               bool valid) {
+// Walker `walker` of a row's walkers_per_row walks the other ends in its share of the nodes, or,
+// with the connections listed, its share of the node's list. With valid unset the walk is done
+// before it starts.
+inline Fit_Walk fit_walk_begin(thread const Fit_Walk_Buffers &buffers, constant Fit_Walk_Constants &constants,
+                               uint node, bool along_column, uint walker, bool valid) {
     Fit_Walk walk;
+    walk.listed = constants.connections_listed != 0u;
+    walk.position = 0;
+    walk.listed_end = 0;
+    walk.entry = 0;
+    if (walk.listed) {
+        walk.node = node;
+        walk.along_column = along_column;
+        walk.top = -1;
+        if (valid) {
+            const int first = along_column ? buffers.incoming_offset[node] : buffers.value_row_start[node];
+            const int end = along_column ? buffers.incoming_offset[node + 1] : buffers.value_row_start[node + 1];
+            const int share = (end - first + static_cast<int>(constants.walkers_per_row) - 1) /
+                              static_cast<int>(constants.walkers_per_row);
+            walk.position = min(first + static_cast<int>(walker) * share, end);
+            walk.listed_end = min(walk.position + share, end);
+        }
+        return walk;
+    }
     const uint share = (constants.node_count + constants.walkers_per_row - 1) / constants.walkers_per_row;
     walk.node = node;
     walk.along_column = along_column;
@@ -153,6 +183,30 @@ inline Fit_Walk fit_walk_begin(constant Fit_Walk_Constants &constants, uint node
 // other ends all lie outside [first, end), and stops past end.
 inline uint fit_walk_next(thread Fit_Walk &walk, thread const Fit_Walk_Buffers &buffers,
                           constant Fit_Walk_Constants &constants) {
+    if (walk.listed) {
+        if (walk.position >= walk.listed_end) {
+            return K2T_NO_NEIGHBOR;
+        }
+        if (!walk.along_column) {
+            walk.entry = walk.position;
+            walk.position += 1;
+            return buffers.value_target[walk.entry];
+        }
+        walk.entry = static_cast<int>(buffers.incoming_entry[walk.position]);
+        walk.position += 1;
+        // The entry's source: the row whose entries hold it.
+        uint low = 0;
+        uint high = constants.node_count;
+        while (low + 1 < high) {
+            uint middle = low + (high - low) / 2;
+            if (buffers.value_row_start[middle] <= walk.entry) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
+    }
     const uint branching_factor = constants.branching_factor;
     const int leaf_level = static_cast<int>(constants.tree_height) - 1;
     while (walk.top >= 0) {
@@ -234,7 +288,7 @@ struct Fit_Value_Cursor {
 
 inline Fit_Value_Cursor fit_value_cursor(thread const Fit_Walk_Buffers &buffers, thread const Fit_Walk &walk) {
     Fit_Value_Cursor cursor;
-    const bool reads_row = !walk.along_column && walk.top >= 0;
+    const bool reads_row = !walk.listed && !walk.along_column && walk.top >= 0;
     cursor.position = reads_row ? fit_value_position(buffers, walk.node, walk.first) : 0;
     cursor.end = reads_row ? buffers.value_row_start[walk.node + 1] : 0;
     return cursor;
@@ -243,6 +297,9 @@ inline Fit_Value_Cursor fit_value_cursor(thread const Fit_Walk_Buffers &buffers,
 // The fit's value for the walk's connection to other_end.
 inline float fit_value_of(thread Fit_Value_Cursor &cursor, thread const Fit_Walk_Buffers &buffers,
                           thread const Fit_Walk &walk, uint other_end) {
+    if (walk.listed) {
+        return buffers.value[walk.entry];
+    }
     if (walk.along_column) {
         return fit_value_at(buffers, other_end, walk.node);
     }
@@ -300,16 +357,18 @@ kernel void fit_walk_residual_kernel(
     const device uint   *value_target          [[ buffer(9) ]],
     const device float  *value                 [[ buffer(10) ]],
     constant Fit_Walk_Constants &constants     [[ buffer(11) ]],
-    const device float  *working_u             [[ buffer(12) ]],
-    const device float  *working_v             [[ buffer(13) ]],
-    const device uint   *rows                  [[ buffer(14) ]],
-    constant uint       &first_row             [[ buffer(15) ]],
-    constant uint       &row_count             [[ buffer(16) ]],
-    constant uint       &walk_columns          [[ buffer(17) ]],
-    constant uint       &rows_are_every_node   [[ buffer(18) ]],
-    const device uchar  *source_moves          [[ buffer(19) ]],
-    device float        *group_loss            [[ buffer(20) ]],
-    device float        *group_worst_error     [[ buffer(21) ]],
+    const device int    *incoming_offset       [[ buffer(12) ]],
+    const device uint   *incoming_entry        [[ buffer(13) ]],
+    const device float  *working_u             [[ buffer(14) ]],
+    const device float  *working_v             [[ buffer(15) ]],
+    const device uint   *rows                  [[ buffer(16) ]],
+    constant uint       &first_row             [[ buffer(17) ]],
+    constant uint       &row_count             [[ buffer(18) ]],
+    constant uint       &walk_columns          [[ buffer(19) ]],
+    constant uint       &rows_are_every_node   [[ buffer(20) ]],
+    const device uchar  *source_moves          [[ buffer(21) ]],
+    device float        *group_loss            [[ buffer(22) ]],
+    device float        *group_worst_error     [[ buffer(23) ]],
     uint thread_id        [[ thread_position_in_grid ]],
     uint grid_size        [[ threads_per_grid ]],
     uint group_id         [[ threadgroup_position_in_grid ]],
@@ -320,7 +379,8 @@ kernel void fit_walk_residual_kernel(
     threadgroup float scratch[32];
     const Fit_Walk_Buffers buffers = {
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        basis_u, basis_v, coefficients, target_lanes, value_row_start, value_target, value};
+        basis_u, basis_v, coefficients, target_lanes, value_row_start, value_target, value,
+        incoming_offset, incoming_entry};
     const bool along_column = walk_columns != 0u;
     const uint walkers = constants.walkers_per_row;
     const ulong walk_count = static_cast<ulong>(row_count) * walkers;
@@ -329,7 +389,7 @@ kernel void fit_walk_residual_kernel(
     for (ulong walk_index = thread_id; walk_index < walk_count; walk_index += grid_size) {
         uint slot = static_cast<uint>(walk_index / walkers);
         uint node = (rows_are_every_node != 0u) ? slot : rows[first_row + slot];
-        Fit_Walk walk = fit_walk_begin(constants, node, along_column, static_cast<uint>(walk_index % walkers), true);
+        Fit_Walk walk = fit_walk_begin(buffers, constants, node, along_column, static_cast<uint>(walk_index % walkers), true);
         Fit_Value_Cursor cursor = fit_value_cursor(buffers, walk);
         while (true) {
             uint other_end = fit_walk_next(walk, buffers, constants);
@@ -402,14 +462,16 @@ kernel void fit_walk_row_solve_kernel(
     const device uint   *value_target          [[ buffer(9) ]],
     const device float  *value                 [[ buffer(10) ]],
     constant Fit_Walk_Constants &constants     [[ buffer(11) ]],
-    device float        *solved_side           [[ buffer(12) ]],
-    const device float  *fixed_side            [[ buffer(13) ]],
-    const device uint   *rows                  [[ buffer(14) ]],
-    constant uint       &first_row             [[ buffer(15) ]],
-    constant uint       &row_count             [[ buffer(16) ]],
-    constant uint       &solving_targets       [[ buffer(17) ]],
-    device float        *triangle_scratch      [[ buffer(18) ]],
-    device float        *vector_scratch        [[ buffer(19) ]],
+    const device int    *incoming_offset       [[ buffer(12) ]],
+    const device uint   *incoming_entry        [[ buffer(13) ]],
+    device float        *solved_side           [[ buffer(14) ]],
+    const device float  *fixed_side            [[ buffer(15) ]],
+    const device uint   *rows                  [[ buffer(16) ]],
+    constant uint       &first_row             [[ buffer(17) ]],
+    constant uint       &row_count             [[ buffer(18) ]],
+    constant uint       &solving_targets       [[ buffer(19) ]],
+    device float        *triangle_scratch      [[ buffer(20) ]],
+    device float        *vector_scratch        [[ buffer(21) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
     const uint walkers = constants.walkers_per_row;
@@ -422,7 +484,8 @@ kernel void fit_walk_row_solve_kernel(
     const uint group_row_count = min(rows_per_group, row_count - group_first_slot);
     const Fit_Walk_Buffers buffers = {
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        basis_u, basis_v, coefficients, target_lanes, value_row_start, value_target, value};
+        basis_u, basis_v, coefficients, target_lanes, value_row_start, value_target, value,
+        incoming_offset, incoming_entry};
     const uint lane_count = constants.lane_count;
     const bool along_column = solving_targets != 0u;
 
@@ -445,7 +508,7 @@ kernel void fit_walk_row_solve_kernel(
     const uint own_row_in_group = thread_in_group / walkers;
     const bool walks = own_row_in_group < group_row_count;
     const uint own_row = walks ? rows[first_row + group_first_slot + own_row_in_group] : 0;
-    Fit_Walk walk = fit_walk_begin(constants, own_row, along_column, thread_in_group % walkers, walks);
+    Fit_Walk walk = fit_walk_begin(buffers, constants, own_row, along_column, thread_in_group % walkers, walks);
     Fit_Value_Cursor cursor = fit_value_cursor(buffers, walk);
     bool walking = walks;
     while (simd_any(walking)) {
@@ -567,15 +630,17 @@ kernel void fit_walk_gradient_kernel(
     const device uint   *value_target          [[ buffer(9) ]],
     const device float  *value                 [[ buffer(10) ]],
     constant Fit_Walk_Constants &constants     [[ buffer(11) ]],
-    const device float  *working_u             [[ buffer(12) ]],
-    const device float  *working_v             [[ buffer(13) ]],
-    const device uint   *moved_rows            [[ buffer(14) ]],
-    constant uint       &moved_source_count    [[ buffer(15) ]],
-    constant uint       &moved_row_count       [[ buffer(16) ]],
-    const device float  *direction             [[ buffer(17) ]],
-    device float        *gradient              [[ buffer(18) ]],
-    device float        *group_ridge_term      [[ buffer(19) ]],
-    device float        *group_slope           [[ buffer(20) ]],
+    const device int    *incoming_offset       [[ buffer(12) ]],
+    const device uint   *incoming_entry        [[ buffer(13) ]],
+    const device float  *working_u             [[ buffer(14) ]],
+    const device float  *working_v             [[ buffer(15) ]],
+    const device uint   *moved_rows            [[ buffer(16) ]],
+    constant uint       &moved_source_count    [[ buffer(17) ]],
+    constant uint       &moved_row_count       [[ buffer(18) ]],
+    const device float  *direction             [[ buffer(19) ]],
+    device float        *gradient              [[ buffer(20) ]],
+    device float        *group_ridge_term      [[ buffer(21) ]],
+    device float        *group_slope           [[ buffer(22) ]],
     uint thread_id        [[ thread_position_in_grid ]],
     uint grid_size        [[ threads_per_grid ]],
     uint group_id         [[ threadgroup_position_in_grid ]],
@@ -586,7 +651,8 @@ kernel void fit_walk_gradient_kernel(
     threadgroup float scratch[32];
     const Fit_Walk_Buffers buffers = {
         internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
-        basis_u, basis_v, coefficients, target_lanes, value_row_start, value_target, value};
+        basis_u, basis_v, coefficients, target_lanes, value_row_start, value_target, value,
+        incoming_offset, incoming_entry};
     const uint lane_count = constants.lane_count;
     const uint walkers = constants.walkers_per_row;
     const uint rows_per_group = FIT_WALK_THREADS_PER_ROW / walkers;
@@ -612,7 +678,7 @@ kernel void fit_walk_gradient_kernel(
         const uint own_slot = group_first_slot + own_row_in_group;
         const uint own_row = walks ? moved_rows[own_slot] : 0;
         const bool along_column = own_slot >= moved_source_count;
-        Fit_Walk walk = fit_walk_begin(constants, own_row, along_column, simd_lane % walkers, walks);
+        Fit_Walk walk = fit_walk_begin(buffers, constants, own_row, along_column, simd_lane % walkers, walks);
         Fit_Value_Cursor cursor = fit_value_cursor(buffers, walk);
         bool walking = walks;
         while (simd_any(walking)) {
