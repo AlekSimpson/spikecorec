@@ -26,7 +26,9 @@ using namespace spikecorec;
 using namespace spikecorec::log;
 
 static Pair<s64, s64> compute_tree_parameters(s64 node_count, s64 branching_factor) {
-    if (node_count <= 1) return {0, 1};
+    if (node_count <= 0) return {0, 1};
+    // One node still needs a level, for its connection to itself.
+    if (node_count == 1) return {1, branching_factor};
 
     s64 tree_height = 0, padded_size = 1;
     while (padded_size < node_count) {
@@ -185,7 +187,7 @@ struct Tree_Arrays {
 // is in [first_row, end_row). The edges are taken one top-level row band at a time: below the root,
 // a band's nodes are contiguous at every level, so the bands' bits are appended band after band and
 // only one band's codes (8 bytes an edge) are held at once. Edges with an end outside the network
-// are skipped; callers refuse self-loops first.
+// are skipped. A node's connection to itself is a diagonal bit like any other.
 template <typename Row_Band_Edges>
 static Tree_Arrays build_tree_arrays(const Row_Band_Edges &row_band_edges, s64 node_count, s64 branching_factor,
                                      s64 superblock_size) {
@@ -492,15 +494,6 @@ Optional<K2_Tree> K2_Tree::from_adjacency_list(
 
     s64 effective_node_count = (node_count >= 0) ? node_count : static_cast<s64>(adjacency_list.size());
 
-    // Every self-loop is refused, even one outside the network.
-    for (usize source_node = 0; source_node < adjacency_list.size(); source_node++) {
-        for (s32 target_node : adjacency_list[source_node]) {
-            if (static_cast<s64>(target_node) != static_cast<s64>(source_node)) continue;
-            throw_invalid_argument(logger(), log::format("K2_Tree: self-loop edges are not supported (node {} -> {})",
-                                                         source_node, target_node));
-        }
-    }
-
     // A negative target becomes a large u32, which the build skips as out of range.
     s64 edge_count = 0;
     const auto row_band_edges = [&](s64 first_row, s64 end_row, const auto &visit) {
@@ -543,12 +536,6 @@ Optional<K2_Tree> K2_Tree::from_edges(
         return nullopt;
     }
 
-    // Every self-loop is refused, even one outside the network.
-    for (s64 edge_index = 0; edge_index < edge_count; edge_index++) {
-        if (source_indices[edge_index] != target_indices[edge_index]) continue;
-        throw_invalid_argument(logger(), log::format("K2_Tree: self-loop edges are not supported (node {} -> {})",
-                                                     source_indices[edge_index], target_indices[edge_index]));
-    }
     const auto row_band_edges = [&](s64 first_row, s64 end_row, const auto &visit) {
         for (s64 edge_index = 0; edge_index < edge_count; edge_index++) {
             const s64 source_node = source_indices[edge_index];

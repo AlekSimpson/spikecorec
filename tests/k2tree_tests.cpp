@@ -23,7 +23,7 @@ using namespace spikecorec::test_support;
 
 namespace {
 
-// A fixed 8-node directed graph. It has no self-loops, which K2_Tree rejects.
+// A fixed 8-node directed graph, without self-loops.
 Vector<Vector<s32>> k2_reference_adjacency() {
     return {
         {1, 4, 7}, // 0
@@ -110,16 +110,20 @@ TEST(K2_Tree, predecessors_bounds_and_degenerate) {
 }
 
 TEST(K2_Tree, single_node_and_bounds) {
-    // A single node's only possible edge is the self-loop (0, 0), which must throw rather than
-    // read as no edge.
+    // A single node's only possible edge is the self-loop (0, 0); the tree takes one level for it.
+    Vector<u32> buffer(4);
     Vector<Vector<s32>> single_with_self_loop = {{0}};
-    EXPECT_THROW({ K2_Tree::from_adjacency_list(shared_backend(), single_with_self_loop, 1); }, Invalid_Argument);
+    K2_Tree looped = *K2_Tree::from_adjacency_list(shared_backend(), single_with_self_loop, 1);
+    EXPECT_EQ(looped.tree_height, 1);
+    EXPECT_EQ(looped.adjacent(0, 0), 1);
+    ASSERT_EQ(looped.get_neighbors(0, buffer.data(), 4), 1);
+    EXPECT_EQ(buffer[0], 0u);
+    ASSERT_EQ(looped.get_predecessors(0, buffer.data(), 4), 1);
+    EXPECT_EQ(buffer[0], 0u);
 
-    // An isolated single node builds a zero-height tree and reports no edge.
+    // An isolated single node reports no edge.
     Vector<Vector<s32>> single_isolated = {{}};
     K2_Tree isolated = *K2_Tree::from_adjacency_list(shared_backend(), single_isolated, 1);
-    EXPECT_EQ(isolated.tree_height, 0);
-    Vector<u32> buffer(4);
     EXPECT_EQ(isolated.adjacent(0, 0), 0);
     EXPECT_EQ(isolated.get_neighbors(0, buffer.data(), 4), 0);
 
@@ -132,21 +136,32 @@ TEST(K2_Tree, single_node_and_bounds) {
     EXPECT_EQ(tree.get_neighbors(0, buffer.data(), 0), 0);
 }
 
-TEST(K2_Tree, self_loop_rejected_for_any_node_count) {
-    // Self-loops are rejected for any node count, through both the adjacency-list and edge-array
-    // entry points.
+TEST(K2_Tree, self_loops_are_edges_like_any_other) {
+    // Through both the adjacency-list and edge-array entry points, a self-loop is stored, walked in
+    // its row and its column, and listed in order with the other edges.
     Vector<Vector<s32>> adjacency_with_self_loop = {
         {1, 2},
         {1, 2}, // node 1: self-loop + normal edge
         {0}
     };
-    EXPECT_THROW({ K2_Tree::from_adjacency_list(shared_backend(), adjacency_with_self_loop, 3); }, Invalid_Argument);
-
-    Vector<u32> source_nodes = {0, 1, 1, 2};
-    Vector<u32> target_nodes = {1, 1, 2, 0};
-    EXPECT_THROW({
-        K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(), static_cast<s64>(source_nodes.size()), 3);
-    }, std::invalid_argument);
+    Vector<u32> source_nodes = {0, 0, 1, 1, 2};
+    Vector<u32> target_nodes = {1, 2, 1, 2, 0};
+    Vector<K2_Tree> trees;
+    trees.push_back(*K2_Tree::from_adjacency_list(shared_backend(), adjacency_with_self_loop, 3));
+    trees.push_back(*K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
+                                         static_cast<s64>(source_nodes.size()), 3));
+    for (const K2_Tree &tree : trees) {
+        EXPECT_EQ(tree.adjacent(1, 1), 1);
+        EXPECT_EQ(tree.adjacent(0, 0), 0);
+        EXPECT_EQ(tree.adjacent(2, 2), 0);
+        Vector<u32> buffer(4);
+        ASSERT_EQ(tree.get_neighbors(1, buffer.data(), 4), 2);
+        EXPECT_EQ(buffer[0], 1u);
+        EXPECT_EQ(buffer[1], 2u);
+        ASSERT_EQ(tree.get_predecessors(1, buffer.data(), 4), 2);
+        EXPECT_EQ(buffer[0], 0u);
+        EXPECT_EQ(buffer[1], 1u);
+    }
 }
 
 TEST(K2_Tree, save_load) {
@@ -244,7 +259,7 @@ TEST(K2_Tree, a_superblock_size_outside_the_subblock_range_is_rejected) {
                     .has_value());
 }
 
-// trace() is the debug twin of adjacent() and must give the same answer for every pair.
+// trace() is the debug twin of adjacent() and must give the same answer for every pair, self-loops included.
 TEST(K2_Tree, trace_agrees_with_adjacent) {
     const s32 node_count = 129;
     Mersenne_Twister random_engine(4242);
@@ -252,7 +267,7 @@ TEST(K2_Tree, trace_agrees_with_adjacent) {
     Vector<Vector<s32>> adjacency(static_cast<usize>(node_count));
     for (s32 source = 0; source < node_count; source += 1) {
         for (s32 target = 0; target < node_count; target += 1) {
-            if (target != source && has_edge(random_engine)) adjacency[static_cast<usize>(source)].push_back(target);
+            if (has_edge(random_engine)) adjacency[static_cast<usize>(source)].push_back(target);
         }
     }
     K2_Tree tree = *K2_Tree::from_adjacency_list(shared_backend(), adjacency, node_count, 2);
@@ -265,7 +280,7 @@ TEST(K2_Tree, trace_agrees_with_adjacent) {
 }
 
 TEST(K2_Tree, random_graphs_answer_every_query_for_every_branching_factor) {
-    // Node counts that are powers of no branching factor, so every tree is padded.
+    // Node counts that are powers of no branching factor, so every tree is padded; self-loops are drawn too.
     for (s32 branching_factor : {2, 3, 4, 5}) {
         for (s32 node_count : {7, 50, 129}) {
             Mersenne_Twister random_engine(static_cast<unsigned>(1000 * branching_factor + node_count));
@@ -274,7 +289,7 @@ TEST(K2_Tree, random_graphs_answer_every_query_for_every_branching_factor) {
             Vector<Vector<s32>> predecessors(static_cast<usize>(node_count));
             for (s32 source = 0; source < node_count; source += 1) {
                 for (s32 target = 0; target < node_count; target += 1) {
-                    if (target == source || !has_edge(random_engine)) continue;
+                    if (!has_edge(random_engine)) continue;
                     adjacency[static_cast<usize>(source)].push_back(target);
                     predecessors[static_cast<usize>(target)].push_back(source);
                 }

@@ -2118,6 +2118,30 @@ TEST(Topology, connection_values_give_each_connection_its_synapse_weight_and_del
     EXPECT_THROW(Spike_Engine(lems, adjacency, synapses, negative_delay), Runtime_Error);
 }
 
+// A neuron's connection to itself is kept and walked like any other: with the same weight and delay,
+// the synapse on 0 -> 0 holds the same state as the one on 0 -> 1 at every tick.
+TEST(Topology, a_self_connection_is_kept_and_delivered_like_any_other) {
+    const Temporary_Directory directory;
+    const String lems = write_model(directory, torus_model(16), "torusNetwork", "50ms", "0.1ms");
+    Vector<Vector<s32>> adjacency(16);
+    adjacency[0] = {0, 1};
+    Spike_Engine engine(lems, adjacency, "torusSynapse", /*connection_weight=*/1.0, /*connection_delay_seconds=*/1e-3);
+    EXPECT_EQ(engine.weights.total_edge_count, 2);
+    EXPECT_NEAR(engine.weights.get(0, 0), 1.0f, 0.01f);
+    EXPECT_EQ(engine.weights.get_edge_delay_ticks(0, 0), 10);
+
+    const s64 plane = engine.synapse_state_variable_plane("torusSynapse", "J");
+    s64 nonzero_ticks = 0;
+    for (s64 tick = 0; tick < engine.lifetime; tick += 1) {
+        engine.step_simulation(tick);
+        const f32 self_value = engine.weights.get_for_matrix(0, 0, plane);
+        const f32 other_value = engine.weights.get_for_matrix(0, 1, plane);
+        EXPECT_NEAR(self_value, other_value, 1e-6f * max(1.0f, fabsf(other_value))) << "tick " << tick;
+        if (other_value != 0.0f) nonzero_ticks += 1;
+    }
+    EXPECT_GT(nonzero_ticks, 0) << "neuron 0 never fired, so the test showed nothing";
+}
+
 // ── randomness ──────────────────────────────────────────────────────────────────
 
 namespace {
