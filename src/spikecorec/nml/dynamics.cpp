@@ -43,7 +43,8 @@ const Set<String> SYNAPSE_ENGINE_NAMES = {
     "sparse_delta_edge_ordinal", "sparse_delta_value", "pending_delta_edge_ordinal",
     "pending_delta_value", "pending_delta_matrix_index", "pending_delta_control", "pending_delta_capacity",
     "updated_plane_count", "walk_pass",
-    "run_first_edge_ordinal", "run_synapse_prototype", "run_count", "synapse_active_ticks"};
+    "run_first_edge_ordinal", "run_synapse_prototype", "run_count", "synapse_active_ticks",
+    "delay_ticks", "spike_history", "spike_history_length", "arrival_delay_ticks", "arrives_next_tick", "delivered_value"};
 
 // Names the generated input code declares or reads in master_step. A LEMS name in an input
 // equal to one of these, or starting with INPUT_PART_PREFIX, would be captured, so it is refused.
@@ -482,6 +483,119 @@ bool has_on_event(const NML_Component_Type &component_type) {
     return false;
 }
 
+// The exposure a cell's select reads ("synapses[*]/i" reads "i"), or "" when it has no select.
+String select_exposure(const NML_Component_Type &cell_type) {
+    for (const NML_Dynamics_Expression &entry : cell_type.dynamics) {
+        if (!entry.select.empty()) return entry.select.substr(entry.select.rfind('/') + 1);
+    }
+    return "";
+}
+
+// The variable a type exposes as exposure_name: the StateVariable or DerivedVariable declared with
+// exposure="exposure_name", the nearest type first; exposure_name itself when none is.
+String exposed_variable_name(const NML_Component_Type &component_type, const String &exposure_name) {
+    Function<const NML_Node *(const NML_Node *)> find_exposed = [&](const NML_Node *node) -> const NML_Node * {
+        for (const NML_Node *child : children_of(node)) {
+            const NML_Tag &tag = child->body;
+            const bool is_variable = tag.tag_type == NML_Declaration_Type::StateVariable ||
+                                     tag.tag_type == NML_Declaration_Type::DerivedVariable ||
+                                     tag.tag_type == NML_Declaration_Type::ConditionalDerivedVariable;
+            if (is_variable && tag.get_attribute_or("exposure", "") == exposure_name) return child;
+            if (const NML_Node *nested = find_exposed(child)) return nested;
+        }
+        return nullptr;
+    };
+    for (const NML_Component_Type *type = &component_type; type; type = type->extends) {
+        if (const NML_Node *declaration = find_exposed(type->source_node)) return declaration->body.get_attribute("name");
+    }
+    return exposure_name;
+}
+
+// The increment of an accumulating value: `variable + increment` or `increment + variable`, or
+// `variable - increment` (negated is then set), where increment does not read variable. nullptr
+// for any other form.
+const Lems_Parse_Node *accumulator_increment(const Lems_Parse_Node *value, const String &variable, bool &negated) {
+    negated = false;
+    if (!value || value->body.syntax_type != Lems_Node_Subtype::OPERATOR) return nullptr;
+    const auto *sum = dynamic_cast<const Binary_Node<Lems_Parse_Body> *>(value);
+    if (!sum) return nullptr;
+
+    auto is_variable = [&variable](const Lems_Parse_Node *node) {
+        return node->body.syntax_type == Lems_Node_Subtype::IDENTIFIER && node->body.token.lexeme == variable;
+    };
+    auto reads_variable = [&variable](const Lems_Parse_Node *node) {
+        Set<String> names;
+        collect_lems_identifiers(node, names);
+        return names.count(variable) != 0;
+    };
+
+    const String &operation = value->body.token.lexeme;
+    const Lems_Parse_Node *increment = nullptr;
+    if (operation == "+" && is_variable(sum->left)) increment = sum->right;
+    else if (operation == "+" && is_variable(sum->right)) increment = sum->left;
+    else if (operation == "-" && is_variable(sum->left)) {
+        increment = sum->right;
+        negated = true;
+    }
+    if (!increment || reads_variable(increment)) return nullptr;
+    return increment;
+}
+
+// Whether variable of a synapse type is a weighted arrival (see Synapse_Delivery): a StateVariable
+// with no TimeDerivative, changed only by one StateAssignment in an OnEvent on "in", whose value
+// adds an increment reading none of the type's StateVariables or DerivedVariables. Sets
+// arrival_expression to that value.
+bool is_weighted_arrival(const NML_Component_Type &component_type, const String &variable, String &arrival_expression) {
+    const Vector<String> &state_names = component_type.state_variable_names;
+    if (std::find(state_names.begin(), state_names.end(), variable) == state_names.end()) return false;
+
+    Set<String> derived_names;
+    const NML_Dynamics_Expression *assignment = nullptr;
+    bool in_event = false;
+    for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
+        switch (entry.source_tag) {
+            case NML_Declaration_Type::TimeDerivative:
+                if (entry.target == variable) return false;
+                in_event = false;
+                break;
+            case NML_Declaration_Type::DerivedVariable:
+            case NML_Declaration_Type::Case:
+                derived_names.insert(entry.target);
+                in_event = false;
+                break;
+            case NML_Declaration_Type::OnEvent:
+                if (entry.target != "in") return false;
+                in_event = true;
+                break;
+            case NML_Declaration_Type::StateAssignment:
+                if (entry.target != variable) break;
+                if (!in_event || assignment) return false;
+                assignment = &entry;
+                break;
+            case NML_Declaration_Type::OnStart:
+                in_event = false;
+                break;
+            default:
+                // Regimes, OnConditions and the like; the synapse's own translation refuses them.
+                return false;
+        }
+    }
+    if (!assignment) return false;
+
+    const Unique_Pointer<Lems_Parse_Node> value(parse_lems_expression(assignment->expression, component_type.name));
+    bool negated = false;
+    const Lems_Parse_Node *increment = accumulator_increment(value.get(), variable, negated);
+    if (!increment || calls_function(increment, "random")) return false;
+    Set<String> read_names;
+    collect_lems_identifiers(increment, read_names);
+    for (const String &name : read_names) {
+        if (derived_names.count(name)) return false;
+        if (std::find(state_names.begin(), state_names.end(), name) != state_names.end()) return false;
+    }
+    arrival_expression = assignment->expression;
+    return true;
+}
+
 // The child slots of node that hold uses of names; declared names, parameters, types,
 // function names and member names are not uses.
 Vector<Kernel_Node **> use_slots(Kernel_Node *node) {
@@ -700,6 +814,129 @@ bool Codegen::cells_receive_events() const {
     return false;
 }
 
+void Codegen::collect_synapse_deliveries() {
+    synapse_deliveries.clear();
+
+    Vector<Pair<s64, const NML_Component_Type *>> population_ends;
+    s64 first_neuron = 0;
+    for (const NML_Component_Instance *population : network_populations(context)) {
+        first_neuron += context.get_population_size(population);
+        population_ends.push_back({first_neuron, population_cell(context, *population).component_type});
+    }
+    auto cell_type_of = [&](s64 neuron_index) -> const NML_Component_Type * {
+        for (const auto &[population_end, cell_type] : population_ends) {
+            if (neuron_index < population_end) return cell_type;
+        }
+        return nullptr;
+    };
+
+    // The exposures each synapse's target cells read, each cell type once per synapse.
+    Unordered_Map<String, Ordered_Set<String>> read_exposures;
+    Unordered_Map<String, Set<const NML_Component_Type *>> seen_cell_types;
+    auto include = [&](const NML_Network_Edge &edge) {
+        const NML_Component_Type *cell_type = cell_type_of(edge.child);
+        if (!cell_type || !seen_cell_types[edge.component_id].insert(cell_type).second) return;
+        const String exposure = select_exposure(*cell_type);
+        if (!exposure.empty()) read_exposures[edge.component_id].insert(exposure);
+    };
+    for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
+        for (const NML_Network_Edge &edge : row) include(edge);
+    }
+    for (const NML_Network_Edge &edge : context.simulation.sampled_connections) include(edge);
+
+    for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
+        if (!synapse.component_type) throw Runtime_Error("Synapse '" + synapse.id + "' has no ComponentType");
+        const NML_Component_Type &component_type = *synapse.component_type;
+
+        // The kernel delivers one value of a synapse to all of its targets.
+        const Ordered_Set<String> &exposures = read_exposures[synapse.id];
+        if (exposures.size() > 1) {
+            String names;
+            for (const String &exposure : exposures) names += (names.empty() ? "'" : ", '") + exposure + "'";
+            throw Runtime_Error("Synapse '" + synapse.id + "' (" + component_type.name + ") reaches cells that read "
+                                "different exposures of it, " + names + ", but a synapse delivers one value to all "
+                                "of its targets");
+        }
+
+        Synapse_Delivery delivery;
+        if (!exposures.empty()) {
+            delivery.read_exposure = *exposures.begin();
+            delivery.read_variable = exposed_variable_name(component_type, delivery.read_exposure);
+            delivery.weighted_arrival =
+                    is_weighted_arrival(component_type, delivery.read_variable, delivery.arrival_expression);
+        }
+        if (delivery.weighted_arrival) {
+            delivery.starting_value = starting_values(context, synapse).at(delivery.read_variable);
+            log::logger().info("Codegen: synapse '{}' delivers '{}' as weighted arrivals: each arrival adds its "
+                               "OnEvent increment to its target's sum once, and nothing is kept per connection",
+                               synapse.id, delivery.read_exposure);
+        } else {
+            delivery.edge_state_variable_names = component_type.state_variable_names;
+        }
+        synapse_deliveries[synapse.id] = std::move(delivery);
+    }
+}
+
+const Synapse_Delivery &Codegen::synapse_delivery(const NML_Component_Instance &synapse) const {
+    auto delivery = synapse_deliveries.find(synapse.id);
+    if (delivery == synapse_deliveries.end()) {
+        throw Runtime_Error("Codegen: synapse '" + synapse.id + "' has no delivery; collect_synapse_deliveries "
+                            "must run before the kernel and its memory are built");
+    }
+    return delivery->second;
+}
+
+bool Codegen::has_weighted_arrivals() const {
+    for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
+        if (synapse_delivery(synapse).weighted_arrival) return true;
+    }
+    return false;
+}
+
+bool Codegen::only_weighted_arrivals() const {
+    Set<String> connected(context.simulation.largest_connection_weight_per_synapse.size());
+    for (const auto &[synapse_id, largest_weight] : context.simulation.largest_connection_weight_per_synapse) {
+        connected.insert(synapse_id);
+    }
+    for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
+        for (const NML_Network_Edge &edge : row) connected.insert(edge.component_id);
+    }
+    for (const NML_Network_Edge &edge : context.simulation.sampled_connections) connected.insert(edge.component_id);
+
+    bool any_connected = false;
+    for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
+        if (!connected.count(synapse.id)) continue;
+        if (!synapse_delivery(synapse).weighted_arrival) return false;
+        any_connected = true;
+    }
+    return any_connected;
+}
+
+s64 Codegen::network_input_row_count() const {
+    return has_weighted_arrivals() ? WEIGHTED_ARRIVAL_SUM_ROW + 1 : WEIGHTED_ARRIVAL_ROW;
+}
+
+void Codegen::check_population_cells() const {
+    for (const NML_Component_Instance *population : network_populations(context)) {
+        if (context.get_population_size(population) == 0) continue;
+        const NML_Component_Instance &cell = population_cell(context, *population);
+        if (!context.is_instance_of(&cell, "baseSpikeSource")) continue;
+
+        // A cell's own dynamics are compiled; child components (a spikeArray's spikes) are not.
+        bool has_child_components = false;
+        for (const String &child_id : cell.data_order) {
+            const NML_Component_Instance *child = context.find_instance(child_id);
+            has_child_components = has_child_components || (child && child->component_type);
+        }
+        if (!has_child_components) continue;
+        throw Runtime_Error("Population '" + population->id + "' is made of '" + cell.id + "' (" +
+                            cell.component_type->name + "), a spike source whose spikes come from its child "
+                            "components, which the engine runs only for an input, so its cells would never fire. "
+                            "Fire a cell with it instead: an explicitInput or inputList of '" + cell.id +
+                            "' onto a population of cells");
+    }
+}
+
 void Codegen::allocate_cell_model_memory() {
     // Two rows like network_inputs when some cell has an OnEvent; otherwise one slot to bind.
     const s64 event_arrival_slots = cells_receive_events() ? 2 * context.simulation.total_neuron_count : 1;
@@ -709,7 +946,8 @@ void Codegen::allocate_cell_model_memory() {
     const s64 entry_count = static_cast<s64>(input_entries.size());
 
     device->partition(sizeof(f32) * context.get_cell_state_size(), Engine_Datatype::FLOAT32, data_partitions)            // cell_state
-          .partition(sizeof(f32) * 2 * context.simulation.total_neuron_count, Engine_Datatype::FLOAT32, data_partitions)    // network_inputs
+          .partition(sizeof(f32) * network_input_row_count() * context.simulation.total_neuron_count, Engine_Datatype::FLOAT32,
+                     data_partitions)                                                                                      // network_inputs
           .partition(sizeof(u8) * spike_history_length(context) * context.simulation.total_neuron_count,
                      Engine_Datatype::UNSIGNED8, data_partitions)                                                           // spike_history
           .partition(sizeof(s64) * context.simulation.total_neuron_count, Engine_Datatype::SIGNED64, data_partitions)       // last_spiked
@@ -726,7 +964,7 @@ void Codegen::allocate_cell_model_memory() {
 
     log::logger().debug("Codegen: {} bytes: cell_state {}, network_inputs {}, spike_history {}, last_spiked {}, "
                         "event_arrival_count {}",
-                        slab.total_bytes, context.get_cell_state_size(), 2 * context.simulation.total_neuron_count,
+                        slab.total_bytes, context.get_cell_state_size(), network_input_row_count() * context.simulation.total_neuron_count,
                         spike_history_length(context) * context.simulation.total_neuron_count,
                         context.simulation.total_neuron_count, event_arrival_slots);
 }
@@ -1106,12 +1344,33 @@ Kernel_Node *Codegen::translate_kernel_code() {
         spiked_index += 2;
     }
 
+    // network_inputs[row * neuron_count + neuron_index]
+    auto input_row_slot = [](Kernel_Node *row) {
+        return new_expression("[]", identifier("network_inputs"),
+                              new_expression("+", new_expression("*", row, identifier("neuron_count")),
+                                             identifier("neuron_index")));
+    };
+
     // The cells run in a tick's first walk pass only; a later pass only walks deferred neurons' edges.
+    // With weighted arrivals, the neuron first adds the increments that reach it this tick to its
+    // running sum, which its select reads with the tick's other input.
+    Kernel_List_Node *first_pass_body = new_block();
+    if (has_weighted_arrivals()) {
+        Kernel_Node *sum_slot = input_row_slot(literal(std::to_string(WEIGHTED_ARRIVAL_SUM_ROW)));
+        Kernel_Node *arrival_slot = input_row_slot(
+                new_expression("+", literal(std::to_string(WEIGHTED_ARRIVAL_ROW)), identifier("current_row")));
+        first_pass_body->children.push_back(new_assignment(sum_slot, "+=", arrival_slot));
+        first_pass_body->children.push_back(new_assignment(clone(arrival_slot), "=", literal("0.0f")));
+        first_pass_body->children.push_back(new_assignment(identifier("network_input"), "+=", clone(sum_slot)));
+    }
     if (dispatch->children.empty()) {
         delete dispatch;
     } else {
-        Kernel_List_Node *first_pass_body = new_block();
         first_pass_body->children.push_back(dispatch);
+    }
+    if (first_pass_body->children.empty()) {
+        delete first_pass_body;
+    } else {
         Kernel_List_Node *first_pass_only = new_conditional();
         add_branch(first_pass_only, new_expression("==", identifier("walk_pass"), literal("0")), first_pass_body);
         insert_statements(body, static_cast<usize>(spiked_index) + 1, {first_pass_only});
@@ -1170,6 +1429,45 @@ Kernel_Node *Codegen::translate_kernel_code() {
             Kernel_List_Node *on_arrival = new_conditional();
             add_branch(on_arrival, identifier("arrived"), count_arrival);
             walk->children.push_back(on_arrival);
+        }
+
+        // When every synapse delivers weighted arrivals, a neuron's edges have work only on a tick
+        // one of its spikes reaches a target on the next tick: one a delay less one tick ago, for
+        // some delay in the network's range. Any other tick skips the walk.
+        if (only_weighted_arrivals()) {
+            const s64 walk_stack_index = find_statement(body, "walk_stack_row_base");
+            if (walk_stack_index < 0) throw Runtime_Error("translate_kernel_code: master_step declares no 'walk_stack_row_base'");
+            const s64 shortest_delay = std::max<s64>(1, context.simulation.minimum_edge_delay);
+            const s64 longest_delay = std::max<s64>(1, context.simulation.maximum_edge_delay);
+
+            Kernel_Node *spike_row = new_expression("%", new_expression("-", identifier("tick"), identifier("elapsed_ticks")),
+                                                    identifier("spike_history_length"));
+            Kernel_Node *spiked_then = new_expression(
+                    "!=",
+                    new_expression("[]", identifier("spike_history"),
+                                   new_expression("+", new_expression("*", spike_row, identifier("neuron_count")),
+                                                  identifier("neuron_index"))),
+                    literal("0"));
+            Kernel_List_Node *mark_due = new_block();
+            mark_due->children.push_back(new_assignment(identifier("arrival_due"), "=", identifier("true")));
+            Kernel_List_Node *check_tick = new_conditional();
+            add_branch(check_tick,
+                       new_expression("&&", new_expression(">=", identifier("tick"), identifier("elapsed_ticks")), spiked_then),
+                       mark_due);
+            Kernel_List_Node *loop_body = new_block();
+            loop_body->children.push_back(check_tick);
+            Kernel_List_Node *loop = new_node<List_Node>(Kernel_Node_Type::FOR, "");
+            loop->children = {new_declaration(new_type("s32"), "elapsed_ticks", literal(std::to_string(shortest_delay - 1))),
+                              new_expression("<=", identifier("elapsed_ticks"), literal(std::to_string(longest_delay - 1))),
+                              new_assignment(identifier("elapsed_ticks"), "+=", literal("1")), loop_body};
+
+            Kernel_List_Node *skip_body = new_block();
+            skip_body->children.push_back(new_node<Unary_Node>(Kernel_Node_Type::JUMP, "return"));
+            Kernel_List_Node *skip_walk = new_conditional();
+            add_branch(skip_walk, new_unary_expression("!", identifier("arrival_due")), skip_body);
+
+            insert_statements(body, static_cast<usize>(walk_stack_index),
+                              {new_declaration(new_type("bool"), "arrival_due", identifier("false")), loop, skip_walk});
         }
     }
 
@@ -1244,9 +1542,10 @@ void place_derived_variables(Kernel_List_Node *body, const Vector<String> &deriv
 
 // Ticks after an arrival until every state variable is within REST_FRACTION of its largest
 // deviation from rest, simulated on the host as the kernel integrates it. -1 when its OnStart
-// values are not a rest state (a nonzero derivative or current), its derived variables form a
-// cycle, or it does not settle within the run.
-s64 synapse_settle_ticks(const NML_Context &context, const NML_Component_Instance &synapse, f64 weight) {
+// values are not a rest state (a nonzero derivative, or a nonzero delivered_variable, which its
+// targets read), its derived variables form a cycle, or it does not settle within the run.
+s64 synapse_settle_ticks(const NML_Context &context, const NML_Component_Instance &synapse, f64 weight,
+                         const String &delivered_variable) {
     const NML_Component_Type &component_type = *synapse.component_type;
     const String &owner_name = component_type.name;
     const Vector<String> &variable_names = component_type.state_variable_names;
@@ -1331,7 +1630,7 @@ s64 synapse_settle_ticks(const NML_Context &context, const NML_Component_Instanc
     for (const Parsed_Entry &derivative : derivatives) {
         if (evaluate_lems(derivative.value.get(), values, owner_name) != 0.0) return -1;
     }
-    if (values.count("i") == 0 || values.at("i") != 0.0) return -1;
+    if (values.count(delivered_variable) == 0 || values.at(delivered_variable) != 0.0) return -1;
 
     Vector<f64> largest_deviation(variable_names.size(), 0.0);
     const s64 tick_limit = std::max<s64>(1, std::llround(context.simulation.simulation_duration / step_dt));
@@ -2379,10 +2678,12 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
 // plane: reads are load_edge, and the tick's changes to it (its Euler step or return to rest, plus
 // the OnEvent on arrival) sum into change_<name>, which one accumulate_edge adds, so an edge
 // queues at most one update per plane per tick. Order: derived variables, derivatives, the step,
-// the OnEvent on arrival, the updates, the current into the target. On the active window's last
-// tick it is set exactly to rest instead of stepped, and stays there while skipped.
-Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &component_type) {
-    auto cached = synapse_type_templates.find(component_type.name);
+// the OnEvent on arrival, the updates, the delivered variable (its current) into the target. On the
+// active window's last tick it is set exactly to rest instead of stepped, and stays there while skipped.
+Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &component_type,
+                                                  const String &delivered_variable) {
+    const String template_key = component_type.name + "/" + delivered_variable;
+    auto cached = synapse_type_templates.find(template_key);
     if (cached != synapse_type_templates.end()) return cached->second;
 
     const String &owner_name = component_type.name;
@@ -2439,9 +2740,10 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
         }
     }
     if (!receives_spikes) throw unsupported("no OnEvent port=\"in\", so no spike ever drives it");
-    const bool exposes_current = derived_entries.count("i") != 0 ||
-                                 std::find(variable_names.begin(), variable_names.end(), "i") != variable_names.end();
-    if (!exposes_current) throw unsupported("no current 'i' to deliver to the target");
+    const bool exposes_delivered = derived_entries.count(delivered_variable) != 0 ||
+                                   std::find(variable_names.begin(), variable_names.end(), delivered_variable) !=
+                                           variable_names.end();
+    if (!exposes_delivered) throw unsupported("no '" + delivered_variable + "' to deliver to the target");
 
     Set<String> lems_names;
     auto translate = [&](const String &expression) {
@@ -2457,6 +2759,9 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
 
     Kernel_List_Node *body = new_block();
     place_derived_variables(body, derived_names, derived_entries, translate, selected_value, unsupported, lems_names);
+    // What the targets read, from the pre-step state like every derived variable: a state variable
+    // read after its update would see it or not depending on whether the edge has an entry in S.
+    body->children.push_back(new_declaration(new_type("const f32"), "delivered_value", identifier(delivered_variable)));
 
     // Every derivative from the pre-step state, then every Euler step.
     Set<String> integrated_names;
@@ -2511,11 +2816,11 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
         body->children.push_back(accumulate_edge(plane_of(variable_name), identifier(CHANGE_PREFIX + variable_name)));
     }
 
-    // The current, into the target's next input row.
+    // What the targets read (the current), into the target's next input row.
     Kernel_Node *input_slot = new_expression(
             "[]", identifier("network_inputs"),
             new_expression("+", new_expression("*", identifier("next_row"), identifier("neuron_count")), identifier("target")));
-    body->children.push_back(function_call("atomic_add", {input_slot, identifier("i")}));
+    body->children.push_back(function_call("atomic_add", {input_slot, identifier("delivered_value")}));
 
     for (const String &name : lems_names) {
         if (is_synapse_engine_name(name)) {
@@ -2533,14 +2838,19 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
     const Unique_Pointer<Kernel_Node> tick_time(identifier("simulation_time"));
     replace_identifier(body_node, "t", tick_time.get());
 
-    synapse_type_templates[component_type.name] = body;
+    synapse_type_templates[template_key] = body;
     return body;
 }
 
 Kernel_List_Node *Codegen::translate_synapse_instance(const NML_Component_Instance &synapse) {
     if (!synapse.component_type) throw Runtime_Error("Synapse '" + synapse.id + "' has no ComponentType");
     const NML_Component_Type &component_type = *synapse.component_type;
-    Kernel_Node *body = clone(translate_synapse_type(component_type));
+    const Synapse_Delivery &delivery = synapse_delivery(synapse);
+    if (delivery.weighted_arrival) return translate_weighted_arrival(synapse);
+
+    // A target with no select reads no value of it; its current goes on as before.
+    const String delivered_variable = delivery.read_variable.empty() ? "i" : delivery.read_variable;
+    Kernel_Node *body = clone(translate_synapse_type(component_type, delivered_variable));
 
     try {
         for (const auto &[name, value] : component_parameter_values(context, synapse)) {
@@ -2575,18 +2885,113 @@ Kernel_List_Node *Codegen::translate_synapse_instance(const NML_Component_Instan
     return static_cast<Kernel_List_Node *>(body);
 }
 
+// The spike that reaches the target on the next tick left the source a delay before it. Delivered
+// into the next tick's row, the increment reaches the target's dynamics exactly a delay after the
+// spike, as the connection's delay says: the scatter's one tick of latency is part of the delay.
+// The delay is held to the network's declared range, which a fitted delay can pass by its fit error.
+Kernel_List_Node *Codegen::translate_weighted_arrival(const NML_Component_Instance &synapse) {
+    const NML_Component_Type &component_type = *synapse.component_type;
+    const Synapse_Delivery &delivery = synapse_delivery(synapse);
+    const String &owner_name = component_type.name;
+    auto unsupported = [&](const String &reason) {
+        return Runtime_Error("Synapse ComponentType '" + owner_name + "' ('" + synapse.id + "'): " + reason);
+    };
+
+    const Unique_Pointer<Lems_Parse_Node> value(parse_lems_expression(delivery.arrival_expression, owner_name));
+    bool negated = false;
+    const Lems_Parse_Node *increment_tree = accumulator_increment(value.get(), delivery.read_variable, negated);
+    if (!increment_tree) throw unsupported("'" + delivery.arrival_expression + "' is not an accumulating OnEvent value");
+    Set<String> lems_names;
+    collect_lems_identifiers(increment_tree, lems_names);
+    for (const String &name : lems_names) {
+        if (is_synapse_engine_name(name)) throw unsupported("the name '" + name + "' is reserved by the generated kernel");
+    }
+
+    Kernel_Node *increment = translate_expression(increment_tree);
+    if (negated) increment = new_unary_expression("-", increment);
+    Kernel_List_Node *arrival_body = new_block();
+    Kernel_List_Node *block = new_block();
+    try {
+        for (const auto &[name, parameter_value] : component_parameter_values(context, synapse)) {
+            const Unique_Pointer<Kernel_Node> value_literal(literal(float_literal(parameter_value)));
+            replace_identifier(increment, name, value_literal.get());
+        }
+        // weight is the connection's, in the weight plane; t is the arrival's, the next tick's time.
+        const Unique_Pointer<Kernel_Node> edge_weight(load_edge(Weight_Matrix::WEIGHT_PLANE));
+        replace_identifier(increment, "weight", edge_weight.get());
+        const Unique_Pointer<Kernel_Node> arrival_time(
+                new_expression("+", identifier("simulation_time"), literal(float_literal(context.simulation.step_dt))));
+        replace_identifier(increment, "t", arrival_time.get());
+        fold_constants(increment);
+
+        Set<String> remaining_names;
+        collect_identifiers(increment, remaining_names);
+        for (const String &name : remaining_names) {
+            if (is_synapse_engine_name(name)) continue;
+            throw unsupported("its OnEvent increment reads '" + name + "', which is not a set parameter, a constant or weight");
+        }
+
+        const s64 shortest_delay = std::max<s64>(1, context.simulation.minimum_edge_delay);
+        const s64 longest_delay = std::max<s64>(1, context.simulation.maximum_edge_delay);
+        Kernel_Trinary_Node *held_below_longest = new_node<Trinary_Node>(Kernel_Node_Type::EXPRESSION, "?:");
+        held_below_longest->left = new_expression(">", identifier("delay_ticks"), literal(std::to_string(longest_delay)));
+        held_below_longest->middle = literal(std::to_string(longest_delay));
+        held_below_longest->right = identifier("delay_ticks");
+        Kernel_Trinary_Node *held_in_range = new_node<Trinary_Node>(Kernel_Node_Type::EXPRESSION, "?:");
+        held_in_range->left = new_expression("<", identifier("delay_ticks"), literal(std::to_string(shortest_delay)));
+        held_in_range->middle = literal(std::to_string(shortest_delay));
+        held_in_range->right = held_below_longest;
+        block->children.push_back(new_declaration(new_type("const s32"), "arrival_delay_ticks", held_in_range));
+
+        // arrives_next_tick = tick + 1 >= delay && spike_history[((tick + 1 - delay) % length) * count + source] != 0
+        Kernel_Node *next_tick = new_expression("+", identifier("tick"), literal("1"));
+        Kernel_Node *spike_row = new_expression(
+                "%", new_expression("-", clone(next_tick), identifier("arrival_delay_ticks")), identifier("spike_history_length"));
+        Kernel_Node *spiked_then = new_expression(
+                "!=",
+                new_expression("[]", identifier("spike_history"),
+                               new_expression("+", new_expression("*", spike_row, identifier("neuron_count")),
+                                              identifier("neuron_index"))),
+                literal("0"));
+        block->children.push_back(new_declaration(
+                new_type("const bool"), "arrives_next_tick",
+                new_expression("&&", new_expression(">=", next_tick, identifier("arrival_delay_ticks")), spiked_then)));
+
+        Kernel_Node *arrival_slot = new_expression(
+                "[]", identifier("network_inputs"),
+                new_expression("+",
+                               new_expression("*",
+                                              new_expression("+", literal(std::to_string(WEIGHTED_ARRIVAL_ROW)),
+                                                             identifier("next_row")),
+                                              identifier("neuron_count")),
+                               identifier("target")));
+        arrival_body->children.push_back(function_call("atomic_add", {arrival_slot, increment}));
+        increment = nullptr;
+        Kernel_List_Node *on_arrival = new_conditional();
+        add_branch(on_arrival, identifier("arrives_next_tick"), arrival_body);
+        arrival_body = nullptr;
+        block->children.push_back(on_arrival);
+    } catch (...) {
+        delete increment;
+        delete arrival_body;
+        delete block;
+        throw;
+    }
+    return block;
+}
+
 s64 Codegen::edge_plane_count() const {
     s64 state_variable_count = 0;
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
         if (!synapse.component_type) throw Runtime_Error("Synapse '" + synapse.id + "' has no ComponentType");
-        state_variable_count = std::max<s64>(state_variable_count, synapse.component_type->state_variable_names.size());
+        state_variable_count = std::max<s64>(state_variable_count, synapse_delivery(synapse).edge_state_variable_names.size());
     }
     return Weight_Matrix::FIRST_STATE_VARIABLE_PLANE + state_variable_count;
 }
 
 s64 Codegen::updated_edge_plane_count() const {
-    // A synapse's dynamics write every one of its StateVariables: the Euler steps, the OnEvent
-    // and the return to rest.
+    // A synapse's dynamics write every one of its StateVariables kept per connection: the Euler
+    // steps, the OnEvent and the return to rest.
     return edge_plane_count() - Weight_Matrix::FIRST_STATE_VARIABLE_PLANE;
 }
 
@@ -2601,15 +3006,27 @@ s64 Codegen::synapse_active_ticks() const {
     }
     for (const NML_Network_Edge &edge : context.simulation.sampled_connections) include(edge);
 
+    // A spike's last weighted arrival is sent the longest delay less one tick after it.
+    if (only_weighted_arrivals()) {
+        const s64 active_ticks = std::max<s64>(1, context.simulation.maximum_edge_delay) - 1;
+        log::logger().info("Codegen: a neuron's synapses run for {} ticks after it spikes, only to send weighted "
+                           "arrivals", active_ticks);
+        return active_ticks;
+    }
+
     // At least a tick, so no arrival ever lands on the tick that puts a synapse back at rest.
     s64 settle_ticks = 1;
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
         auto weight = largest_weight.find(synapse.id);
         if (weight == largest_weight.end()) continue;
+        // A weighted arrival keeps nothing to settle.
+        const Synapse_Delivery &delivery = synapse_delivery(synapse);
+        if (delivery.weighted_arrival) continue;
 
         s64 ticks = -1;
         try {
-            ticks = synapse_settle_ticks(context, synapse, weight->second);
+            ticks = synapse_settle_ticks(context, synapse, weight->second,
+                                         delivery.read_variable.empty() ? "i" : delivery.read_variable);
         } catch (const Runtime_Error &error) {
             log::logger().warn("Codegen: synapse '{}' cannot be simulated on the host: {}", synapse.id, error.what());
         }

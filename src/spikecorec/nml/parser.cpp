@@ -929,6 +929,8 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
             simulation.network_data.add(edge);
             simulation.total_edge_count += 1;
             simulation.maximum_edge_delay = std::max(simulation.maximum_edge_delay, edge.delay_ticks);
+            simulation.minimum_edge_delay = simulation.total_edge_count == 1
+                    ? edge.delay_ticks : std::min(simulation.minimum_edge_delay, edge.delay_ticks);
         }
     }
 

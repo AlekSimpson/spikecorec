@@ -48,7 +48,8 @@ namespace spikecorec {
         // The master kernel source as compiled, with its constants baked in.
         String master_kernel_source;
         // Ticks after a spike during which a neuron's outgoing synapses run: the longest delay
-        // plus the slowest synapse's settle time. -1 runs every synapse every tick.
+        // plus the slowest synapse's settle time, or the longest delay less one when every synapse
+        // delivers weighted arrivals. -1 runs every synapse every tick.
         s64 synapse_active_ticks = -1;
         s32 rank_float4_stride_argument = 0;
         // Extra walk passes the run has needed because the update queue was full.
@@ -85,7 +86,11 @@ namespace spikecorec {
 
         // Two rows alternating by tick parity: a neuron drains one row while this tick's scatters
         // land in the other, so synaptic latency is exactly one tick whatever the thread order.
-        Engine_Pointer network_inputs;     // [2][total_neuron_count]
+        // With weighted arrivals (see Synapse_Delivery) three more: the increments arriving on a
+        // tick, by tick parity like the first two, and each neuron's running sum of them, which its
+        // select reads with the tick's other input. An arrival is sent the tick before it arrives,
+        // so it reaches its target exactly a delay after its spike.
+        Engine_Pointer network_inputs;     // [2 or 5][total_neuron_count]
 
         Engine_Pointer empty_edge_plane;
 
@@ -277,7 +282,8 @@ namespace spikecorec {
         // The state variable named `variable_name` for one neuron, read back from the GPU.
         [[nodiscard]] f32 read_state_variable(s64 neuron_index, const String &variable_name) const;
 
-        // The weight-matrix plane holding StateVariable `variable_name` of the named synapse.
+        // The weight-matrix plane holding StateVariable `variable_name` of the named synapse. Throws
+        // for a synapse that keeps it in no plane: one that delivers weighted arrivals.
         [[nodiscard]] s64 synapse_state_variable_plane(const String &synapse_component_id,
                                                        const String &variable_name) const;
 
@@ -304,9 +310,14 @@ namespace spikecorec {
         void initialize_model_buffers();
 
         // Builds the weight matrix from network_data, or from the adjacency topology when one was
-        // given: planes weight, delay, then synapse state variables, fitted from each run's
-        // starting values. Also copies the runs to the device.
-        void build_weight_matrix(s64 matrix_count, s64 updated_plane_count);
+        // given: planes weight, delay, then the synapse state variables kept per connection, fitted
+        // from each run's starting values. Also copies the runs to the device, and starts each
+        // neuron's sum of weighted arrivals at its connections' starting values.
+        void build_weight_matrix(const Codegen &compiler, s64 matrix_count, s64 updated_plane_count);
+
+        // Per synapse id, the StateVariables kept per connection, in plane order from
+        // Weight_Matrix::FIRST_STATE_VARIABLE_PLANE (Synapse_Delivery::edge_state_variable_names).
+        Unordered_Map<String, Vector<String>> synapse_edge_state_variable_names;
 
         // Fills kernel_argument_sources; throws on a master_step parameter with no source.
         void register_kernel_arguments();

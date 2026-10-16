@@ -156,7 +156,7 @@ engine = spc.Spike_Engine("LEMS_torus.xml", spc.square_torus(5),
 |---|---|---|
 | `master_kernel_source` | str | the generated kernel exactly as compiled, every constant baked in |
 | `kernel_parameter_names` | list[str] | the kernel's bound parameters, in binding order |
-| `synapse_active_ticks` | int | ticks after a neuron spikes during which its outgoing synapses run: the longest delay plus the slowest synapse's settle time. `-1` means every synapse runs every tick |
+| `synapse_active_ticks` | int | ticks after a neuron spikes during which its outgoing synapses run: the longest delay plus the slowest synapse's settle time, or the longest delay less one when every synapse delivers weighted arrivals (see below). `-1` means every synapse runs every tick |
 | `run_count` | int | runs of edges with the same synapse that the kernel looks synapses up in |
 | `calibration_tick_count` | int | ticks construction's calibration ran (see below); 0 when no plane needed it |
 | `deferred_walk_pass_count` | int | extra walk passes the run has needed: a neuron whose edge walk could queue more updates than the queue had room for that tick walks again, after the queue was merged into S |
@@ -229,7 +229,8 @@ One neuron's variable, read from the GPU. Raises if its cell type does not decla
 The same variable for every neuron. Every cell type must declare it.
 
 #### `synapse_state_variable_plane(synapse_component_id, variable_name) -> int`
-The `weights` plane that holds one of a synapse's LEMS state variables on its edges.
+The `weights` plane that holds one of a synapse's LEMS state variables on its edges. Raises for
+a synapse that delivers weighted arrivals, which keeps no state per edge (see below).
 
 ```python
 plane = engine.synapse_state_variable_plane("excitatorySynapse", "I")
@@ -243,7 +244,7 @@ Copies of the engine's GPU buffers. Each raises `RuntimeError` after `shutdown()
 | name | shape | meaning |
 |---|---|---|
 | `cell_state` | float32[`context.get_cell_state_size()`] | every cell's state variables; `context.resolve_path("pop[0]/v")` gives an index |
-| `network_inputs` | float32[2][neurons] | synaptic input accumulators, alternating by tick parity |
+| `network_inputs` | float32[2][neurons], or [5][neurons] with weighted arrivals | rows 0 and 1: synaptic input accumulators, alternating by tick parity. With weighted arrivals, rows 2 and 3 hold the increments arriving on a tick, alternating the same way, and row 4 each neuron's running sum of them |
 | `event_arrival_count` | uint32[2][neurons] | spikes that reached each cell, alternating by tick parity; read by cells with an `OnEvent`. Shape [0][neurons] when no cell type has one |
 | `spike_history` | uint8[`spike_history_row_count`][neurons] | row `tick % rows` holds that tick's spikes |
 | `last_spiked` | int64[neurons] | each neuron's last spike tick, or `NEVER_SPIKED_TICK` |
@@ -396,7 +397,7 @@ summed, plus `DEFAULT_FIT_RIDGE` times the squared rows that move.
 | name | type | meaning |
 |---|---|---|
 | `node_count`, `total_edge_count`, `max_neighbor_count`, `max_predecessor_count` | int | |
-| `matrix_count` | int | planes: weight, delay, then the largest synapse type's state variables |
+| `matrix_count` | int | planes: weight, delay, then the state variables of the synapse that keeps the most per edge (none for weighted arrivals) |
 | `updated_plane_count` | int | planes the kernel updates each tick |
 | `rank`, `rank_float4_stride` | int | lanes in the basis, and lanes / 4 |
 | `fit_tolerance` | float | the tolerance refits run to (read/write; the engine sets it from `Spike_Engine.fit_tolerance` before each refit it runs) |
@@ -570,7 +571,7 @@ context.parse("LEMS_model.xml")      # no GPU involved
 | `simulation_component_id`, `target_network_id` | |
 | `step_dt`, `simulation_duration` | seconds |
 | `total_tick_count`, `total_neuron_count`, `total_edge_count` | |
-| `maximum_edge_delay` | ticks |
+| `maximum_edge_delay`, `minimum_edge_delay` | ticks; both 0 with no connections |
 | `random_seed` | int or `None` |
 | `population_base_indices` | dict: population path → where its cells start in `cell_state` |
 | `instance_positions` | dict: a `populationList` `<instance>`'s full path → its position among the list's instances, which is its cell's index whatever the instance's id |
@@ -588,7 +589,8 @@ context.parse("LEMS_model.xml")      # no GPU involved
 `name`, `extends` (`NML_Component_Type` or `None`), `source_file`, `source_node`
 (`NML_Node`), `dynamics` (list of `NML_Dynamics_Expression`), `structure` (list of
 `NML_Structure_Entry`, from the nearest `<Structure>` in the `extends` chain), `state_variable_names`
-(inherited first; for a synapse these are its per-edge planes, in order), and
+(inherited first; for a synapse these are its per-edge planes, in order, unless it delivers weighted
+arrivals, which keep none), and
 `find_declaration(namespace_key)`, which searches up the `extends` chain and returns an
 `NML_Node` or `None`.
 
@@ -624,9 +626,22 @@ children. `NML_Tag` has `tag_name`, `tag_type` (`NML_Declaration_Type`), `attrib
 | `Simulation_Input_Config` | `input_component_id`, `targets` |
 | `Input_Target` | `neuron_index` (cell-memory index), `weight`, `destination` (the cell's attachment; `""` means `"synapses"`) |
 
-The engine sums every synapse and input of a cell into one current, which the cell reads through
-its one `select` (`synapses[*]/i`). A cell type with more than one `select`, or a synapse or input
-whose `destination` is not the attachment the `select` reads, is refused when the engine is built.
+The engine sums every synapse and input of a cell into one value, which the cell reads through
+its one `select` (`synapses[*]/i`, or another exposure such as `synapses[*]/accumulated_jump`). A
+cell type with more than one `select`, or a synapse or input whose `destination` is not the
+attachment the `select` reads, is refused when the engine is built, as is a synapse whose targets
+read different exposures of it.
+
+**Weighted arrivals.** When the exposure a cell's `select` reads is a synapse StateVariable that
+only an `OnEvent` changes, by an increment that reads none of the synapse's state (for example
+`accumulated_jump = accumulated_jump + weight * jump`), the synapse keeps no state per edge: each
+arriving spike adds its increment, once, to its target's running sum (`network_inputs` row 4), which
+the cell's `select` reads with the tick's other input. Such a synapse does no work between
+arrivals and never needs to settle. An arrival is sent on the tick before it reaches the target,
+so it reaches the cell's dynamics exactly one delay after the spike, before the cell checks its
+threshold on that tick: the spike-to-spike latency through the synapse is the delay. A population
+whose cell is a spike source built from child components (a `spikeArray`) is refused, since only an
+input runs those.
 
 ### Functions
 

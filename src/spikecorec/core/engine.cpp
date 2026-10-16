@@ -163,7 +163,12 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
     }
 
     Codegen compiler(context, &gpu);
+    compiler.check_population_cells();
     compiler.check_cell_inputs();
+    compiler.collect_synapse_deliveries();
+    for (const auto &[synapse_id, delivery] : compiler.synapse_deliveries) {
+        synapse_edge_state_variable_names[synapse_id] = delivery.edge_state_variable_names;
+    }
 
     compiler.allocate_cell_model_memory();
     cell_state = compiler.data_partitions[0];
@@ -185,7 +190,7 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
     compiler.initialize_cell_state(random_generator);
     compiler.initialize_input_state(random_generator);
 
-    build_weight_matrix(compiler.edge_plane_count(), compiler.updated_edge_plane_count());
+    build_weight_matrix(compiler, compiler.edge_plane_count(), compiler.updated_edge_plane_count());
 
     weights.plasticity_reserve_entries = 0;
     if (hebbian_plasticity_enabled) {
@@ -268,12 +273,24 @@ void Spike_Engine::initialize_model_buffers() {
     std::fill_n(last_spiked.get_contents_as<s64>(), total_neuron_count, NEVER_SPIKED_TICK);
 }
 
-void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count) {
+void Spike_Engine::build_weight_matrix(const Codegen &compiler, s64 matrix_count, s64 updated_plane_count) {
     // A synapse's prototype index is its position in synapse_instances, as in codegen.
     Unordered_Map<String, s32> synapse_prototype_indices;
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
         synapse_prototype_indices.emplace(synapse.id, static_cast<s32>(synapse_prototype_indices.size()));
     }
+
+    // Each connection of a weighted arrival adds the synapse's starting value to its target's sum.
+    Vector<f32> weighted_arrival_starting_value;
+    bool any_weighted_arrival_starting_value = false;
+    for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
+        const Synapse_Delivery &delivery = compiler.synapse_delivery(synapse);
+        weighted_arrival_starting_value.push_back(delivery.weighted_arrival ? static_cast<f32>(delivery.starting_value) : 0.0f);
+        any_weighted_arrival_starting_value = any_weighted_arrival_starting_value || weighted_arrival_starting_value.back() != 0.0f;
+    }
+    f32 *weighted_arrival_sums = any_weighted_arrival_starting_value
+            ? network_inputs.get_contents_as<f32>() + Codegen::WEIGHTED_ARRIVAL_SUM_ROW * total_neuron_count
+            : nullptr;
 
     // Edge ordinals: sources ascending, each source's targets ascending (the k^2-tree's row order).
     // Consecutive edges with the same synapse, weight and delay share a run.
@@ -354,6 +371,9 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
             network[source].push_back(edge.child);
             f64 &largest = largest_weight_per_prototype[static_cast<usize>(edge.prototype)];
             largest = std::max(largest, std::fabs(static_cast<f64>(edge.weight)));
+            if (any_weighted_arrival_starting_value) {
+                weighted_arrival_sums[edge.child] += weighted_arrival_starting_value[static_cast<usize>(edge.prototype)];
+            }
 
             // The engine's synaptic latency is one tick, so every delay is at least one tick.
             const s32 edge_delay = std::max<s32>(1, edge.delay_ticks);
@@ -385,13 +405,13 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
         if (largest >= 0.0) context.simulation.largest_connection_weight_per_synapse[synapse.id] = largest;
     }
 
-    // Each run's starting value per plane: weight, delay, then its synapse's StateVariables at
-    // their OnStart values (0 past the synapse's own count).
+    // Each run's starting value per plane: weight, delay, then the StateVariables its synapse keeps
+    // per connection at their OnStart values (0 past the synapse's own count).
     Vector<Vector<f32>> starting_state_per_prototype;
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
         const Unordered_Map<String, f64> values = starting_values(context, synapse);
         Vector<f32> &starting_state = starting_state_per_prototype.emplace_back();
-        for (const String &name : synapse.component_type->state_variable_names) {
+        for (const String &name : compiler.synapse_delivery(synapse).edge_state_variable_names) {
             starting_state.push_back(static_cast<f32>(values.at(name)));
             if (std::isfinite(starting_state.back())) continue;
             log::throw_runtime_error(*logger,
@@ -603,6 +623,7 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
     Vector<u8> sampled(synapse_component_ids.size() * population_ends.size(), 0);
     simulation.sampled_connections.clear();
     simulation.maximum_edge_delay = connection_values ? 0 : delay_ticks;
+    simulation.minimum_edge_delay = connection_values ? 0 : delay_ticks;
     s64 edge_ordinal = 0;
     usize proportion_synapse = 0;
     for (usize source = 0; source < adjacency.size(); source += 1) {
@@ -626,6 +647,8 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
                 weight = values.weight;
                 edge_delay_ticks = units::seconds_to_ticks(values.delay_seconds, simulation.step_dt);
                 simulation.maximum_edge_delay = std::max(simulation.maximum_edge_delay, edge_delay_ticks);
+                simulation.minimum_edge_delay = edge_ordinal == 0 ? edge_delay_ticks
+                                                                  : std::min(simulation.minimum_edge_delay, edge_delay_ticks);
             } else {
                 while (edge_ordinal >= first_edge_of_synapse[proportion_synapse + 1]) proportion_synapse += 1;
                 synapse_index = proportion_synapse;
@@ -958,9 +981,15 @@ s64 Spike_Engine::synapse_state_variable_plane(const String &synapse_component_i
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
         if (synapse.id != synapse_component_id) continue;
 
-        const Vector<String> &names = synapse.component_type->state_variable_names;
+        const Vector<String> &names = synapse_edge_state_variable_names.at(synapse.id);
         for (usize index = 0; index < names.size(); index += 1) {
             if (names[index] == variable_name) return Weight_Matrix::FIRST_STATE_VARIABLE_PLANE + static_cast<s64>(index);
+        }
+        const Vector<String> &declared = synapse.component_type->state_variable_names;
+        if (std::find(declared.begin(), declared.end(), variable_name) != declared.end()) {
+            log::throw_runtime_error(*logger, "synapse_state_variable_plane: synapse '" + synapse_component_id +
+                                     "' keeps no '" + variable_name + "' per connection: it delivers weighted "
+                                     "arrivals, whose increments only their target's sum keeps");
         }
         log::throw_runtime_error(*logger, "synapse_state_variable_plane: synapse '" + synapse_component_id +
                                  "' has no state variable '" + variable_name + "'");
