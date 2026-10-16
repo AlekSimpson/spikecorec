@@ -386,6 +386,36 @@ def test_a_topology_constructor_splits_the_edges_into_shares(tmp_path):
         spc.Spike_Engine(lems, adjacency, "noSuchSynapse")
 
 
+def test_a_topology_constructor_reads_connection_arrays(tmp_path):
+    lems = write_lems(tmp_path, WEIGHTED_MODEL, "weightNetwork", "10ms", "0.1ms")
+    adjacency = spc.random_fixed_outdegree(4, 5, 3)
+    source_neurons = np.array([source for source in range(16) for target in adjacency[source]], dtype=np.uint32)
+    target_neurons = np.array([target for source in range(16) for target in adjacency[source]], dtype=np.uint32)
+    order = np.random.default_rng(7).permutation(source_neurons.size)
+    source_neurons, target_neurons = source_neurons[order], target_neurons[order]
+    synapse_indices = (source_neurons % 2).astype(np.int32)
+    weights = np.where(target_neurons < 8, 2.0, -3.0)  # float64, converted to a float32 copy
+    delays_seconds = np.where(source_neurons < 8, 1e-3, 2.5e-3).astype(np.float32)
+    engine = spc.Spike_Engine(lems, ["syn", "otherSyn"], source_neurons, target_neurons, synapse_indices,
+                             weights, delays_seconds)
+
+    matrix = engine.weights
+    assert matrix.total_edge_count == 80
+    for source, target in zip(source_neurons[:10].tolist(), target_neurons[:10].tolist()):
+        assert matrix.get_edge_synapse_prototype(source, target) == source % 2
+        expected_weight = 2.0 if target < 8 else -3.0
+        assert matrix.get(source, target) == pytest.approx(expected_weight, abs=matrix.fit_tolerance * 3.0)
+        assert matrix.get_edge_delay_ticks(source, target) == (10 if source < 8 else 25)
+
+    with pytest.raises(ValueError, match="weights"):
+        spc.Spike_Engine(lems, ["syn", "otherSyn"], source_neurons, target_neurons, synapse_indices,
+                         weights[:-1], delays_seconds)
+    repeated = np.append(source_neurons, source_neurons[0]), np.append(target_neurons, target_neurons[0])
+    with pytest.raises(RuntimeError, match="given twice"):
+        spc.Spike_Engine(lems, ["syn", "otherSyn"], repeated[0], repeated[1], np.append(synapse_indices, 0),
+                         np.append(weights, 1.0), np.append(delays_seconds, 1e-3))
+
+
 # ── Weight_Matrix ────────────────────────────────────────────────────────────────
 
 def test_weight_matrix_reads_every_plane(tmp_path):

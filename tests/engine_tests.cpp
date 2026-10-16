@@ -2118,6 +2118,70 @@ TEST(Topology, connection_values_give_each_connection_its_synapse_weight_and_del
     EXPECT_THROW(Spike_Engine(lems, adjacency, synapses, negative_delay), Runtime_Error);
 }
 
+// Connection_Arrays give the same network as connection_values, from entries in any order. A pair
+// given twice, a neuron outside the network or a missing array is refused.
+TEST(Topology, connection_arrays_give_each_connection_its_synapse_weight_and_delay) {
+    const Temporary_Directory directory;
+    const String lems = write_model(directory, torus_model(16), "torusNetwork", "10ms", "0.1ms");
+    const Vector<Vector<s32>> adjacency = random_fixed_outdegree(4, 5, 3);  // 80 edges
+    const Vector<String> synapses = {"torusSynapse", "otherSynapse"};
+    const auto expected_weight = [](s32 target) { return target < 8 ? 2.0f : -3.0f; };
+    const auto expected_delay_ticks = [](s32 source) { return source < 8 ? 10 : 25; };
+
+    Vector<u32> source_neurons, target_neurons;
+    Vector<s32> synapse_indices;
+    Vector<f32> weights, delays_seconds;
+    for (s32 source = 0; source < 16; source += 1) {
+        for (s32 target : adjacency[static_cast<usize>(source)]) {
+            source_neurons.push_back(static_cast<u32>(source));
+            target_neurons.push_back(static_cast<u32>(target));
+        }
+    }
+    // Reverse the entries' order, and within that swap neighbours, so neither rows nor targets come sorted.
+    std::reverse(source_neurons.begin(), source_neurons.end());
+    std::reverse(target_neurons.begin(), target_neurons.end());
+    for (usize index = 0; index + 1 < source_neurons.size(); index += 2) {
+        std::swap(source_neurons[index], source_neurons[index + 1]);
+        std::swap(target_neurons[index], target_neurons[index + 1]);
+    }
+    for (usize index = 0; index < source_neurons.size(); index += 1) {
+        const s32 source = static_cast<s32>(source_neurons[index]);
+        synapse_indices.push_back(source % 2);
+        weights.push_back(expected_weight(static_cast<s32>(target_neurons[index])));
+        delays_seconds.push_back(source < 8 ? 1.0e-3f : 2.5e-3f);
+    }
+    const auto arrays_of = [&](s64 connection_count) {
+        return Spike_Engine::Connection_Arrays{connection_count, source_neurons.data(), target_neurons.data(),
+                                               synapse_indices.data(), weights.data(), delays_seconds.data()};
+    };
+
+    Spike_Engine engine(lems, synapses, arrays_of(static_cast<s64>(source_neurons.size())));
+    EXPECT_EQ(engine.weights.total_edge_count, 80);
+    for (s32 source = 0; source < 16; source += 1) {
+        for (s32 target : adjacency[static_cast<usize>(source)]) {
+            EXPECT_EQ(engine.weights.get_edge_synapse_prototype(source, target), source % 2);
+            EXPECT_NEAR(engine.weights.get(source, target), expected_weight(target), 0.01 * 3.0)
+                << source << " -> " << target;
+            EXPECT_EQ(engine.weights.get_edge_delay_ticks(source, target), expected_delay_ticks(source))
+                << source << " -> " << target;
+        }
+    }
+
+    Spike_Engine::Connection_Arrays missing = arrays_of(static_cast<s64>(source_neurons.size()));
+    missing.weights = nullptr;
+    EXPECT_THROW(Spike_Engine(lems, synapses, missing), Invalid_Argument);
+
+    source_neurons.push_back(source_neurons.front());
+    target_neurons.push_back(target_neurons.front());
+    synapse_indices.push_back(synapse_indices.front());
+    weights.push_back(weights.front());
+    delays_seconds.push_back(delays_seconds.front());
+    EXPECT_THROW(Spike_Engine(lems, synapses, arrays_of(static_cast<s64>(source_neurons.size()))), Runtime_Error);
+
+    target_neurons.back() = 16;
+    EXPECT_THROW(Spike_Engine(lems, synapses, arrays_of(static_cast<s64>(source_neurons.size()))), Runtime_Error);
+}
+
 // A neuron's connection to itself is kept and walked like any other: with the same weight and delay,
 // the synapse on 0 -> 0 holds the same state as the one on 0 -> 1 at every tick.
 TEST(Topology, a_self_connection_is_kept_and_delivered_like_any_other) {

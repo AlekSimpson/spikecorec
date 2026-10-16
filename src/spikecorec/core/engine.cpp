@@ -54,8 +54,8 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
                          Weight_Matrix::Fit_Method fit_method,
                          f32 expected_active_edge_fraction)
     : Spike_Engine(lems_input_file, adjacency, synapse_component_ids, synapse_proportions, connection_weight,
-                  connection_delay_seconds, Connection_Values_Function(), enable_hebbian_plasticity, fit_tolerance,
-                  fit_method, expected_active_edge_fraction) {}
+                  connection_delay_seconds, Connection_Values_Function(), nullptr, enable_hebbian_plasticity,
+                  fit_tolerance, fit_method, expected_active_edge_fraction) {}
 
 Spike_Engine::Spike_Engine(const String &lems_input_file,
                          const Vector<Vector<s32>> &adjacency,
@@ -66,11 +66,21 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
                          Weight_Matrix::Fit_Method fit_method,
                          f32 expected_active_edge_fraction)
     : Spike_Engine(lems_input_file, adjacency, synapse_component_ids, Vector<f64>{}, 1.0, 0.0, connection_values,
-                  enable_hebbian_plasticity, fit_tolerance, fit_method, expected_active_edge_fraction) {
+                  nullptr, enable_hebbian_plasticity, fit_tolerance, fit_method, expected_active_edge_fraction) {
     if (!connection_values && !adjacency.empty()) {
         log::throw_invalid_argument(*logger, "Spike_Engine: connection_values is empty, so no connection has values");
     }
 }
+
+Spike_Engine::Spike_Engine(const String &lems_input_file,
+                         const Vector<String> &synapse_component_ids,
+                         const Connection_Arrays &connections,
+                         bool enable_hebbian_plasticity,
+                         f32 fit_tolerance,
+                         Weight_Matrix::Fit_Method fit_method,
+                         f32 expected_active_edge_fraction)
+    : Spike_Engine(lems_input_file, {}, synapse_component_ids, Vector<f64>{}, 1.0, 0.0, Connection_Values_Function(),
+                  &connections, enable_hebbian_plasticity, fit_tolerance, fit_method, expected_active_edge_fraction) {}
 
 Spike_Engine::Spike_Engine(const String &lems_input_file,
                          const Vector<Vector<s32>> &adjacency,
@@ -79,6 +89,7 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
                          f64 connection_weight,
                          f64 connection_delay_seconds,
                          const Connection_Values_Function &connection_values,
+                         const Connection_Arrays *connection_arrays,
                          bool enable_hebbian_plasticity,
                          f32 fit_tolerance,
                          Weight_Matrix::Fit_Method fit_method,
@@ -101,7 +112,18 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
 
     context.parse(lems_input_file);
 
-    if (!adjacency.empty()) {
+    if (connection_arrays != nullptr) {
+        sort_connection_arrays(*connection_arrays, context.simulation.total_neuron_count);
+        const Connection_Arrays connections = *connection_arrays;
+        const Connection_Values_Function values_of = [this, connections](s32 source, s32 target) {
+            const Vector<s32> &targets = connection_rows.adjacency[static_cast<usize>(source)];
+            const s64 position = std::lower_bound(targets.begin(), targets.end(), target) - targets.begin();
+            const u32 index = connection_rows.array_index[static_cast<usize>(connection_rows.row_start[static_cast<usize>(source)] + position)];
+            return Connection_Values{connections.synapse_indices[index], static_cast<f64>(connections.weights[index]),
+                                     static_cast<f64>(connections.delays_seconds[index])};
+        };
+        apply_topology(connection_rows.adjacency, synapse_component_ids, {}, 1.0, 0.0, values_of);
+    } else if (!adjacency.empty()) {
         apply_topology(adjacency, synapse_component_ids, synapse_proportions,
                        connection_weight, connection_delay_seconds, connection_values);
     }
@@ -357,6 +379,7 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
     Vector<Row_Edge>().swap(row);
     context.simulation.network_data = Adjacency_List(0, 0);
     topology_connections = Topology_Connections();
+    connection_rows = Connection_Rows();
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
         const f64 largest = largest_weight_per_prototype[static_cast<usize>(synapse_prototype_indices.at(synapse.id))];
         if (largest >= 0.0) context.simulation.largest_connection_weight_per_synapse[synapse.id] = largest;
@@ -623,6 +646,65 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
             edge.parent = static_cast<s64>(source);
             edge.child = target;
             simulation.sampled_connections.push_back(edge);
+        }
+    }
+}
+
+// A counting sort by source puts each row's connections in array order; each row is then sorted by
+// target, which also brings a repeated pair together.
+void Spike_Engine::sort_connection_arrays(const Connection_Arrays &connections, s64 neuron_count) {
+    const s64 connection_count = connections.connection_count;
+    if (connection_count < 0 || connection_count > static_cast<s64>(Numeric_Limits<u32>::max())) {
+        log::throw_invalid_argument(*logger, "Spike_Engine: connection_count " + to_string(connection_count) +
+                                             " is outside 0 to " + to_string(Numeric_Limits<u32>::max()));
+    }
+    if (connection_count > 0 && (connections.source_neurons == nullptr || connections.target_neurons == nullptr ||
+                                 connections.synapse_indices == nullptr || connections.weights == nullptr ||
+                                 connections.delays_seconds == nullptr)) {
+        log::throw_invalid_argument(*logger, "Spike_Engine: a Connection_Arrays array is missing");
+    }
+    for (s64 index = 0; index < connection_count; index += 1) {
+        const u32 source = connections.source_neurons[index];
+        const u32 target = connections.target_neurons[index];
+        if (static_cast<s64>(source) < neuron_count && static_cast<s64>(target) < neuron_count) continue;
+        log::throw_runtime_error(*logger, "Spike_Engine: connection " + to_string(index) + " is " + to_string(source) +
+                                          " -> " + to_string(target) + ", outside the network's " +
+                                          to_string(neuron_count) + " neurons");
+    }
+
+    Connection_Rows &rows = connection_rows;
+    rows.row_start.assign(static_cast<usize>(neuron_count + 1), 0);
+    for (s64 index = 0; index < connection_count; index += 1) rows.row_start[connections.source_neurons[index] + 1] += 1;
+    for (s64 source = 0; source < neuron_count; source += 1) {
+        rows.row_start[static_cast<usize>(source + 1)] += rows.row_start[static_cast<usize>(source)];
+    }
+    rows.array_index.resize(static_cast<usize>(connection_count));
+    Vector<s64> next_slot(rows.row_start.begin(), rows.row_start.end() - 1);
+    for (s64 index = 0; index < connection_count; index += 1) {
+        s64 &slot = next_slot[connections.source_neurons[index]];
+        rows.array_index[static_cast<usize>(slot)] = static_cast<u32>(index);
+        slot += 1;
+    }
+    Vector<s64>().swap(next_slot);
+
+    rows.adjacency.assign(static_cast<usize>(neuron_count), {});
+    for (s64 source = 0; source < neuron_count; source += 1) {
+        const auto first = rows.array_index.begin() + rows.row_start[static_cast<usize>(source)];
+        const auto last = rows.array_index.begin() + rows.row_start[static_cast<usize>(source + 1)];
+        std::sort(first, last, [&](u32 left, u32 right) {
+            return connections.target_neurons[left] < connections.target_neurons[right];
+        });
+        Vector<s32> &targets = rows.adjacency[static_cast<usize>(source)];
+        targets.reserve(static_cast<usize>(last - first));
+        for (auto entry = first; entry != last; ++entry) {
+            const s32 target = static_cast<s32>(connections.target_neurons[*entry]);
+            if (!targets.empty() && targets.back() == target) {
+                log::throw_runtime_error(*logger, "Spike_Engine: the connection " + to_string(source) + " -> " +
+                                                  to_string(target) + " is given twice (entries " +
+                                                  to_string(*(entry - 1)) + " and " + to_string(*entry) +
+                                                  "); each ordered pair holds one connection");
+            }
+            targets.push_back(target);
         }
     }
 }

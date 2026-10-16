@@ -976,7 +976,46 @@ PYBIND11_MODULE(_spikecorec, m) {
              "The same, with each connection's synapse, weight and delay from "
              "connection_values(source, target), which returns a Spike_Engine.Connection_Values. It is "
              "called twice per connection during construction and must give the same values each time. "
-             "Calling into Python for every connection is slow on large networks; build those in C++.")
+             "Calling into Python for every connection is slow on large networks; give those as arrays.")
+        .def(py::init([](const String &lems_input_file, const Vector<String> &synapse_component_ids,
+                         const py::array_t<u32, py::array::c_style | py::array::forcecast> &source_neurons,
+                         const py::array_t<u32, py::array::c_style | py::array::forcecast> &target_neurons,
+                         const py::array_t<s32, py::array::c_style | py::array::forcecast> &synapse_indices,
+                         const py::array_t<f32, py::array::c_style | py::array::forcecast> &weights,
+                         const py::array_t<f32, py::array::c_style | py::array::forcecast> &delays_seconds,
+                         bool enable_hebbian_plasticity, f32 fit_tolerance, Weight_Matrix::Fit_Method fit_method,
+                         f32 expected_active_edge_fraction) {
+                 const py::ssize_t connection_count = source_neurons.size();
+                 const auto check = [connection_count](const py::array &array, const char *name) {
+                     if (array.ndim() != 1 || array.size() != connection_count) {
+                         throw py::value_error(String(name) + " must be one-dimensional, one entry per connection "
+                                               "like source_neurons (" + std::to_string(connection_count) + ")");
+                     }
+                 };
+                 check(source_neurons, "source_neurons");
+                 check(target_neurons, "target_neurons");
+                 check(synapse_indices, "synapse_indices");
+                 check(weights, "weights");
+                 check(delays_seconds, "delays_seconds");
+                 const Spike_Engine::Connection_Arrays connections{
+                         static_cast<s64>(connection_count), source_neurons.data(), target_neurons.data(),
+                         synapse_indices.data(), weights.data(), delays_seconds.data()};
+                 return std::make_unique<Spike_Engine>(lems_input_file, synapse_component_ids, connections,
+                                                       enable_hebbian_plasticity, fit_tolerance, fit_method,
+                                                       expected_active_edge_fraction);
+             }),
+             py::arg("lems_input_file"), py::arg("synapse_component_ids"),
+             py::arg("source_neurons"), py::arg("target_neurons"), py::arg("synapse_indices"),
+             py::arg("weights"), py::arg("delays_seconds"),
+             py::arg("enable_hebbian_plasticity") = false,
+             py::arg("fit_tolerance") = Spike_Engine::FIT_TOLERANCE_STANDARD,
+             py::arg("fit_method") = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
+             py::arg("expected_active_edge_fraction") = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION,
+             "The same, with every connection as one entry of five arrays (the C++ Connection_Arrays): "
+             "source_neurons[index] -> target_neurons[index] carries synapse synapse_indices[index] (an index into "
+             "synapse_component_ids), weights[index] and delays_seconds[index]. Any order; each ordered pair at "
+             "most once. Arrays of dtype uint32, uint32, int32, float32 and float32 are read in place; "
+             "others are converted to a copy first.")
 
         // What the engine was built from.
         .def_property_readonly("context", [](Spike_Engine &self) -> NML_Context & { return self.context; },
