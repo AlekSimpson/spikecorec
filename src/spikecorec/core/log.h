@@ -33,31 +33,22 @@ namespace spikecorec::log {
         off
     };
 
-    // The level's name as a pattern prints it: "trace", "debug", "info", "warning", "error",
-    // "critical" or "off".
+    // The name %l prints: the enumerator's name, except "warning" for warn.
     [[nodiscard]] const char *level_name(Log_Level level);
 
-    // Accepts "trace", "debug", "info", "warn", "warning", "err", "error", "critical" and "off".
-    // Throws std::invalid_argument for anything else.
+    // Accepts each level's name, "warning" and "err"; throws std::invalid_argument otherwise.
     [[nodiscard]] Log_Level level_from_string(const String &name);
 
-    // One message after its pattern has been applied. When the pattern has a %^ ... %$ range,
-    // [color_begin, color_end) is that range; otherwise both are zero.
+    // A formatted message; [color_begin, color_end) is the %^ ... %$ span, or both zero if none.
     struct Formatted_Line {
         String text;
         size_t color_begin = 0;
         size_t color_end = 0;
     };
 
-    // Where messages end up. A sink owns a pattern and turns each message into a line with it:
-    //   %Y %m %d %H %M %S   year, month, day, hour, minute, second of the local time
-    //   %e                  milliseconds, three digits
-    //   %l                  the level's name
-    //   %v                  the message
-    //   %^ and %$           begin and end of the span a colored sink colors
-    //   %%                  a literal percent sign
-    // Every other character is copied as it is. log, flush and set_pattern may be called from any
-    // thread; subclasses write inside the sink's lock and need no locking of their own.
+    // Turns each message into a line with its pattern: %Y %m %d %H %M %S local time, %e
+    // milliseconds (3 digits), %l level name, %v message, %^ %$ colored span, %% a literal %.
+    // Other characters are copied. Thread-safe; subclasses write under the sink's lock.
     class Log_Sink {
     public:
         virtual ~Log_Sink() = default;
@@ -121,10 +112,10 @@ namespace spikecorec::log {
     };
 
     // ── message formatting ────────────────────────────────────────────────────────
-    // "{}" takes the next argument; "{:spec}" takes it with a specification of the form
-    // [#][0][width][.precision][type], where type is d, x, X, o or b for integers, f, F, e, E, g or
-    // G for floating point and s for text. "{{" and "}}" are literal braces. Throws
-    // std::invalid_argument for a malformed specification or for more placeholders than arguments.
+    // "{}" takes the next argument; "{:spec}" applies [#][0][width][.precision][type], where type
+    // is d, x, X, o or b for integers, f, F, e, E, g or G for floating point and s for text.
+    // "{{" and "}}" are literal braces. A malformed placeholder or too few arguments throws
+    // std::invalid_argument.
 
     using Argument_Formatter = Function<String(String_View specification)>;
 

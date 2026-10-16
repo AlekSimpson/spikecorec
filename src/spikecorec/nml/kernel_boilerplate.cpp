@@ -5,14 +5,10 @@ using namespace std;
 
 namespace spikecorec::nml {
 
-// The predefined kernel code, parsed by create_kernel_root. Codegen inserts each
-// population's dynamics into master_step right after the spiked declaration, and each
-// synapse's dynamics into the propagate walk right after the arrived declaration.
-//
-// Metal's k^2-tree helpers (k2t_next_neighbor and the rest, plus MAX_K2TREE_HEIGHT) come
-// from k2tree_device.metalinc, which create_kernel_root parses in ahead of the first
-// function here. The CUDA source carries its own port of them.
-//
+// The fixed kernel source that create_kernel_root parses. Codegen inserts the population
+// dispatch after master_step's `spiked` declaration and the synapse dispatch after the
+// propagate walk's `arrived` declaration. Metal takes its k^2-tree helpers from
+// k2tree_device.metalinc; the CUDA source carries its own port.
 // Bodies of if, else, for and while must be braced: the parser requires it.
 
 const char *METAL_KERNEL_BOILERPLATE = R"METAL(
@@ -23,10 +19,10 @@ inline float spikecorec_heaviside(float value) {
     return value > 0.0f ? 1.0f : 0.0f;
 }
 
-// One edge's stored value, reconstructed from the shared basis: U[source] . (Ck * V[target]).
+// One edge's basis value, without its update in S: U[source] . (Ck * V[target]).
 inline float spikecorec_reconstruct_edge(
     const device float4 *basis_u, const device float4 *basis_v, const device float *coefficients,
-    int rank_float4_stride, int source_node, int target_node
+    int rank_float4_stride, uint source_node, uint target_node
 ) {
     const device float4 *u_row = basis_u + (long)source_node * rank_float4_stride;
     const device float4 *v_row = basis_v + (long)target_node * rank_float4_stride;
@@ -42,26 +38,24 @@ inline float spikecorec_reconstruct_edge(
     return dot_product;
 }
 
-// Where one edge's update sits in plane's segment of the delta arrays, or -1. Rows
-// are CSR over source nodes, sorted by edge ordinal, so this is a binary search over the row.
+// Position of one edge's entry in S's pool, or -1: a binary search of the source's CSR row in plane.
 inline int spikecorec_edge_delta_index(
-    const device int *row_start, const device long *entry_ordinal,
-    int node_count, long delta_capacity, int plane, int source_node, long edge_ordinal
+    const device int *row_start, const device uint *entry_ordinal,
+    int node_count, int plane, uint source_node, long edge_ordinal
 ) {
     const int row_base = plane * (node_count + 1);
-    const device long *plane_ordinal = entry_ordinal + (long)plane * delta_capacity;
     int low = row_start[row_base + source_node];
     int high = row_start[row_base + source_node + 1];
 
     while (low < high) {
         const int middle = low + (high - low) / 2;
-        if (plane_ordinal[middle] < edge_ordinal) {
+        if (entry_ordinal[middle] < edge_ordinal) {
             low = middle + 1;
         } else {
             high = middle;
         }
     }
-    if (low < row_start[row_base + source_node + 1] && plane_ordinal[low] == edge_ordinal) {
+    if (low < row_start[row_base + source_node + 1] && entry_ordinal[low] == edge_ordinal) {
         return low;
     }
     return -1;
@@ -70,43 +64,38 @@ inline int spikecorec_edge_delta_index(
 // One edge's value in plane: the basis reconstruction plus the edge's update in S.
 inline float spikecorec_load_edge(
     const device float4 *basis_u, const device float4 *basis_v, const device float *edge_coefficients,
-    int rank_float4_stride, const device int *row_start, const device long *entry_ordinal,
-    const device float *entry_value, int node_count, long delta_capacity,
-    int plane, int source_node, int target_node, long edge_ordinal
+    int rank_float4_stride, const device int *row_start, const device uint *entry_ordinal,
+    const device float *entry_value, int node_count,
+    int plane, uint source_node, uint target_node, long edge_ordinal
 ) {
     float value = spikecorec_reconstruct_edge(
         basis_u, basis_v, edge_coefficients + (long)plane * rank_float4_stride * 4, rank_float4_stride,
         source_node, target_node);
     const int delta_index = spikecorec_edge_delta_index(
-        row_start, entry_ordinal, node_count, delta_capacity, plane, source_node, edge_ordinal);
+        row_start, entry_ordinal, node_count, plane, source_node, edge_ordinal);
     if (delta_index >= 0) {
-        value += entry_value[(long)plane * delta_capacity + delta_index];
+        value += entry_value[delta_index];
     }
     return value;
 }
 
-// Adds delta to one edge's value in plane. An edge that already holds an update there is
-// written in place: only its source neuron's thread walks it, so nothing races. Otherwise the
-// update is queued with its plane and becomes readable once the host merges the queue. A
-// delta written back to exactly zero queues an empty update, so the merge removes it.
+// Adds delta to one edge's value in plane. An entry already in S is updated in place (only the
+// source's thread walks the edge, so no race), even when it sums to zero; otherwise the update is
+// queued for the host merge, in room the walk reserved. So only edges with no S entry queue.
 inline void spikecorec_accumulate_edge(
-    const device int *row_start, const device long *entry_ordinal, device float *entry_value,
-    device long *pending_ordinal, device float *pending_value, device int *pending_matrix_index,
-    device atomic_int *pending_count, long pending_capacity, int node_count, long delta_capacity,
-    int plane, int source_node, long edge_ordinal, float delta
+    const device int *row_start, const device uint *entry_ordinal, device float *entry_value,
+    device uint *pending_ordinal, device float *pending_value, device uchar *pending_matrix_index,
+    device atomic_int *pending_count, long pending_capacity, int node_count,
+    int plane, uint source_node, long edge_ordinal, float delta
 ) {
     if (delta == 0.0f) {
         return;
     }
     const int delta_index = spikecorec_edge_delta_index(
-        row_start, entry_ordinal, node_count, delta_capacity, plane, source_node, edge_ordinal);
+        row_start, entry_ordinal, node_count, plane, source_node, edge_ordinal);
     if (delta_index >= 0) {
-        const long slot = (long)plane * delta_capacity + delta_index;
-        entry_value[slot] += delta;
-        if (entry_value[slot] != 0.0f) {
-            return;
-        }
-        delta = 0.0f;
+        entry_value[delta_index] += delta;
+        return;
     }
     const int pending = atomic_fetch_add_explicit(pending_count, 1, memory_order_relaxed);
     if (pending < pending_capacity) {
@@ -116,8 +105,7 @@ inline void spikecorec_accumulate_edge(
     }
 }
 
-// The synapse prototype of one edge: the prototype of the last projection run that starts at
-// or before it.
+// An edge's synapse prototype: that of the last run starting at or before it.
 inline int spikecorec_synapse_prototype(
     const device long *run_first_edge_ordinal, const device int *run_synapse_prototype,
     int run_count, long edge_ordinal
@@ -141,9 +129,9 @@ kernel void master_step(
     constant int          &spike_history_length          [[ buffer(2)  ]],
     constant long         &synapse_active_ticks          [[ buffer(3)  ]],
     constant int          &rank_float4_stride            [[ buffer(4)  ]],
-    constant long         &sparse_delta_capacity         [[ buffer(5)  ]],
     constant long         &pending_delta_capacity        [[ buffer(6)  ]],
-    constant int          &projection_run_count          [[ buffer(7)  ]],
+    constant int          &updated_plane_count           [[ buffer(6)  ]],
+    constant int          &run_count          [[ buffer(7)  ]],
     constant int          &branching_factor              [[ buffer(8)  ]],
     constant int          &superblock_size_words         [[ buffer(9)  ]],
     constant int          &padded_node_count             [[ buffer(10) ]],
@@ -162,29 +150,42 @@ kernel void master_step(
     const device float    *edge_coefficients             [[ buffer(23) ]],
     const device long     *edge_row_offset               [[ buffer(24) ]],
     const device int      *sparse_delta_row_start        [[ buffer(25) ]],
-    const device long     *sparse_delta_edge_ordinal     [[ buffer(26) ]],
+    const device uint     *sparse_delta_edge_ordinal     [[ buffer(26) ]],
     device   float        *sparse_delta_value            [[ buffer(27) ]],
-    device   long         *pending_delta_edge_ordinal    [[ buffer(28) ]],
+    device   uint         *pending_delta_edge_ordinal    [[ buffer(28) ]],
     device   float        *pending_delta_value           [[ buffer(29) ]],
-    device   int          *pending_delta_matrix_index    [[ buffer(30) ]],
-    device   atomic_int   *pending_delta_count           [[ buffer(31) ]],
-    const device long     *projection_first_edge_ordinal [[ buffer(32) ]],
-    const device int      *projection_synapse_prototype  [[ buffer(33) ]],
+    device   uchar        *pending_delta_matrix_index    [[ buffer(30) ]],
+    device   atomic_int   *pending_delta_control         [[ buffer(31) ]],
+    const device long     *run_first_edge_ordinal [[ buffer(32) ]],
+    const device int      *run_synapse_prototype  [[ buffer(33) ]],
     const device float    *random_values                 [[ buffer(34) ]],
     device   uint         *event_arrival_count           [[ buffer(35) ]],
     const device long     *input_row_start               [[ buffer(36) ]],
     const device int      *input_entry_prototype         [[ buffer(37) ]],
     device   float        *input_values                  [[ buffer(38) ]],
     const device uchar    *input_spike_counts            [[ buffer(39) ]],
+    constant float        &simulation_time               [[ buffer(40) ]],
     uint thread_id [[ thread_position_in_grid ]]
 ) {
-    const long neuron_index = (long)thread_id;
+    // pending_delta_control: [0] updates queued, [1] queue room reserved, [2] this tick's walk pass,
+    // [3] neurons this pass walks, [4] neurons it defers, then two lists of deferred neurons of
+    // neuron_count each. Pass 0 runs every stage for every neuron; a later pass of the same tick
+    // walks only the neurons the pass before deferred (see the reservation in stage 6), once the
+    // host has merged the queue into S.
+    const int walk_pass = atomic_load_explicit(pending_delta_control + 2, memory_order_relaxed);
+    long neuron_index = (long)thread_id;
+    if (walk_pass > 0) {
+        if ((int)thread_id >= atomic_load_explicit(pending_delta_control + 3, memory_order_relaxed)) {
+            return;
+        }
+        neuron_index = (long)atomic_load_explicit(
+            pending_delta_control + 5 + ((walk_pass - 1) % 2) * neuron_count + (int)thread_id, memory_order_relaxed);
+    }
     if (neuron_index >= neuron_count) {
         return;
     }
 
-    // Stage 1, deliver. network_inputs is two rows: this tick's arrivals are drained from
-    // one while this tick's scatters land in the other.
+    // Stage 1, deliver: drain this tick's row of network_inputs; scatters go to the other row.
     const int current_row = (int)(tick % 2);
     const int next_row = 1 - current_row;
     const long input_slot = current_row * neuron_count + neuron_index;
@@ -192,26 +193,49 @@ kernel void master_step(
     float network_input = network_inputs[input_slot];
     network_inputs[input_slot] = 0.0f;
 
-    // Stages 2-5: the population dispatch goes here.
+    // Stages 2-5: codegen inserts the population dispatch after this declaration.
     bool spiked = false;
 
     if (spiked) {
         last_spiked[neuron_index] = tick;
     }
-    spike_history[(tick % spike_history_length) * neuron_count + neuron_index] = spiked ? 1 : 0;
+    if (walk_pass == 0) {
+        spike_history[(tick % spike_history_length) * neuron_count + neuron_index] = spiked ? 1 : 0;
+    }
 
-    // Stage 6, propagate: walk this neuron's outgoing edges. Its synapses can only be away
-    // from rest from its spike until the longest delay has passed and they have settled
-    // after the arrival; outside that window every one is at rest, so the walk is skipped.
+    // Stage 6, propagate: walk this neuron's outgoing edges. Its synapses are at rest once
+    // synapse_active_ticks have passed since its last spike, so the walk is skipped then.
     // A negative synapse_active_ticks walks every tick.
     if (synapse_active_ticks >= 0 &&
         (last_spiked[neuron_index] < 0 || tick - last_spiked[neuron_index] > synapse_active_ticks)) {
         return;
     }
 
+    // Reserve queue room for every update the walk can queue: one per updated plane (the planes
+    // from 2) for each edge with no entry in that plane of S, since an entry in S changes in place.
+    // A walk the queue cannot take now is deferred to the next pass.
+    if (updated_plane_count > 0) {
+        const int out_degree = (int)(edge_row_offset[neuron_index + 1] - edge_row_offset[neuron_index]);
+        int needed = 0;
+        for (int plane = 2; plane < 2 + updated_plane_count; plane += 1) {
+            const int row_base = plane * (neuron_count + 1) + (int)neuron_index;
+            needed += out_degree - (sparse_delta_row_start[row_base + 1] - sparse_delta_row_start[row_base]);
+        }
+        if (needed > 0) {
+            const int reserved = atomic_fetch_add_explicit(pending_delta_control + 1, needed, memory_order_relaxed);
+            if (reserved + needed > pending_delta_capacity) {
+                atomic_fetch_sub_explicit(pending_delta_control + 1, needed, memory_order_relaxed);
+                const int deferred_slot = atomic_fetch_add_explicit(pending_delta_control + 4, 1, memory_order_relaxed);
+                atomic_store_explicit(pending_delta_control + 5 + (walk_pass % 2) * neuron_count + deferred_slot,
+                                      (int)neuron_index, memory_order_relaxed);
+                return;
+            }
+        }
+    }
+
     // Each edge runs its synapse and scatters its current into the target's next input row.
-    thread int walk_stack_row_base[MAX_K2TREE_HEIGHT];
-    thread int walk_stack_column_base[MAX_K2TREE_HEIGHT];
+    thread uint walk_stack_row_base[MAX_K2TREE_HEIGHT];
+    thread uint walk_stack_column_base[MAX_K2TREE_HEIGHT];
     thread int walk_stack_block_size[MAX_K2TREE_HEIGHT];
     thread int walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
     thread int walk_stack_next_column[MAX_K2TREE_HEIGHT];
@@ -222,16 +246,15 @@ kernel void master_step(
     walk_stack_next_column[0] = 0;
     int walk_stack_top = tree_height > 0 ? 0 : -1;
 
-    // edge_row_offset is only read once the walk has found an edge: a model with no
-    // connections binds a placeholder there.
+    // Read edge_row_offset only after finding an edge: with no connections it is a placeholder.
     int slot = 0;
     while (true) {
-        const int target = k2t_next_neighbor(
+        const uint target = k2t_next_neighbor(
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
             branching_factor, superblock_size_words, neuron_count, tree_height, internal_bit_count,
-            (int)neuron_index, walk_stack_row_base, walk_stack_column_base, walk_stack_block_size,
+            (uint)neuron_index, walk_stack_row_base, walk_stack_column_base, walk_stack_block_size,
             walk_stack_bit_offset, walk_stack_next_column, walk_stack_top);
-        if (target < 0) {
+        if (target == K2T_NO_NEIGHBOR) {
             break;
         }
         const long current_edge = edge_row_offset[neuron_index] + slot;
@@ -242,15 +265,20 @@ kernel void master_step(
 
         int delay_ticks = (int)round(spikecorec_load_edge(
             basis_u, basis_v, edge_coefficients, rank_float4_stride, sparse_delta_row_start,
-            sparse_delta_edge_ordinal, sparse_delta_value, neuron_count, sparse_delta_capacity,
-            1, (int)neuron_index, target, current_edge));
+            sparse_delta_edge_ordinal, sparse_delta_value, neuron_count,
+            1, (uint)neuron_index, target, current_edge));
         if (delay_ticks < 1) {
             delay_ticks = 1;
+        }
+        // A fitted delay can pass the longest declared one by the fit error; past the ring it
+        // would wrap onto a row written this tick or lately.
+        if (delay_ticks > spike_history_length - 1) {
+            delay_ticks = spike_history_length - 1;
         }
         const bool arrived = tick >= delay_ticks &&
             spike_history[((tick - delay_ticks) % spike_history_length) * neuron_count + neuron_index] != 0;
 
-        // The synapse dispatch goes here.
+        // Codegen inserts the synapse dispatch after the `arrived` declaration.
     }
 }
 )METAL";
@@ -258,11 +286,14 @@ kernel void master_step(
 const char *CUDA_KERNEL_BOILERPLATE = R"CUDA(
 #define MAX_K2TREE_HEIGHT 32
 
+// Node indices are unsigned, so a walk that finds no node returns this (UINT_MAX) instead of -1.
+#define K2T_NO_NEIGHBOR 4294967295u
+
 __device__ inline float spikecorec_heaviside(float value) {
     return value > 0.0f ? 1.0f : 0.0f;
 }
 
-// k^2-tree bit-walk helpers, ported from k2tree_device.metalinc.
+// CUDA port of the k^2-tree helpers in k2tree_device.metalinc.
 __device__ inline unsigned int k2t_get_bit(const unsigned int *words, int bit_index) {
     return (words[bit_index >> 5] >> (unsigned int)(bit_index & 31)) & 1u;
 }
@@ -284,9 +315,9 @@ __device__ inline int k2t_rank1_exclusive(
     return (int)(superblock_base + subblock_base + partial_word_popcount);
 }
 
-// Resumes a DFS over row_node's neighbors from the caller's stack state, returning the next
-// neighbor each call, or -1 when exhausted.
-__device__ inline int k2t_next_neighbor(
+// Returns row_node's next neighbor, resuming the DFS from the caller's stack, or K2T_NO_NEIGHBOR
+// when done.
+__device__ inline unsigned int k2t_next_neighbor(
     const unsigned int *internal_node_words,
     const unsigned int *leaf_node_words,
     const unsigned int *rank_superblock_table,
@@ -296,9 +327,9 @@ __device__ inline int k2t_next_neighbor(
     int node_count,
     int tree_height,
     int internal_bit_count,
-    int row_node,
-    int *stack_row_base,
-    int *stack_column_base,
+    unsigned int row_node,
+    unsigned int *stack_row_base,
+    unsigned int *stack_column_base,
     int *stack_block_size,
     int *stack_bit_offset,
     int *stack_next_column,
@@ -315,20 +346,20 @@ __device__ inline int k2t_next_neighbor(
         }
         stack_next_column[level] = column_offset + 1;
 
-        const int row_base = stack_row_base[level];
-        const int column_base = stack_column_base[level];
+        const unsigned int row_base = stack_row_base[level];
+        const unsigned int column_base = stack_column_base[level];
         const int block_size = stack_block_size[level];
         const int level_bit_offset = stack_bit_offset[level];
 
         const int child_block_size = block_size / branching_factor;
-        const int row_offset = (row_node - row_base) / child_block_size;
+        const int row_offset = (int)((row_node - row_base) / (unsigned int)child_block_size);
         const int child_flat_index = row_offset * branching_factor + column_offset;
         const int bit_position = level_bit_offset + child_flat_index;
 
         if (level == tree_height - 1) {
             if (k2t_get_bit(leaf_node_words, bit_position)) {
-                const int neighbor = column_base + column_offset;
-                if (neighbor < node_count) {
+                const unsigned int neighbor = column_base + (unsigned int)column_offset;
+                if (neighbor < (unsigned int)node_count) {
                     return neighbor;
                 }
             }
@@ -337,21 +368,21 @@ __device__ inline int k2t_next_neighbor(
                                                            rank_subblock_table, bit_position, superblock_size_words) + 1;
             const int child_level = stack_top + 1;
             const int raw_offset = branching_factor_squared * rank_inclusive;
-            stack_row_base[child_level] = row_base + row_offset * child_block_size;
-            stack_column_base[child_level] = column_base + column_offset * child_block_size;
+            stack_row_base[child_level] = row_base + (unsigned int)(row_offset * child_block_size);
+            stack_column_base[child_level] = column_base + (unsigned int)(column_offset * child_block_size);
             stack_block_size[child_level] = child_block_size;
             stack_bit_offset[child_level] = (child_level == tree_height - 1) ? (raw_offset - internal_bit_count) : raw_offset;
             stack_next_column[child_level] = 0;
             stack_top = child_level;
         }
     }
-    return -1;
+    return K2T_NO_NEIGHBOR;
 }
 
-// One edge's stored value, reconstructed from the shared basis: U[source] . (Ck * V[target]).
+// One edge's basis value, without its update in S: U[source] . (Ck * V[target]).
 __device__ inline float spikecorec_reconstruct_edge(
     const float4 *basis_u, const float4 *basis_v, const float *coefficients,
-    int rank_float4_stride, int source_node, int target_node
+    int rank_float4_stride, unsigned int source_node, unsigned int target_node
 ) {
     const float4 *u_row = basis_u + (long long)source_node * rank_float4_stride;
     const float4 *v_row = basis_v + (long long)target_node * rank_float4_stride;
@@ -368,26 +399,24 @@ __device__ inline float spikecorec_reconstruct_edge(
     return dot_product;
 }
 
-// Where one edge's update sits in plane's segment of the delta arrays, or -1. Rows
-// are CSR over source nodes, sorted by edge ordinal, so this is a binary search over the row.
+// Position of one edge's entry in S's pool, or -1: a binary search of the source's CSR row in plane.
 __device__ inline int spikecorec_edge_delta_index(
-    const int *row_start, const long long *entry_ordinal,
-    int node_count, long long delta_capacity, int plane, int source_node, long long edge_ordinal
+    const int *row_start, const unsigned int *entry_ordinal,
+    int node_count, int plane, unsigned int source_node, long long edge_ordinal
 ) {
     const int row_base = plane * (node_count + 1);
-    const long long *plane_ordinal = entry_ordinal + (long long)plane * delta_capacity;
     int low = row_start[row_base + source_node];
     int high = row_start[row_base + source_node + 1];
 
     while (low < high) {
         const int middle = low + (high - low) / 2;
-        if (plane_ordinal[middle] < edge_ordinal) {
+        if (entry_ordinal[middle] < edge_ordinal) {
             low = middle + 1;
         } else {
             high = middle;
         }
     }
-    if (low < row_start[row_base + source_node + 1] && plane_ordinal[low] == edge_ordinal) {
+    if (low < row_start[row_base + source_node + 1] && entry_ordinal[low] == edge_ordinal) {
         return low;
     }
     return -1;
@@ -396,43 +425,38 @@ __device__ inline int spikecorec_edge_delta_index(
 // One edge's value in plane: the basis reconstruction plus the edge's update in S.
 __device__ inline float spikecorec_load_edge(
     const float4 *basis_u, const float4 *basis_v, const float *edge_coefficients,
-    int rank_float4_stride, const int *row_start, const long long *entry_ordinal,
-    const float *entry_value, int node_count, long long delta_capacity,
-    int plane, int source_node, int target_node, long long edge_ordinal
+    int rank_float4_stride, const int *row_start, const unsigned int *entry_ordinal,
+    const float *entry_value, int node_count,
+    int plane, unsigned int source_node, unsigned int target_node, long long edge_ordinal
 ) {
     float value = spikecorec_reconstruct_edge(
         basis_u, basis_v, edge_coefficients + (long long)plane * rank_float4_stride * 4, rank_float4_stride,
         source_node, target_node);
     const int delta_index = spikecorec_edge_delta_index(
-        row_start, entry_ordinal, node_count, delta_capacity, plane, source_node, edge_ordinal);
+        row_start, entry_ordinal, node_count, plane, source_node, edge_ordinal);
     if (delta_index >= 0) {
-        value += entry_value[(long long)plane * delta_capacity + delta_index];
+        value += entry_value[delta_index];
     }
     return value;
 }
 
-// Adds delta to one edge's value in plane. An edge that already holds an update there is
-// written in place: only its source neuron's thread walks it, so nothing races. Otherwise the
-// update is queued with its plane and becomes readable once the host merges the queue. A
-// delta written back to exactly zero queues an empty update, so the merge removes it.
+// Adds delta to one edge's value in plane. An entry already in S is updated in place (only the
+// source's thread walks the edge, so no race), even when it sums to zero; otherwise the update is
+// queued for the host merge, in room the walk reserved. So only edges with no S entry queue.
 __device__ inline void spikecorec_accumulate_edge(
-    const int *row_start, const long long *entry_ordinal, float *entry_value,
-    long long *pending_ordinal, float *pending_value, int *pending_matrix_index,
-    int *pending_count, long long pending_capacity, int node_count, long long delta_capacity,
-    int plane, int source_node, long long edge_ordinal, float delta
+    const int *row_start, const unsigned int *entry_ordinal, float *entry_value,
+    unsigned int *pending_ordinal, float *pending_value, unsigned char *pending_matrix_index,
+    int *pending_count, long long pending_capacity, int node_count,
+    int plane, unsigned int source_node, long long edge_ordinal, float delta
 ) {
     if (delta == 0.0f) {
         return;
     }
     const int delta_index = spikecorec_edge_delta_index(
-        row_start, entry_ordinal, node_count, delta_capacity, plane, source_node, edge_ordinal);
+        row_start, entry_ordinal, node_count, plane, source_node, edge_ordinal);
     if (delta_index >= 0) {
-        const long long slot = (long long)plane * delta_capacity + delta_index;
-        entry_value[slot] += delta;
-        if (entry_value[slot] != 0.0f) {
-            return;
-        }
-        delta = 0.0f;
+        entry_value[delta_index] += delta;
+        return;
     }
     const int pending = atomicAdd(pending_count, 1);
     if (pending < pending_capacity) {
@@ -442,8 +466,7 @@ __device__ inline void spikecorec_accumulate_edge(
     }
 }
 
-// The synapse prototype of one edge: the prototype of the last projection run that starts at
-// or before it.
+// An edge's synapse prototype: that of the last run starting at or before it.
 __device__ inline int spikecorec_synapse_prototype(
     const long long *run_first_edge_ordinal, const int *run_synapse_prototype,
     int run_count, long long edge_ordinal
@@ -467,9 +490,9 @@ extern "C" __global__ void master_step(
     int spike_history_length,
     long long synapse_active_ticks,
     int rank_float4_stride,
-    long long sparse_delta_capacity,
     long long pending_delta_capacity,
-    int projection_run_count,
+    int updated_plane_count,
+    int run_count,
     int branching_factor,
     int superblock_size_words,
     int padded_node_count,
@@ -488,28 +511,37 @@ extern "C" __global__ void master_step(
     const float *edge_coefficients,
     const long long *edge_row_offset,
     const int *sparse_delta_row_start,
-    const long long *sparse_delta_edge_ordinal,
+    const unsigned int *sparse_delta_edge_ordinal,
     float *sparse_delta_value,
-    long long *pending_delta_edge_ordinal,
+    unsigned int *pending_delta_edge_ordinal,
     float *pending_delta_value,
-    int *pending_delta_matrix_index,
-    int *pending_delta_count,
-    const long long *projection_first_edge_ordinal,
-    const int *projection_synapse_prototype,
+    unsigned char *pending_delta_matrix_index,
+    int *pending_delta_control,
+    const long long *run_first_edge_ordinal,
+    const int *run_synapse_prototype,
     const float *random_values,
     unsigned int *event_arrival_count,
     const long long *input_row_start,
     const int *input_entry_prototype,
     float *input_values,
-    const unsigned char *input_spike_counts
+    const unsigned char *input_spike_counts,
+    double simulation_time
 ) {
-    const long long neuron_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    // pending_delta_control: laid out as in the Metal kernel.
+    const int walk_pass = pending_delta_control[2];
+    const long long thread_index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long neuron_index = thread_index;
+    if (walk_pass > 0) {
+        if (thread_index >= pending_delta_control[3]) {
+            return;
+        }
+        neuron_index = pending_delta_control[5 + ((walk_pass - 1) % 2) * neuron_count + (int)thread_index];
+    }
     if (neuron_index >= neuron_count) {
         return;
     }
 
-    // Stage 1, deliver. network_inputs is two rows: this tick's arrivals are drained from
-    // one while this tick's scatters land in the other.
+    // Stage 1, deliver: drain this tick's row of network_inputs; scatters go to the other row.
     const int current_row = (int)(tick % 2);
     const int next_row = 1 - current_row;
     const long long input_slot = current_row * neuron_count + neuron_index;
@@ -517,26 +549,46 @@ extern "C" __global__ void master_step(
     float network_input = network_inputs[input_slot];
     network_inputs[input_slot] = 0.0f;
 
-    // Stages 2-5: the population dispatch goes here.
+    // Stages 2-5: codegen inserts the population dispatch after this declaration.
     bool spiked = false;
 
     if (spiked) {
         last_spiked[neuron_index] = tick;
     }
-    spike_history[(tick % spike_history_length) * neuron_count + neuron_index] = spiked ? 1 : 0;
+    if (walk_pass == 0) {
+        spike_history[(tick % spike_history_length) * neuron_count + neuron_index] = spiked ? 1 : 0;
+    }
 
-    // Stage 6, propagate: walk this neuron's outgoing edges. Its synapses can only be away
-    // from rest from its spike until the longest delay has passed and they have settled
-    // after the arrival; outside that window every one is at rest, so the walk is skipped.
+    // Stage 6, propagate: walk this neuron's outgoing edges. Its synapses are at rest once
+    // synapse_active_ticks have passed since its last spike, so the walk is skipped then.
     // A negative synapse_active_ticks walks every tick.
     if (synapse_active_ticks >= 0 &&
         (last_spiked[neuron_index] < 0 || tick - last_spiked[neuron_index] > synapse_active_ticks)) {
         return;
     }
 
+    // Reserve queue room as the Metal kernel does.
+    if (updated_plane_count > 0) {
+        const int out_degree = (int)(edge_row_offset[neuron_index + 1] - edge_row_offset[neuron_index]);
+        int needed = 0;
+        for (int plane = 2; plane < 2 + updated_plane_count; plane += 1) {
+            const int row_base = plane * (neuron_count + 1) + (int)neuron_index;
+            needed += out_degree - (sparse_delta_row_start[row_base + 1] - sparse_delta_row_start[row_base]);
+        }
+        if (needed > 0) {
+            const int reserved = atomicAdd(pending_delta_control + 1, needed);
+            if (reserved + needed > pending_delta_capacity) {
+                atomicSub(pending_delta_control + 1, needed);
+                const int deferred_slot = atomicAdd(pending_delta_control + 4, 1);
+                pending_delta_control[5 + (walk_pass % 2) * neuron_count + deferred_slot] = (int)neuron_index;
+                return;
+            }
+        }
+    }
+
     // Each edge runs its synapse and scatters its current into the target's next input row.
-    int walk_stack_row_base[MAX_K2TREE_HEIGHT];
-    int walk_stack_column_base[MAX_K2TREE_HEIGHT];
+    unsigned int walk_stack_row_base[MAX_K2TREE_HEIGHT];
+    unsigned int walk_stack_column_base[MAX_K2TREE_HEIGHT];
     int walk_stack_block_size[MAX_K2TREE_HEIGHT];
     int walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
     int walk_stack_next_column[MAX_K2TREE_HEIGHT];
@@ -547,16 +599,15 @@ extern "C" __global__ void master_step(
     walk_stack_next_column[0] = 0;
     int walk_stack_top = tree_height > 0 ? 0 : -1;
 
-    // edge_row_offset is only read once the walk has found an edge: a model with no
-    // connections binds a placeholder there.
+    // Read edge_row_offset only after finding an edge: with no connections it is a placeholder.
     int slot = 0;
     while (true) {
-        const int target = k2t_next_neighbor(
+        const unsigned int target = k2t_next_neighbor(
             internal_node_words, leaf_node_words, rank_superblock_table, rank_subblock_table,
             branching_factor, superblock_size_words, neuron_count, tree_height, internal_bit_count,
-            (int)neuron_index, walk_stack_row_base, walk_stack_column_base, walk_stack_block_size,
+            (unsigned int)neuron_index, walk_stack_row_base, walk_stack_column_base, walk_stack_block_size,
             walk_stack_bit_offset, walk_stack_next_column, walk_stack_top);
-        if (target < 0) {
+        if (target == K2T_NO_NEIGHBOR) {
             break;
         }
         const long long current_edge = edge_row_offset[neuron_index] + slot;
@@ -567,15 +618,20 @@ extern "C" __global__ void master_step(
 
         int delay_ticks = (int)roundf(spikecorec_load_edge(
             basis_u, basis_v, edge_coefficients, rank_float4_stride, sparse_delta_row_start,
-            sparse_delta_edge_ordinal, sparse_delta_value, neuron_count, sparse_delta_capacity,
-            1, (int)neuron_index, target, current_edge));
+            sparse_delta_edge_ordinal, sparse_delta_value, neuron_count,
+            1, (unsigned int)neuron_index, target, current_edge));
         if (delay_ticks < 1) {
             delay_ticks = 1;
+        }
+        // A fitted delay can pass the longest declared one by the fit error; past the ring it
+        // would wrap onto a row written this tick or lately.
+        if (delay_ticks > spike_history_length - 1) {
+            delay_ticks = spike_history_length - 1;
         }
         const bool arrived = tick >= delay_ticks &&
             spike_history[((tick - delay_ticks) % spike_history_length) * neuron_count + neuron_index] != 0;
 
-        // The synapse dispatch goes here.
+        // Codegen inserts the synapse dispatch after the `arrived` declaration.
     }
 }
 )CUDA";

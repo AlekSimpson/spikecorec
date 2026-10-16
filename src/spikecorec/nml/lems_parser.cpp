@@ -13,7 +13,7 @@ namespace spikecorec::nml {
 
 namespace {
 
-// LEMS function name -> the name emitted into GPU source.
+// LEMS functions an expression may call. Only the keys are read; codegen spells them itself.
 const Unordered_Map<String, String> FUNCTIONS = {
     {"exp", "exp"},   {"ln", "log"},    {"log", "log"},   {"sqrt", "sqrt"},
     {"abs", "fabs"},  {"ceil", "ceil"}, {"floor", "floor"},
@@ -72,11 +72,12 @@ Lems_Parse_Node *Lems_Expression_Parser::parse_primary() {
         return inner_expression;
     }
 
+    // A sign applies to a whole power, as in jLEMS: -x^2 is -(x^2).
     if (token.kind == Lems_Expression_Token::Kind::Operator && (token.lexeme == "-" || token.lexeme == "+")) {
         token_index += 1;
         auto *unary_operator =
                 new Unary_Node<Lems_Parse_Body>(lems_body(Lems_Node_Subtype::OPERATOR, token));
-        auto *operand = parse_unary();
+        auto *operand = parse_binary(binary_precedence(Lems_Expression_Token{Lems_Expression_Token::Kind::Operator, "^"}));
         unary_operator->child = operand;
         return unary_operator;
     }
@@ -136,10 +137,8 @@ Lems_Parse_Node *Lems_Expression_Parser::parse_binary(s32 minimum_precedence) {
 
         token_index += 1;
 
-        // `^` is the only right-associative operator, so its right operand is parsed at
-        // the same precedence rather than one above: a^b^c is a^(b^c).
-        auto *right =
-                parse_binary(operator_token.lexeme == "^" ? precedence : precedence + 1);
+        // Every operator is left-associative, as in jLEMS: a^b^c is (a^b)^c.
+        auto *right = parse_binary(precedence + 1);
 
         if (operator_token.lexeme == "^") {
             Lems_Expression_Token power_token{Lems_Expression_Token::Kind::Identifier, "pow"};

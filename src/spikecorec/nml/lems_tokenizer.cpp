@@ -1,5 +1,6 @@
 #include "dynamics.h"
 
+#include <algorithm>
 #include <cctype>
 #include <stdexcept>
 
@@ -14,12 +15,10 @@ namespace spikecorec::nml {
 
 namespace {
 
-// Lexer rules are installed as plain function pointers, so every rule lambda below has
-// to be captureless. The tables and helpers those lambdas consult therefore live at
-// file scope rather than as locals of tokenize_lems.
+// Lexer rules are plain function pointers, so their lambdas cannot capture; the tables and
+// helpers they use live at file scope.
 
-// NML spells its comparisons and boolean connectives as dotted words; everything else in
-// the expression grammar -- + - * / ( ) , and the function-call form -- is already C.
+// LEMS dotted comparison and boolean operators, with their C spelling.
 const Unordered_Map<String, String> DOTTED_OPERATORS = {
     {".gt.", ">"},  {".lt.", "<"},   {".geq.", ">="}, {".leq.", "<="},
     {".eq.", "=="}, {".neq.", "!="}, {".and.", "&&"}, {".or.", "||"},
@@ -33,8 +32,7 @@ bool is_identifier_character(char character) {
     return isalnum(static_cast<unsigned char>(character)) || character == '_';
 }
 
-// A dotted operator and a decimal point both start with '.', so the two are told apart by
-// what follows: ".5" is a number, ".gt." an operator.
+// '.' followed by a letter starts a dotted operator (".gt."); otherwise a number (".5").
 bool starts_dotted_operator(const String &text, usize position) {
     return (position + 1 < text.size() &&
             isalpha(static_cast<unsigned char>(text[position + 1])));
@@ -96,7 +94,7 @@ Vector<Lems_Expression_Token> tokenize_lems(const String &expression, const Stri
             ) {
                 lexer.position += 1;
             }
-            // check for an exponent, and the sign that may follow it, ex: 2.7e-5
+            // Exponent with an optional sign, e.g. 2.7e-5.
             if (
                 lexer.position < lexer.source.size() &&
                 (lexer.source[lexer.position] == 'e' || lexer.source[lexer.position] == 'E')
@@ -122,10 +120,14 @@ Vector<Lems_Expression_Token> tokenize_lems(const String &expression, const Stri
                     }
                 }
             }
-            lexer.tokens.push_back({
-                Lems_Expression_Token::Kind::Number,
-                lexer.source.substr(start, lexer.position - start)
-            });
+            // "1.2.3" or "1..5" would otherwise read as 1.2 or 1.0.
+            const String literal = lexer.source.substr(start, lexer.position - start);
+            const usize mantissa_end = literal.find_first_of("eE");
+            const String mantissa = literal.substr(0, mantissa_end);
+            if (std::count(mantissa.begin(), mantissa.end(), '.') > 1 || mantissa == ".") {
+                throw Runtime_Error("lems_tokenizer: malformed number '" + literal + "' in '" + lexer.source + "'");
+            }
+            lexer.tokens.push_back({Lems_Expression_Token::Kind::Number, literal});
         })
         .add_check([](Lems_Lexer &, char character) -> bool {
             return is_identifier_start(character);
@@ -143,7 +145,7 @@ Vector<Lems_Expression_Token> tokenize_lems(const String &expression, const Stri
             });
         })
         .add_check([](Lems_Lexer &lexer, char) -> bool {
-            // Two-character comparisons are also legal LEMS spelling alongside the dotted form.
+            // LEMS also accepts these C operators alongside the dotted forms.
             static const Set<String> pairs = {"<=", ">=", "==", "!=", "&&", "||"};
             return pairs.count(lexer.source.substr(lexer.position, 2)) != 0;
         }, [](Lems_Lexer &lexer) {
@@ -164,8 +166,7 @@ Vector<Lems_Expression_Token> tokenize_lems(const String &expression, const Stri
     try {
         tokens = lexer.lex(expression);
     } catch (const Runtime_Error &error) {
-        // Lexer is generic and knows nothing about which NML component it was run for, so
-        // the owning component is attached to the message here.
+        // The generic lexer does not know the owning component, so it is added here.
         throw Runtime_Error(String(error.what()) + " (" + owner_name + ")");
     }
 

@@ -4,24 +4,10 @@
          id="TwoCellSynapse">
 
     <!--
-      The smallest model that exercises a synapse: two driven sources feeding one target
-      through one projection, so the target's input is a sum over more than one edge.
-
-      Sized to be checkable by hand. Both source cells are the same iafCell driven above
-      rheobase, so they fire at a known rate:
-
-        tau  = C / leakConductance = 100 pF / 5 nS = 20 ms
-        rheobase                   = 5 nS * 15 mV  = 75 pA
-
-      The target sits at 60 pA, BELOW rheobase, so it cannot fire on its own drive alone.
-      Anything it does is the synapse's doing, which is what makes this fixture worth
-      having: a bug that drops synaptic input shows up as a silent target rather than as a
-      slightly wrong number.
-
-      The two connections carry different weights on purpose. Aggregating a target's
-      incoming synapses into one accumulator is exact only because the arrival increment is
-      linear in the edge's weight; equal weights would not tell a correct implementation
-      apart from one that ignored weight entirely.
+      Two driven sources feed one target through one projection, so the target sums two edges.
+      tau = C / leakConductance = 100 pF / 5 nS = 20 ms; rheobase = 5 nS * 15 mV = 75 pA.
+      The sources get 90 pA and fire regularly. The target's 60 pA is below rheobase, so it
+      fires only through the synapse. The weights differ, so ignoring weight changes the result.
     -->
 
     <iafCell id="sourceCell"
@@ -39,13 +25,8 @@
              C="100 pF"/>
 
     <!--
-      Current-based, so Phase 1 can simulate it, and linear in its own state, so a
-      target's incoming edges sum exactly into one accumulator:
-
-        i    = I
-        dI/dt = (e*J - I) / tau
-        dJ/dt = -J / tau
-        on arrival: J = J + weight * ibase
+      Current-based: i = I, dI/dt = (e*J - I) / tau, dJ/dt = -J / tau;
+      each arrival adds weight * ibase to J.
     -->
     <alphaCurrentSynapse id="excitatorySynapse" tau="2 ms" ibase="40 pA"/>
 

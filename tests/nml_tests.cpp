@@ -47,9 +47,9 @@ Vector<NML_Dynamics_Expression> entries_of(const NML_Component_Type &component_t
     return entries;
 }
 
-// Two populations of different cell types, a projection with a connectionWD and one with a plain
-// connection, an explicitInput and an inputList with one plain and one weighted input. Valid NeuroML,
-// whose schema wants synapses before cells.
+// Two populations of different cell types, a connectionWD projection and a plain-connection one,
+// an explicitInput, and an inputList with one plain and one weighted input. Valid NeuroML, whose
+// schema wants synapses before cells.
 String two_population_network() {
     return R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="testnet">
     <expOneSynapse id="syn0" gbase="0.5nS" erev="0mV" tauDecay="3ms"/>
@@ -114,7 +114,7 @@ struct Two_Population_Model {
         parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
     }
 
-    // Where a variable of pop2's cells (izhikevich2007Cell, two state variables) sits in cell memory.
+    // Cell-memory index of one variable of a pop2 cell (izhikevich2007Cell, two state variables).
     s64 izhikevich_memory_index(s64 cell, const String &variable) const {
         const Vector<String> &names = type_named(context, "izhikevich2007Cell").state_variable_names;
         const s64 offset = find(names.begin(), names.end(), variable) - names.begin();
@@ -128,7 +128,7 @@ struct Two_Population_Model {
 
 TEST(Quantity, a_declared_unit_takes_precedence_over_the_built_in_table) {
     const Temporary_Directory directory;
-    // A deliberately non-SI redefinition: if the document's <Unit> is consulted, mV scales by 1000.
+    // A non-SI redefinition: mV scales by 1000 only if the document's <Unit> is used.
     const String main_file = directory.write("units.xml", R"(<Lems>
     <Unit symbol="mV" dimension="voltage" power="3"/>
     <Unit symbol="quux" dimension="none" power="0" scale="7"/>
@@ -159,6 +159,46 @@ TEST(Quantity, standard_library_units_carry_their_scale_power_and_offset) {
     EXPECT_DOUBLE_EQ(context.resolve_quantity("0.7nS_per_mV"), 0.7e-6);
     EXPECT_DOUBLE_EQ(context.resolve_quantity("5offsetUnit"), 15.0);
     EXPECT_DOUBLE_EQ(context.resolve_quantity("12"), 12.0);
+}
+
+// A unit typo or malformed number would silently scale a value by 1 or make it 0.
+TEST(Quantity, unknown_units_and_malformed_quantities_are_refused) {
+    const Two_Population_Model model;
+    const NML_Context &context = model.context;
+    for (const String &value : {"-50mv", "100 msec", "-60mV;", "3 mV extra", "abc", "nan", "1e400", "1.2.3mV", ""}) {
+        EXPECT_THROW(static_cast<void>(context.resolve_quantity(value)), Runtime_Error) << "'" << value << "'";
+    }
+    EXPECT_DOUBLE_EQ(context.resolve_quantity(" -60 mV "), -0.06);
+    EXPECT_DOUBLE_EQ(context.resolve_quantity(".5e-3 s"), 0.5e-3);
+}
+
+// A value's unit must be of its parameter's dimension, and a dimensional value needs a unit.
+TEST(Quantity, a_value_of_the_wrong_dimension_is_refused) {
+    const Two_Population_Model model;
+    const NML_Context &context = model.context;
+    EXPECT_DOUBLE_EQ(context.resolve_quantity_of_dimension("30 ms", "time"), 0.03);
+    EXPECT_DOUBLE_EQ(context.resolve_quantity_of_dimension("2.5", "none"), 2.5);
+    EXPECT_DOUBLE_EQ(context.resolve_quantity_of_dimension("7 mV", "*"), 7e-3);
+    EXPECT_THROW(static_cast<void>(context.resolve_quantity_of_dimension("30", "time")), Runtime_Error);
+    EXPECT_THROW(static_cast<void>(context.resolve_quantity_of_dimension("30 mV", "time")), Runtime_Error);
+
+    // A cell parameter without its unit, and a Simulation length in an unknown unit.
+    const Temporary_Directory directory;
+    String network = two_population_network();
+    network.replace(network.find("C=\"0.2nF\""), 9, "C=\"0.2\"");
+    directory.write("net.nml", network);
+    NML_Context cell_context;
+    parse_model(cell_context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
+    try {
+        static_cast<void>(component_parameter_values(cell_context, *cell_context.find_instance("cell0")));
+        ADD_FAILURE() << "a capacitance without a unit was accepted";
+    } catch (const Runtime_Error &error) {
+        EXPECT_NE(String(error.what()).find("cell0"), String::npos) << error.what();
+    }
+
+    String simulation = recorded_simulation("net.nml");
+    simulation.replace(simulation.find("length=\"100ms\""), 14, "length=\"100 msec\"");
+    EXPECT_NE(parse_error(directory.write("LEMS.xml", simulation)).find("msec"), String::npos);
 }
 
 // A <Constant> resolves after every document is read, so it may use a unit a later file declares.
@@ -270,7 +310,7 @@ TEST(Resolution, a_redeclared_name_shadows_the_ancestors_declaration) {
     ASSERT_NE(tau, nullptr);
     EXPECT_EQ(tau->body.tag_type, NML_Declaration_Type::StateVariable);
 
-    // x is a state variable of the parent but a parameter of the child, so the child has no slot for it.
+    // x is a parent state variable but a child parameter, so the child has no slot for it.
     EXPECT_EQ(child.state_variable_names, (Vector<String>{"tau"}));
     EXPECT_EQ(type_named(context, "parent_type").state_variable_names, (Vector<String>{"x"}));
 }
@@ -416,6 +456,19 @@ TEST(Instances, tags_with_no_component_type_are_skipped) {
 
     EXPECT_EQ(context.simulation.total_neuron_count, 2);
     EXPECT_EQ(context.find_instance("someUnmodelledAnnotation0"), nullptr);
+}
+
+// A ComponentType's name in the wrong case is a typo that would drop the element, not an annotation.
+TEST(Instances, a_component_type_name_in_the_wrong_case_is_refused) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="2"/>
+        <projection id="proj1" presynapticPopulation="pop1" postsynapticPopulation="pop1" synapse="syn0">
+            <connectionWd id="0" preCellId="../pop1[0]" postCellId="../pop1[1]" weight="1" delay="1ms"/>
+        </projection>
+)"));
+    const String error = parse_error(directory.write("LEMS.xml", recorded_simulation("net.nml")));
+    EXPECT_NE(error.find("connectionWd"), String::npos) << error;
+    EXPECT_NE(error.find("connectionWD"), String::npos) << error;
 }
 
 // ── includes ────────────────────────────────────────────────────────────────────
@@ -680,6 +733,55 @@ TEST(Simulation, settings_come_from_the_lems_target) {
     EXPECT_EQ(*simulation.random_seed, 1234u);
 }
 
+// Included files are processed after the main file, and their <Target> must not win.
+TEST(Simulation, the_main_files_target_wins_over_an_included_one) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", two_population_network());
+    directory.write("other.xml", R"(<Lems>
+    <Target component="simulationFromInclude"/>
+    <Simulation id="simulationFromInclude" length="5ms" step="0.5ms" target="net1"/>
+</Lems>
+)");
+    String main_document = recorded_simulation("net.nml");
+    main_document.insert(main_document.find("    <Simulation"), "    <Include file=\"other.xml\"/>\n");
+    NML_Context context;
+    parse_model(context, directory.write("LEMS.xml", main_document));
+    EXPECT_EQ(context.simulation.simulation_component_id, "sim1");
+    EXPECT_EQ(context.simulation.total_tick_count, 10000);
+}
+
+// Network children the engine has no edges for are refused, not silently dropped.
+TEST(Simulation, connections_outside_a_projection_are_refused) {
+    const Temporary_Directory directory;
+    const auto network_with = [&](const String &child) {
+        directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" size="3"/>
+)" + child));
+        return directory.write("LEMS.xml", recorded_simulation("net.nml"));
+    };
+    EXPECT_NE(parse_error(network_with(R"(        <synapticConnection from="pop1[0]" to="pop1[1]" synapse="syn0" destination="synapses"/>
+)")).find("synapticConnection"),
+              String::npos);
+    EXPECT_NE(parse_error(network_with(R"(        <electricalProjection id="gaps" presynapticPopulation="pop1" postsynapticPopulation="pop1"/>
+)")).find("electricalProjection"),
+              String::npos);
+    EXPECT_NE(parse_error(network_with(R"(        <continuousProjection id="graded" presynapticPopulation="pop1" postsynapticPopulation="pop1"/>
+)")).find("continuousProjection"),
+              String::npos);
+}
+
+// A failed parse leaves an empty context, not a half-built one whose queries crash.
+TEST(Simulation, a_failed_parse_leaves_an_empty_context) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="noSuchCell" size="3"/>
+)"));
+    NML_Context context;
+    EXPECT_THROW(context.parse(directory.write("LEMS.xml", recorded_simulation("net.nml"))), Runtime_Error);
+    EXPECT_EQ(context.get_cell_state_size(), 0);
+    EXPECT_EQ(context.resolve_path("pop1[0]/v"), -1);
+    EXPECT_TRUE(context.component_instances.empty());
+    EXPECT_THROW(static_cast<void>(context.get_population_size(nullptr)), Invalid_Argument);
+}
+
 // Populations sit in cell memory in document order, each cell taking one slot per state variable.
 TEST(Simulation, populations_are_laid_out_in_document_order) {
     const Two_Population_Model model;
@@ -734,7 +836,7 @@ TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
     ASSERT_EQ(simulation.synapse_instances.size(), 1u);
     EXPECT_EQ(simulation.synapse_instances[0].id, "syn0");
 
-    // pop1[0] is neuron 0 and pop2[1] is neuron 4; 2 ms at 0.01 ms is 200 ticks, not 199.
+    // pop1[0] is neuron 0 and pop2[1] is neuron 4; 2 ms at 0.01 ms is 200 ticks.
     ASSERT_EQ(simulation.network_data.list[0].size(), 1u);
     const NML_Network_Edge &weighted = simulation.network_data.list[0][0];
     EXPECT_EQ(weighted.child, 4);
@@ -754,7 +856,7 @@ TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
     EXPECT_TRUE(simulation.network_data.list[3].empty());
 }
 
-// An input profile keeps the input component and its targets; the input's own dynamics are compiled.
+// An input profile keeps the input's id and its targets; the input's dynamics are compiled.
 TEST(Simulation, inputs_resolve_their_targets) {
     const Two_Population_Model model;
     const Vector<Simulation_Input_Config> &profiles = model.context.simulation.input_profiles;
@@ -765,7 +867,7 @@ TEST(Simulation, inputs_resolve_their_targets) {
     ASSERT_EQ(explicit_input.targets.size(), 1u);
     EXPECT_EQ(explicit_input.targets[0].neuron_index, 0);
 
-    // Targets are the cell-memory index of the cell's first slot: pop2 starts at 3, two slots a cell.
+    // A target is its cell's first slot in cell memory: pop2 starts at 3, two slots a cell.
     // <input> weighs 1 and <inputW> carries its own weight.
     const Simulation_Input_Config &input_list = profiles[1];
     ASSERT_EQ(input_list.targets.size(), 2u);
@@ -867,7 +969,7 @@ TEST(Input_Tree, a_poisson_firing_synapse_routes_its_spikes_into_its_own_synapse
     EXPECT_EQ(tree.routes[0].target, 1);
 }
 
-// Each generator in a compoundInput is a part of its own, which the compound sums through its select.
+// Each generator in a compoundInput is its own part; the compound sums them through its select.
 TEST(Input_Tree, a_compound_input_holds_each_generator_as_a_part) {
     const Temporary_Directory directory;
     NML_Context context;
@@ -913,6 +1015,39 @@ TEST(Simulation, recordings_resolve_their_selections) {
     ASSERT_EQ(events.selections.size(), 1u);
     EXPECT_EQ(events.selections[0].neuron_index, 5);
     EXPECT_EQ(events.selections[0].event_port, "spike");
+}
+
+// Each selection knows its own id and, for a column, the variable it records; relative file
+// names go beside the LEMS file.
+TEST(Simulation, recordings_carry_their_ids_variables_and_directory) {
+    const Two_Population_Model model;
+    const Vector<Recording_Config> &profiles = model.context.simulation.recording_profiles;
+    ASSERT_EQ(profiles.size(), 2u);
+    EXPECT_EQ(profiles[0].selections[0].variable_name, "v");
+    EXPECT_EQ(profiles[0].selections[0].selection_id, "c0");
+    EXPECT_EQ(profiles[0].selections[1].selection_id, "c1");
+    EXPECT_EQ(profiles[0].event_format, "");
+    EXPECT_EQ(profiles[1].selections[0].variable_name, "");
+    EXPECT_EQ(profiles[1].selections[0].selection_id, "0");
+    EXPECT_EQ(profiles[1].event_format, "TIME_ID");
+    EXPECT_EQ(std::filesystem::weakly_canonical(profiles[0].output_directory),
+              std::filesystem::weakly_canonical(model.directory.path()));
+}
+
+TEST(Simulation, an_event_file_format_other_than_time_id_or_id_time_is_refused) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", two_population_network());
+    EXPECT_NE(parse_error(directory.write("LEMS.xml", R"(<Lems>
+    <Target component="sim1"/>
+    <Include file="net.nml"/>
+    <Simulation id="sim1" length="10ms" step="0.01ms" target="net1">
+        <EventOutputFile id="ef1" fileName="spikes.dat" format="TIME_FIRST">
+            <EventSelection id="0" select="pop1[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+</Lems>
+)")).find("TIME_FIRST"),
+              String::npos);
 }
 
 // An excitatory/inhibitory pair built from one cell type, and two projections with one synapse
@@ -971,6 +1106,117 @@ TEST(Simulation, a_population_list_is_sized_and_addressed_by_its_instances) {
     EXPECT_EQ(context.simulation.total_neuron_count, 3);
     ASSERT_EQ(context.simulation.network_data.list[0].size(), 1u);
     EXPECT_EQ(context.simulation.network_data.list[0][0].child, 2);
+}
+
+// A cell type with no state variables still takes one slot per cell, so the next population does
+// not share its base index and paths into it resolve to its own cells.
+TEST(Simulation, a_population_of_a_stateless_cell_type_keeps_its_own_cells) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", one_population_network(R"(        <population id="clocks" component="clock" size="2"/>
+        <population id="targets" component="cell0" size="2"/>
+        <projection id="proj1" presynapticPopulation="clocks" postsynapticPopulation="targets" synapse="syn0">
+            <connection id="0" preCellId="../clocks[1]" postCellId="../targets[1]"/>
+        </projection>
+)", R"(    <ComponentType name="clockCell" extends="baseSpikingCell">
+        <Dynamics>
+            <OnCondition test="t .geq. 0">
+                <EventOut port="spike"/>
+            </OnCondition>
+        </Dynamics>
+    </ComponentType>
+    <clockCell id="clock"/>
+)"));
+    NML_Context context;
+    parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
+
+    EXPECT_EQ(context.simulation.population_base_indices.at("net1/clocks"), 0);
+    EXPECT_EQ(context.simulation.population_base_indices.at("net1/targets"), 2);
+    EXPECT_EQ(context.get_cell_state_size(), 4);
+    EXPECT_EQ(context.neuron_index_of(context.resolve_path("clocks[1]")), 1);
+    ASSERT_EQ(context.simulation.network_data.list[1].size(), 1u);
+    EXPECT_EQ(context.simulation.network_data.list[1][0].child, 3);
+}
+
+// NeuroML allows any instance ids: an instance's place in the list is its cell's index.
+TEST(Simulation, a_population_list_with_any_instance_ids_is_addressed_by_position) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", one_population_network(R"(        <population id="pop1" component="cell0" type="populationList" size="2">
+            <instance id="1"><location x="0" y="0" z="0"/></instance>
+            <instance id="2"><location x="10" y="0" z="0"/></instance>
+        </population>
+        <projection id="proj1" presynapticPopulation="pop1" postsynapticPopulation="pop1" synapse="syn0">
+            <connection id="0" preCellId="../pop1/1/cell0" postCellId="../pop1/2/cell0"/>
+        </projection>
+)"));
+    NML_Context context;
+    parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
+
+    EXPECT_EQ(context.simulation.total_neuron_count, 2);
+    ASSERT_EQ(context.simulation.network_data.list[0].size(), 1u);
+    EXPECT_EQ(context.simulation.network_data.list[0][0].child, 1);
+}
+
+// The cell id is stripped only where a path repeats it, so a cell whose id is also one of its
+// variables' names still has that variable addressed.
+TEST(Simulation, a_cell_id_equal_to_a_variable_name_keeps_the_variable_addressable) {
+    const Temporary_Directory directory;
+    directory.write("net.nml", R"(<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="net">
+    <izhikevich2007Cell id="u" C="100pF" v0="-60mV" k="0.7nS_per_mV" vr="-60mV" vt="-40mV" vpeak="35mV"
+                        a="0.03per_ms" b="-2nS" c="-50mV" d="100pA"/>
+    <network id="net1">
+        <population id="pop0" component="u" size="2"/>
+    </network>
+</neuroml>
+)");
+    NML_Context context;
+    parse_model(context, directory.write("LEMS.xml", recorded_simulation("net.nml")));
+
+    const Vector<String> &names = type_named(context, "izhikevich2007Cell").state_variable_names;
+    const s64 u_offset = find(names.begin(), names.end(), "u") - names.begin();
+    const s64 v_offset = find(names.begin(), names.end(), "v") - names.begin();
+    const s64 stride = static_cast<s64>(names.size());
+    EXPECT_EQ(context.resolve_path("pop0[1]/u"), stride + u_offset);
+    EXPECT_EQ(context.resolve_path("pop0[1]/v"), stride + v_offset);
+    EXPECT_EQ(context.resolve_path("pop0[1]/u/u"), stride + u_offset);
+    EXPECT_EQ(context.resolve_path("pop0[1]/u/v"), stride + v_offset);
+}
+
+// A missing or malformed count, index, weight, delay or length is refused, naming the element.
+TEST(Simulation, missing_or_malformed_required_values_are_refused) {
+    const Temporary_Directory directory;
+    const auto network_error = [&](const String &network_body) {
+        directory.write("net.nml", one_population_network(network_body));
+        return parse_error(directory.write("LEMS.xml", recorded_simulation("net.nml")));
+    };
+    const String population = R"(        <population id="pop1" component="cell0" size="3"/>
+)";
+    const auto projection_with = [&](const String &connection) {
+        return population + R"(        <projection id="proj1" presynapticPopulation="pop1" postsynapticPopulation="pop1" synapse="syn0">
+)" + connection + R"(        </projection>
+)";
+    };
+
+    EXPECT_NE(network_error(R"(        <population id="pop1" component="cell0" size="2.6"/>
+)").find("2.6"), String::npos);
+    EXPECT_NE(network_error(R"(        <population id="pop1" component="cell0" size="two"/>
+)").find("two"), String::npos);
+    EXPECT_NE(network_error(projection_with(R"(            <connectionWD id="0" preCellId="../pop1[0]" postCellId="../pop1[1]" weight="2"/>
+)")).find("connectionWD"), String::npos);
+    EXPECT_NE(network_error(projection_with(R"(            <connectionWD id="0" preCellId="../pop1[0]" postCellId="../pop1[1]" weight="2" delay="-1ms"/>
+)")).find("proj1"), String::npos);
+    EXPECT_NE(network_error(projection_with(R"(            <connection id="0" preCellId="../pop1[0]" postCellId="../pop1[1.9]"/>
+)")).find("pop1[1.9]"), String::npos);
+    EXPECT_NE(network_error(projection_with(R"(            <connection id="0" preCellId="../pop1[x]" postCellId="../pop1[1]"/>
+)")).find("pop1[x]"), String::npos);
+
+    directory.write("net.nml", one_population_network(population));
+    EXPECT_NE(parse_error(directory.write("LEMS.xml", R"(<Lems>
+    <Target component="sim1"/>
+    <Include file="net.nml"/>
+    <Simulation id="sim1" step="0.01ms" target="net1"/>
+</Lems>
+)")).find("no length"),
+              String::npos);
 }
 
 // Two contexts parsing one model agree on everything indices depend on, and a context parsing it

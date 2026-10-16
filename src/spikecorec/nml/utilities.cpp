@@ -18,8 +18,7 @@ using namespace std::filesystem;
 namespace spikecorec::nml {
 
 
-// Output format inferred from the file extension, matching resolve_spire_compression's
-// rules. A non-.spire extension means the NML-standard column matrix.
+// The output format a filename's extension selects; any non-.spire name is the NML column format.
 Output_File_Format output_format_for_filename(const String &filename) {
     auto ends_with = [&filename](const String &suffix) {
         return filename.size() >= suffix.size() &&
@@ -35,28 +34,23 @@ Output_File_Format output_format_for_filename(const String &filename) {
 }
 
 
-// Accumulates each schema validation error's line number and message (libxml2's messages
-// already name the offending element, e.g. "Element 'thisTagDoesNotExistInSchema': No
-// matching global declaration available for the validation root.") into `*user_data`,
-// joined by " | " -- see validate_against_schema's own comment for why this replaces
-// libxml2's default, stderr-only error handler.
-// libxml2 2.12 made xmlStructuredErrorFunc take a `const xmlError *`; before that it took
-// a mutable xmlErrorPtr. This machine has both 2.9 (pkg-config, what the Makefile picks)
-// and 2.13 (xml2-config) installed, so the signature is selected rather than assumed.
-#if LIBXML_VERSION >= 21200
-void collect_schema_validation_error(void *user_data, const xmlError *error) {
-#else
-void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
-#endif
-    if (!error || !error->message) return;
-
-    String message(error->message);
-    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) message.pop_back();
-
-    String *destination = static_cast<String *>(user_data);
-    if (!destination->empty()) *destination += " | ";
-    *destination += "line " + std::to_string(error->line) + ": " + message;
-}
+// Unused: parser.cpp has its own static copy, which is the one it calls.
+// // Appends "line N: message" for each schema error to *user_data, joined by " | ".
+// // libxml2 2.12 changed the error parameter to `const xmlError *`.
+// #if LIBXML_VERSION >= 21200
+// void collect_schema_validation_error(void *user_data, const xmlError *error) {
+// #else
+// void collect_schema_validation_error(void *user_data, xmlErrorPtr error) {
+// #endif
+//     if (!error || !error->message) return;
+//
+//     String message(error->message);
+//     while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) message.pop_back();
+//
+//     String *destination = static_cast<String *>(user_data);
+//     if (!destination->empty()) *destination += " | ";
+//     *destination += "line " + std::to_string(error->line) + ": " + message;
+// }
 
 
 

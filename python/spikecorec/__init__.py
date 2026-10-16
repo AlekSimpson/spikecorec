@@ -3,8 +3,7 @@ import sys as _sys
 from ._spikecorec import *  # noqa: F401, F403
 from ._spikecorec import __version__, nml, units  # noqa: F401
 
-# The submodules are attributes of the extension; registering them makes
-# `import spikecorec.nml` and `from spikecorec.units import parse_quantity` work too.
+# Registered so `import spikecorec.nml` and `from spikecorec.units import ...` also work.
 _sys.modules[__name__ + ".nml"] = nml
 _sys.modules[__name__ + ".units"] = units
 

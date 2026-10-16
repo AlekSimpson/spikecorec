@@ -20,7 +20,6 @@ constexpr f64 INFINITE = Numeric_Limits<f64>::infinity();
 // ── durations to ticks ──────────────────────────────────────────────────────────
 
 TEST(TickConversion, rounds_to_the_nearest_tick) {
-    // 2 / 0.01 is 199.99999999999997 in doubles; rounding, not truncation, makes it 200.
     EXPECT_EQ(seconds_to_ticks(2e-3, 1e-5), 200);
     EXPECT_EQ(seconds_to_ticks(1.0, 1e-4), 10000);
     EXPECT_EQ(seconds_to_ticks(1.0, 2.5e-5), 40000);

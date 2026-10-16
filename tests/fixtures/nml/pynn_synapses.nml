@@ -1,13 +1,11 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="PynnSynapses">
 
   <!--
-    The PyNN current synapses against jNeuroML. A spikeGenerator fires every 10 ms into four
-    PyNN cells through expCurrSynapse and alphaCurrSynapse:
-      - expPsp and alphaPsp sit at rest (i_offset 0), so each arrival is one postsynaptic
-        potential whose height and rise time the tests compare;
-      - expSpiking and alphaSpiking are held 1 mV below threshold by i_offset, so arrivals
-        make them fire, and the tests compare the spike times.
-    tests/fixtures/reference/regenerate_references.sh runs this through jNeuroML.
+    PyNN current synapses, compared with jNeuroML. A spikeGenerator fires every 10 ms into
+    four cells through expCurrSynapse and alphaCurrSynapse. expPsp and alphaPsp sit at rest,
+    so each arrival is one postsynaptic potential; the tests compare its height and time to
+    peak. expSpiking and alphaSpiking sit 1 mV below threshold (i_offset), so arrivals fire them.
+    tests/fixtures/reference/regenerate_references.sh writes the jNeuroML outputs.
   -->
 
   <expCurrSynapse id="expSynapse" tau_syn="5"/>

@@ -23,9 +23,7 @@ using namespace spikecorec::test_support;
 
 namespace {
 
-// Small fixed 8-node directed graph. Self-loops are not supported (see
-// K2_Tree's self-loop validation in build_tree_arrays), so this fixture must
-// not declare any i==j edge.
+// A fixed 8-node directed graph. It has no self-loops, which K2_Tree rejects.
 Vector<Vector<s32>> k2_reference_adjacency() {
     return {
         {1, 4, 7}, // 0
@@ -59,11 +57,11 @@ TEST(K2_Tree, adjacent_and_neighbors) {
             EXPECT_EQ(tree.adjacent(source, target), (row.count(target) ? 1 : 0));
     }
 
-    Vector<s32> buffer(node_count);
+    Vector<u32> buffer(node_count);
     for (s32 source = 0; source < node_count; ++source) {
         s64 count = tree.get_neighbors(source, buffer.data(), node_count);
-        Vector<s32> neighbors(buffer.begin(), buffer.begin() + count);
-        Vector<s32> expected = adjacency[static_cast<usize>(source)];
+        Vector<u32> neighbors(buffer.begin(), buffer.begin() + count);
+        Vector<u32> expected(adjacency[static_cast<usize>(source)].begin(), adjacency[static_cast<usize>(source)].end());
         std::sort(expected.begin(), expected.end());
         EXPECT_EQ(neighbors, expected);
     }
@@ -74,30 +72,28 @@ TEST(K2_Tree, adjacent_and_predecessors) {
     const s32 node_count = 8;
     K2_Tree tree = *K2_Tree::from_adjacency_list(shared_backend(), adjacency, node_count);
 
-    // Ground-truth predecessor lists = the TRANSPOSE of the reference adjacency: node u is a
-    // predecessor of node v iff the edge u -> v exists in the forward adjacency. Derived from
-    // the fixture rather than from tree.adjacent(), so a wrong `adjacent` cannot make this
-    // pass by agreeing with itself.
+    // Expected predecessors are the transpose of the fixture, not derived from tree.adjacent(), so
+    // a wrong adjacent() cannot pass by agreeing with itself.
     Vector<Vector<s32>> predecessors(static_cast<usize>(node_count));
     for (s32 source = 0; source < node_count; ++source)
         for (s32 target : adjacency[static_cast<usize>(source)])
             predecessors[static_cast<usize>(target)].push_back(source);
 
-    Vector<s32> buffer(node_count);
+    Vector<u32> buffer(node_count);
     for (s32 target = 0; target < node_count; ++target) {
         s64 count = tree.get_predecessors(target, buffer.data(), node_count);
-        Vector<s32> found(buffer.begin(), buffer.begin() + count);
+        Vector<u32> found(buffer.begin(), buffer.begin() + count);
         std::sort(found.begin(), found.end());
-        Vector<s32> expected = predecessors[static_cast<usize>(target)];
+        Vector<u32> expected(predecessors[static_cast<usize>(target)].begin(), predecessors[static_cast<usize>(target)].end());
         std::sort(expected.begin(), expected.end());
         EXPECT_EQ(found, expected) << "target=" << target;
     }
 }
 
 TEST(K2_Tree, predecessors_bounds_and_degenerate) {
-    // Out-of-range / degenerate queries return 0 written, mirroring get_neighbors' own bounds checks.
+    // Out-of-range or degenerate queries write nothing and return 0, like get_neighbors.
     K2_Tree tree = *K2_Tree::from_adjacency_list(shared_backend(), k2_reference_adjacency(), 8);
-    Vector<s32> buffer(8);
+    Vector<u32> buffer(8);
     EXPECT_EQ(tree.get_predecessors(-1, buffer.data(), 8), 0);
     EXPECT_EQ(tree.get_predecessors(8, buffer.data(), 8), 0);
     EXPECT_EQ(tree.get_predecessors(0, buffer.data(), 0), 0);
@@ -106,48 +102,24 @@ TEST(K2_Tree, predecessors_bounds_and_degenerate) {
     K2_Tree isolated = *K2_Tree::from_adjacency_list(shared_backend(), single_isolated, 1);
     EXPECT_EQ(isolated.get_predecessors(0, buffer.data(), 8), 0);
 
-    // max_neighbor_count truncation: node 3 has two predecessors (2 and 7); asking for at most 1
-    // must write exactly 1 (and only a real predecessor).
-    Set<s32> node3_predecessors = {2, 7};
+    // Node 3 has predecessors 2 and 7; a limit of 1 must write exactly one real predecessor.
+    Set<u32> node3_predecessors = {2, 7};
     s64 truncated = tree.get_predecessors(3, buffer.data(), 1);
     EXPECT_EQ(truncated, 1);
     EXPECT_TRUE(node3_predecessors.count(buffer[0])) << "wrote a non-predecessor: " << buffer[0];
 }
 
-TEST(K2_Tree, adjacent_batch) {
-    auto adjacency = k2_reference_adjacency();
-    const s32 node_count = 8;
-    K2_Tree tree = *K2_Tree::from_adjacency_list(shared_backend(), adjacency, node_count);
-
-    Vector<s32> source_nodes, target_nodes;
-    for (s32 source = 0; source < node_count; ++source)
-        for (s32 target = 0; target < node_count; ++target) {
-            source_nodes.push_back(source);
-            target_nodes.push_back(target);
-        }
-    Vector<uint8_t> output(source_nodes.size());
-    tree.adjacent_batch(source_nodes.data(), target_nodes.data(), output.data(), static_cast<s32>(source_nodes.size()));
-
-    for (usize query = 0; query < source_nodes.size(); ++query)
-        EXPECT_EQ(output[query], static_cast<uint8_t>(tree.adjacent(source_nodes[query], target_nodes[query])));
-}
-
 TEST(K2_Tree, single_node_and_bounds) {
-    // A single-node graph's only possible edge would be the self-loop (0,0),
-    // which is not supported -- constructing over an adjacency list containing
-    // it must throw, not silently report "no edge" (see the self-loop
-    // validation in build_tree_arrays, which from_adjacency_list/from_edges
-    // both funnel through).
+    // A single node's only possible edge is the self-loop (0, 0), which must throw rather than
+    // read as no edge.
     Vector<Vector<s32>> single_with_self_loop = {{0}};
     EXPECT_THROW({ K2_Tree::from_adjacency_list(shared_backend(), single_with_self_loop, 1); }, Invalid_Argument);
 
-    // An isolated single node (no self-loop declared) constructs normally: with
-    // no other node to connect to, it collapses to a zero-level tree
-    // (tree_height=0) and correctly reports no edge.
+    // An isolated single node builds a zero-height tree and reports no edge.
     Vector<Vector<s32>> single_isolated = {{}};
     K2_Tree isolated = *K2_Tree::from_adjacency_list(shared_backend(), single_isolated, 1);
     EXPECT_EQ(isolated.tree_height, 0);
-    Vector<s32> buffer(4);
+    Vector<u32> buffer(4);
     EXPECT_EQ(isolated.adjacent(0, 0), 0);
     EXPECT_EQ(isolated.get_neighbors(0, buffer.data(), 4), 0);
 
@@ -161,10 +133,8 @@ TEST(K2_Tree, single_node_and_bounds) {
 }
 
 TEST(K2_Tree, self_loop_rejected_for_any_node_count) {
-    // Self-loops (i==j) are never supported, for any node_count -- not just the
-    // degenerate single-node case above -- and regardless of which entry point
-    // (adjacency list or flat edge arrays) the edge arrives through, since both
-    // funnel through the same build_tree_arrays validation.
+    // Self-loops are rejected for any node count, through both the adjacency-list and edge-array
+    // entry points.
     Vector<Vector<s32>> adjacency_with_self_loop = {
         {1, 2},
         {1, 2}, // node 1: self-loop + normal edge
@@ -172,10 +142,10 @@ TEST(K2_Tree, self_loop_rejected_for_any_node_count) {
     };
     EXPECT_THROW({ K2_Tree::from_adjacency_list(shared_backend(), adjacency_with_self_loop, 3); }, Invalid_Argument);
 
-    Vector<s32> source_nodes = {0, 1, 1, 2};
-    Vector<s32> target_nodes = {1, 1, 2, 0};
+    Vector<u32> source_nodes = {0, 1, 1, 2};
+    Vector<u32> target_nodes = {1, 1, 2, 0};
     EXPECT_THROW({
-        K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(), static_cast<s32>(source_nodes.size()), 3);
+        K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(), static_cast<s64>(source_nodes.size()), 3);
     }, std::invalid_argument);
 }
 
@@ -199,7 +169,7 @@ TEST(K2_Tree, save_load) {
 TEST(K2_Tree, from_edges) {
     auto adjacency = k2_reference_adjacency();
     const s32 node_count = 8;
-    Vector<s32> source_nodes, target_nodes;
+    Vector<u32> source_nodes, target_nodes;
     for (s32 source = 0; source < node_count; ++source)
         for (s32 target : adjacency[static_cast<usize>(source)]) {
             source_nodes.push_back(source);
@@ -207,7 +177,7 @@ TEST(K2_Tree, from_edges) {
         }
 
     K2_Tree from_edge_list = *K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
-                                                static_cast<s32>(source_nodes.size()), node_count);
+                                                static_cast<s64>(source_nodes.size()), node_count);
     K2_Tree from_adjacency = *K2_Tree::from_adjacency_list(shared_backend(), adjacency, node_count);
     for (s32 source = 0; source < node_count; ++source)
         for (s32 target = 0; target < node_count; ++target)
@@ -217,27 +187,27 @@ TEST(K2_Tree, from_edges) {
 TEST(K2_Tree, from_edges_invalid_branching_factor) {
     auto adjacency_list = k2_reference_adjacency();
     const s32 node_count = 8;
-    Vector<s32> source_nodes, target_nodes;
+    Vector<u32> source_nodes, target_nodes;
     for (usize source = 0; source < static_cast<usize>(node_count); ++source)
         for (s32 target : adjacency_list[source]) {
-            source_nodes.push_back(static_cast<s32>(source));
+            source_nodes.push_back(static_cast<u32>(source));
             target_nodes.push_back(target);
         }
 
     auto result = K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
-                                     static_cast<s32>(source_nodes.size()), node_count, 10);
+                                     static_cast<s64>(source_nodes.size()), node_count, 10);
     EXPECT_FALSE(result.has_value());
 
     result = K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
-                                static_cast<s32>(source_nodes.size()), node_count, -1);
+                                static_cast<s64>(source_nodes.size()), node_count, -1);
     EXPECT_FALSE(result.has_value());
 }
 
 
-// Fewer than two children per node never subdivides, so building such a tree would never finish.
+// A branching factor below two never subdivides, so the build would never finish.
 TEST(K2_Tree, a_branching_factor_below_two_is_rejected) {
     const auto adjacency = k2_reference_adjacency();
-    Vector<s32> source_nodes, target_nodes;
+    Vector<u32> source_nodes, target_nodes;
     for (s32 source = 0; source < 8; source += 1) {
         for (s32 target : adjacency[static_cast<usize>(source)]) {
             source_nodes.push_back(source);
@@ -248,8 +218,49 @@ TEST(K2_Tree, a_branching_factor_below_two_is_rejected) {
         EXPECT_FALSE(K2_Tree::from_adjacency_list(shared_backend(), adjacency, 8, branching_factor).has_value())
             << "branching factor " << branching_factor;
         EXPECT_FALSE(K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
-                                        static_cast<s32>(source_nodes.size()), 8, branching_factor).has_value())
+                                        static_cast<s64>(source_nodes.size()), 8, branching_factor).has_value())
             << "branching factor " << branching_factor;
+    }
+}
+
+// The subblock table holds a u16 popcount, which overflows past 2048 words per superblock.
+TEST(K2_Tree, a_superblock_size_outside_the_subblock_range_is_rejected) {
+    const auto adjacency = k2_reference_adjacency();
+    Vector<u32> source_nodes, target_nodes;
+    for (s32 source = 0; source < 8; source += 1) {
+        for (s32 target : adjacency[static_cast<usize>(source)]) {
+            source_nodes.push_back(source);
+            target_nodes.push_back(target);
+        }
+    }
+    for (s32 superblock_size : {0, -1, K2_Tree::MAX_SUPERBLOCK_SIZE_WORDS + 1}) {
+        EXPECT_FALSE(K2_Tree::from_adjacency_list(shared_backend(), adjacency, 8, 4, superblock_size).has_value())
+            << "superblock size " << superblock_size;
+        EXPECT_FALSE(K2_Tree::from_edges(shared_backend(), source_nodes.data(), target_nodes.data(),
+                                        static_cast<s64>(source_nodes.size()), 8, 4, superblock_size).has_value())
+            << "superblock size " << superblock_size;
+    }
+    EXPECT_TRUE(K2_Tree::from_adjacency_list(shared_backend(), adjacency, 8, 4, K2_Tree::MAX_SUPERBLOCK_SIZE_WORDS)
+                    .has_value());
+}
+
+// trace() is the debug twin of adjacent() and must give the same answer for every pair.
+TEST(K2_Tree, trace_agrees_with_adjacent) {
+    const s32 node_count = 129;
+    Mersenne_Twister random_engine(4242);
+    Bernoulli_Distribution has_edge(0.1);
+    Vector<Vector<s32>> adjacency(static_cast<usize>(node_count));
+    for (s32 source = 0; source < node_count; source += 1) {
+        for (s32 target = 0; target < node_count; target += 1) {
+            if (target != source && has_edge(random_engine)) adjacency[static_cast<usize>(source)].push_back(target);
+        }
+    }
+    K2_Tree tree = *K2_Tree::from_adjacency_list(shared_backend(), adjacency, node_count, 2);
+
+    for (s32 source = 0; source < node_count; source += 1) {
+        for (s32 target = 0; target < node_count; target += 1) {
+            ASSERT_EQ(tree.trace(source, target), tree.adjacent(source, target)) << source << " -> " << target;
+        }
     }
 }
 
@@ -279,17 +290,21 @@ TEST(K2_Tree, random_graphs_answer_every_query_for_every_branching_factor) {
                 }
             }
 
-            Vector<s32> buffer(static_cast<usize>(node_count));
+            Vector<u32> buffer(static_cast<usize>(node_count));
             for (s32 node = 0; node < node_count; node += 1) {
                 const s64 neighbor_count = tree.get_neighbors(node, buffer.data(), node_count);
-                Vector<s32> neighbors(buffer.begin(), buffer.begin() + neighbor_count);
+                Vector<u32> neighbors(buffer.begin(), buffer.begin() + neighbor_count);
                 sort(neighbors.begin(), neighbors.end());
-                EXPECT_EQ(neighbors, adjacency[static_cast<usize>(node)]) << label << ", neighbors of " << node;
+                const Vector<u32> expected_neighbors(adjacency[static_cast<usize>(node)].begin(),
+                                                     adjacency[static_cast<usize>(node)].end());
+                EXPECT_EQ(neighbors, expected_neighbors) << label << ", neighbors of " << node;
 
                 const s64 predecessor_count = tree.get_predecessors(node, buffer.data(), node_count);
-                Vector<s32> found(buffer.begin(), buffer.begin() + predecessor_count);
+                Vector<u32> found(buffer.begin(), buffer.begin() + predecessor_count);
                 sort(found.begin(), found.end());
-                EXPECT_EQ(found, predecessors[static_cast<usize>(node)]) << label << ", predecessors of " << node;
+                const Vector<u32> expected_predecessors(predecessors[static_cast<usize>(node)].begin(),
+                                                        predecessors[static_cast<usize>(node)].end());
+                EXPECT_EQ(found, expected_predecessors) << label << ", predecessors of " << node;
             }
         }
     }

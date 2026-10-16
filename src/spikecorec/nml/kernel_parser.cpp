@@ -17,7 +17,7 @@ using Kind = Kernel_Token::Kind;
 const Set<String> ASSIGNMENT_OPERATORS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="};
 const Set<String> PREFIX_OPERATORS = {"-", "+", "!", "~", "++", "--", "*", "&"};
 
-// Implied by the node type, so emission puts them back.
+// Dropped on parse: the node type implies them and emission writes its own.
 const Set<String> KERNEL_QUALIFIERS = {"kernel", "__global__"};
 const Set<String> FUNCTION_QUALIFIERS = {"inline", "static", "extern", "__device__", "__forceinline__"};
 
@@ -188,8 +188,8 @@ Kernel_Node *Kernel_Parser::parse_parameter() {
     return parameter;
 }
 
-// Qualifiers and base type words, then any "*" and "&". The base type is normalized to its
-// neutral name; a type with no neutral name keeps its spelling.
+// Qualifiers and base type words, then any "*" and "&". A base type with a neutral name is
+// normalized to it; any other keeps its spelling.
 Kernel_Node *Kernel_Parser::parse_type() {
     String qualifiers;
     String base_type;
@@ -265,7 +265,7 @@ Kernel_Node *Kernel_Parser::parse_statement() {
     return statement;
 }
 
-// A declaration, assignment or expression, without its ';' so for headers can use it.
+// A declaration, assignment or expression without its ';', so for-loop headers can use it.
 // A statement-level x++ / x-- becomes x += 1 / x -= 1.
 Kernel_Node *Kernel_Parser::parse_simple_statement() {
     if (starts_type()) return parse_declaration();

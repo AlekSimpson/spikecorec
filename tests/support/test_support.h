@@ -1,7 +1,7 @@
 #pragma once
 
-// What more than one test file needs: one GPU backend, a temporary directory per test, the
-// fixture directory, a LEMS document around a model, and spike statistics.
+// Helpers shared by the test files: one GPU backend, a temporary directory per test, fixture
+// paths, a LEMS document around a model, and spike statistics.
 
 #include <unistd.h>
 
@@ -26,15 +26,14 @@
 
 namespace spikecorec::test_support {
 
-// One backend for the whole runner. Every k^2-tree and weight matrix carves its own slab out of
-// it and releases that slab when it dies, so sharing the backend is not sharing storage; it only
-// avoids standing up a device per test.
+// One backend for the whole runner, so tests do not each create a device. Each k^2-tree and
+// weight matrix owns its own slab of it and frees the slab on destruction.
 inline Engine_Backend &shared_backend() {
     static Engine_Backend backend;
     return backend;
 }
 
-// An absolute path into tests/fixtures, so a test finds its fixture from any working directory.
+// An absolute path into tests/fixtures, valid from any working directory.
 inline String fixture_path(const String &relative_path) {
     return String(SPIKECOREC_TEST_FIXTURE_DIR) + "/" + relative_path;
 }
@@ -45,8 +44,8 @@ inline bool standard_library_available() {
     return !context.STANDARD_LIBRARY_PATH.empty() && std::filesystem::exists(context.STANDARD_LIBRARY_PATH);
 }
 
-// A directory of the current test's own, removed with the object. It sits under a root named
-// after this process, so test runners that overlap on one machine never share a file.
+// A directory for the current test, removed on destruction. Its root is named after the process
+// ID, so concurrent test runners never share a file.
 class Temporary_Directory {
 public:
     Temporary_Directory() {
@@ -82,8 +81,7 @@ private:
     Path root;
 };
 
-// Everything the engine logs while the object lives, kept in memory so a test can check that a
-// warning was given without reading the log file.
+// Captures the engine's log output in memory while alive, so a test can check for a warning.
 class Captured_Log {
 public:
     Captured_Log() : sink(std::make_shared<log::Ostream_Sink>(text)) {
@@ -110,7 +108,7 @@ private:
 };
 
 // A LEMS document that includes the NeuroML core types and model_file and simulates network_id.
-// simulation_children goes inside <Simulation>: output files, for instance.
+// simulation_children goes inside <Simulation>, e.g. output files.
 inline String lems_document(const String &model_file, const String &network_id, const String &length,
                             const String &step, const String &simulation_children = "") {
     Output_String_Stream document;
@@ -128,6 +126,16 @@ inline String lems_document(const String &model_file, const String &network_id, 
              << "  <Target component=\"sim1\"/>\n"
              << "</Lems>\n";
     return document.str();
+}
+
+// What fit_tolerance allows a read of `value` to be off by: the tolerance times the larger of the
+// value and the RMS of its plane's declared values.
+inline f64 fit_allowance(f32 fit_tolerance, f64 value, const Vector<f32> &declared_plane) {
+    f64 sum_of_squares = 0.0;
+    for (f32 entry : declared_plane) sum_of_squares += static_cast<f64>(entry) * static_cast<f64>(entry);
+    const f64 root_mean_square =
+        declared_plane.empty() ? 0.0 : std::sqrt(sum_of_squares / static_cast<f64>(declared_plane.size()));
+    return static_cast<f64>(fit_tolerance) * std::max(std::fabs(value), root_mean_square);
 }
 
 // One neuron's spike times, in order.
@@ -161,8 +169,7 @@ inline f64 coefficient_of_variation(const Vector<f64> &values) {
     return std::sqrt(sum_of_squares / static_cast<f64>(values.size() - 1)) / mean;
 }
 
-// The two-sample Kolmogorov-Smirnov statistic: the largest gap between the two samples' empirical
-// cumulative distributions.
+// The two-sample Kolmogorov-Smirnov statistic: the largest gap between the two empirical CDFs.
 inline f64 kolmogorov_smirnov_statistic(Vector<f64> first, Vector<f64> second) {
     std::sort(first.begin(), first.end());
     std::sort(second.begin(), second.end());

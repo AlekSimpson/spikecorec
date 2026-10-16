@@ -17,15 +17,12 @@ namespace spikecorec {
 
     class K2_Tree {
     public:
-        // Upper bound on the queries adjacent_batch stages in one pass. The staging
-        // buffers are carved from this tree's own slab at construction, because the
-        // backend hands out one chunk per partition -> allocate round and there is no
-        // per-call allocation to fall back on. A larger batch is chunked, not refused.
-        static constexpr s64 ADJACENT_BATCH_QUERY_CAP = 65536;
+        // The subblock table stores a u16 popcount within each superblock, which holds at most
+        // 32 bits for each of 2047 words.
+        static constexpr s32 MAX_SUPERBLOCK_SIZE_WORDS = 2048;
 
-        // metadata. Initialized so a default-constructed K2_Tree is the empty adjacency
-        // rather than uninitialized memory: tree_height 0 is what every row walk, on host
-        // and on device, already checks before descending.
+        // Defaults describe the empty adjacency; every walk returns early on tree_height 0. These are
+        // s32 because the kernels read them as int. Node indices are u32, as on the GPU.
         s32 branching_factor = DEFAULT_BRANCHING_FACTOR;
         s32 superblock_size_words = 1024; // words per rank superblock
         s32 node_count = 0; // number of nodes N
@@ -33,30 +30,16 @@ namespace spikecorec {
         s32 tree_height = 0; // height H of the k^2-tree
         s32 internal_bit_count = 0; // number of bits in internal_node_words
 
-        // Bit arrays packed as uint32 words. All four are sub-ranges of one slab that this
-        // tree owns; none of them owns anything itself, which is what makes them plain
-        // copyable values rather than the move-only handles they used to be.
+        // Bit arrays packed as u32 words; sub-ranges of the slab this tree owns.
         Engine_Pointer internal_node_words; // internal node bits, levels 0..tree_height-2
         Engine_Pointer leaf_node_words; // leaf bits, level tree_height-1
         Engine_Pointer rank_superblock_table; // rank superblock table over internal_node_words
         Engine_Pointer rank_subblock_table; // rank subblock table over internal_node_words
 
-        // Staging for adjacent_batch, carved from the same slab (see ADJACENT_BATCH_QUERY_CAP).
-        Engine_Pointer query_source_staging;
-        Engine_Pointer query_target_staging;
-        Engine_Pointer query_output_staging;
-
-        // The backend this tree's slab came from, and the whole-chunk handle allocate()
-        // returned for it. The destructor releases that one chunk, which frees every
-        // sub-range above at once. Null on a default-constructed (empty) tree, and nulled
-        // in the moved-from object so the chunk is released exactly once.
+        // The slab holding every range above, and its backend; the destructor releases it.
+        // Null when empty or moved from, so the slab is released once.
         Engine_Backend *owning_backend = nullptr;
         Engine_Pointer owning_slab;
-
-        // The ahead-of-time batch-query kernel, built into a pipeline on first use. Mutable
-        // because adjacent_batch is const and building a pipeline is caching, not a change
-        // to the adjacency this tree represents.
-        mutable Engine_Function adjacent_batch_function;
 
         // lengths of the arrays above (in elements, not bytes)
         usize internal_node_words_length = 0;
@@ -64,22 +47,16 @@ namespace spikecorec {
         usize rank_superblock_length = 0;
         usize rank_subblock_length = 0;
 
-        // The empty adjacency: no nodes, no bits, no slab, no backend. Destructing one is
-        // safe because the destructor no-ops on a null owning_backend, and every walk
-        // bails on tree_height == 0 before touching an array.
+        // The empty adjacency: no nodes, no bits, no slab, no backend.
         K2_Tree() = default;
         K2_Tree(const K2_Tree&)            = delete;
         K2_Tree& operator=(const K2_Tree&) = delete;
 
-        // Hand-written rather than defaulted, for one reason only: the moved-from object
-        // must forget its backend, or both objects release the same slab. Every other
-        // member is a plain value that a defaulted move would handle correctly.
+        // A move clears the source's backend so the slab is released once.
         K2_Tree(K2_Tree&& other) noexcept;
         K2_Tree& operator=(K2_Tree&& other) noexcept;
 
-        // Takes the ranges already carved and filled by a factory below. `owning_slab` is
-        // the whole-chunk handle its partition -> allocate round returned; this object
-        // owns it and releases it in the destructor.
+        // Takes the ranges a factory below carved and filled; this object owns `owning_slab`.
         K2_Tree(
             Engine_Backend &backend,
             Engine_Pointer owning_slab,
@@ -88,10 +65,6 @@ namespace spikecorec {
             Engine_Pointer leaf_node_words,
             Engine_Pointer rank_superblock_table,
             Engine_Pointer rank_subblock_table,
-
-            Engine_Pointer query_source_staging,
-            Engine_Pointer query_target_staging,
-            Engine_Pointer query_output_staging,
 
             usize internal_node_words_length,
             usize leaf_node_words_length,
@@ -108,57 +81,44 @@ namespace spikecorec {
 
         ~K2_Tree();
 
-        // factory: build from an adjacency list (node i -> list of neighbor indices)
+        // factory: build from an adjacency list (node i -> list of neighbor indices). Both factories
+        // return nullopt for a branching factor outside 2-5, a superblock size outside
+        // 1-MAX_SUPERBLOCK_SIZE_WORDS, or a tree too large for the kernels' 32-bit indices.
         static Optional<K2_Tree> from_adjacency_list(
             Engine_Backend &backend,
             const Vector<Vector<s32> > &adjacency_list,
-            s32 node_count = -1,
-            s32 branching_factor = DEFAULT_BRANCHING_FACTOR,
-            s32 superblock_size = 1024
+            s64 node_count = -1,
+            s64 branching_factor = DEFAULT_BRANCHING_FACTOR,
+            s64 superblock_size = 1024
         );
 
         // factory: build from a flat edge list (parallel source[] and target[] arrays)
         static Optional<K2_Tree> from_edges(
             Engine_Backend &backend,
-            const s32 *source_indices,
-            const s32 *target_indices,
-            s32 edge_count,
-            s32 node_count,
-            s32 branching_factor = DEFAULT_BRANCHING_FACTOR,
-            s32 superblock_size = 1024
+            const u32 *source_indices,
+            const u32 *target_indices,
+            s64 edge_count,
+            s64 node_count,
+            s64 branching_factor = DEFAULT_BRANCHING_FACTOR,
+            s64 superblock_size = 1024
         );
 
         // factory: deserialize from file
         static K2_Tree load(Engine_Backend &backend, const char *path);
 
         // single edge query: returns 1 if the edge source_node -> target_node exists, 0 otherwise
-        [[nodiscard]] s32 adjacent(s32 source_node, s32 target_node) const;
+        [[nodiscard]] s64 adjacent(u32 source_node, u32 target_node) const;
 
-        // row enumeration: writes up to max_neighbor_count neighbor indices of `node_index`
-        // into output_buffer (caller-allocated, at least max_neighbor_count elements), in
-        // tree-traversal order. Returns the number of neighbors written (<= max_neighbor_count).
-        // Walks only the populated subtrees of the row — never touches unrelated regions.
-        [[nodiscard]] s64 get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const;
+        // Writes up to max_neighbor_count targets of node_index into output_buffer, ascending,
+        // and returns the count. Walks only the row's populated subtrees.
+        [[nodiscard]] s64 get_neighbors(u32 node_index, u32 *output_buffer, s64 max_neighbor_count) const;
 
-        // column enumeration (the exact mirror of get_neighbors): writes up to max_neighbor_count
-        // PREDECESSOR indices of `node_index` into output_buffer — every node `u` for which the edge
-        // u -> node_index exists (i.e. `node_index` acting as the target/column). Returns the number
-        // written (<= max_neighbor_count). Reads the SAME stored bits get_neighbors does; it simply
-        // fixes the column (from node_index) and walks the rows at each tree level instead of fixing
-        // the row and walking the columns. Walks only populated subtrees of the column.
-        [[nodiscard]] s64 get_predecessors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const;
+        // The column mirror of get_neighbors: writes up to max_neighbor_count sources u with an
+        // edge u -> node_index, ascending, and returns the count. Walks only populated subtrees.
+        [[nodiscard]] s64 get_predecessors(u32 node_index, u32 *output_buffer, s64 max_neighbor_count) const;
 
-        // batched edge query: writes 0 or 1 into output_buffer[i] for each (source_indices[i], target_indices[i])
-        void adjacent_batch(
-            const s32 *source_indices,
-            const s32 *target_indices,
-            uint8_t *output_buffer,
-            s32 query_count
-        ) const;
-
-        // debug: prints the full tree traversal path for the edge source_node -> target_node
-        // and returns the result
-        [[nodiscard]] s32 trace(s32 source_node, s32 target_node) const;
+        // debug: logs the tree walk for source_node -> target_node; returns 1 if the edge exists
+        [[nodiscard]] s64 trace(u32 source_node, u32 target_node) const;
 
         // serialize to file
         void save(const char *path) const;

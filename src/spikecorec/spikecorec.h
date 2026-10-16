@@ -1,28 +1,31 @@
 #pragma once
 
+// The engine's public headers, for a program that wants them in one include.
+
 #include "types.h"
-
-#if defined(SPIKECOREC_CUDA)
-#  include "kernels.cuh"
-#elif defined(SPIKECOREC_METAL)
-#  include "kernels.h"
-#endif
-
-
+#include "units.h"
+#include "backend.h"
+#include "k2tree.h"
+#include "weight_matrix.h"
+#include "recording.h"
+#include "topologies.h"
+#include "parser.h"
+#include "engine.h"
 
 namespace spikecorec {
 
-String combine(const Vector<String> &values) {
-    String result = "";
-    for (String string_ : values) result += string_;
+// The values joined in order.
+inline String combine(const Vector<String> &values) {
+    String result;
+    for (const String &value : values) result += value;
     return result;
 }
 
-String combine(String &filler, const Vector<String> &values) {
-    String result = "";
-    for (String string_: values) result += string_ + filler;
+// Each value followed by filler.
+inline String combine(const String &filler, const Vector<String> &values) {
+    String result;
+    for (const String &value : values) result += value + filler;
     return result;
 }
 
-
-};
+} // namespace spikecorec

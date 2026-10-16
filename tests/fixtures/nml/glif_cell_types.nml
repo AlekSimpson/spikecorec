@@ -1,22 +1,17 @@
 <neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="GlifCellTypes">
 
   <!--
-    The GLIF family (Allen Institute Generalized LIF), as LEMS ComponentTypes. None of
-    these are in the NeuroML standard library, so the model carries its own definitions
-    and the engine compiles them like any other ComponentType.
+    The GLIF family (Allen Institute generalized LIF) as LEMS ComponentTypes. The NeuroML
+    standard library does not define them, so models include this file.
 
-    What each one adds to the one before:
       GLIF1  leaky integrate-and-fire with a refractory period
-      GLIF2  + a voltage-dependent reset rule (vreset + resetScale * (v - vth))
-      GLIF3  + two after-spike currents asc1/asc2, decaying and bumped at each spike
-      GLIF4  + an adapting threshold theta that relaxes to thetaInf and jumps on a spike
+      GLIF2  + reset that depends on v: vreset + resetScale * (v - vth)
+      GLIF3  + two after-spike currents asc1/asc2 that decay and jump at each spike
+      GLIF4  + a threshold theta that relaxes to thetaInf and jumps at each spike
       GLIF5  + both after-spike currents and the adapting threshold
 
-    Every one declares the same two regimes: an active "integrating" regime and a
-    "refractory" one it sits in for t_ref after firing. The engine lowers that pair to a
-    comparison against when the cell last fired rather than to a state machine  :  the
-    refractory regime's timer variable, its OnEntry and its Transitions all collapse into
-    that one test. Anything more elaborate than this pair is refused at load.
+    Each type's integrating/refractory regime pair compiles to a test on the cell's last
+    spike tick; the engine refuses any other regime structure.
   -->
 
   <ComponentType name="GLIF1Cell" extends="baseCell">

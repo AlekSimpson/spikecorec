@@ -10,8 +10,7 @@ using namespace spikecorec;
 namespace spikecorec::units {
 
 s64 ms_to_ticks(f64 total_ms, f64 ms_step) {
-    // A zero, negative or non-finite step divides into infinity or NaN, and so can a non-finite
-    // total; converting either to an integer is undefined behaviour, as is a count past s64.
+    // Converting NaN, infinity or a count past s64 to an integer is undefined behaviour.
     if (!isfinite(ms_step) || ms_step <= 0.0) throw Invalid_Argument("ms_step must be > 0 and finite");
     if (!isfinite(total_ms) || total_ms < 0.0) throw Invalid_Argument("total_ms must be >= 0 and finite");
     const f64 ticks = std::round(total_ms / ms_step);
@@ -51,7 +50,9 @@ f64 tick_to_seconds(s64 tick, f64 total_seconds, s64 total_ticks) {
     );
 }
 
-f64 unit_suffix_scale(const String &suffix) {
+namespace {
+
+const Unordered_Map<String, f64> &built_in_unit_scales() {
     static const Unordered_Map<String, f64> scales = {
         {"", 1.0}, {"none", 1.0},
         {"V", 1.0}, {"mV", 1e-3},
@@ -65,15 +66,22 @@ f64 unit_suffix_scale(const String &suffix) {
         {"ohm", 1.0}, {"kohm", 1e3}, {"Mohm", 1e6},
         {"degC", 1.0}, {"K", 1.0},
     };
+    return scales;
+}
 
-    auto entry = scales.find(suffix);
-    if (entry == scales.end()) return 1.0;
+} // namespace
+
+f64 unit_suffix_scale(const String &suffix) {
+    auto entry = built_in_unit_scales().find(suffix);
+    if (entry == built_in_unit_scales().end()) return 1.0;
 
     return entry->second;
 }
 
-// Splits "-60mV" into its numeric magnitude and its unit suffix. Shared by parse_quantity
-// and NML_Context::resolve_quantity so both scan numbers identically.
+bool unit_suffix_is_known(const String &suffix) {
+    return built_in_unit_scales().count(suffix) != 0;
+}
+
 Pair<f64, String> split_quantity(const String &value) {
     if (value.empty()) return {0.0, ""};
 

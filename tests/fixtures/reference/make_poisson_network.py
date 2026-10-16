@@ -1,6 +1,8 @@
-"""Writes tests/fixtures/nml/pynn_poisson_network.nml: 100 Poisson sources at 20 Hz driving 50 IF_curr_exp
-cells through expCurrSynapse and 50 IF_curr_alpha cells through alphaCurrSynapse, each cell hearing 25
-sources chosen at random. Deterministic: rerunning it writes the same file.
+"""Writes tests/fixtures/nml/pynn_poisson_network.nml.
+
+100 Poisson sources at 20 Hz drive 50 IF_curr_exp cells through expCurrSynapse and 50
+IF_curr_alpha cells through alphaCurrSynapse; each cell receives 25 randomly chosen sources.
+The fixed seed makes every run write the same file.
 
     python3 tests/fixtures/reference/make_poisson_network.py
 """

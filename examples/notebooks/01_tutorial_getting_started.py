@@ -1,20 +1,17 @@
 # ---
-# Code cells for 01_tutorial_getting_started.ipynb, in jupytext "percent" format.
-# `jupytext --to ipynb 01_tutorial_getting_started.py` produces the notebook.
-#
-# Audience: researchers and adopters. Every cell runs against the engine as built by
-# `make python`; nothing here is pseudocode.
+# The tutorial in jupytext "percent" format; `jupytext --to ipynb 01_tutorial_getting_started.py`
+# writes the notebook. Every cell runs against the engine built by `make python`.
 # ---
 
 # %% [markdown]
 # # Getting started with spikecorec
 #
-# spikecorec simulates spiking neural networks on the GPU, driven by NeuroML. You hand it
-# a LEMS document describing cells, synapses, stimulus and a run; it generates a GPU
-# kernel for those dynamics, compiles it, and runs the network.
+# spikecorec simulates spiking neural networks on the GPU. You give it a LEMS document
+# describing cells, synapses, stimulus and a run; it generates a GPU kernel for those
+# dynamics, compiles it, and runs the network.
 #
-# This notebook goes from the shortest complete run to driving the tick loop yourself.
-# It assumes `make python` has been run.
+# This notebook goes from the shortest complete run to driving the tick loop yourself and
+# inspecting the parsed model, the weight matrix and the kernel. Run `make python` first.
 
 # %%
 import os
@@ -33,8 +30,8 @@ MODELS = os.path.join("..", "models")
 # %% [markdown]
 # ## 1. The shortest complete run
 #
-# One cell, one current step, 500 ms. The document says everything: the cell's
-# parameters, the stimulus, the timestep and the run length. `run()` executes every tick.
+# One cell, one current step, 500 ms. The document holds the cell's parameters, the
+# stimulus, the timestep and the run length. `run()` executes every tick.
 
 # %%
 engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_single_cell.xml"))
@@ -47,13 +44,13 @@ print(f"final membrane potential: {1000 * engine.read_state_variable(0, 'v'):.2f
 engine.shutdown()
 
 # %% [markdown]
-# That is a GLIF1 cell at 2.5x rheobase. Its interspike interval is derivable by hand:
-# the 5 ms refractory period plus `tau * ln(50/30)`, which is 10.1 ms, so almost exactly
-# 100 Hz. The engine reports 50 spikes in 500 ms.
+# That is a GLIF1 cell at 2.5x rheobase. Its interspike interval is the 5 ms refractory
+# period plus `tau * ln(50/30)`, 10.1 ms in all, so about 50 spikes in 500 ms.
+# Membrane potentials are in volts; multiply by 1000 for millivolts.
 #
 # ## 2. The model that just ran
 #
-# Nothing is hidden in Python. Here is the document, and it is the whole specification.
+# The NeuroML document holds the cell, the stimulus and the network; the LEMS file adds the run.
 
 # %%
 with open(os.path.join(MODELS, "single_cell.nml")) as model_file:
@@ -62,13 +59,11 @@ with open(os.path.join(MODELS, "single_cell.nml")) as model_file:
 # %% [markdown]
 # ### Changing a parameter and re-running
 #
-# Drop the drive from 500 pA to 250 pA, which is 1.25x rheobase rather than 2.5x, and the
-# cell should fire much more slowly. Membrane potentials are volts in the engine, so
-# multiply by 1000 to read millivolts.
+# The same model at 250, 500 and 1000 pA: 1.25x, 2.5x and 5x rheobase.
 
 # %%
 def run_at_amplitude(amplitude_picoamperes, directory="/tmp/spikecorec_tutorial"):
-    """Rewrites the drive amplitude, runs, and returns (spike count, rate)."""
+    """Runs a copy of single_cell.nml at the given drive; returns (spike count, rate)."""
     os.makedirs(directory, exist_ok=True)
 
     with open(os.path.join(MODELS, "single_cell.nml")) as model_file:
@@ -97,15 +92,15 @@ for amplitude in (250, 500, 1000):
     print(f"{amplitude:5d} pA -> {count:3d} spikes, {rate:6.1f} Hz")
 
 # %% [markdown]
-# That is an f-I curve in three points: firing rate rises with drive, and below the
-# 200 pA rheobase the cell would not fire at all.
+# That is an f-I curve in three points: the rate rises with drive, and below the 200 pA
+# rheobase the cell does not fire.
 #
 # ## 3. Building a network in code
 #
-# Writing a `<connection>` element per edge does not scale: a million-neuron network
-# would be a million lines of XML. So connectivity can come from Python instead, as an
-# adjacency list with one row per neuron. The document then declares only the cells, the
-# synapse and the stimulus.
+# One `<connection>` element per edge does not scale: a million edges is a million lines
+# of XML. Connectivity can instead come from Python as an adjacency list, one row per
+# neuron listing its targets. The document then declares only the cells, the synapse and
+# the stimulus.
 #
 # Three cells in a line, A to B to C:
 
@@ -129,16 +124,15 @@ print("first spike: " + ", ".join(f"{name} at {1000 * first_of[index]:.1f} ms"
 engine.shutdown()
 
 # %% [markdown]
-# A to C takes about 13 ms, of which only 2 ms is the 1 ms wire delay on each edge. The
-# rest is the synapse: an alpha current peaks a full `tau` after the spike that caused it,
-# so the target needs several milliseconds to charge. The delay parameter sets when a
-# spike **arrives**, not when it has an **effect**.
+# A to C takes about 13 ms, of which only 2 ms is the 1 ms delay on each edge. The rest
+# is the synapse: an alpha current peaks `tau` after the spike arrives, so the target
+# takes several milliseconds to charge. The delay sets when a spike arrives, not when it
+# takes effect.
 #
 # ## 4. The same network written as NeuroML
 #
-# The adjacency list above is equivalent to this, which is what you would write if the
-# connectivity belonged in the document. For three edges it is perfectly reasonable; for
-# ten thousand it is not.
+# The adjacency list above is equivalent to this projection. Writing edges out is fine
+# for two, not for ten thousand.
 
 # %%
 print(textwrap.dedent("""
@@ -158,15 +152,13 @@ print(textwrap.dedent("""
 # %% [markdown]
 # ## 5. A balanced excitatory/inhibitory network
 #
-# Real cortex is roughly four excitatory cells to every inhibitory one. Hand the engine a
-# list of synapses and a share for each, and it splits the edges, in adjacency order, into
-# one contiguous run per synapse. Nothing is random: the topology is exactly the list you
-# gave. Edges are ordered by source cell, so with `[0.8, 0.2]` the first 80% of cells send
-# only excitatory edges and the rest only inhibitory ones, except a cell at the boundary,
-# which can send both.
+# Cortex has roughly four excitatory cells to every inhibitory one. Give the engine a list
+# of synapses and a share for each, and it splits the edges, in adjacency order, into one
+# contiguous block per synapse; nothing is random. Edges are ordered by source cell, so
+# with `[0.8, 0.2]` the first 80% of edges are excitatory. Here every cell has four edges,
+# so that is the first 80% of cells; a cell at a block boundary can send both kinds.
 #
-# The topology comes from a generator; `square_torus` wires each cell to its four
-# neighbours with the edges wrapped.
+# `square_torus` wires each cell to its four grid neighbours, wrapping at the edges.
 
 # %%
 engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
@@ -177,8 +169,7 @@ engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_glif1_torus.xml"),
                          connection_delay_seconds=1e-3)
 engine.run()
 
-# Which synapse each cell's edges carry: 0 is excitatorySynapse, 1 inhibitorySynapse, in
-# the order they were listed.
+# Each cell's synapse indices, in the order listed: 0 excitatorySynapse, 1 inhibitorySynapse.
 weights = engine.weights
 carried = [{weights.get_edge_synapse_prototype(cell, int(target)) for target in weights.get_neighbors(cell)}
            for cell in range(engine.total_neuron_count)]
@@ -211,12 +202,11 @@ engine.shutdown()
 # %% [markdown]
 # ## 6. Recording to .spire and reading it back
 #
-# `record_membrane_video` records every neuron's membrane potential every Nth tick to a
-# `.spire` file. It has to be called **before** `run()`, because it is what makes the run
-# record anything.
+# `record_membrane_video` writes every neuron's `v` to a `.spire` file every Nth tick.
+# Call it before `run()`; frames are recorded as the ticks run.
 #
-# The format is a 4-byte big-endian neuron count followed by native float32 frames, and
-# `read_spire_recording` hands it back as a plain numpy array.
+# The format is a 4-byte big-endian neuron count followed by native float32 frames.
+# `read_spire_recording` returns it as a (frames, neurons) numpy array.
 
 # %%
 recording_path = "/tmp/spikecorec_tutorial/torus_membrane.spire"
@@ -248,10 +238,8 @@ pyplot.show()
 # %% [markdown]
 # ## 7. Reading state and spikes back
 #
-# Three ways in, depending on what you want:
-#
-# - `read_state_variable(neuron, name)` for one cell's one variable
-# - `state_variable_array(name)` for that variable across the whole population
+# - `read_state_variable(neuron, name)` for one variable of one cell
+# - `state_variable_array(name)` for that variable on every neuron
 # - `spike_counts_per_neuron` and `recorded_spikes` for what fired and when
 
 # %%
@@ -280,9 +268,9 @@ engine.shutdown()
 # %% [markdown]
 # ## 8. Driving your own tick loop
 #
-# `run()` is a loop over `step_simulation`. Calling it yourself lets you read state or
-# inject something between ticks. The tick index matters: the engine uses it for the
-# spike-history ring and the refractory gate, so pass a monotonically increasing count.
+# `run()` is a loop over `step_simulation`; calling it yourself lets you act between ticks.
+# The tick index sets spike times, the spike-history row and the refractory test, so pass
+# 0, 1, 2, ... in order.
 
 # %%
 engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_single_cell.xml"))
@@ -306,23 +294,19 @@ pyplot.show()
 engine.shutdown()
 
 # %% [markdown]
-# Reading state on every tick is slow: it copies from the GPU each time. Sampling every
-# tenth tick, as above, costs almost nothing.
+# `read_state_variable` looks the variable up by name and reads it from memory shared with
+# the GPU; it does not copy the state buffer.
 #
 # ## 9. What is supported, and what gets refused
 #
-# Any NeuroML model that fits the engine's constraints runs, whether its ComponentTypes are
-# standard or your own: point-neuron cells built from state variables, derived variables,
-# time derivatives, `OnCondition` threshold blocks, `random()` and optionally an
-# integrating/refractory regime pair; current-based synapses; `pulseGenerator` and
-# `spikeArray` stimulus; and arbitrary connectivity.
+# Any NeuroML model within the engine's limits runs, with standard or custom ComponentTypes:
+# point-neuron cells (state variables, derived variables, time derivatives, `OnCondition`,
+# `OnEvent`, `random()` and an optional integrating/refractory regime pair); current-based
+# synapses; every NeuroML input; and any connectivity. python/docs/README.md has the details.
 #
-# What it does not cover, it refuses at construction rather than simulating incorrectly.
-# Conductance-based synapses are the clearest example: their current depends on the
-# target cell's membrane potential, which a synapse's per-edge code cannot read. The
-# exception for now is the other input types (sine, ramp, compound, timed-synaptic,
-# Poisson-synapse and voltage-clamp inputs): they are accepted but do not yet behave as
-# NeuroML defines them. The README lists what each does today.
+# Anything else is refused at construction rather than simulated incorrectly. A
+# conductance-based synapse is one example: its current depends on the target cell's
+# membrane potential, which a synapse's per-edge code cannot read.
 
 # %%
 directory = "/tmp/spikecorec_tutorial"
@@ -365,17 +349,15 @@ except RuntimeError as refusal:
     print(f"  {refusal}")
 
 # %% [markdown]
-# The message names the offending ComponentType and says why. That is the contract: a
-# model the engine cannot simulate correctly fails loudly at construction rather than
-# producing a plausible-looking recording nobody can check.
+# The message names the ComponentType and the reason. A model the engine cannot simulate
+# correctly fails at construction instead of producing a wrong recording.
 
 # %% [markdown]
 # ## 10. Looking inside: the parsed model, the edge store and the kernel
 #
-# `engine.context` is the parsed model the engine was built from, as the C++ holds it:
-# component types with their dynamics, instances, populations, connectivity, stimulus and
-# recordings. `spikecorec.nml.NML_Context` parses a model on its own, with no GPU, when
-# all you want is to inspect it.
+# `engine.context` is the parsed model the engine was built from: component types with
+# their dynamics, instances, populations, connectivity, stimulus and recordings.
+# `spikecorec.nml.NML_Context` parses a model without a GPU, for inspection only.
 
 # %%
 context = spc.nml.NML_Context()
@@ -393,10 +375,11 @@ print(f"synapse {synapse.id}: {synapse.component_type.name}, "
       f"per-edge state {synapse.component_type.state_variable_names}")
 
 # %% [markdown]
-# Every per-edge value -- weight, delay and each synapse state variable -- is one plane of
-# the weight matrix, stored as a shared low-rank basis plus a sparse matrix S of the
-# updates since the last refit. `synapse_state_variable_plane` says which plane holds a
-# synapse's variable, and `neighbor_weights_for_matrix` reads a plane for every edge.
+# Each per-edge quantity is a plane of the weight matrix: plane 0 the weight, plane 1 the
+# delay in ticks, then the synapse's state variables. All planes share a low-rank basis
+# (memory compression), plus a sparse matrix S of the updates since the last refit.
+# `synapse_state_variable_plane` names a variable's plane; `neighbor_weights_for_matrix`
+# reads a plane for every edge.
 
 # %%
 engine = spc.Spike_Engine(os.path.join(MODELS, "LEMS_three_cell_chain.xml"),

@@ -1,5 +1,3 @@
-// FORMERLY: nml.h
-
 #pragma once
 
 #include <libxml/parser.h>
@@ -39,8 +37,12 @@ struct NML_Context {
         s64 total_edge_count = 0;
         s64 maximum_edge_delay = 0;
     
-        // keys are indices in cell_instances which map to indices in the engine cell memory where they start
+        // Population id -> cell-memory index of its first cell's first state slot.
         Unordered_Map<String, s64> population_base_indices;
+
+        // A populationList <instance>'s full id -> its position among the list's instances, which
+        // is its cell's index whatever the instance's own id.
+        Unordered_Map<String, s64> instance_positions;
     
         Unordered_Map<String, Real> global_constants;
     
@@ -52,7 +54,7 @@ struct NML_Context {
         Vector<Simulation_Input_Config> input_profiles;
         Vector<Recording_Config> recording_profiles;
     
-        NML_Simulation_Context(): simulation_component_id(""), target_network_id(""), network_data(0, 0) {}
+        NML_Simulation_Context(): network_data(0, 0) {}
     };
 
     NML_Simulation_Context simulation;
@@ -74,7 +76,7 @@ struct NML_Context {
 
     String last_schema_validation_errors;
 
-    NML_Context() {};
+    NML_Context() = default;
     ~NML_Context();
 
     // Copies and moves would share the owned document trees.
@@ -86,29 +88,36 @@ struct NML_Context {
     void reset();
     void parse(const String &main_filepath);
     NML_Node *parse_neuroml_file(const String &filepath, Vector<String> &files_to_parse);
-    NML_Node *parse_neuroml(const String &filepath);
     void parse_component_types();
     NML_Component_Type *create_component_type(const NML_Node *type_node, const String &source_filepath);
     void parse_component_instances();
     NML_Component_Instance *create_component_instance(
             const NML_Component_Type *component_type, const NML_Node *instance_node,
             NML_Component_Instance *parent_instance);
-    void parse_simulation_details(NML_Node *lems_root); // previously extract_neuroml_context
+    void parse_simulation_details(NML_Node *lems_root);
 
-    const NML_Component_Instance *find_instance(const String &instance_id) const;
+    [[nodiscard]] const NML_Component_Instance *find_instance(const String &instance_id) const;
     // Whether the instance's ComponentType is type_name or extends it.
     bool is_instance_of(const NML_Component_Instance *instance, const String &type_name) const;
 
     bool validate_lems_schema(const String &lems_filepath);
-    f64 resolve_quantity(const String &value) const;
+    // "-60mV" -> -0.06 with the document's units, then the built-in table. Throws on text that is
+    // not a number with an optional unit, and on a unit neither knows.
+    [[nodiscard]] f64 resolve_quantity(const String &value) const;
+    // resolve_quantity, also throwing when the value's unit is not of `dimension` (as a <Unit>
+    // declares it), or it has no unit and `dimension` is not "none". "" or "*" checks nothing.
+    [[nodiscard]] f64 resolve_quantity_of_dimension(const String &value, const String &dimension) const;
     xmlNodePtr get_xml_root(const String &filepath);
 
+    // Slots one cell takes in cell_state: one per state variable, and one for a cell with none, so
+    // every neuron has its own index.
+    [[nodiscard]] static s64 cell_slot_count(const NML_Component_Type &cell_type);
     s64 get_cell_variable_count(s64 cell_instance_index);
-    s64 get_cell_state_size() const;
+    [[nodiscard]] s64 get_cell_state_size() const;
     s64 get_population_size(const NML_Component_Instance *population) const;
 
-    // The neuron whose cells occupy cell_memory_index (a resolve_path result), or -1.
-    s64 neuron_index_of(s64 cell_memory_index) const;
+    // The neuron whose state slots include cell_memory_index (a resolve_path result), or -1.
+    [[nodiscard]] s64 neuron_index_of(s64 cell_memory_index) const;
     s64 resolve_path(const String &path, const NML_Component_Instance *current = nullptr) const;
 };
 

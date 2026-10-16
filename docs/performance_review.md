@@ -62,7 +62,7 @@ What the table shows:
 | GLIF5 network, same shape | adapting threshold, after-spike currents |
 | `glif_family` fixture | all five GLIF types in one kernel |
 | `pynn_synapses` fixture | `IF_curr_exp`, `IF_curr_alpha`, two synapse types |
-| `pynn_poisson_network` fixture | Poisson sources, 200 projection runs, two synapse types |
+| `pynn_poisson_network` fixture | Poisson sources, 200 runs, two synapse types |
 | `izhikevich2007Cell`, `adExIaFCell`, `iafRefCell` with two synapse types | nonlinear cells, refractory-regime dynamics |
 | Every input category on one population | compound, ramp, clamp, `timedSynapticInput`, `poissonFiringSynapse`, `spikeArray` |
 | A cell with an `OnEvent` | `event_arrival_count` |
@@ -111,7 +111,7 @@ contend on one address.
 
 ### 6. Synapse-type lookup per connection per tick (medium)
 
-With more than one synapse type, `spikecorec_synapse_prototype` binary-searches the projection runs
+With more than one synapse type, `spikecorec_synapse_prototype` binary-searches the runs
 for every connection on every tick. That is about 8 steps for the 200 runs in
 `pynn_poisson_network`. The type never changes, and a branch per type follows the lookup.
 
@@ -306,17 +306,17 @@ cells one call costs about 60 ticks of GPU time.
   `parse()` alone is also quadratic in the number of `explicitInput`s: 0.28 s at 4000 inputs and
   2.6 s at 12,000. That cause was not traced.
 
-### 31. The projection scan is quadratic in the number of connections (medium)
+### 31. The run scan is quadratic in the number of connections (medium)
 
-`fit_basis_from_projections` runs a linear `find` over every distinct value combination seen so
-far, once per projection run. That is O(runs × distinct). The 256-lane check runs only after the
+`fit_basis_from_connections` runs a linear `find` over every distinct value combination seen so
+far, once per run. That is O(runs × distinct). The 256-lane check runs only after the
 whole scan. With per-connection values (one run per connection, as `build_weight_matrix`
 produces), it therefore makes about E²/2 vector comparisons before giving up.
 
 - **Location:** `src/spikecorec/core/weight_matrix.cpp:858-870`.
 - **Measured:**
 
-  | Connections | Scan time | Share of `declare_projections` |
+  | Connections | Scan time | Share of `declare_runs` |
   |---|---|---|
   | 10,240 | 0.025 s | 14% |
   | 40,960 | 0.31 s | 49% |

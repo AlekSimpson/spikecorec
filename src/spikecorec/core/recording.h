@@ -25,72 +25,62 @@ namespace spikecorec {
         SPIREBZ2,
         SPIREXZ,
         SPIKE_EVENTS,
-        NML_STANDARD // can be any file format
-                     // but the data is always 
-                     // written as a matrix of
-                     // columns where the first
-                     // column is time and the 
-                     // rest are the values 
-                     // specified to record
+        NML_STANDARD // any other extension: rows of time, then each recorded value
     };
+
+    // Unused: nothing stores recorded values this way yet.
+    // union Recorded_Value {
+    //     f64 float64;
+    //     s64 int64;
+    //     f32 float32;
+    //     s32 int32;
+    // };
     
-    union Recorded_Value {
-        // TODO: this is not final and is just filler code really until we 
-        // use it and think of something better
-        f64 float64;
-        s64 int64;
-        f32 float32;
-        s32 int32;
-    };
-    
-    // One recorded quantity, as named by a LEMS <OutputColumn quantity="pop1[0]/v"/> or
-    // <EventSelection select="pop1[0]" eventPort="spike"/>. recordings_count counts these;
-    // this is what each one actually selects.
+    // One recorded quantity: a LEMS <OutputColumn quantity="pop1[0]/v"/> or
+    // <EventSelection select="pop1[0]" eventPort="spike"/>.
     struct Recording_Selection {
         String quantity_path;   // verbatim LEMS path, e.g. "pop1[0]/v"
-        String variable_name;   // trailing variable, e.g. "v"; "" for an event selection
+        String variable_name;   // the state variable it records, e.g. "v"; "" for an event selection
         String event_port;      // EventSelection's port, e.g. "spike"; "" for a column
+        String selection_id;    // the element's own id; an event file writes it beside each time
         s64 neuron_index = -1;
     };
 
     struct Recording_Config {
         Vector<String> output_filenames;
         Vector<Output_File_Format> file_output_format;
-        Vector<Recorded_Value> recored_data;
+        // Where a relative filename goes: the LEMS file's directory, or the element's path in it.
+        String output_directory;
+        // An EventOutputFile's column order, "TIME_ID" or "ID_TIME"; "" for an OutputFile.
+        String event_format;
+        // Unused: nothing reads or writes it.
+        // Vector<Recorded_Value> recored_data;
 
-        // What recordings_count counts; parallel to nothing, one entry per selected
-        // quantity across this config's output files.
+        // One entry per OutputColumn or EventSelection; recordings_count is its size.
         Vector<Recording_Selection> selections;
 
         static constexpr s64 DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1014;
         s32 recordings_count;
 
-        void add_output(String &filename);
+        // Unused: declared but never defined or called.
+        // void add_output(String &filename);
     };
 
 
 
     enum class Spire_Compression { None, Gzip, Xz, Bz2 };
 
-    // Resolves the compression to use for `filename`. `requested` mirrors
-    // _resolve_record_compression's `compression` argument:
-    //   - "auto" (default) or nullopt → infer from filename extension
-    //     (.gz/.gzip → Gzip, .xz/.lzma → Xz, .bz2 → Bz2, anything else → None)
-    //   - "none"/"gzip"/"xz"/"bz2" → explicit request, validated
-    // Returns the resolved compression and `filename` unchanged — the Python
-    // reference appends an extension when one is missing for an explicit
-    // request, but spikecorec callers always pass a complete path, so the
-    // returned path is always exactly `filename`.
+    // "auto" or nullopt infers the compression from the extension (.gz/.gzip, .xz/.lzma, .bz2,
+    // else none). Otherwise `requested` names it (none/raw, gzip/gz, xz/lzma, bz2/bzip2) and an
+    // unknown name throws. The returned path is always `filename`.
     Pair<Spire_Compression, String> resolve_spire_compression(
         const String &filename, Optional<String> requested = String("auto"));
 
     // ── byte-stream sink/source seam ─────────────────────────────────────────
     //
-    // Lets Spire_Writer/Spire_Reader (Phase 4+) wrap any of {raw fstream, gzip,
-    // xz, bz2} behind one interface — mirrors _open_record_file's /
-    // _open_spire_file's "return a file-like object" design. `compression_level`
-    // mirrors each library's native level/preset (1-9 for gzip/bz2, 0-9 "preset"
-    // for xz); default 6 everywhere, matching _open_record_file's defaults.
+    // One interface over raw, gzip, xz and bz2 streams, used by Simulation_Recorder and
+    // read_spire_recording. `compression_level` is the library's own level (gzip and bz2 1-9,
+    // xz preset 0-9); the default is 6.
 
     class Spire_Sink {
     public:
@@ -102,14 +92,11 @@ namespace spikecorec {
     class Spire_Source {
     public:
         virtual ~Spire_Source() = default;
-        // Reads up to `byte_count` bytes into `out`; returns the number of
-        // bytes actually read (0 = clean EOF).
+        // Returns the number of bytes read into `out`, at most `byte_count`; 0 at end of stream.
         virtual usize read(u8 *out, usize byte_count) = 0;
     };
 
-    // Builds the sink/source for `compression` writing/reading `filename`.
-    // Throws std::runtime_error if the corresponding SPIKECOREC_HAVE_* macro
-    // wasn't defined at build time (library unavailable).
+    // Throws std::runtime_error when the codec's library was not available at build time.
     Unique_Pointer<Spire_Sink> make_spire_sink(const String &filename, Spire_Compression compression, int compression_level = 6);
     Unique_Pointer<Spire_Source> make_spire_source(const String &filename, Spire_Compression compression);
 
@@ -207,14 +194,9 @@ namespace spikecorec {
 
     // ── async background writer ──────────────────────────────────────────────
     //
-    // Direct port of the Python reference's `_AsyncWriter` (spike_engine_cuda.py
-    // :26-65): a bounded blocking queue feeds a background thread that drains
-    // chunks into `sink`. `write()` blocks the calling (producer) thread when
-    // the queue is full — backpressure, mirroring `queue.Queue.put(block=True)`.
-    // Exceptions raised on the worker thread are captured and re-raised from
-    // the next `write()`/`close()` call on the producer thread (mirrors the
-    // reference's `self._error` propagation). A `nullopt` chunk is the
-    // sentinel that tells the worker to flush, close the sink, and exit.
+    // A worker thread drains a bounded queue of chunks into `sink`. write() blocks while the
+    // queue is full; max_queued_chunks = 0 means unbounded. A worker exception is rethrown from
+    // the next write() or close().
     class Async_Spire_Writer {
     public:
         Async_Spire_Writer() = delete;
@@ -224,14 +206,11 @@ namespace spikecorec {
         explicit Async_Spire_Writer(Unique_Pointer<Spire_Sink> sink, usize max_queued_chunks = 8);
         ~Async_Spire_Writer();
 
-        // Blocks until there is room in the queue (backpressure), then enqueues
-        // `chunk` for the worker thread to write. Re-raises any exception
-        // already captured from the worker before/instead of enqueueing.
+        // Waits for queue space, then enqueues `chunk`; throws a captured worker error instead.
         void write(Vector<u8> chunk);
 
-        // Pushes the sentinel, joins the worker thread, and re-raises any
-        // captured exception. Safe to call at most once (throws otherwise);
-        // the destructor calls this automatically if not already closed.
+        // Drains the queue, closes the sink, joins the worker and rethrows any worker error.
+        // A second call throws; the destructor calls it if needed.
         void close();
 
     private:
@@ -251,10 +230,8 @@ namespace spikecorec {
         Thread worker_;
     };
 
-    // Sequential `.spire` encoder: writes the 4-byte big-endian neuron_count
-    // header on construction, then raw float32 frames (native byte order) via
-    // write_frame(). One instance per output file. Not compression-aware —
-    // always writes a raw byte stream (see Spire_Sink/Phase 2 for compression).
+    // Uncompressed `.spire` encoder. File layout: a 4-byte big-endian u32 neuron_count, then
+    // frames of neuron_count float32 values in native byte order.
     class Spire_Writer {
     public:
         Spire_Writer() = delete;
@@ -263,20 +240,25 @@ namespace spikecorec {
 
         Spire_Writer(const String &filename, s64 neuron_count);
 
+        // Each throws when the file cannot be written, and write_frame after close().
         void write_frame(const f32 *membrane_potentials);
+
+        // Pushes the frames written so far to the file.
+        void flush();
+
+        // Flushes and closes the file; later calls do nothing. The destructor closes it too.
+        void close();
 
         [[nodiscard]] s64 neuron_count() const { return neuron_count_; }
 
     private:
         Output_File_Stream file_;
         s64 neuron_count_;
+        bool closed_ = false;
     };
 
-    // Sequential `.spire` decoder: reads the 4-byte big-endian neuron_count
-    // header on construction, then yields frames via read_frame(). Returns
-    // false at a clean end-of-file (no bytes remain before the next frame);
-    // throws std::runtime_error if a frame is truncated mid-way (mirrors
-    // play_spire_recording's "Truncated recording" check).
+    // Uncompressed `.spire` decoder. read_frame() returns false at a clean end of file and
+    // throws std::runtime_error on a truncated frame.
     class Spire_Reader {
     public:
         Spire_Reader() = delete;
@@ -296,15 +278,9 @@ namespace spikecorec {
 
     // ── buffering / chunking layer ───────────────────────────────────────────
     //
-    // Ties the raw codec (Phase 1), compression backends (Phase 2), and async
-    // writer (Phase 3) together — equivalent to the inline buffering logic at
-    // spike_engine_cuda.py:328-363. Resolves `compression`/`filename` (mirrors
-    // _resolve_record_compression), writes the .spire header, accumulates
-    // frame bytes into an internal buffer, and flushes to the (possibly async)
-    // sink once `chunk_bytes` is reached. `record_frame` may be called any
-    // number of times; `finish` flushes/closes exactly once (also invoked by
-    // the destructor if the caller didn't, so partially-written files still
-    // get closed on exception — mirrors the reference's try/finally cleanup).
+    // Writes a `.spire` file through the resolved compression and an optional async writer.
+    // The header and frames collect in a buffer that is flushed each time it reaches
+    // `chunk_bytes`. The destructor calls finish() if the caller did not.
     class Simulation_Recorder {
     public:
         Simulation_Recorder() = delete;
@@ -318,17 +294,13 @@ namespace spikecorec {
 
         ~Simulation_Recorder();
 
-        // Appends one frame's raw bytes (frame_length * sizeof(f32)) to the
-        // internal buffer, flushing to the sink once chunk_bytes is reached.
-        // `frame_length` must equal neuron_count() — it is validated so a caller
-        // handing over a user-supplied array (e.g. the Python binding) cannot
-        // trigger an out-of-bounds read of `membrane_potentials`.
+        // Throws unless `frame_length` equals neuron_count(), so a wrongly sized array from a
+        // caller such as the Python binding is never read past its end.
         void record_frame(const f32 *membrane_potentials, s64 frame_length);
 
         [[nodiscard]] s64 neuron_count() const { return neuron_count_; }
 
-        // Flushes any buffered bytes and closes the underlying sink/writer.
-        // Safe to call multiple times — only the first call has an effect.
+        // Flushes the buffer and closes the sink; later calls do nothing.
         void finish();
 
     private:
@@ -345,14 +317,9 @@ namespace spikecorec {
 
     // ── decoding / frame-loading ─────────────────────────────────────────────
     //
-    // Ports the file-loading half of `play_spire_recording` (frame decoding
-    // only — visualization stays out of scope). Auto-detects compression from
-    // the filename extension (mirrors _open_spire_file), parses the header,
-    // and reads every frame sequentially into one contiguous row-major buffer.
-    // Throws std::runtime_error on a truncated final frame (mirrors the
-    // reference's "Truncated recording" check). Backed by Spire_Source/
-    // Spire_Reader-equivalent decoding — callers wanting frame-at-a-time
-    // streaming access can drive Spire_Reader directly instead.
+    // read_spire_recording loads a whole `.spire` file, compression inferred from the extension,
+    // and throws std::runtime_error on a truncated final frame. Spire_Reader reads an
+    // uncompressed file one frame at a time.
     struct Spire_Recording {
         s64 neuron_count;
         s64 frame_count;

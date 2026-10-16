@@ -7,36 +7,11 @@ except Exception:  # tqdm is optional; train_epochs degrades to a plain loop
 
 
 class OnlineSoftmaxProbe:
-    """Single-layer softmax (multinomial logistic-regression) readout, tuned
-    for fast streaming (batch-size-1) SGD updates.
+    """Softmax readout (logits = [x | 1] @ W) trained by SGD on cross-entropy, in float32.
 
-    Same model as the reference implementation -- a linear layer
-    ``logits = [x | 1] @ W`` trained with softmax cross-entropy -- but rewritten
-    so the per-step path allocates almost nothing:
-
-    - features are standardized with a *precomputed reciprocal* std (a multiply,
-      not a divide) straight into one preallocated augmented buffer that already
-      carries the bias column (the reference rebuilt this with ``column_stack``
-      every step);
-    - the B=1 gradient never materializes a one-hot or a (d, C) gradient: the
-      softmax cross-entropy gradient on the logits is just ``p - e_label``, so we
-      do ``p[label] -= 1`` and apply the rank-1 outer product ``x (x) (p - e)``
-      to W directly;
-    - L2 is folded in as decoupled weight decay on the non-bias rows, which for
-      plain SGD is *algebraically identical* to adding ``l2 * W`` to the gradient
-      (``W(1 - lr*l2) - lr*g``), but avoids forming the extra array;
-    - the reported loss/accuracy are *prequential* -- measured on the pre-update
-      logits we already compute for the gradient -- which is the honest online
-      metric and costs no second matmul. (Note: OnlineRLSProbe reports its
-      metric *after* the update, so per-step numbers are not directly
-      comparable, though both converge to the same fit.)
-
-    All state stays float32. Weights are zero-initialized: softmax regression is
-    convex, so this is well-posed and fully reproducible (the per-class
-    gradients differ from step one, so there is no symmetry to break).
-
-    Interface mirrors OnlineRLSProbe so the two probes are drop-in
-    interchangeable in the training loop.
+    Loss and accuracy are measured on the logits before each update; OnlineRLSProbe
+    measures after its update, so per-step numbers differ. Zero initial weights are fine
+    because the loss is convex. The interface matches OnlineRLSProbe.
     """
 
     def __init__(self, n_features, n_classes=10, lr=5e-2, l2=1e-4):
@@ -123,9 +98,8 @@ class OnlineSoftmaxProbe:
         return self.last_loss, self.last_batch_acc
 
     def _update_single(self, x, label, lr, l2):
-        # x: (d,) standardized+augmented feature. One SGD step on a single
-        # example. dL/dlogits = p - e_label, so the data gradient is the rank-1
-        # outer product x (x) (p - e_label); no one-hot or (d, C) grad needed.
+        # One SGD step. x: (d,) augmented features. dL/dlogits = p - e_label, so the
+        # gradient is outer(x, p - e_label) and no one-hot is built.
         probs = (x @ self.weights)[None, :]        # (1, C)
         self._softmax_rows(probs)
         p = probs[0]
@@ -137,8 +111,8 @@ class OnlineSoftmaxProbe:
         self.weights -= np.float32(lr) * np.outer(x, p)
 
     def _update_batch(self, X, labels, lr, l2):
-        # Mini-batch SGD. Mean cross-entropy gradient over the batch; L2 added to
-        # the non-bias rows (per-step, not per-example, matching the reference).
+        # Mini-batch SGD on the mean cross-entropy gradient; L2 applies once per step to the
+        # non-bias rows.
         B = X.shape[0]
         probs = X @ self.weights                    # (B, C)
         self._softmax_rows(probs)
@@ -153,8 +127,7 @@ class OnlineSoftmaxProbe:
 
     def train_epochs(self, features, labels, epochs=1, batch_size=128, seed=0,
                      progress_desc=None):
-        # Convenience epoch loop over an in-memory feature/label set (mirrors the
-        # reference). The streaming use case calls partial_fit directly instead.
+        # Epoch loop over an in-memory dataset; streaming callers use partial_fit.
         rng = np.random.default_rng(seed)
         features = self._as_matrix(features)
         labels = np.asarray(labels, dtype=np.int64).reshape(-1)

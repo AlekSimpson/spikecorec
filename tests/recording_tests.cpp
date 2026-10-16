@@ -1,5 +1,10 @@
+#include <sys/resource.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
+#include <csignal>
+#include <filesystem>
 #include <condition_variable>
 #include <cstdint>
 #include <fstream>
@@ -24,8 +29,7 @@ using namespace spikecorec::test_support;
 
 namespace {
 
-// A sink whose writes wait at a gate until the test opens it, so a test can hold the writer's
-// worker inside a write for as long as it needs instead of sleeping.
+// Each write waits until the test opens the gate, holding the worker inside the sink.
 struct Gated_Sink : Spire_Sink {
     Mutex gate_mutex;
     Condition_Variable gate_opened;
@@ -233,8 +237,7 @@ TEST(Async_Spire_Writer, a_full_queue_blocks_the_producer_until_the_sink_drains)
     });
     const auto deadline = Steady_Clock::now() + Seconds(10);
     while (accepted_count < 3 && Steady_Clock::now() < deadline) this_thread::yield();
-    // EXPECT rather than ASSERT throughout: returning early would leave the gate shut and the
-    // writer's destructor waiting on its worker forever.
+    // EXPECT, not ASSERT: an early return leaves the gate shut and the destructor hangs.
     EXPECT_EQ(accepted_count.load(), 3);
     EXPECT_EQ(producer.wait_for(chrono::milliseconds(100)), future_status::timeout)
         << "the producer finished while the sink was still blocked";
@@ -249,8 +252,7 @@ TEST(Async_Spire_Writer, a_full_queue_blocks_the_producer_until_the_sink_drains)
 TEST(Async_Spire_Writer, a_sink_failure_reaches_the_producer_and_close) {
     Async_Spire_Writer writer(make_unique<Failing_Sink>(/*failing_write=*/3), /*max_queued_chunks=*/1);
 
-    // The queue holds one chunk, so the producer can get at most two chunks past the failing one
-    // before a write sees the failure.
+    // With a one-chunk queue, at most one chunk gets past the failing one before a write throws.
     bool write_threw = false;
     try {
         for (int index = 0; index < 20; index += 1) writer.write(Vector<u8>{static_cast<u8>(index)});
@@ -291,3 +293,129 @@ TEST(Async_Spire_Writer, an_unbounded_queue_takes_every_chunk_without_blocking) 
     writer.close();
     EXPECT_EQ(sink->write_count, 16);
 }
+
+// A writer still in scope can be flushed and closed, so its file reads back at once.
+TEST(SpireCodec, a_live_writer_flushes_and_closes) {
+    const Temporary_Directory directory;
+    const String path = directory.path_of("live.spire");
+    const Vector<f32> frame = {1.0f, 2.0f, 3.0f};
+
+    Spire_Writer writer(path, 3);
+    writer.write_frame(frame.data());
+    writer.flush();
+    EXPECT_EQ(read_spire_recording(path).frame_count, 1);
+    writer.write_frame(frame.data());
+    writer.close();
+    writer.close();
+    EXPECT_EQ(read_spire_recording(path).frame_count, 2);
+    EXPECT_THROW(writer.write_frame(frame.data()), Runtime_Error);
+}
+
+// ── sink failures ───────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr s64 FRAME_NEURON_COUNT = 1000;
+constexpr s32 FRAME_COUNT = 100;  // 400 KB of frames, past the 64 KiB limit below
+
+// Random values, so no codec compresses them under the limit.
+Vector<f32> incompressible_frame(s32 frame_index) {
+    Mersenne_Twister random_engine(static_cast<unsigned>(frame_index));
+    Uniform_Real_Distribution<f32> distribution(-1.0f, 1.0f);
+    Vector<f32> frame(static_cast<usize>(FRAME_NEURON_COUNT));
+    for (f32 &value : frame) value = distribution(random_engine);
+    return frame;
+}
+
+// Files in this process may not grow past 64 KiB, as on a full disk.
+void limit_file_size() {
+    const rlimit limit{64 * 1024, 64 * 1024};
+    setrlimit(RLIMIT_FSIZE, &limit);
+    signal(SIGXFSZ, SIG_IGN);
+}
+
+// Exits 1 when a write or the close throws, 0 when every one returns.
+[[noreturn]] void record_past_the_file_size_limit(const String &filename, bool asynchronous) {
+    limit_file_size();
+    try {
+        Simulation_Recorder recorder(filename, FRAME_NEURON_COUNT, String("auto"), nullopt, asynchronous, 8, 16 * 1024);
+        for (s32 frame_index = 0; frame_index < FRAME_COUNT; frame_index += 1) {
+            recorder.record_frame(incompressible_frame(frame_index).data(), FRAME_NEURON_COUNT);
+        }
+        recorder.finish();
+    } catch (const Exception &) {
+        _exit(1);
+    }
+    _exit(0);
+}
+
+// Exits 2 when the recorder's destructor returns after a failed write; aborts otherwise.
+[[noreturn]] void destroy_a_recorder_after_a_failed_write(const String &filename, bool asynchronous) {
+    limit_file_size();
+    {
+        Simulation_Recorder recorder(filename, FRAME_NEURON_COUNT, String("auto"), nullopt, asynchronous, 8, 16 * 1024);
+        try {
+            for (s32 frame_index = 0; frame_index < FRAME_COUNT; frame_index += 1) {
+                recorder.record_frame(incompressible_frame(frame_index).data(), FRAME_NEURON_COUNT);
+            }
+        } catch (const Exception &) {
+        }
+    }
+    _exit(2);
+}
+
+Vector<String> recording_names_for_every_codec() {
+    Vector<String> names = {"recording.spire"};
+#ifdef SPIKECOREC_HAVE_ZLIB
+    names.push_back("recording.spire.gz");
+#endif
+#ifdef SPIKECOREC_HAVE_LZMA
+    names.push_back("recording.spire.xz");
+#endif
+#ifdef SPIKECOREC_HAVE_BZ2
+    names.push_back("recording.spire.bz2");
+#endif
+    return names;
+}
+
+} // namespace
+
+TEST(SpireSinks, a_full_disk_surfaces_as_an_error_for_every_codec) {
+    const Temporary_Directory directory;
+    for (const String &name : recording_names_for_every_codec()) {
+        for (bool asynchronous : {false, true}) {
+            EXPECT_EXIT(record_past_the_file_size_limit(directory.path_of(name), asynchronous),
+                        ::testing::ExitedWithCode(1), "")
+                << name << (asynchronous ? " (async)" : "");
+        }
+    }
+}
+
+TEST(SpireSinks, a_recorder_destroyed_on_a_full_disk_does_not_abort) {
+    const Temporary_Directory directory;
+    for (const String &name : recording_names_for_every_codec()) {
+        for (bool asynchronous : {false, true}) {
+            EXPECT_EXIT(destroy_a_recorder_after_a_failed_write(directory.path_of(name), asynchronous),
+                        ::testing::ExitedWithCode(2), "")
+                << name << (asynchronous ? " (async)" : "");
+        }
+    }
+}
+
+#ifdef SPIKECOREC_HAVE_ZLIB
+// zlib reads the level from the mode string one digit at a time, so 10 must not become 0.
+TEST(SpireSinks, a_gzip_level_past_nine_compresses_at_nine) {
+    const Temporary_Directory directory;
+    const String path = directory.path_of("zeros.spire.gz");
+    const Vector<f32> zeros(static_cast<usize>(FRAME_NEURON_COUNT), 0.0f);
+    {
+        Simulation_Recorder recorder(path, FRAME_NEURON_COUNT, String("gzip"), 10);
+        for (s32 frame_index = 0; frame_index < FRAME_COUNT; frame_index += 1) {
+            recorder.record_frame(zeros.data(), FRAME_NEURON_COUNT);
+        }
+        recorder.finish();
+    }
+    EXPECT_LT(std::filesystem::file_size(path), 10u * 1024u);
+    EXPECT_EQ(read_spire_recording(path).frame_count, FRAME_COUNT);
+}
+#endif
