@@ -50,6 +50,16 @@ struct NML_Context {
         Vector<NML_Component_Instance> synapse_instances;
 
         Adjacency_List network_data;
+
+        // The largest |weight| of the connections each synapse (by id) carries, kept for codegen
+        // once the engine has consumed and released network_data. Codegen also reads whatever
+        // network_data still holds.
+        Unordered_Map<String, f64> largest_connection_weight_per_synapse;
+
+        // When an engine's adjacency topology gives the connections, network_data stays empty and
+        // this holds one of them per synapse and target population: what codegen checks of the
+        // connections, without a record per connection.
+        Vector<NML_Network_Edge> sampled_connections;
     
         Vector<Simulation_Input_Config> input_profiles;
         Vector<Recording_Config> recording_profiles;

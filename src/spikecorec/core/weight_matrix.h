@@ -292,8 +292,10 @@ namespace spikecorec {
         // Planes that hold no lanes yet: those that started at zero, waiting for their lane budget.
         [[nodiscard]] Vector<s64> planes_awaiting_lane_budget() const;
 
-        // One plane's updates in S, as (edge ordinal, delta) by ordinal, and their sum of squares.
+        // One plane's updates in S: as (edge ordinal, delta) by ordinal; as one value per edge (zero
+        // where there is none); and their sum of squares.
         [[nodiscard]] Vector<Pair<s64, f32>> plane_updates(s64 matrix_index) const;
+        [[nodiscard]] Vector<f32> plane_update_values(s64 matrix_index) const;
         [[nodiscard]] f64 plane_update_sum_of_squares(s64 matrix_index) const;
 
         // Sets the lane budget of a plane that holds no lanes, from values it is expected to hold
@@ -394,6 +396,10 @@ namespace spikecorec {
 
         // The capacity S grows to when a plane needs required_entries.
         [[nodiscard]] s64 grown_delta_capacity(s64 required_entries) const;
+
+        // Moves S into a new slab of new_capacity entries (at least the entries it holds). The
+        // planes stay packed from position 0, so the row starts and entries are copied as they are.
+        void move_delta_storage(s64 new_capacity);
 
         // Σ_k U[i][k] * Ck[k] * V[j][k]: the basis value for one coefficient row, without S.
         [[nodiscard]] f32 reconstruct_entry(s32 source_node, s32 target_node,

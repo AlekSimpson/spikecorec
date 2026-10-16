@@ -1436,16 +1436,18 @@ void Codegen::check_cell_inputs() const {
 
     // Each synapse against each cell type and destination it reaches, once.
     Unordered_Map<String, Ordered_Set<Pair<const NML_Component_Type *, String>>> checked_per_synapse;
-    for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
-        for (const NML_Network_Edge &edge : row) {
-            const NML_Component_Type *cell_type = cell_type_of(edge.child);
-            if (!cell_type || !checked_per_synapse[edge.component_id].insert({cell_type, edge.destination}).second) continue;
+    auto check_connection = [&](const NML_Network_Edge &edge) {
+        const NML_Component_Type *cell_type = cell_type_of(edge.child);
+        if (!cell_type || !checked_per_synapse[edge.component_id].insert({cell_type, edge.destination}).second) return;
 
-            const NML_Component_Instance *synapse = context.find_instance(edge.component_id);
-            if (!synapse || !synapse->component_type) continue;
-            check_attached(*cell_type, *synapse, "Synapse", true, true, edge.destination);
-        }
+        const NML_Component_Instance *synapse = context.find_instance(edge.component_id);
+        if (!synapse || !synapse->component_type) return;
+        check_attached(*cell_type, *synapse, "Synapse", true, true, edge.destination);
+    };
+    for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
+        for (const NML_Network_Edge &edge : row) check_connection(edge);
     }
+    for (const NML_Network_Edge &edge : context.simulation.sampled_connections) check_connection(edge);
 
     for (const Simulation_Input_Config &profile : context.simulation.input_profiles) {
         const NML_Component_Instance *input = context.find_instance(profile.input_component_id);
@@ -2589,13 +2591,15 @@ s64 Codegen::updated_edge_plane_count() const {
 }
 
 s64 Codegen::synapse_active_ticks() const {
-    Unordered_Map<String, f64> largest_weight;
+    Unordered_Map<String, f64> largest_weight = context.simulation.largest_connection_weight_per_synapse;
+    const auto include = [&](const NML_Network_Edge &edge) {
+        f64 &largest = largest_weight[edge.component_id];
+        largest = std::max(largest, std::fabs(static_cast<f64>(edge.weight)));
+    };
     for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
-        for (const NML_Network_Edge &edge : row) {
-            f64 &largest = largest_weight[edge.component_id];
-            largest = std::max(largest, std::fabs(static_cast<f64>(edge.weight)));
-        }
+        for (const NML_Network_Edge &edge : row) include(edge);
     }
+    for (const NML_Network_Edge &edge : context.simulation.sampled_connections) include(edge);
 
     // At least a tick, so no arrival ever lands on the tick that puts a synapse back at rest.
     s64 settle_ticks = 1;
