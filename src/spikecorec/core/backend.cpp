@@ -345,13 +345,51 @@ String describe_cuda_driver_error(CUresult result) {
     return String(error_name) + " (" + String(error_string) + ")";
 }
 
+void throw_on_cuda_driver_error(CUresult result, const String &operation) {
+    if (result == CUDA_SUCCESS) return;
+    log::throw_runtime_error(log::logger(),
+            "Cuda_Backend: " + operation + " failed: " + describe_cuda_driver_error(result));
+}
+
+// The NVRTC target for the device: its own real architecture when NVRTC can build for it, so the
+// module loads with no JIT step; otherwise PTX for the newest virtual architecture NVRTC has below
+// it, which the driver compiles at load. Empty when NVRTC has none, which leaves NVRTC's default.
+struct Nvrtc_Target {
+    String architecture_option;
+    bool builds_device_code = false;
+};
+
+Nvrtc_Target nvrtc_target_for_device(CUdevice device) {
+    int major_version = 0;
+    int minor_version = 0;
+    cuDeviceGetAttribute(&major_version, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+    cuDeviceGetAttribute(&minor_version, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+    const int device_architecture = major_version * 10 + minor_version;
+
+    int architecture_count = 0;
+    if (nvrtcGetNumSupportedArchs(&architecture_count) != NVRTC_SUCCESS || architecture_count <= 0) return {};
+    Vector<int> supported_architectures(static_cast<usize>(architecture_count));
+    if (nvrtcGetSupportedArchs(supported_architectures.data()) != NVRTC_SUCCESS) return {};
+
+    const auto exact = std::find(supported_architectures.begin(), supported_architectures.end(), device_architecture);
+    if (exact != supported_architectures.end()) {
+        return {"--gpu-architecture=sm_" + to_string(device_architecture), true};
+    }
+    int newest_below = 0;
+    for (int architecture : supported_architectures) {
+        if (architecture <= device_architecture) newest_below = std::max(newest_below, architecture);
+    }
+    if (newest_below == 0) return {};
+    return {"--gpu-architecture=compute_" + to_string(newest_below), false};
+}
+
 Engine_Backend::Engine_Backend(s64 threads_per_block_argument) {
     threads_per_block = threads_per_block_argument;
 
-    cuInit(0); // flags must be 0
-    cuDeviceGet(&cuda_gpu_device, 0); // device ordinal 0
-    cuDevicePrimaryCtxRetain(&cuda_context, cuda_gpu_device);
-    cuCtxSetCurrent(cuda_context);
+    throw_on_cuda_driver_error(cuInit(0), "cuInit");  // flags must be 0
+    throw_on_cuda_driver_error(cuDeviceGet(&cuda_gpu_device, 0), "cuDeviceGet");  // device ordinal 0
+    throw_on_cuda_driver_error(cuDevicePrimaryCtxRetain(&cuda_context, cuda_gpu_device), "cuDevicePrimaryCtxRetain");
+    throw_on_cuda_driver_error(cuCtxSetCurrent(cuda_context), "cuCtxSetCurrent");
 
     log::logger().debug("Cuda_Backend: context ready, threads_per_block={}", threads_per_block);
 }
@@ -446,21 +484,37 @@ Optional<Engine_Function> Engine_Backend::create_function(
     const String &name, const String &source_code
 ) {
     log::logger().debug("create_function: name={} source_bytes={}", name, source_code.size());
+    // Driver calls act on the calling thread's current context, and a thread the engine did not
+    // start on has none.
+    cuCtxSetCurrent(cuda_context);
 
     const String program_name = name + ".cu";
 
     nvrtcProgram program{};
-    nvrtcCreateProgram(&program, source_code.c_str(), program_name.c_str(), 0, nullptr, nullptr);
+    const nvrtcResult create_result =
+            nvrtcCreateProgram(&program, source_code.c_str(), program_name.c_str(), 0, nullptr, nullptr);
+    if (create_result != NVRTC_SUCCESS) {
+        log::logger().critical("create_function: nvrtcCreateProgram failed: {}", nvrtcGetErrorString(create_result));
+        return std::nullopt;
+    }
 
-    // TODO: pass --gpu-architecture (compute_87 for Orin).
-    const nvrtcResult compile_result = nvrtcCompileProgram(program, 0, nullptr);
+    const Nvrtc_Target target = nvrtc_target_for_device(cuda_gpu_device);
+    Vector<const char *> compile_options;
+    if (!target.architecture_option.empty()) compile_options.push_back(target.architecture_option.c_str());
+    const nvrtcResult compile_result =
+            nvrtcCompileProgram(program, static_cast<int>(compile_options.size()), compile_options.data());
 
+    // After a successful compile the log holds only warnings, such as a declared but unused variable.
     size_t compile_log_size = 0;
     nvrtcGetProgramLogSize(program, &compile_log_size);
     if (compile_log_size > 1) {
         Vector<char> compile_log(compile_log_size);
         nvrtcGetProgramLog(program, compile_log.data());
-        log::logger().error("create_function: nvrtc log: {}", compile_log.data());
+        if (compile_result == NVRTC_SUCCESS) {
+            log::logger().debug("create_function: nvrtc log: {}", compile_log.data());
+        } else {
+            log::logger().error("create_function: nvrtc log: {}", compile_log.data());
+        }
     }
     if (compile_result != NVRTC_SUCCESS) {
         log::logger().critical("create_function: nvrtcCompileProgram failed: {}",
@@ -469,16 +523,24 @@ Optional<Engine_Function> Engine_Backend::create_function(
         return std::nullopt;
     }
 
-    size_t parallel_thread_executor_size = 0;
-    nvrtcGetPTXSize(program, &parallel_thread_executor_size);
-    Vector<char> parallel_thread_executor(parallel_thread_executor_size);
-    nvrtcGetPTX(program, parallel_thread_executor.data());
+    // A real architecture gives a CUBIN the device runs as is; a virtual one gives PTX.
+    size_t module_image_size = 0;
+    if (target.builds_device_code) {
+        nvrtcGetCUBINSize(program, &module_image_size);
+    } else {
+        nvrtcGetPTXSize(program, &module_image_size);
+    }
+    Vector<char> module_image(module_image_size);
+    if (target.builds_device_code) {
+        nvrtcGetCUBIN(program, module_image.data());
+    } else {
+        nvrtcGetPTX(program, module_image.data());
+    }
     nvrtcDestroyProgram(&program);
 
     Engine_Function function{};
 
-    const CUresult module_result =
-            cuModuleLoadData(&function.cuda_module, parallel_thread_executor.data());
+    const CUresult module_result = cuModuleLoadData(&function.cuda_module, module_image.data());
     if (module_result != CUDA_SUCCESS) {
         log::logger().critical("create_function: cuModuleLoadData failed: {}",
                                describe_cuda_driver_error(module_result));
@@ -507,6 +569,7 @@ Optional<Engine_Function> Engine_Backend::load_precompiled_function(const String
 
 void Engine_Backend::release_function(Engine_Function &function) {
     if (function.cuda_module == nullptr) return;
+    cuCtxSetCurrent(cuda_context);
     cuModuleUnload(function.cuda_module);
     function.cuda_module = nullptr;
     function.cuda_function = nullptr;
@@ -558,7 +621,17 @@ void Engine_Backend::prefetch_to_cpu(const Engine_Pointer &range, u64 byte_count
 bool Engine_Backend::run_function(
     Engine_Function &function, Vector<Engine_Pointer> &parameters, s64 job_count
 ) {
-    const s64 block_count = (job_count + threads_per_block - 1) / threads_per_block;
+    if (function.cuda_function == nullptr) {
+        log::logger().critical("run_function: the function has no CUDA kernel");
+        return false;
+    }
+    // The launch needs this thread's current context to be the engine's.
+    cuCtxSetCurrent(cuda_context);
+
+    // At least one thread, as on Metal: a grid of zero blocks is an invalid launch, and the
+    // kernels return early for threads past their job count.
+    const s64 thread_count = std::max<s64>(job_count, 1);
+    const s64 block_count = (thread_count + threads_per_block - 1) / threads_per_block;
 
     // cuLaunchKernel takes a pointer to each argument's value. A buffer's device address needs
     // a stable cell to point at; an inline scalar's own storage is that cell.
