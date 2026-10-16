@@ -236,6 +236,30 @@ namespace spikecorec {
                     Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
                     f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
+        // Every connection as one entry of five arrays: source_neurons[index] -> target_neurons[index]
+        // carries synapse synapse_indices[index] (an index into synapse_component_ids), weights[index]
+        // and delays_seconds[index]. The entries may come in any order, and each ordered pair at most once.
+        struct Connection_Arrays {
+            s64 connection_count = 0;
+            const u32 *source_neurons = nullptr;
+            const u32 *target_neurons = nullptr;
+            const s32 *synapse_indices = nullptr;
+            const f32 *weights = nullptr;
+            const f32 *delays_seconds = nullptr;
+        };
+
+        // The same, with the connections from `connections`, whose arrays are read during
+        // construction only. Neurons are numbered across the document's populations in order.
+        // Besides the arrays, construction holds 8 bytes a connection: the connections sorted by
+        // source, as each one's target and its index in the arrays.
+        Spike_Engine(const String &lems_input_file,
+                    const Vector<String> &synapse_component_ids,
+                    const Connection_Arrays &connections,
+                    bool enable_hebbian_plasticity = false,
+                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
+                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
+                    f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
+
         ~Spike_Engine();
 
         // Steps every tick of the run not yet stepped, so it resumes a stopped run. after_each_tick,
@@ -293,9 +317,10 @@ namespace spikecorec {
         // Where one neuron's variable sits in cell_state.
         [[nodiscard]] s64 cell_memory_index_of(s64 neuron_index, const String &variable_name) const;
 
-        // Every public constructor runs this one. With adjacency empty the document's connections
-        // are used; otherwise adjacency's, with their values from connection_values when it is set,
-        // and from synapse_proportions, connection_weight and connection_delay_seconds when not.
+        // Every public constructor runs this one. With connection_arrays set its connections are
+        // used; otherwise, with adjacency empty, the document's; otherwise adjacency's, with their
+        // values from connection_values when it is set, and from synapse_proportions,
+        // connection_weight and connection_delay_seconds when not.
         Spike_Engine(const String &lems_input_file,
                     const Vector<Vector<s32>> &adjacency,
                     const Vector<String> &synapse_component_ids,
@@ -303,10 +328,25 @@ namespace spikecorec {
                     f64 connection_weight,
                     f64 connection_delay_seconds,
                     const Connection_Values_Function &connection_values,
+                    const Connection_Arrays *connection_arrays,
                     bool enable_hebbian_plasticity,
                     f32 fit_tolerance,
                     Weight_Matrix::Fit_Method fit_method,
                     f32 expected_active_edge_fraction);
+
+        // A Connection_Arrays' connections by source, for apply_topology: adjacency[source] lists
+        // source's targets ascending, and array_index[row_start[source] + position] is the index in
+        // the arrays of the connection to adjacency[source][position]. Kept only during construction.
+        struct Connection_Rows {
+            Vector<Vector<s32>> adjacency;
+            Vector<s64> row_start;
+            Vector<u32> array_index;
+        };
+        Connection_Rows connection_rows;
+
+        // Sorts `connections` into connection_rows, one row per neuron. Throws on a missing array,
+        // a neuron outside the network, or an ordered pair given twice.
+        void sort_connection_arrays(const Connection_Arrays &connections, s64 neuron_count);
 
         // Replaces the document's connections with `adjacency`: each connection's values come from
         // connection_values when it is set, and otherwise the connections are split across the

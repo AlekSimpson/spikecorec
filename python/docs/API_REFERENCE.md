@@ -96,8 +96,27 @@ in order. Nothing is kept per edge: `connection_values` is called twice for each
 construction (once to check the topology, for the longest delay and the input checks, and once
 to build the weight matrix), so it must return the same values for an edge every time. It
 raises `RuntimeError` for a synapse index outside the list or a negative delay. Calling into
-Python for every edge is slow on large networks; in C++ the same constructor takes a
-`Spike_Engine::Connection_Values_Function`.
+Python for every edge is slow on large networks; give those as arrays (below). In C++ the same
+constructor takes a `Spike_Engine::Connection_Values_Function`.
+
+```python
+Spike_Engine(lems_input_file, synapse_component_ids, source_neurons, target_neurons,
+            synapse_indices, weights, delays_seconds,
+            enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD,
+            fit_method=Weight_Matrix.Fit_Method.MASKED_ALTERNATING_LEAST_SQUARES,
+            expected_active_edge_fraction=Weight_Matrix.DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION)
+```
+Every edge as one entry of five one-dimensional numpy arrays of equal length:
+`source_neurons[index] -> target_neurons[index]` carries synapse `synapse_indices[index]` (an
+index into `synapse_component_ids`), `weights[index]` and `delays_seconds[index]`. Entries may
+come in any order; each ordered pair may appear once (a self-connection included). Arrays of
+dtype `uint32`, `uint32`, `int32`, `float32` and `float32` are read in place, others are
+converted to a copy first. The arrays are read during construction only, which holds 8 bytes
+an edge beyond them (the edges sorted by source). It raises `ValueError` for arrays of
+different lengths and `RuntimeError` for a pair given twice, a neuron outside the network, a
+synapse index outside the list or a negative delay. In C++ it is
+`Spike_Engine(lems_input_file, synapse_component_ids, Spike_Engine::Connection_Arrays{...})`,
+whose arrays are pointers.
 
 Construction parses and validates the document, allocates the model's buffers, fits the
 weight matrix, and generates and compiles the kernel. It raises `RuntimeError` when the
