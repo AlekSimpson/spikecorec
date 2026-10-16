@@ -363,9 +363,12 @@ Unordered_Map<String, f64> starting_values(const NML_Context &context, const NML
     Unordered_Map<String, f64> values = component_parameter_values(context, cell);
     for (const String &name : variable_names) values[name] = 0.0;
 
-    // In order, so a value may use the state assigned above it.
+    // In order, so a value may use the state assigned above it. A dropped variable has no value to
+    // start: nothing reads it.
+    const Vector<String> &dropped_names = component_type.dropped_state_variable_names;
     for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
         if (entry.source_tag != NML_Declaration_Type::OnStart) continue;
+        if (std::find(dropped_names.begin(), dropped_names.end(), entry.target) != dropped_names.end()) continue;
         if (std::find(variable_names.begin(), variable_names.end(), entry.target) == variable_names.end()) {
             throw Runtime_Error("OnStart in " + component_type.name + " assigns '" + entry.target +
                                 "', which is not a state variable");
@@ -1142,9 +1145,24 @@ void Codegen::collect_tracked_totals() {
         }
     }
 
+    // A tracker an OutputColumn records keeps its slot; any other is dropped.
+    for (const Recording_Config &profile : context.simulation.recording_profiles) {
+        for (const Recording_Selection &selection : profile.selections) {
+            if (!selection.event_port.empty() || selection.neuron_index < 0) continue;
+            const NML_Component_Type *cell_type = cell_type_of(context.neuron_index_of(selection.neuron_index));
+            if (!cell_type) continue;
+            auto tracked = candidates.find(cell_type->name);
+            if (tracked != candidates.end() && selection.variable_name == tracked->second.tracker_variable) {
+                tracked->second.tracker_kept = true;
+            }
+        }
+    }
+
     for (auto &[cell_type_name, tracked] : candidates) {
         log::logger().info("Codegen: '{}' reads its total '{}' only less '{}', so the kernel keeps their difference "
-                           "instead of either", cell_type_name, tracked.total_variable, tracked.tracker_variable);
+                           "instead of either; '{}' is {}", cell_type_name, tracked.total_variable,
+                           tracked.tracker_variable, tracked.tracker_variable,
+                           tracked.tracker_kept ? "recorded, so kept" : "read by nothing else, so dropped");
     }
     tracked_totals = std::move(candidates);
 }
@@ -1174,10 +1192,8 @@ void Codegen::allocate_cell_model_memory() {
     // Two rows like network_inputs when some cell has an OnEvent; otherwise one slot to bind.
     const s64 event_arrival_slots = cells_receive_events() ? 2 * context.simulation.total_neuron_count : 1;
 
-    // Every input buffer has at least one slot, so there is always one to bind. A tracked total
-    // depends on the inputs reaching its cells, and sizes network_inputs.
-    collect_inputs();
-    collect_tracked_totals();
+    // Every input buffer has at least one slot, so there is always one to bind. The inputs and the
+    // tracked totals are already collected (see collect_tracked_totals).
     const s64 entry_count = static_cast<s64>(input_entries.size());
 
     device->partition(sizeof(f32) * context.get_cell_state_size(), Engine_Datatype::FLOAT32, data_partitions)            // cell_state
@@ -1894,8 +1910,8 @@ void replace_tracked_differences(Kernel_Node *&node, const Tracked_Total &tracke
     for (Kernel_Node **slot : use_slots(node)) replace_tracked_differences(*slot, tracked, difference);
 }
 
-// Turns every `tracker = total` under node into `tracker += difference; difference = 0`: the
-// tracker takes up what it had not yet, and the difference, the total less the tracker, is then 0.
+// Turns every `tracker = total` under node into `difference = 0`: the difference, the total less
+// the tracker, is then 0. A kept tracker first takes up what it had not yet: `tracker += difference`.
 void expand_tracker_assignments(Kernel_Node *node, const Tracked_Total &tracked, const Kernel_Node *difference) {
     if (!node) return;
     if (node->body.syntax_type == Kernel_Node_Type::BLOCK) {
@@ -1911,10 +1927,12 @@ void expand_tracker_assignments(Kernel_Node *node, const Tracked_Total &tracked,
                 continue;
             }
             delete statement;
-            statements[index] = new_assignment(identifier(tracked.tracker_variable), "+=", clone(difference));
-            statements.insert(statements.begin() + static_cast<s64>(index) + 1,
-                              new_assignment(clone(difference), "=", literal("0.0f")));
-            index += 1;
+            statements[index] = new_assignment(clone(difference), "=", literal("0.0f"));
+            if (tracked.tracker_kept) {
+                statements.insert(statements.begin() + static_cast<s64>(index),
+                                  new_assignment(identifier(tracked.tracker_variable), "+=", clone(difference)));
+                index += 1;
+            }
         }
         return;
     }
@@ -2428,9 +2446,11 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
 
         Set<String> remaining_names;
         collect_identifiers(body, remaining_names);
-        if (remaining_names.count(tracked->second.total_variable)) {
+        if (remaining_names.count(tracked->second.total_variable) ||
+            (!tracked->second.tracker_kept && remaining_names.count(tracked->second.tracker_variable))) {
             delete body;
-            throw unsupported("its total '" + tracked->second.total_variable + "' is still read after it was tracked");
+            throw unsupported("its total '" + tracked->second.total_variable + "' or tracker '" +
+                              tracked->second.tracker_variable + "' is still read after the total was tracked");
         }
     }
 

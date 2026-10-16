@@ -281,9 +281,14 @@ def test_weighted_arrivals_reach_their_target_exactly_a_delay_after_the_spike():
     ticks = np.rint(np.asarray(times) / engine.step_dt).astype(int)
     assert list(zip(neurons.tolist(), ticks.tolist())) == [(0, 100), (1, 101), (2, 116)]
     # The model A neuron reads its total only less applied_jump, so its running sum holds what it
-    # has not applied yet: nothing, once the one 25 mV jump that reached it is applied.
+    # has not applied yet: nothing, once the one 25 mV jump that reached it is applied. Nothing
+    # else reads applied_jump, so it has no slot.
     assert list(engine.network_inputs[4][1:]) == [0.0, 0.0]
-    assert [engine.read_state_variable(neuron, "applied_jump") for neuron in (1, 2)] == pytest.approx([0.025, 0.025], rel=1e-3)
+    cell_type = engine.context.simulation.cell_instances[1].component_type
+    assert "applied_jump" not in cell_type.state_variable_names
+    assert cell_type.dropped_state_variable_names == ["applied_jump"]
+    with pytest.raises(RuntimeError, match="no state variable 'applied_jump'"):
+        engine.read_state_variable(1, "applied_jump")
 
 
 def test_written_spikes_match_the_recorded_ones(tmp_path):

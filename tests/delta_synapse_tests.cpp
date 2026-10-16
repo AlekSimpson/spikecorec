@@ -146,11 +146,12 @@ TEST(Delta_Synapse, single_neuron_verification_matches_the_exact_solution) {
     EXPECT_LT(largest_difference, EULER_VOLTAGE_TOLERANCE);
 
     // Refractory from the spike until 21.5 ms: held exactly at reset, the jump at 21.0 ms discarded,
-    // and consumed, so it is never applied later. applied_jump ends at every jump's sum.
+    // and consumed, so it is never applied later: nothing is left to apply at the end (the total
+    // less the tracker, kept in network_inputs, is 0; the tracker itself is dropped).
     for (s64 tick = tick_of(19.5e-3, step_dt); tick <= tick_of(21.5e-3, step_dt); tick += 1) {
         EXPECT_EQ(static_cast<f32>(neuron_0_voltage[static_cast<usize>(tick)]), static_cast<f32>(RESET)) << "tick " << tick;
     }
-    EXPECT_NEAR(engine.read_state_variable(0, "applied_jump"), (5.0 * 5.0 - 3.0 - 3.0) * MILLIVOLT, 1e-6 * MILLIVOLT * 1e3);
+    EXPECT_EQ(engine.network_inputs.get_contents_as<f32>()[Codegen::RUNNING_SUM_ROW * engine.total_neuron_count + 0], 0.0f);
 
     // The jump at 41.5 ms lowers v by exactly 3 mV, after that tick's leak step.
     const usize jump_tick = static_cast<usize>(tick_of(41.5e-3, step_dt));
@@ -434,8 +435,8 @@ TEST(Tracked_Total, keeps_every_jump_exact_however_large_the_totals_grow) {
     }
     EXPECT_GT(jump_ticks, 1000);
     EXPECT_LT(largest_residual, 1e-6);
-    // applied_jump reads the total consumed so far: the drives' sum, which stays near 0.
-    EXPECT_LT(std::fabs(engine.read_state_variable(0, "applied_jump")), 10.0);
+    // Nothing reads applied_jump any more, and nothing records it, so it has no slot.
+    EXPECT_THROW((void)engine.read_state_variable(0, "applied_jump"), Runtime_Error);
 }
 
 // A cell type that reads its total anywhere but in total - tracker keeps the lifetime total, and
@@ -497,9 +498,55 @@ TEST(Tracked_Total, a_cell_that_reads_its_total_elsewhere_keeps_it_whole_and_beh
     }
     EXPECT_EQ(ticks_of(spike_times_of(engine, 0), engine.step_dt), ticks_of({19.5e-3}, engine.step_dt));
     EXPECT_EQ(ticks_of(spike_times_of(engine, 1), engine.step_dt), ticks_of({19.5e-3}, engine.step_dt));
-    // Both apply the same jumps; only f32 rounding of v, near 1 nV here, may differ. applied_jump is
-    // summed differently (consumed amounts against whole totals): each of the 7 consumptions may
-    // round each by half the 1.9 nV spacing at 19 mV.
+    // Both apply the same jumps; only f32 rounding of v, near 1 nV here, may differ. The whole one's
+    // applied_jump is every jump's sum, discarded ones included; the tracked one's is dropped.
     EXPECT_LT(largest_difference, 1e-8);
-    EXPECT_NEAR(engine.read_state_variable(0, "applied_jump"), engine.read_state_variable(1, "applied_jump"), 7 * 1.9e-9);
+    EXPECT_NEAR(engine.read_state_variable(1, "applied_jump"), (5.0 * 5.0 - 3.0 - 3.0) * MILLIVOLT, 1e-8);
+    EXPECT_THROW((void)engine.read_state_variable(0, "applied_jump"), Runtime_Error);
+}
+
+// A tracker an OutputColumn records keeps its slot and reads the total applied so far, here the one
+// 25 mV jump each delta neuron took, while both still fire exactly a delay after their input.
+TEST(Tracked_Total, a_recorded_tracker_is_kept) {
+    Captured_Log log;
+    const Temporary_Directory directory;
+    const String lems = directory.write("LEMS.xml", R"(<Lems>
+  <Target component="delay_simulation"/>
+  <Include file=")" + fixture_path("nml/Brunel2000_ModelA_Components.xml") + R"("/>
+  <deltaVoltageSynapse id="suprathreshold_delta_synapse" jump="25mV"/>
+  <spikeArray id="trigger_spikes">
+    <spike id="0" time="10ms"/>
+  </spikeArray>
+  <iafCell id="trigger_cell" leakConductance="10nS" leakReversal="-70mV" thresh="-50mV" reset="-70mV" C="200pF"/>
+  <network id="delay_network">
+    <population id="trigger" component="trigger_cell" size="1"/>
+    <population id="presynaptic" component="brunel_model_a_neuron" size="1"/>
+    <population id="postsynaptic" component="brunel_model_a_neuron" size="1"/>
+    <projection id="trigger_projection" presynapticPopulation="trigger" postsynapticPopulation="presynaptic"
+                synapse="suprathreshold_delta_synapse">
+      <connectionWD id="0" preCellId="../trigger[0]" postCellId="../presynaptic[0]" weight="1" delay="0.1ms"/>
+    </projection>
+    <projection id="delay_projection" presynapticPopulation="presynaptic" postsynapticPopulation="postsynaptic"
+                synapse="suprathreshold_delta_synapse">
+      <connectionWD id="0" preCellId="../presynaptic[0]" postCellId="../postsynaptic[0]" weight="1" delay="1.5ms"/>
+    </projection>
+    <explicitInput target="trigger[0]" input="trigger_spikes"/>
+  </network>
+  <Simulation id="delay_simulation" length="30ms" step="0.1ms" target="delay_network" seed="1">
+    <OutputFile id="applied" fileName="applied.dat">
+      <OutputColumn id="presynaptic_applied" quantity="presynaptic[0]/applied_jump"/>
+    </OutputFile>
+  </Simulation>
+</Lems>
+)");
+    Spike_Engine engine(lems);
+    EXPECT_TRUE(log.contains("'applied_jump' is recorded, so kept"));
+    engine.run();
+
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 1), engine.step_dt), ticks_of({10.1e-3}, engine.step_dt));
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 2), engine.step_dt), ticks_of({11.6e-3}, engine.step_dt));
+    EXPECT_NEAR(engine.read_state_variable(1, "applied_jump"), 25.0 * MILLIVOLT, 1e-3 * 25.0 * MILLIVOLT);
+    EXPECT_NEAR(engine.read_state_variable(2, "applied_jump"), 25.0 * MILLIVOLT, 1e-3 * 25.0 * MILLIVOLT);
+    ASSERT_FALSE(engine.recorded_traces.empty());
+    EXPECT_NEAR(engine.recorded_traces.back(), 25.0 * MILLIVOLT, 1e-3 * 25.0 * MILLIVOLT);
 }

@@ -397,12 +397,15 @@ struct Synapse_Delivery {
 // StateVariable whose only assignment is `tracker = total`. Shifting the total and the tracker by
 // the same amount changes nothing the cell does, so the kernel keeps only their difference: what
 // has reached the cell since the tracker last caught up. The lifetime total, which grows without
-// bound and loses its last digits in f32, is never formed. `tracker = total` becomes
-// `tracker += difference; difference = 0`, so the tracker still reads the total caught up to,
-// which the cell no longer reads.
+// bound and loses its last digits in f32, is never formed. Nothing in the cell reads the tracker
+// then, so unless a recording observes it the engine drops it (no cell_state slot, see
+// NML_Component_Type::dropped_state_variable_names) and `tracker = total` becomes `difference = 0`.
+// A recorded tracker is kept, and `tracker = total` becomes `tracker += difference; difference = 0`,
+// so it reads the total caught up to.
 struct Tracked_Total {
     String total_variable;    // the add-select DerivedVariable
     String tracker_variable;  // the StateVariable assigned only the total
+    bool tracker_kept = false;  // an OutputColumn records the tracker on a cell of the type
 };
 
 struct Codegen {
@@ -466,6 +469,7 @@ struct Codegen {
     // One prototype's dynamics for one entry on a cell of the population.
     Kernel_List_Node *translate_input_prototype(s32 prototype, const NML_Component_Instance &population, s64 first_neuron);
 
+    // Allocates the model buffers. collect_inputs and collect_tracked_totals must have run.
     void allocate_cell_model_memory();
     // Writes every cell's starting state (OnStart values, otherwise 0) into cell_state. An
     // OnStart that calls random() draws for each neuron from random_generator.
@@ -491,7 +495,8 @@ struct Codegen {
     // Per cell type name, the cell types whose totals are tracked (see Tracked_Total): the pattern
     // holds, the tracker starts at 0, and everything reaching their cells delivers increments that
     // start at 0 (weighted arrivals, and inputs whose exposure only accumulates). Filled by
-    // collect_tracked_totals, which allocate_cell_model_memory runs once the inputs are collected.
+    // collect_tracked_totals, which needs the synapse deliveries and the inputs collected. The engine
+    // then drops each tracker that is not kept, before allocate_cell_model_memory sizes cell_state.
     Unordered_Map<String, Tracked_Total> tracked_totals;
     void collect_tracked_totals();
 
