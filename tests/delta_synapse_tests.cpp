@@ -498,10 +498,19 @@ TEST(Tracked_Total, a_cell_that_reads_its_total_elsewhere_keeps_it_whole_and_beh
     }
     EXPECT_EQ(ticks_of(spike_times_of(engine, 0), engine.step_dt), ticks_of({19.5e-3}, engine.step_dt));
     EXPECT_EQ(ticks_of(spike_times_of(engine, 1), engine.step_dt), ticks_of({19.5e-3}, engine.step_dt));
-    // Both apply the same jumps; only f32 rounding of v, near 1 nV here, may differ. The whole one's
-    // applied_jump is every jump's sum, discarded ones included; the tracked one's is dropped.
-    EXPECT_LT(largest_difference, 1e-8);
-    EXPECT_NEAR(engine.read_state_variable(1, "applied_jump"), (5.0 * 5.0 - 3.0 - 3.0) * MILLIVOLT, 1e-8);
+    // The two neurons get the same jumps through different edges, each fitted only to within the fit
+    // tolerance, so each is held to its own edges' fitted weights (neurons 0 tracked, 1 whole, 2 and
+    // 3 the excitatory and inhibitory sources; a weight unit is 0.1 mV). Their v then differ by the
+    // fitted weights' differences, over the 5 excitatory and 2 inhibitory jumps, and by f32 rounding
+    // of v, near 1 nV here. The whole one's applied_jump is every jump's sum, discarded ones
+    // included; the tracked one's is dropped.
+    const f64 jump_per_weight = 0.1 * MILLIVOLT;
+    const f64 excitatory_weight_difference = std::fabs(static_cast<f64>(engine.weights.get(2, 0)) - engine.weights.get(2, 1));
+    const f64 inhibitory_weight_difference = std::fabs(static_cast<f64>(engine.weights.get(3, 0)) - engine.weights.get(3, 1));
+    EXPECT_LT(largest_difference,
+              (5.0 * excitatory_weight_difference + 2.0 * inhibitory_weight_difference) * jump_per_weight + 1e-8);
+    EXPECT_NEAR(engine.read_state_variable(1, "applied_jump"),
+                (5.0 * engine.weights.get(2, 1) - 2.0 * engine.weights.get(3, 1)) * jump_per_weight, 1e-8);
     EXPECT_THROW((void)engine.read_state_variable(0, "applied_jump"), Runtime_Error);
 }
 
