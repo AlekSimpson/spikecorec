@@ -27,7 +27,7 @@ model has a LEMS root, and its included `.nml` files are never validated.
 ### 12. Regular generators drift in float32 (low)
 
 The time `t` is computed on the host in f64 and passed to the kernel as `simulation_time` (f32
-on Metal, f64 on CUDA). A `spikeGenerator` still advances `tnext = tnext + period` in f32 state,
+on both backends). A `spikeGenerator` still advances `tnext = tnext + period` in f32 state,
 and each addition rounds to the ulp of `t`. Because the period is not a multiple of that ulp, the
 error is systematic: in [16, 32) s, a 1 ms period becomes 0.99945 ms.
 

@@ -67,12 +67,10 @@ namespace spikecorec {
         // synapse: synapse_active_ticks is about the longest delay plus ln(1 / REST_FRACTION),
         // about 14, of those time constants, so the spread is a fourteenth of it.
         static constexpr s64 CALIBRATION_SPIKE_SPREAD_DIVISOR = 14;
-        // The tick's time in seconds, computed on the host each tick. f32 on Metal, which has no f64.
-#ifdef SPIKECOREC_CUDA
-        f64 simulation_time_argument = 0.0;
-#else
+        // The tick's time in seconds, computed on the host each tick. f32 on both backends (Metal
+        // has no f64): the kernel compares it with constants baked as f32, and an f64 time against
+        // those moves an input's window edge by a tick whenever the constant rounds away from it.
         f32 simulation_time_argument = 0.0f;
-#endif
         s32 run_count = 0;
 
         // The slab Codegen::allocate_cell_model_memory carves the model buffers from.
