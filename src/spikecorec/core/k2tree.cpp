@@ -291,16 +291,17 @@ static Tree_Arrays build_tree_arrays(const Row_Band_Edges &row_band_edges, s64 n
     };
 }
 
-// The kernels index nodes and bits with 32-bit ints, so the tree's sizes are stored as s32. A
-// leaf's bit offset is computed as internal_bit_count plus its place among the leaf bits, so
-// the two counts together must fit.
+// The kernels read the tree's sizes as int, so the padded node count and the internal bit count
+// must fit s32. They index bits with u32: a leaf's bit offset is computed as internal_bit_count
+// plus its place among the leaf bits, so the two counts together must fit u32.
 static bool tree_fits_32_bit_indices(const Tree_Arrays &arrays, const char *factory_name) {
     const s64 leaf_bit_count = static_cast<s64>(arrays.leaf_node_words.size()) * 32;
-    const s64 largest_index = max(arrays.padded_node_count, arrays.internal_bit_count + leaf_bit_count);
-    if (largest_index <= Numeric_Limits<s32>::max()) return true;
+    const bool sizes_fit_int = max(arrays.padded_node_count, arrays.internal_bit_count) <= Numeric_Limits<s32>::max();
+    const bool bits_fit_unsigned = arrays.internal_bit_count + leaf_bit_count <= Numeric_Limits<u32>::max();
+    if (sizes_fit_int && bits_fit_unsigned) return true;
 
     logger().warn("{}: rejecting a tree of {} padded nodes, {} internal bits and {} leaf bits; the GPU "
-                  "indexes them with 32-bit ints", factory_name, arrays.padded_node_count,
+                  "indexes bits with 32-bit unsigned ints", factory_name, arrays.padded_node_count,
                   arrays.internal_bit_count, leaf_bit_count);
     return false;
 }

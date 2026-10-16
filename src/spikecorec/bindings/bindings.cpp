@@ -908,6 +908,17 @@ PYBIND11_MODULE(_spikecorec, m) {
     // ── the engine ────────────────────────────────────────────────────────────────
     py::class_<Spike_Engine> engine_class(m, "Spike_Engine");
 
+    py::class_<Spike_Engine::Connection_Values>(engine_class, "Connection_Values",
+                                                "One connection's synapse (an index into synapse_component_ids), "
+                                                "weight and delay in seconds.")
+        .def(py::init([](s32 synapse_index, f64 weight, f64 delay_seconds) {
+                 return Spike_Engine::Connection_Values{synapse_index, weight, delay_seconds};
+             }),
+             py::arg("synapse_index") = 0, py::arg("weight") = 1.0, py::arg("delay_seconds") = 0.0)
+        .def_readwrite("synapse_index", &Spike_Engine::Connection_Values::synapse_index)
+        .def_readwrite("weight", &Spike_Engine::Connection_Values::weight)
+        .def_readwrite("delay_seconds", &Spike_Engine::Connection_Values::delay_seconds);
+
     engine_class
         .def(py::init<const String &, bool, f32, Weight_Matrix::Fit_Method, f32>(),
              py::arg("lems_input_file"),
@@ -944,6 +955,28 @@ PYBIND11_MODULE(_spikecorec, m) {
              "The same, with several synapses: the edges are split, in adjacency order, into one "
              "contiguous share per synapse, sized by synapse_proportions (normalised; empty means "
              "equal). weights.get_edge_synapse_prototype gives any edge's synapse.")
+        .def(py::init([](const String &lems_input_file, const Vector<Vector<s32>> &adjacency,
+                         const Vector<String> &synapse_component_ids, const py::function &connection_values,
+                         bool enable_hebbian_plasticity, f32 fit_tolerance, Weight_Matrix::Fit_Method fit_method,
+                         f32 expected_active_edge_fraction) {
+                 const Spike_Engine::Connection_Values_Function values_of = [&connection_values](s32 source, s32 target) {
+                     return connection_values(source, target).cast<Spike_Engine::Connection_Values>();
+                 };
+                 return std::make_unique<Spike_Engine>(lems_input_file, adjacency, synapse_component_ids, values_of,
+                                                       enable_hebbian_plasticity, fit_tolerance, fit_method,
+                                                       expected_active_edge_fraction);
+             }),
+             py::arg("lems_input_file"), py::arg("adjacency"),
+             py::arg("synapse_component_ids"),
+             py::arg("connection_values"),
+             py::arg("enable_hebbian_plasticity") = false,
+             py::arg("fit_tolerance") = Spike_Engine::FIT_TOLERANCE_STANDARD,
+             py::arg("fit_method") = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
+             py::arg("expected_active_edge_fraction") = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION,
+             "The same, with each connection's synapse, weight and delay from "
+             "connection_values(source, target), which returns a Spike_Engine.Connection_Values. It is "
+             "called twice per connection during construction and must give the same values each time. "
+             "Calling into Python for every connection is slow on large networks; build those in C++.")
 
         // What the engine was built from.
         .def_property_readonly("context", [](Spike_Engine &self) -> NML_Context & { return self.context; },

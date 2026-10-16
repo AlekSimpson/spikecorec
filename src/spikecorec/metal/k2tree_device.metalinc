@@ -6,25 +6,26 @@
 // Bodies of if, else, for and while must be braced: the codegen's parser requires it.
 
 // ── k2tree bit-walk helpers ───────────────────────────────────────────────────
-inline uint k2t_get_bit(const device uint *words, int bit_index) {
-    return (words[bit_index >> 5] >> static_cast<uint>(bit_index & 31)) & 1u;
+// Bit positions are unsigned, so a tree may hold up to 2^32 bits.
+inline uint k2t_get_bit(const device uint *words, uint bit_index) {
+    return (words[bit_index >> 5] >> (bit_index & 31u)) & 1u;
 }
 
-inline int k2t_rank1_exclusive(
+inline uint k2t_rank1_exclusive(
     const device uint *internal_words,
     const device uint *superblock_table,
     const device ushort *subblock_table,
-    int position,
+    uint position,
     int superblock_size
 ) {
-    int word_index = position >> 5;
-    int bit_offset = position & 31;
-    int superblock_index = word_index / superblock_size;
+    uint word_index = position >> 5;
+    uint bit_offset = position & 31u;
+    uint superblock_index = word_index / static_cast<uint>(superblock_size);
     uint superblock_base = superblock_table[superblock_index];
     uint subblock_base = static_cast<uint>(subblock_table[word_index]);
-    uint partial_word_mask = (bit_offset == 0) ? 0u : ((1u << static_cast<uint>(bit_offset)) - 1u);
+    uint partial_word_mask = (bit_offset == 0u) ? 0u : ((1u << bit_offset) - 1u);
     uint partial_word_popcount = popcount(internal_words[word_index] & partial_word_mask);
-    return static_cast<int>(superblock_base + subblock_base + partial_word_popcount);
+    return superblock_base + subblock_base + partial_word_popcount;
 }
 
 #define MAX_K2TREE_HEIGHT 32
@@ -58,7 +59,7 @@ inline uint k2t_find_nth_neighbor(
     uint stack_row_base[MAX_K2TREE_HEIGHT];
     uint stack_col_base[MAX_K2TREE_HEIGHT];
     int stack_block_size[MAX_K2TREE_HEIGHT];
-    int stack_bit_offset[MAX_K2TREE_HEIGHT];
+    uint stack_bit_offset[MAX_K2TREE_HEIGHT];
     int stack_next_col[MAX_K2TREE_HEIGHT];
 
     stack_row_base[0] = 0;
@@ -82,12 +83,12 @@ inline uint k2t_find_nth_neighbor(
         uint row_base = stack_row_base[level];
         uint col_base = stack_col_base[level];
         int block_size = stack_block_size[level];
-        int level_bit_offset = stack_bit_offset[level];
+        uint level_bit_offset = stack_bit_offset[level];
 
         int child_block_size = block_size / branching_factor;
         int row_offset = static_cast<int>((u - row_base) / static_cast<uint>(child_block_size));
         int child_flat_index = row_offset * branching_factor + col_offset;
-        int bit_position = level_bit_offset + child_flat_index;
+        uint bit_position = level_bit_offset + static_cast<uint>(child_flat_index);
 
         if (level == tree_height - 1) {
             if (k2t_get_bit(leaf_node_words, bit_position)) {
@@ -100,15 +101,15 @@ inline uint k2t_find_nth_neighbor(
                 }
             }
         } else if (k2t_get_bit(internal_node_words, bit_position)) {
-            int rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
-                                                      rank_subblock_table, bit_position, superblock_size_words) + 1;
+            uint rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
+                                                       rank_subblock_table, bit_position, superblock_size_words) + 1u;
             int child_level = stack_top + 1;
-            int raw_offset = branching_factor_squared * rank_inclusive;
+            uint raw_offset = static_cast<uint>(branching_factor_squared) * rank_inclusive;
             stack_row_base[child_level] = row_base + static_cast<uint>(row_offset * child_block_size);
             stack_col_base[child_level] = col_base + static_cast<uint>(col_offset * child_block_size);
             stack_block_size[child_level] = child_block_size;
             stack_bit_offset[child_level] = (child_level == tree_height - 1)
-                ? (raw_offset - internal_bit_count)
+                ? (raw_offset - static_cast<uint>(internal_bit_count))
                 : raw_offset;
             stack_next_col[child_level] = 0;
             stack_top = child_level;
@@ -136,7 +137,7 @@ inline uint k2t_next_neighbor(
     thread uint *stack_row_base,
     thread uint *stack_col_base,
     thread int *stack_block_size,
-    thread int *stack_bit_offset,
+    thread uint *stack_bit_offset,
     thread int *stack_next_col,
     thread int &stack_top
 ) {
@@ -151,15 +152,15 @@ inline uint k2t_next_neighbor(
         }
         stack_next_col[level] = col_offset + 1;
 
-        uint row_base        = stack_row_base[level];
-        uint col_base        = stack_col_base[level];
-        int block_size       = stack_block_size[level];
-        int level_bit_offset = stack_bit_offset[level];
+        uint row_base         = stack_row_base[level];
+        uint col_base         = stack_col_base[level];
+        int block_size        = stack_block_size[level];
+        uint level_bit_offset = stack_bit_offset[level];
 
-        int child_block_size = block_size / branching_factor;
-        int row_offset       = static_cast<int>((u - row_base) / static_cast<uint>(child_block_size));
-        int child_flat_index = row_offset * branching_factor + col_offset;
-        int bit_position     = level_bit_offset + child_flat_index;
+        int child_block_size  = block_size / branching_factor;
+        int row_offset        = static_cast<int>((u - row_base) / static_cast<uint>(child_block_size));
+        int child_flat_index  = row_offset * branching_factor + col_offset;
+        uint bit_position     = level_bit_offset + static_cast<uint>(child_flat_index);
 
         if (level == tree_height - 1) {
             if (k2t_get_bit(leaf_node_words, bit_position)) {
@@ -169,17 +170,85 @@ inline uint k2t_next_neighbor(
                 }
             }
         } else if (k2t_get_bit(internal_node_words, bit_position)) {
-            int rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
-                                                      rank_subblock_table, bit_position, superblock_size_words) + 1;
+            uint rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
+                                                       rank_subblock_table, bit_position, superblock_size_words) + 1u;
             int child_level = stack_top + 1;
-            int raw_offset  = branching_factor_squared * rank_inclusive;
+            uint raw_offset = static_cast<uint>(branching_factor_squared) * rank_inclusive;
             stack_row_base[child_level]   = row_base + static_cast<uint>(row_offset * child_block_size);
             stack_col_base[child_level]   = col_base + static_cast<uint>(col_offset * child_block_size);
             stack_block_size[child_level] = child_block_size;
             stack_bit_offset[child_level] = (child_level == tree_height - 1)
-                ? (raw_offset - internal_bit_count)
+                ? (raw_offset - static_cast<uint>(internal_bit_count))
                 : raw_offset;
             stack_next_col[child_level] = 0;
+            stack_top = child_level;
+        }
+    }
+    return K2T_NO_NEIGHBOR;
+}
+
+// Returns column v's next source, ascending, resuming the DFS from the caller's stack, or
+// K2T_NO_NEIGHBOR when done: the column mirror of k2t_next_neighbor, which fixes the column offset
+// at each level and steps through the row offsets. The caller initializes the stack the same way,
+// with stack_next_row in place of stack_next_col.
+inline uint k2t_next_predecessor(
+    const device uint   *internal_node_words,
+    const device uint   *leaf_node_words,
+    const device uint   *rank_superblock_table,
+    const device ushort *rank_subblock_table,
+    int branching_factor,
+    int superblock_size_words,
+    int node_count,
+    int tree_height,
+    int internal_bit_count,
+    uint v,
+    thread uint *stack_row_base,
+    thread uint *stack_col_base,
+    thread int *stack_block_size,
+    thread uint *stack_bit_offset,
+    thread int *stack_next_row,
+    thread int &stack_top
+) {
+    int branching_factor_squared = branching_factor * branching_factor;
+
+    while (stack_top >= 0) {
+        int level      = stack_top;
+        int row_offset = stack_next_row[level];
+        if (row_offset >= branching_factor) {
+            stack_top--;
+            continue;
+        }
+        stack_next_row[level] = row_offset + 1;
+
+        uint row_base         = stack_row_base[level];
+        uint col_base         = stack_col_base[level];
+        int block_size        = stack_block_size[level];
+        uint level_bit_offset = stack_bit_offset[level];
+
+        int child_block_size  = block_size / branching_factor;
+        int col_offset        = static_cast<int>((v - col_base) / static_cast<uint>(child_block_size));
+        int child_flat_index  = row_offset * branching_factor + col_offset;
+        uint bit_position     = level_bit_offset + static_cast<uint>(child_flat_index);
+
+        if (level == tree_height - 1) {
+            if (k2t_get_bit(leaf_node_words, bit_position)) {
+                uint source = row_base + static_cast<uint>(row_offset);
+                if (source < static_cast<uint>(node_count)) {
+                    return source;
+                }
+            }
+        } else if (k2t_get_bit(internal_node_words, bit_position)) {
+            uint rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
+                                                       rank_subblock_table, bit_position, superblock_size_words) + 1u;
+            int child_level = stack_top + 1;
+            uint raw_offset = static_cast<uint>(branching_factor_squared) * rank_inclusive;
+            stack_row_base[child_level]   = row_base + static_cast<uint>(row_offset * child_block_size);
+            stack_col_base[child_level]   = col_base + static_cast<uint>(col_offset * child_block_size);
+            stack_block_size[child_level] = child_block_size;
+            stack_bit_offset[child_level] = (child_level == tree_height - 1)
+                ? (raw_offset - static_cast<uint>(internal_bit_count))
+                : raw_offset;
+            stack_next_row[child_level] = 0;
             stack_top = child_level;
         }
     }
