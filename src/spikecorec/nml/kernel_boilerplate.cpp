@@ -526,7 +526,7 @@ extern "C" __global__ void master_step(
     const int *input_entry_prototype,
     float *input_values,
     const unsigned char *input_spike_counts,
-    double simulation_time
+    float simulation_time
 ) {
     // pending_delta_control: laid out as in the Metal kernel.
     const int walk_pass = pending_delta_control[2];
