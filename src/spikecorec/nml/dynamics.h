@@ -389,6 +389,20 @@ struct Synapse_Delivery {
     // The StateVariables kept per connection, in plane order from FIRST_STATE_VARIABLE_PLANE: all of
     // the type's, or none for a weighted arrival.
     Vector<String> edge_state_variable_names;
+    // The cell types of its targets.
+    Ordered_Set<String> target_cell_types;
+};
+
+// A cell type whose add-select total is read only as `total - tracker`, where tracker is a
+// StateVariable whose only assignment is `tracker = total`. Shifting the total and the tracker by
+// the same amount changes nothing the cell does, so the kernel keeps only their difference: what
+// has reached the cell since the tracker last caught up. The lifetime total, which grows without
+// bound and loses its last digits in f32, is never formed. `tracker = total` becomes
+// `tracker += difference; difference = 0`, so the tracker still reads the total caught up to,
+// which the cell no longer reads.
+struct Tracked_Total {
+    String total_variable;    // the add-select DerivedVariable
+    String tracker_variable;  // the StateVariable assigned only the total
 };
 
 struct Codegen {
@@ -468,10 +482,18 @@ struct Codegen {
     void check_population_cells() const;
 
     // network_inputs rows: each tick's input by tick parity (rows 0 and 1). With weighted
-    // arrivals, also the increments arriving on a tick, by tick parity (rows 2 and 3), and each
-    // neuron's running sum of them (row 4), which its select reads with row 0 or 1.
+    // arrivals or a tracked total, also the increments arriving on a tick, by tick parity (rows 2
+    // and 3), and a running sum per neuron (row 4): of the weighted arrivals, which its select reads
+    // with row 0 or 1; or, for a cell with a tracked total, the total less its tracker.
     static constexpr s64 WEIGHTED_ARRIVAL_ROW = 2;
-    static constexpr s64 WEIGHTED_ARRIVAL_SUM_ROW = 4;
+    static constexpr s64 RUNNING_SUM_ROW = 4;
+
+    // Per cell type name, the cell types whose totals are tracked (see Tracked_Total): the pattern
+    // holds, the tracker starts at 0, and everything reaching their cells delivers increments that
+    // start at 0 (weighted arrivals, and inputs whose exposure only accumulates). Filled by
+    // collect_tracked_totals, which allocate_cell_model_memory runs once the inputs are collected.
+    Unordered_Map<String, Tracked_Total> tracked_totals;
+    void collect_tracked_totals();
 
     // Per synapse id. Filled by collect_synapse_deliveries from the connections, so before the
     // engine allocates memory or builds the weight matrix, while it still has them.
@@ -481,7 +503,7 @@ struct Codegen {
     // Whether some synapse delivers weighted arrivals, and whether every synapse with connections does.
     bool has_weighted_arrivals() const;
     bool only_weighted_arrivals() const;
-    // Rows in network_inputs: 2, or 5 with weighted arrivals.
+    // Rows in network_inputs: 2, or 5 with weighted arrivals or a tracked total.
     s64 network_input_row_count() const;
 
     Kernel_Node *create_kernel_root();

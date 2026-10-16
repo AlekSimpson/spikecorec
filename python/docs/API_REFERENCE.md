@@ -244,7 +244,7 @@ Copies of the engine's GPU buffers. Each raises `RuntimeError` after `shutdown()
 | name | shape | meaning |
 |---|---|---|
 | `cell_state` | float32[`context.get_cell_state_size()`] | every cell's state variables; `context.resolve_path("pop[0]/v")` gives an index |
-| `network_inputs` | float32[2][neurons], or [5][neurons] with weighted arrivals | rows 0 and 1: synaptic input accumulators, alternating by tick parity. With weighted arrivals, rows 2 and 3 hold the increments arriving on a tick, alternating the same way, and row 4 each neuron's running sum of them |
+| `network_inputs` | float32[2][neurons], or [5][neurons] with weighted arrivals or a tracked total | rows 0 and 1: synaptic input accumulators, alternating by tick parity. With either, rows 2 and 3 hold the weighted-arrival increments arriving on a tick, alternating the same way, and row 4 each neuron's running sum of them, or for a cell with a tracked total its total less its tracker: what it has not yet applied |
 | `event_arrival_count` | uint32[2][neurons] | spikes that reached each cell, alternating by tick parity; read by cells with an `OnEvent`. Shape [0][neurons] when no cell type has one |
 | `spike_history` | uint8[`spike_history_row_count`][neurons] | row `tick % rows` holds that tick's spikes |
 | `last_spiked` | int64[neurons] | each neuron's last spike tick, or `NEVER_SPIKED_TICK` |
@@ -642,6 +642,17 @@ so it reaches the cell's dynamics exactly one delay after the spike, before the 
 threshold on that tick: the spike-to-spike latency through the synapse is the delay. A population
 whose cell is a spike source built from child components (a `spikeArray`) is refused, since only an
 input runs those.
+
+**Tracked totals.** A cell type may read its `select` total only as `total - tracker`, where
+`tracker` is a StateVariable that starts at 0 and whose only assignment is `tracker = total` (as
+`iafRefCellDeltaInput` does with `total_jump - applied_jump`). When everything reaching its cells
+delivers increments that start at 0 (weighted arrivals, and inputs whose exposure only accumulates,
+such as `poissonDeltaVoltageInput`), the kernel keeps only the difference, in `network_inputs` row
+4: each tick's increments add to it, and `tracker = total` becomes `tracker += difference;
+difference = 0`. Neither lifetime total is formed, so a jump keeps its f32 precision however long
+the run. The tracker then reads the total applied so far, which no longer feeds the dynamics, and
+such an input's own exposure stays at its starting value. Any other read of the total or the
+tracker keeps the whole total, as before.
 
 ### Functions
 

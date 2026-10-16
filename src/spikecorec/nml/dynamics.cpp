@@ -34,7 +34,7 @@ namespace {
 const Set<String> ENGINE_NAMES = {
     "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true", "random_values",
     "walk_pass",
-    "event_arrivals", "arrival", "simulation_time"};
+    "event_arrivals", "arrival", "simulation_time", "network_inputs", "neuron_count", "current_row"};
 
 // Names the generated synapse dynamics use in the propagate walk, on top of ENGINE_NAMES.
 const Set<String> SYNAPSE_ENGINE_NAMES = {
@@ -156,6 +156,12 @@ Kernel_Node *accumulate_edge(s64 plane, Kernel_Node *delta) {
         identifier("pending_delta_matrix_index"), identifier("pending_delta_control"), identifier("pending_delta_capacity"),
         identifier("neuron_count"), literal(std::to_string(plane)),
         edge_source(), identifier("current_edge"), delta});
+}
+
+// network_inputs[row * neuron_count + neuron_index]: one of the running thread's own slots.
+Kernel_Node *own_input_slot(Kernel_Node *row) {
+    return new_expression("[]", identifier("network_inputs"),
+                          new_expression("+", new_expression("*", row, identifier("neuron_count")), identifier("neuron_index")));
 }
 
 // A name the generated synapse code reserves.
@@ -596,6 +602,170 @@ bool is_weighted_arrival(const NML_Component_Type &component_type, const String 
     return true;
 }
 
+// Calls visit with each LEMS expression of a type's dynamics and the entry it belongs to: derived
+// values, case conditions and values, derivatives, OnCondition tests, StateAssignment and OnStart
+// values. A StateAssignment's copy of its OnCondition's test is not visited again.
+void for_each_dynamics_expression(const NML_Component_Type &component_type,
+                                  const Function<void(const NML_Dynamics_Expression &, const Lems_Parse_Node *)> &visit) {
+    for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
+        Vector<const String *> texts;
+        switch (entry.source_tag) {
+            case NML_Declaration_Type::Case:
+                texts = {&entry.condition, &entry.expression};
+                break;
+            case NML_Declaration_Type::DerivedVariable:
+            case NML_Declaration_Type::TimeDerivative:
+            case NML_Declaration_Type::OnCondition:
+            case NML_Declaration_Type::StateAssignment:
+            case NML_Declaration_Type::OnStart:
+                texts = {&entry.expression};
+                break;
+            default:
+                break;
+        }
+        for (const String *text : texts) {
+            if (text->empty()) continue;
+            const Unique_Pointer<Lems_Parse_Node> tree(parse_lems_expression(*text, component_type.name));
+            visit(entry, tree.get());
+        }
+    }
+}
+
+bool is_identifier_named(const Lems_Parse_Node *node, const String &name) {
+    return node && node->body.syntax_type == Lems_Node_Subtype::IDENTIFIER && node->body.token.lexeme == name;
+}
+
+// Counts how node reads total and tracker: each `total - tracker` is a difference use, and any
+// other read of either name is an other use.
+void count_tracked_uses(const Lems_Parse_Node *node, const String &total, const String &tracker,
+                        s64 &difference_uses, s64 &other_uses) {
+    if (!node) return;
+    if (node->body.syntax_type == Lems_Node_Subtype::IDENTIFIER) {
+        if (node->body.token.lexeme == total || node->body.token.lexeme == tracker) other_uses += 1;
+        return;
+    }
+    if (node->body.syntax_type == Lems_Node_Subtype::FUNCTION_CALL) {
+        for (const Lems_Parse_Node *argument : children_of(static_cast<const Binary_Node<Lems_Parse_Body> *>(node)->right)) {
+            count_tracked_uses(argument, total, tracker, difference_uses, other_uses);
+        }
+        return;
+    }
+    if (const auto *unary = dynamic_cast<const Unary_Node<Lems_Parse_Body> *>(node)) {
+        count_tracked_uses(unary->child, total, tracker, difference_uses, other_uses);
+    } else if (const auto *binary = dynamic_cast<const Binary_Node<Lems_Parse_Body> *>(node)) {
+        if (node->body.token.lexeme == "-" && is_identifier_named(binary->left, total) &&
+            is_identifier_named(binary->right, tracker)) {
+            difference_uses += 1;
+            return;
+        }
+        count_tracked_uses(binary->left, total, tracker, difference_uses, other_uses);
+        count_tracked_uses(binary->right, total, tracker, difference_uses, other_uses);
+    }
+}
+
+// Every name `total - name` subtracts from total in node.
+void collect_subtracted_names(const Lems_Parse_Node *node, const String &total, Set<String> &names) {
+    if (!node) return;
+    if (node->body.syntax_type == Lems_Node_Subtype::FUNCTION_CALL) {
+        for (const Lems_Parse_Node *argument : children_of(static_cast<const Binary_Node<Lems_Parse_Body> *>(node)->right)) {
+            collect_subtracted_names(argument, total, names);
+        }
+        return;
+    }
+    if (const auto *unary = dynamic_cast<const Unary_Node<Lems_Parse_Body> *>(node)) {
+        collect_subtracted_names(unary->child, total, names);
+    } else if (const auto *binary = dynamic_cast<const Binary_Node<Lems_Parse_Body> *>(node)) {
+        if (node->body.syntax_type == Lems_Node_Subtype::OPERATOR && node->body.token.lexeme == "-" &&
+            is_identifier_named(binary->left, total) && binary->right->body.syntax_type == Lems_Node_Subtype::IDENTIFIER) {
+            names.insert(binary->right->body.token.lexeme);
+        }
+        collect_subtracted_names(binary->left, total, names);
+        collect_subtracted_names(binary->right, total, names);
+    }
+}
+
+// Whether a cell type reads its add-select total only as `total - tracker` (see Tracked_Total):
+// every read of the total or the tracker is inside that difference, except the tracker's own
+// assignments, which are all `tracker = total`. The tracker is a StateVariable with no
+// TimeDerivative, and nothing else reads it, its OnStart value aside.
+bool find_tracked_total(const NML_Component_Type &cell_type, Tracked_Total &tracked) {
+    String total;
+    for (const NML_Dynamics_Expression &entry : cell_type.dynamics) {
+        if (entry.source_tag != NML_Declaration_Type::DerivedVariable || entry.select.empty()) continue;
+        if (entry.reduce != "add" || !total.empty()) return false;
+        total = entry.target;
+    }
+    if (total.empty()) return false;
+
+    Set<String> subtracted;
+    for_each_dynamics_expression(cell_type, [&](const NML_Dynamics_Expression &, const Lems_Parse_Node *tree) {
+        collect_subtracted_names(tree, total, subtracted);
+    });
+    const Vector<String> &state_names = cell_type.state_variable_names;
+    if (subtracted.size() != 1) return false;
+    const String tracker = *subtracted.begin();
+    if (std::find(state_names.begin(), state_names.end(), tracker) == state_names.end()) return false;
+
+    bool tracked_only = true;
+    s64 difference_uses = 0;
+    for_each_dynamics_expression(cell_type, [&](const NML_Dynamics_Expression &entry, const Lems_Parse_Node *tree) {
+        if (entry.target == tracker) {
+            if (entry.source_tag == NML_Declaration_Type::OnStart) return;
+            if (entry.source_tag == NML_Declaration_Type::StateAssignment && is_identifier_named(tree, total)) return;
+            tracked_only = false;
+            return;
+        }
+        s64 other_uses = 0;
+        count_tracked_uses(tree, total, tracker, difference_uses, other_uses);
+        tracked_only = tracked_only && other_uses == 0;
+    });
+    if (!tracked_only || difference_uses == 0) return false;
+    tracked.total_variable = total;
+    tracked.tracker_variable = tracker;
+    return true;
+}
+
+// Whether variable of a type only accumulates: a StateVariable with no TimeDerivative, whose every
+// StateAssignment adds an increment that does not read it (variable = variable + increment), and
+// which nothing else reads. Its value is then the sum of its starting value and the increments.
+bool only_accumulates(const NML_Component_Type &component_type, const String &variable) {
+    const Vector<String> &state_names = component_type.state_variable_names;
+    if (std::find(state_names.begin(), state_names.end(), variable) == state_names.end()) return false;
+
+    bool accumulates = true;
+    for_each_dynamics_expression(component_type, [&](const NML_Dynamics_Expression &entry, const Lems_Parse_Node *tree) {
+        if (entry.target == variable) {
+            if (entry.source_tag == NML_Declaration_Type::OnStart) return;
+            bool negated = false;
+            if (entry.source_tag == NML_Declaration_Type::StateAssignment && accumulator_increment(tree, variable, negated)) return;
+            accumulates = false;
+            return;
+        }
+        Set<String> names;
+        collect_lems_identifiers(tree, names);
+        accumulates = accumulates && names.count(variable) == 0;
+    });
+    return accumulates;
+}
+
+// A variable's OnStart value for one instance, when it needs no random draw; false otherwise. A
+// variable with no OnStart starts at 0.
+bool fixed_starting_value(const NML_Context &context, const NML_Component_Instance &instance, const String &variable,
+                          f64 &value) {
+    value = 0.0;
+    for (const NML_Dynamics_Expression &entry : instance.component_type->dynamics) {
+        if (entry.source_tag != NML_Declaration_Type::OnStart || entry.target != variable) continue;
+        const Unique_Pointer<Lems_Parse_Node> tree(parse_lems_expression(entry.expression, instance.component_type->name));
+        if (calls_function(tree.get(), "random")) return false;
+        try {
+            value = evaluate_lems(tree.get(), component_parameter_values(context, instance), instance.component_type->name);
+        } catch (const Runtime_Error &) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // The child slots of node that hold uses of names; declared names, parameters, types,
 // function names and member names are not uses.
 Vector<Kernel_Node **> use_slots(Kernel_Node *node) {
@@ -873,6 +1043,7 @@ void Codegen::collect_synapse_deliveries() {
         } else {
             delivery.edge_state_variable_names = component_type.state_variable_names;
         }
+        for (const NML_Component_Type *cell_type : seen_cell_types[synapse.id]) delivery.target_cell_types.insert(cell_type->name);
         synapse_deliveries[synapse.id] = std::move(delivery);
     }
 }
@@ -913,7 +1084,69 @@ bool Codegen::only_weighted_arrivals() const {
 }
 
 s64 Codegen::network_input_row_count() const {
-    return has_weighted_arrivals() ? WEIGHTED_ARRIVAL_SUM_ROW + 1 : WEIGHTED_ARRIVAL_ROW;
+    return has_weighted_arrivals() || !tracked_totals.empty() ? RUNNING_SUM_ROW + 1 : WEIGHTED_ARRIVAL_ROW;
+}
+
+void Codegen::collect_tracked_totals() {
+    tracked_totals.clear();
+
+    // Candidates by cell type: the pattern holds and the tracker starts at 0 in every population.
+    Unordered_Map<String, Tracked_Total> candidates;
+    Set<String> refused;
+    Vector<Pair<s64, const NML_Component_Type *>> population_ends;
+    s64 first_neuron = 0;
+    for (const NML_Component_Instance *population : network_populations(context)) {
+        const NML_Component_Instance &cell = population_cell(context, *population);
+        const NML_Component_Type &cell_type = *cell.component_type;
+        first_neuron += context.get_population_size(population);
+        population_ends.push_back({first_neuron, &cell_type});
+        if (refused.count(cell_type.name)) continue;
+
+        Tracked_Total tracked;
+        f64 tracker_start = 0.0;
+        if (!find_tracked_total(cell_type, tracked) ||
+            !fixed_starting_value(context, cell, tracked.tracker_variable, tracker_start) || tracker_start != 0.0) {
+            refused.insert(cell_type.name);
+            candidates.erase(cell_type.name);
+            continue;
+        }
+        candidates[cell_type.name] = tracked;
+    }
+    if (candidates.empty()) return;
+
+    // Everything that reaches such a cell must deliver increments to a total that starts at 0:
+    // synapses as weighted arrivals, and inputs whose exposure only accumulates.
+    for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
+        const Synapse_Delivery &delivery = synapse_delivery(synapse);
+        if (delivery.weighted_arrival && delivery.starting_value == 0.0) continue;
+        for (const String &cell_type_name : delivery.target_cell_types) candidates.erase(cell_type_name);
+    }
+    auto cell_type_of = [&](s64 neuron_index) -> const NML_Component_Type * {
+        for (const auto &[population_end, cell_type] : population_ends) {
+            if (neuron_index < population_end) return cell_type;
+        }
+        return nullptr;
+    };
+    Ordered_Set<Pair<s32, String>> checked;
+    for (const Input_Entry &entry : input_entries) {
+        const NML_Component_Type *cell_type = cell_type_of(entry.neuron_index);
+        if (!cell_type || !candidates.count(cell_type->name) || !checked.insert({entry.prototype, cell_type->name}).second) {
+            continue;
+        }
+        const NML_Component_Instance &input = *input_prototypes[static_cast<usize>(entry.prototype)];
+        const String variable = exposed_variable_name(*input.component_type, select_exposure(*cell_type));
+        f64 input_start = 0.0;
+        if (context.is_instance_of(&input, "baseSpikeSource") || !only_accumulates(*input.component_type, variable) ||
+            !fixed_starting_value(context, input, variable, input_start) || input_start != 0.0) {
+            candidates.erase(cell_type->name);
+        }
+    }
+
+    for (auto &[cell_type_name, tracked] : candidates) {
+        log::logger().info("Codegen: '{}' reads its total '{}' only less '{}', so the kernel keeps their difference "
+                           "instead of either", cell_type_name, tracked.total_variable, tracked.tracker_variable);
+    }
+    tracked_totals = std::move(candidates);
 }
 
 void Codegen::check_population_cells() const {
@@ -941,8 +1174,10 @@ void Codegen::allocate_cell_model_memory() {
     // Two rows like network_inputs when some cell has an OnEvent; otherwise one slot to bind.
     const s64 event_arrival_slots = cells_receive_events() ? 2 * context.simulation.total_neuron_count : 1;
 
-    // Every input buffer has at least one slot, so there is always one to bind.
+    // Every input buffer has at least one slot, so there is always one to bind. A tracked total
+    // depends on the inputs reaching its cells, and sizes network_inputs.
     collect_inputs();
+    collect_tracked_totals();
     const s64 entry_count = static_cast<s64>(input_entries.size());
 
     device->partition(sizeof(f32) * context.get_cell_state_size(), Engine_Datatype::FLOAT32, data_partitions)            // cell_state
@@ -1344,33 +1579,12 @@ Kernel_Node *Codegen::translate_kernel_code() {
         spiked_index += 2;
     }
 
-    // network_inputs[row * neuron_count + neuron_index]
-    auto input_row_slot = [](Kernel_Node *row) {
-        return new_expression("[]", identifier("network_inputs"),
-                              new_expression("+", new_expression("*", row, identifier("neuron_count")),
-                                             identifier("neuron_index")));
-    };
-
     // The cells run in a tick's first walk pass only; a later pass only walks deferred neurons' edges.
-    // With weighted arrivals, the neuron first adds the increments that reach it this tick to its
-    // running sum, which its select reads with the tick's other input.
-    Kernel_List_Node *first_pass_body = new_block();
-    if (has_weighted_arrivals()) {
-        Kernel_Node *sum_slot = input_row_slot(literal(std::to_string(WEIGHTED_ARRIVAL_SUM_ROW)));
-        Kernel_Node *arrival_slot = input_row_slot(
-                new_expression("+", literal(std::to_string(WEIGHTED_ARRIVAL_ROW)), identifier("current_row")));
-        first_pass_body->children.push_back(new_assignment(sum_slot, "+=", arrival_slot));
-        first_pass_body->children.push_back(new_assignment(clone(arrival_slot), "=", literal("0.0f")));
-        first_pass_body->children.push_back(new_assignment(identifier("network_input"), "+=", clone(sum_slot)));
-    }
     if (dispatch->children.empty()) {
         delete dispatch;
     } else {
+        Kernel_List_Node *first_pass_body = new_block();
         first_pass_body->children.push_back(dispatch);
-    }
-    if (first_pass_body->children.empty()) {
-        delete first_pass_body;
-    } else {
         Kernel_List_Node *first_pass_only = new_conditional();
         add_branch(first_pass_only, new_expression("==", identifier("walk_pass"), literal("0")), first_pass_body);
         insert_statements(body, static_cast<usize>(spiked_index) + 1, {first_pass_only});
@@ -1659,6 +1873,52 @@ s64 synapse_settle_ticks(const NML_Context &context, const NML_Component_Instanc
         if (settled) return tick + 1;
     }
     return -1;
+}
+
+bool is_kernel_identifier_named(const Kernel_Node *node, const String &name) {
+    return node && node->body.syntax_type == Kernel_Node_Type::IDENTIFIER && node->body.token == name;
+}
+
+// Puts a clone of difference in place of every `total - tracker` under node.
+void replace_tracked_differences(Kernel_Node *&node, const Tracked_Total &tracked, const Kernel_Node *difference) {
+    if (!node) return;
+    if (node->body.syntax_type == Kernel_Node_Type::EXPRESSION && node->body.token == "-") {
+        const auto *binary = dynamic_cast<const Kernel_Binary_Node *>(node);
+        if (binary && is_kernel_identifier_named(binary->left, tracked.total_variable) &&
+            is_kernel_identifier_named(binary->right, tracked.tracker_variable)) {
+            delete node;
+            node = clone(difference);
+            return;
+        }
+    }
+    for (Kernel_Node **slot : use_slots(node)) replace_tracked_differences(*slot, tracked, difference);
+}
+
+// Turns every `tracker = total` under node into `tracker += difference; difference = 0`: the
+// tracker takes up what it had not yet, and the difference, the total less the tracker, is then 0.
+void expand_tracker_assignments(Kernel_Node *node, const Tracked_Total &tracked, const Kernel_Node *difference) {
+    if (!node) return;
+    if (node->body.syntax_type == Kernel_Node_Type::BLOCK) {
+        Vector<Kernel_Node *> &statements = static_cast<Kernel_List_Node *>(node)->children;
+        for (usize index = 0; index < statements.size(); index += 1) {
+            Kernel_Node *statement = statements[index];
+            const auto *assignment = dynamic_cast<const Kernel_Binary_Node *>(statement);
+            const bool catches_up = statement->body.syntax_type == Kernel_Node_Type::ASSIGNMENT && statement->body.token == "=" &&
+                                    is_kernel_identifier_named(assignment->left, tracked.tracker_variable) &&
+                                    is_kernel_identifier_named(assignment->right, tracked.total_variable);
+            if (!catches_up) {
+                expand_tracker_assignments(statement, tracked, difference);
+                continue;
+            }
+            delete statement;
+            statements[index] = new_assignment(identifier(tracked.tracker_variable), "+=", clone(difference));
+            statements.insert(statements.begin() + static_cast<s64>(index) + 1,
+                              new_assignment(clone(difference), "=", literal("0.0f")));
+            index += 1;
+        }
+        return;
+    }
+    for (Kernel_Node **slot : use_slots(node)) expand_tracker_assignments(*slot, tracked, difference);
 }
 
 } // namespace
@@ -2152,6 +2412,28 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
         }
     }
 
+    // A tracked total is never formed: its difference with the tracker is the neuron's running
+    // sum, which translate_component_instance brings up to date before these statements run.
+    auto tracked = tracked_totals.find(component_type.name);
+    if (tracked != tracked_totals.end()) {
+        const s64 total_index = find_statement(body, DERIVED_PREFIX + tracked->second.total_variable);
+        if (total_index >= 0) {
+            delete body->children[static_cast<usize>(total_index)];
+            body->children.erase(body->children.begin() + total_index);
+        }
+        const Unique_Pointer<Kernel_Node> difference(own_input_slot(literal(std::to_string(RUNNING_SUM_ROW))));
+        Kernel_Node *tracked_body = body;
+        replace_tracked_differences(tracked_body, tracked->second, difference.get());
+        expand_tracker_assignments(body, tracked->second, difference.get());
+
+        Set<String> remaining_names;
+        collect_identifiers(body, remaining_names);
+        if (remaining_names.count(tracked->second.total_variable)) {
+            delete body;
+            throw unsupported("its total '" + tracked->second.total_variable + "' is still read after it was tracked");
+        }
+    }
+
     // Derived variables are read through their declared locals, and t is the tick's time from the host.
     Kernel_Node *body_node = body;
     for (const String &name : derived_names) {
@@ -2216,6 +2498,31 @@ Kernel_List_Node *Codegen::translate_component_instance(const NML_Component_Inst
             throw Runtime_Error("ComponentType '" + component_type.name + "' (cell '" + cell.id + "'): '" + name +
                                 "' is not a state variable, a set parameter, a constant or a derived variable");
         }
+
+        // The weighted arrivals that reach the neuron this tick go into its running sum, which its
+        // select reads with the tick's other input. For a tracked total the running sum is the
+        // total less the tracker: it takes this tick's arrivals and what the inputs added, which is
+        // all network_input holds then. The inputs run first, ahead of these.
+        Vector<Kernel_Node *> arrivals;
+        const bool total_tracked = tracked_totals.count(component_type.name) != 0;
+        if (has_weighted_arrivals()) {
+            Kernel_Node *arrival_slot = own_input_slot(
+                    new_expression("+", literal(std::to_string(WEIGHTED_ARRIVAL_ROW)), identifier("current_row")));
+            if (total_tracked) {
+                arrivals.push_back(new_assignment(identifier("network_input"), "+=", arrival_slot));
+                arrivals.push_back(new_assignment(clone(arrival_slot), "=", literal("0.0f")));
+            } else {
+                Kernel_Node *sum_slot = own_input_slot(literal(std::to_string(RUNNING_SUM_ROW)));
+                arrivals.push_back(new_assignment(sum_slot, "+=", arrival_slot));
+                arrivals.push_back(new_assignment(clone(arrival_slot), "=", literal("0.0f")));
+                arrivals.push_back(new_assignment(identifier("network_input"), "+=", clone(sum_slot)));
+            }
+        }
+        if (total_tracked) {
+            arrivals.push_back(new_assignment(own_input_slot(literal(std::to_string(RUNNING_SUM_ROW))), "+=",
+                                              identifier("network_input")));
+        }
+        insert_statements(static_cast<Kernel_List_Node *>(body), 0, arrivals);
     } catch (...) {
         delete body;
         throw;
@@ -2344,6 +2651,14 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
         add_export(0, read_exposure);
     }
 
+    // A tracked total (see Tracked_Total) takes the input's increments of this tick, not its
+    // lifetime value: the exposure only accumulates, so its assignments add to the export, which
+    // starts at 0 each tick, and the input's own lifetime copy is never formed.
+    String accumulating_variable;
+    if (!spike_source && tracked_totals.count(cell_type.name)) {
+        accumulating_variable = exposed_variable_name(*input.component_type, read_exposure);
+    }
+
     auto translate = [&](const String &expression, const String &owner_name) {
         const Unique_Pointer<Lems_Parse_Node> tree_node(parse_lems_expression(expression, owner_name));
         return translate_expression(tree_node.get());
@@ -2355,6 +2670,10 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
     auto resolve_part_names = [&](Kernel_Node *node, s64 part_index) {
         const Input_Part &part = tree.parts[static_cast<usize>(part_index)];
         const NML_Component_Type &component_type = *part.instance->component_type;
+        if (part_index == 0 && !accumulating_variable.empty()) {
+            const Unique_Pointer<Kernel_Node> increments(identifier(export_local(0, read_exposure)));
+            replace_identifier(node, accumulating_variable, increments.get());
+        }
         Set<String> used_names;
         collect_identifiers(node, used_names);
 
@@ -2601,8 +2920,10 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
         }
 
         for (const String &name : exports[static_cast<usize>(part_index)]) {
-            body->children.push_back(new_assignment(identifier(export_local(part_index, name)), "=", identifier(name)));
             lems_names.insert(name);
+            // An accumulating exposure's increments already went into its export.
+            if (part_index == 0 && name == read_exposure && !accumulating_variable.empty()) continue;
+            body->children.push_back(new_assignment(identifier(export_local(part_index, name)), "=", identifier(name)));
         }
 
         check_part_names(part_index, lems_names);

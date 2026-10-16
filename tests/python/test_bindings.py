@@ -280,8 +280,10 @@ def test_weighted_arrivals_reach_their_target_exactly_a_delay_after_the_spike():
     times, neurons = engine.recorded_spikes
     ticks = np.rint(np.asarray(times) / engine.step_dt).astype(int)
     assert list(zip(neurons.tolist(), ticks.tolist())) == [(0, 100), (1, 101), (2, 116)]
-    # Each delta neuron's running sum holds the one 25 mV jump that reached it.
-    assert engine.network_inputs[4][1:] == pytest.approx([0.025, 0.025], rel=1e-3)
+    # The model A neuron reads its total only less applied_jump, so its running sum holds what it
+    # has not applied yet: nothing, once the one 25 mV jump that reached it is applied.
+    assert list(engine.network_inputs[4][1:]) == [0.0, 0.0]
+    assert [engine.read_state_variable(neuron, "applied_jump") for neuron in (1, 2)] == pytest.approx([0.025, 0.025], rel=1e-3)
 
 
 def test_written_spikes_match_the_recorded_ones(tmp_path):

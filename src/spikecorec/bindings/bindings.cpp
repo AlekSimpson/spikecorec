@@ -1118,15 +1118,15 @@ PYBIND11_MODULE(_spikecorec, m) {
         }, "Every cell's state variables; context.resolve_path gives a variable's index.")
         .def_property_readonly("network_inputs", [](const Spike_Engine &self) {
             require_alive(self, "network_inputs");
-            // Five rows only when some synapse delivers weighted arrivals.
-            const s64 weighted_row_count = Codegen::WEIGHTED_ARRIVAL_SUM_ROW + 1;
+            // Five rows only with weighted arrivals or a tracked total.
+            const s64 weighted_row_count = Codegen::RUNNING_SUM_ROW + 1;
             const u64 weighted_rows_bytes = sizeof(f32) * static_cast<u64>(weighted_row_count) *
                                             static_cast<u64>(self.total_neuron_count);
             const s64 row_count = self.network_inputs.total_bytes >= weighted_rows_bytes ? weighted_row_count : 2;
             return device_buffer_to_numpy_rows<f32>(self.network_inputs, row_count, self.total_neuron_count);
-        }, "[2][total_neuron_count], alternating by tick parity. With weighted arrivals "
-           "[5][total_neuron_count]: rows 2 and 3 the increments arriving on a tick, by tick parity, and "
-           "row 4 each neuron's running sum of them.")
+        }, "[2][total_neuron_count], alternating by tick parity. With weighted arrivals or a tracked "
+           "total [5][total_neuron_count]: rows 2 and 3 the increments arriving on a tick, by tick parity, "
+           "and row 4 each neuron's running sum of them, or for a tracked total the total less its tracker.")
         .def_property_readonly("event_arrival_count", [](const Spike_Engine &self) {
             require_alive(self, "event_arrival_count");
             // Two rows only when some cell type has an OnEvent; otherwise the buffer is a placeholder.

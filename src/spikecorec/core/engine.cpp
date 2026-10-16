@@ -289,7 +289,7 @@ void Spike_Engine::build_weight_matrix(const Codegen &compiler, s64 matrix_count
         any_weighted_arrival_starting_value = any_weighted_arrival_starting_value || weighted_arrival_starting_value.back() != 0.0f;
     }
     f32 *weighted_arrival_sums = any_weighted_arrival_starting_value
-            ? network_inputs.get_contents_as<f32>() + Codegen::WEIGHTED_ARRIVAL_SUM_ROW * total_neuron_count
+            ? network_inputs.get_contents_as<f32>() + Codegen::RUNNING_SUM_ROW * total_neuron_count
             : nullptr;
 
     // Edge ordinals: sources ascending, each source's targets ascending (the k^2-tree's row order).

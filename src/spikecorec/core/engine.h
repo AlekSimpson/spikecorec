@@ -86,9 +86,10 @@ namespace spikecorec {
 
         // Two rows alternating by tick parity: a neuron drains one row while this tick's scatters
         // land in the other, so synaptic latency is exactly one tick whatever the thread order.
-        // With weighted arrivals (see Synapse_Delivery) three more: the increments arriving on a
-        // tick, by tick parity like the first two, and each neuron's running sum of them, which its
-        // select reads with the tick's other input. An arrival is sent the tick before it arrives,
+        // With weighted arrivals (see Synapse_Delivery) or a tracked total (see Tracked_Total) three
+        // more: the increments arriving on a tick, by tick parity like the first two, and a running
+        // sum per neuron: of the arrivals, which its select reads with the tick's other input, or for
+        // a tracked total the total less its tracker. An arrival is sent the tick before it arrives,
         // so it reaches its target exactly a delay after its spike.
         Engine_Pointer network_inputs;     // [2 or 5][total_neuron_count]
 
