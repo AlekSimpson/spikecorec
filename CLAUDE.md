@@ -22,6 +22,7 @@ src/spikecorec/       — include root is `src/`; headers (.h, .cuh) live beside
 src/spikecorec/core/      — CPU-side logic: main loop, Engine, weight matrix, k²-tree, backend dispatch
 src/spikecorec/nml/       — NeuroML parsing, resolution and kernel codegen (Metal and CUDA source)
 src/spikecorec/metal/     — metal-cpp impl file, k²-tree device helpers (.metalinc), fixed kernels (.metal)
+src/spikecorec/cuda/      — the same fixed kernels and k²-tree device helpers for CUDA (.cu, .cuh), built by nvcc
 src/spikecorec/bindings/  — pybind11 Python bindings
 python/spikecorec/    — Python package
 tests/                — C++ tests
@@ -37,7 +38,8 @@ docs/                 — design notes and reviews
 - `src/spikecorec/core/backend.h` defines the CPU↔GPU dispatch interface
 - `src/spikecorec/nml/` generates the simulation kernel (`master_step`) as Metal or CUDA source;
   `src/spikecorec/metal/` holds the metal-cpp one-time impl file and the fixed Metal kernels (the
-  weight-matrix fits), each with a host fallback, which is what runs on CUDA
+  weight-matrix fits), and `src/spikecorec/cuda/` their CUDA ports, precompiled by nvcc at build time.
+  Each fixed kernel has a host fallback, which runs when its GPU kernel can't be loaded
 - Metal host code uses **metal-cpp** (pure C++, no `.mm` / Objective-C++)
 - Backend is selected at compile time via `-DSPIKECOREC_METAL` or `-DSPIKECOREC_CUDA`
 
