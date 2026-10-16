@@ -1,0 +1,32 @@
+<Lems>
+
+    <!--
+    Brunel (2000) model A parameter values (Section 2 and Section 6 of the paper).
+
+    Neuron: tau = 20 ms, theta = 20 mV, V_r = 10 mV, tau_rp = 2 ms, rest at 0 mV.
+    Synapses: excitatory jump J = 0.1 mV. Inhibitory jump -J, with the inhibitory
+    connection weight set to g, so one component serves every g in the sweep.
+    External drive: C_ext = C_E = 1000 sources at nu_ext each, merged into one
+    Poisson input at C_E * nu_ext. nu_thr = theta / (J * C_E * tau) = 10 Hz.
+    -->
+
+    <Include file="Brunel2000_ModelA_ComponentTypes.xml"/>
+
+    <iafRefCellDeltaInput id="brunel_model_a_neuron"
+                          leak_reversal="0mV"
+                          membrane_time_constant="20ms"
+                          refractory_period="2ms"
+                          thresh="20mV"
+                          reset="10mV"/>
+
+    <deltaVoltageSynapse id="excitatory_delta_synapse" jump="0.1mV"/>
+    <deltaVoltageSynapse id="inhibitory_delta_synapse" jump="-0.1mV"/>
+
+    <!-- nu_ext / nu_thr = 2: Fig 8A (SR, g = 3) and Fig 8C (AI, g = 5) -->
+    <poissonDeltaVoltageInput id="external_drive_nu_ext_over_nu_thr_2" average_rate="20000Hz" jump="0.1mV"/>
+    <!-- nu_ext / nu_thr = 4: Fig 8B (SI fast, g = 6) -->
+    <poissonDeltaVoltageInput id="external_drive_nu_ext_over_nu_thr_4" average_rate="40000Hz" jump="0.1mV"/>
+    <!-- nu_ext / nu_thr = 0.9: Fig 8D (SI slow, g = 4.5) -->
+    <poissonDeltaVoltageInput id="external_drive_nu_ext_over_nu_thr_0_9" average_rate="9000Hz" jump="0.1mV"/>
+
+</Lems>

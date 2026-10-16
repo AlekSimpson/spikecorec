@@ -463,6 +463,8 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_readonly("random_seed", &NML_Context::NML_Simulation_Context::random_seed)
         .def_readonly("total_edge_count", &NML_Context::NML_Simulation_Context::total_edge_count)
         .def_readonly("maximum_edge_delay", &NML_Context::NML_Simulation_Context::maximum_edge_delay, "Ticks.")
+        .def_readonly("minimum_edge_delay", &NML_Context::NML_Simulation_Context::minimum_edge_delay,
+                      "Ticks; 0 with no connections.")
         .def_readonly("population_base_indices", &NML_Context::NML_Simulation_Context::population_base_indices,
                       "Population id -> where its cells start in cell_state.")
         .def_readonly("instance_positions", &NML_Context::NML_Simulation_Context::instance_positions,
@@ -1116,8 +1118,15 @@ PYBIND11_MODULE(_spikecorec, m) {
         }, "Every cell's state variables; context.resolve_path gives a variable's index.")
         .def_property_readonly("network_inputs", [](const Spike_Engine &self) {
             require_alive(self, "network_inputs");
-            return device_buffer_to_numpy_rows<f32>(self.network_inputs, 2, self.total_neuron_count);
-        }, "[2][total_neuron_count], alternating by tick parity.")
+            // Five rows only when some synapse delivers weighted arrivals.
+            const s64 weighted_row_count = Codegen::WEIGHTED_ARRIVAL_SUM_ROW + 1;
+            const u64 weighted_rows_bytes = sizeof(f32) * static_cast<u64>(weighted_row_count) *
+                                            static_cast<u64>(self.total_neuron_count);
+            const s64 row_count = self.network_inputs.total_bytes >= weighted_rows_bytes ? weighted_row_count : 2;
+            return device_buffer_to_numpy_rows<f32>(self.network_inputs, row_count, self.total_neuron_count);
+        }, "[2][total_neuron_count], alternating by tick parity. With weighted arrivals "
+           "[5][total_neuron_count]: rows 2 and 3 the increments arriving on a tick, by tick parity, and "
+           "row 4 each neuron's running sum of them.")
         .def_property_readonly("event_arrival_count", [](const Spike_Engine &self) {
             require_alive(self, "event_arrival_count");
             // Two rows only when some cell type has an OnEvent; otherwise the buffer is a placeholder.

@@ -35,7 +35,9 @@ struct NML_Context {
         s64 total_neuron_count = 0;
         Optional<u64> random_seed;
         s64 total_edge_count = 0;
+        // The longest and shortest connection delays, in ticks; both 0 with no connections.
         s64 maximum_edge_delay = 0;
+        s64 minimum_edge_delay = 0;
     
         // Population id -> cell-memory index of its first cell's first state slot.
         Unordered_Map<String, s64> population_base_indices;

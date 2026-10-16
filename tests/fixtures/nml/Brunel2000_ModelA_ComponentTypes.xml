@@ -1,0 +1,148 @@
+<Lems>
+
+    <!--
+    Component types for Brunel (2000) model A, J Comput Neurosci 8:183-208.
+
+    Brunel's synapses are delta functions (Eq. 2): each spike arriving at time
+    t_spike + D moves the postsynaptic membrane potential instantly by the PSP
+    amplitude (J for excitatory, -gJ for inhibitory). NeuroML core types have no
+    such synapse, because a NeuroML synapse contributes a current to its cell and
+    cannot set the cell's voltage. These types implement the jump instead:
+
+      1. deltaVoltageSynapse and poissonDeltaVoltageInput each keep a running sum
+         of the voltage jumps they have received (accumulated_jump).
+      2. iafRefCellDeltaInput sums accumulated_jump over everything attached to it
+         and adds any new amount to v, which is a single voltage jump per arrival.
+      3. During the refractory period the cell discards new jumps, matching
+         Brunel's statement that the potential is insensitive to stimulation then.
+
+    Semantics for simulators that implement these types natively (NEST
+    iaf_psc_delta, Brian2 on_pre "v += w", SpikeCore): a spike arriving through a
+    deltaVoltageSynapse adds weight * jump to v at arrival time, unless the target
+    neuron is refractory.
+
+    Note for jNeuroML execution only: jLEMS applies the jump and detects threshold
+    crossings on following steps, which adds about two integration steps of latency
+    (0.02 ms at dt = 0.01 ms). Native implementations should apply it at arrival.
+    -->
+
+    <Include file="Cells.xml"/>
+    <Include file="Synapses.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Inputs.xml"/>
+    <Include file="Simulation.xml"/>
+
+
+    <ComponentType name="baseDeltaVoltageSynapse"
+                   extends="baseSynapse"
+                   description="Base type for inputs that move the target membrane potential by instantaneous jumps instead of producing a current. Exposes the running sum of jumps delivered so far.">
+        <Exposure name="accumulated_jump" dimension="voltage" description="Running sum of all voltage jumps delivered through this input"/>
+    </ComponentType>
+
+
+    <ComponentType name="deltaVoltageSynapse"
+                   extends="baseDeltaVoltageSynapse"
+                   description="Delta synapse: each incoming event moves the postsynaptic membrane potential instantly by weight * jump. Produces no current.">
+
+        <Property name="weight" dimension="none" defaultValue="1"/>
+
+        <Parameter name="jump" dimension="voltage" description="Postsynaptic voltage jump per event at weight 1 (Brunel's J, or -J for inhibitory synapses with the connection weight set to g)"/>
+
+        <Constant name="NO_CURRENT" dimension="current" value="0A"/>
+
+        <Dynamics>
+            <StateVariable name="accumulated_jump" dimension="voltage" exposure="accumulated_jump"/>
+
+            <DerivedVariable name="i" dimension="current" exposure="i" value="NO_CURRENT"/>
+
+            <OnStart>
+                <StateAssignment variable="accumulated_jump" value="0"/>
+            </OnStart>
+
+            <OnEvent port="in">
+                <StateAssignment variable="accumulated_jump" value="accumulated_jump + weight * jump"/>
+            </OnEvent>
+        </Dynamics>
+
+    </ComponentType>
+
+
+    <ComponentType name="poissonDeltaVoltageInput"
+                   extends="baseDeltaVoltageSynapse"
+                   description="External drive: a Poisson process at average_rate where each event moves the target membrane potential instantly by weight * jump. Brunel's C_ext independent sources at rate nu_ext are equivalent to one source at C_ext * nu_ext.">
+
+        <Property name="weight" dimension="none" defaultValue="1"/>
+
+        <Parameter name="average_rate" dimension="per_time" description="Total Poisson rate of external spikes onto one neuron (C_ext * nu_ext)"/>
+        <Parameter name="jump" dimension="voltage" description="Voltage jump per external spike (Brunel's J)"/>
+
+        <DerivedParameter name="average_interspike_interval" dimension="time" value="1 / average_rate"/>
+
+        <Constant name="NO_CURRENT" dimension="current" value="0A"/>
+
+        <Dynamics>
+            <StateVariable name="accumulated_jump" dimension="voltage" exposure="accumulated_jump"/>
+            <StateVariable name="next_event_time" dimension="time"/>
+
+            <DerivedVariable name="i" dimension="current" exposure="i" value="NO_CURRENT"/>
+
+            <OnStart>
+                <StateAssignment variable="accumulated_jump" value="0"/>
+                <StateAssignment variable="next_event_time" value="- average_interspike_interval * log(1 - random(1))"/>
+            </OnStart>
+
+            <!-- jNeuroML can fire this at most once per step, so it needs average_rate * dt well below 1 -->
+            <OnCondition test="t .gt. next_event_time">
+                <StateAssignment variable="accumulated_jump" value="accumulated_jump + weight * jump"/>
+                <StateAssignment variable="next_event_time" value="next_event_time - average_interspike_interval * log(1 - random(1))"/>
+            </OnCondition>
+        </Dynamics>
+
+    </ComponentType>
+
+
+    <ComponentType name="iafRefCellDeltaInput"
+                   extends="baseIaf"
+                   description="Brunel (2000) leaky integrate-and-fire neuron: tau dV/dt = -(V - leak_reversal) between inputs, instantaneous voltage jumps from attached delta synapses and Poisson inputs, spike when V exceeds thresh, then V is held at reset for refractory_period and incoming jumps are discarded.">
+
+        <Parameter name="leak_reversal" dimension="voltage" description="Resting potential (0 mV in Brunel's convention)"/>
+        <Parameter name="membrane_time_constant" dimension="time" description="tau (20 ms)"/>
+        <Parameter name="refractory_period" dimension="time" description="tau_rp (2 ms)"/>
+
+        <Attachments name="synapses" type="baseDeltaVoltageSynapse"/>
+
+        <Dynamics>
+            <StateVariable name="v" dimension="voltage" exposure="v"/>
+            <StateVariable name="applied_jump" dimension="voltage"/>
+            <StateVariable name="refractory_end_time" dimension="time"/>
+
+            <DerivedVariable name="total_jump" dimension="voltage" select="synapses[*]/accumulated_jump" reduce="add"/>
+            <DerivedVariable name="pending_jump" dimension="voltage" value="total_jump - applied_jump"/>
+            <!-- 1 while integrating, 0 while refractory. Written without Regimes because jLEMS
+                 conditions inside a Regime cannot read derived variables. -->
+            <DerivedVariable name="is_integrating" dimension="none" value="H((t - refractory_end_time) / membrane_time_constant)"/>
+
+            <TimeDerivative variable="v" value="is_integrating * (leak_reversal - v) / membrane_time_constant"/>
+
+            <OnStart>
+                <StateAssignment variable="v" value="leak_reversal"/>
+                <StateAssignment variable="applied_jump" value="0"/>
+                <StateAssignment variable="refractory_end_time" value="-1 * refractory_period"/>
+            </OnStart>
+
+            <!-- Apply new jumps while integrating; discard them while refractory -->
+            <OnCondition test="pending_jump .neq. 0">
+                <StateAssignment variable="v" value="v + is_integrating * pending_jump"/>
+                <StateAssignment variable="applied_jump" value="total_jump"/>
+            </OnCondition>
+
+            <OnCondition test="v .gt. thresh">
+                <EventOut port="spike"/>
+                <StateAssignment variable="v" value="reset"/>
+                <StateAssignment variable="refractory_end_time" value="t + refractory_period"/>
+            </OnCondition>
+        </Dynamics>
+
+    </ComponentType>
+
+</Lems>

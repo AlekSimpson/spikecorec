@@ -1,0 +1,73 @@
+<Lems>
+
+    <!--
+    The single-neuron verification of the Brunel (2000) model A types (WORKSPACE_MANIFEST.md
+    section 4), with the scripted spikes sent by cells and the connections in projections, which
+    is how the engine reads a network: each spikeArray fires a source iafCell at its spike times,
+    and the source reaches neuron 0 through a delta synapse in a projection.
+
+    Neuron 0: five excitatory spikes (weight 50, so +5 mV each) sent at 10-18 ms arrive at
+    11.5-19.5 ms; the fifth crosses threshold, so it spikes at 19.5 ms, resets to 10 mV and is
+    refractory for 2 ms. An inhibitory spike (weight 30, so -3 mV) arriving at 21.0 ms, inside the
+    refractory period, is discarded; one arriving at 41.5 ms lowers v by exactly 3 mV.
+    Neuron 1: only a 1 kHz Poisson drive of 0.1 mV jumps, so its mean v settles at
+    rate * jump * tau = 2 mV and its SD at sqrt(rate * jump^2 * tau / 2) = 0.316 mV.
+    -->
+
+    <Target component="verification_simulation"/>
+
+    <Include file="Brunel2000_ModelA_Components.xml"/>
+
+    <poissonDeltaVoltageInput id="verification_poisson_drive" average_rate="1000Hz" jump="0.1mV"/>
+
+    <spikeArray id="excitatory_test_spikes">
+        <spike id="0" time="10ms"/>
+        <spike id="1" time="12ms"/>
+        <spike id="2" time="14ms"/>
+        <spike id="3" time="16ms"/>
+        <spike id="4" time="18ms"/>
+    </spikeArray>
+
+    <spikeArray id="inhibitory_test_spikes">
+        <spike id="0" time="19.5ms"/>
+        <spike id="1" time="40ms"/>
+    </spikeArray>
+
+    <!-- Fires on the tick each of its spikeArray's spikes reaches it. -->
+    <iafCell id="spike_source_cell" leakConductance="10nS" leakReversal="-70mV" thresh="-50mV" reset="-70mV" C="200pF"/>
+
+    <network id="verification_network">
+        <population id="verification_neurons" component="brunel_model_a_neuron" size="2"/>
+        <population id="excitatory_source" component="spike_source_cell" size="1"/>
+        <population id="inhibitory_source" component="spike_source_cell" size="1"/>
+
+        <projection id="excitatory_projection" presynapticPopulation="excitatory_source"
+                    postsynapticPopulation="verification_neurons" synapse="excitatory_delta_synapse">
+            <connectionWD id="0" preCellId="../excitatory_source[0]" postCellId="../verification_neurons[0]"
+                          weight="50" delay="1.5ms"/>
+        </projection>
+        <projection id="inhibitory_projection" presynapticPopulation="inhibitory_source"
+                    postsynapticPopulation="verification_neurons" synapse="inhibitory_delta_synapse">
+            <connectionWD id="0" preCellId="../inhibitory_source[0]" postCellId="../verification_neurons[0]"
+                          weight="30" delay="1.5ms"/>
+        </projection>
+
+        <explicitInput target="excitatory_source[0]" input="excitatory_test_spikes"/>
+        <explicitInput target="inhibitory_source[0]" input="inhibitory_test_spikes"/>
+        <explicitInput target="verification_neurons[1]" input="verification_poisson_drive" destination="synapses"/>
+    </network>
+
+    <Simulation id="verification_simulation" length="2000ms" step="0.01ms" target="verification_network" seed="1234">
+        <OutputFile id="membrane_potentials" fileName="brunel_model_a_single_neuron_v.dat">
+            <OutputColumn id="v_neuron_0" quantity="verification_neurons[0]/v"/>
+            <OutputColumn id="v_neuron_1" quantity="verification_neurons[1]/v"/>
+        </OutputFile>
+        <EventOutputFile id="spikes" fileName="brunel_model_a_single_neuron_spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="verification_neurons[0]" eventPort="spike"/>
+            <EventSelection id="1" select="verification_neurons[1]" eventPort="spike"/>
+            <EventSelection id="2" select="excitatory_source[0]" eventPort="spike"/>
+            <EventSelection id="3" select="inhibitory_source[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+
+</Lems>

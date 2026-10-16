@@ -266,6 +266,24 @@ def test_a_cells_on_event_runs_once_per_arriving_spike(tmp_path):
     assert engine.read_state_variable(1, "received") == len(delivered)
 
 
+def test_weighted_arrivals_reach_their_target_exactly_a_delay_after_the_spike():
+    # A trigger fires at 10 ms; a 0.1 ms and then a 1.5 ms delta synapse each fire the next neuron.
+    engine = spc.Spike_Engine(str(FIXTURES / "nml" / "LEMS_brunel_model_a_effective_delay.xml"))
+    assert engine.context.simulation.minimum_edge_delay == 1
+    assert engine.context.simulation.maximum_edge_delay == 15
+    assert engine.network_inputs.shape == (5, 3)
+    assert engine.weights.matrix_count == 2
+    with pytest.raises(RuntimeError, match="keeps no 'accumulated_jump' per connection"):
+        engine.synapse_state_variable_plane("suprathreshold_delta_synapse", "accumulated_jump")
+
+    engine.run()
+    times, neurons = engine.recorded_spikes
+    ticks = np.rint(np.asarray(times) / engine.step_dt).astype(int)
+    assert list(zip(neurons.tolist(), ticks.tolist())) == [(0, 100), (1, 101), (2, 116)]
+    # Each delta neuron's running sum holds the one 25 mV jump that reached it.
+    assert engine.network_inputs[4][1:] == pytest.approx([0.025, 0.025], rel=1e-3)
+
+
 def test_written_spikes_match_the_recorded_ones(tmp_path):
     spike_file = tmp_path / "events.dat"
     children = (f'<EventOutputFile id="spikes" fileName="{tmp_path / "declared.dat"}" format="TIME_ID">'

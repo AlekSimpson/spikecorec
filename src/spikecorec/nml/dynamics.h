@@ -368,6 +368,29 @@ struct Input_Entry {
     f32 weight = 1.0f;
 };
 
+// How one synapse (a prototype) delivers to its targets: what they read of it, and whether that
+// needs any state per connection.
+struct Synapse_Delivery {
+    // The exposure its targets' select reads, e.g. "i"; empty when none of them reads one.
+    String read_exposure;
+    // The synapse's StateVariable or DerivedVariable behind read_exposure.
+    String read_variable;
+    // True when read_variable is a StateVariable that only an OnEvent changes, by an increment
+    // that reads none of the synapse's state, e.g. accumulated_jump = accumulated_jump + weight * jump.
+    // A target's select then reads the sum, over its synapses, of their starting values plus every
+    // increment delivered so far, and nothing else of the synapse is observable. So no state is kept
+    // per connection: an arrival adds its increment to its target's running sum once, on the tick
+    // it arrives, and the synapse does no work between arrivals.
+    bool weighted_arrival = false;
+    // A weighted arrival's OnEvent value for read_variable, as written in LEMS.
+    String arrival_expression;
+    // read_variable's OnStart value; each connection adds it to its target's sum at the start.
+    f64 starting_value = 0.0;
+    // The StateVariables kept per connection, in plane order from FIRST_STATE_VARIABLE_PLANE: all of
+    // the type's, or none for a weighted arrival.
+    Vector<String> edge_state_variable_names;
+};
+
 struct Codegen {
     const NML_Context &context;
     Engine_Backend *device;
@@ -439,6 +462,28 @@ struct Codegen {
     // input to a cell with an OnEvent. Called before anything is built.
     void check_cell_inputs() const;
 
+    // Refuses a population whose cell can never fire because its spikes come from child
+    // components (a spikeArray's spikes), which the engine runs only for an input. Called before
+    // anything is built.
+    void check_population_cells() const;
+
+    // network_inputs rows: each tick's input by tick parity (rows 0 and 1). With weighted
+    // arrivals, also the increments arriving on a tick, by tick parity (rows 2 and 3), and each
+    // neuron's running sum of them (row 4), which its select reads with row 0 or 1.
+    static constexpr s64 WEIGHTED_ARRIVAL_ROW = 2;
+    static constexpr s64 WEIGHTED_ARRIVAL_SUM_ROW = 4;
+
+    // Per synapse id. Filled by collect_synapse_deliveries from the connections, so before the
+    // engine allocates memory or builds the weight matrix, while it still has them.
+    Unordered_Map<String, Synapse_Delivery> synapse_deliveries;
+    void collect_synapse_deliveries();
+    const Synapse_Delivery &synapse_delivery(const NML_Component_Instance &synapse) const;
+    // Whether some synapse delivers weighted arrivals, and whether every synapse with connections does.
+    bool has_weighted_arrivals() const;
+    bool only_weighted_arrivals() const;
+    // Rows in network_inputs: 2, or 5 with weighted arrivals.
+    s64 network_input_row_count() const;
+
     Kernel_Node *create_kernel_root();
     Kernel_Node *translate_kernel_code();
     Kernel_List_Node *translate_component_type(const NML_Component_Type &component_type);
@@ -446,19 +491,25 @@ struct Codegen {
 
     // A synapse type's dynamics for one edge, with LEMS names still in it. Runs on a neuron's
     // edges while they are active (see synapse_active_ticks); each state variable is a plane.
-    Kernel_List_Node *translate_synapse_type(const NML_Component_Type &component_type);
+    // delivered_variable, which its targets read, goes into the target's next input row each tick.
+    Kernel_List_Node *translate_synapse_type(const NML_Component_Type &component_type, const String &delivered_variable);
     // The type's template with every state variable read from its plane, weight from the
-    // weight plane and every parameter by its value.
+    // weight plane and every parameter by its value. A weighted arrival's is translate_weighted_arrival.
     Kernel_List_Node *translate_synapse_instance(const NML_Component_Instance &synapse);
+    // A weighted arrival on one edge: when a spike reaches the target on the next tick, its OnEvent
+    // increment goes into the target's next row of weighted arrivals.
+    Kernel_List_Node *translate_weighted_arrival(const NML_Component_Instance &synapse);
 
-    // Weight-matrix planes the kernel uses: weight, delay, then one per state variable of the
-    // largest synapse type.
+    // Weight-matrix planes the kernel uses: weight, delay, then one per StateVariable kept per
+    // connection, for the synapse that keeps the most (see Synapse_Delivery).
     s64 edge_plane_count() const;
     // How many of those planes the generated kernel writes: the state-variable planes.
     s64 updated_edge_plane_count() const;
     // Ticks after a neuron spikes during which its outgoing synapses can be away from rest: the
     // longest delay plus the slowest synapse's settle time. -1 when some synapse cannot be left
-    // at rest, so every synapse runs every tick.
+    // at rest, so every synapse runs every tick. Weighted arrivals have nothing to settle, so when
+    // every synapse with connections delivers them it is the longest delay less one, the tick a
+    // spike's last arrival is sent.
     s64 synapse_active_ticks() const;
     Kernel_Node *translate_expression(const Lems_Parse_Node *node);
     Kernel_Node *translate_lems(const String &expression, const String &owner_name);
