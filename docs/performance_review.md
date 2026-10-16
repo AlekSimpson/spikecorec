@@ -1,8 +1,8 @@
 # Performance review
 
 Made on 2026-10-07, branch `agent_integration_2`, commit `843fb03`, as a read-only review, and
-brought up to date on 2026-10-15: items 15, 28 and 31 were fixed and are gone, the others keep
-their numbers, and items 3, 4, 5 and 24 describe the current S and update queue. The measurements are the
+brought up to date on 2026-10-15: items 15, 28, 31 and 32 were fixed and are gone, the others keep
+their numbers, and items 3, 4, 5, 24 and 26 describe the current S and update queue. The measurements are the
 baseline from before any speed work. It is based on:
 - the generated master kernels of nine models;
 - the shared device helpers;
@@ -233,14 +233,16 @@ batched into one submission.
 ### 24. Merging updates every tick (high)
 
 `Weight_Matrix::compact_pending_deltas` runs after every walk pass of every tick whenever synapse
-state changes. On each run it:
-- copies every entry of S, for every plane (`current_deltas`);
-- fully sorts each plane;
-- rebuilds the whole pool and every plane's row starts.
+state changes. It merges the queue into S in place and copies only the queue, sorted by
+connection. Each run still touches all of S on the CPU:
+- one pass drops the entries the device zeroed;
+- the merge moves every entry above a plane's first queued connection;
+- every plane's row starts are recomputed over all neurons.
 
-That is O(S log S) work on the CPU per tick, with S up to about 90% of connections while synapses
-are active. It is the most likely cause of the faster-than-linear growth: 84 ms per tick at
-2 million connections.
+That is O(S + neurons) work per walk pass, with S up to about 90% of connections while synapses are
+active. (Until 2026-10-15 each run also copied all of S and fully sorted every plane, O(S log S);
+that was the most likely cause of the faster-than-linear growth measured here, 84 ms per tick at
+2 million connections.)
 
 ### 25. Random numbers drawn on the CPU for every slot (medium)
 
@@ -250,7 +252,8 @@ Poisson source only uses its draw on the tick it fires, so with 100,000 Poisson 
 
 ### 26. Kernel arguments rebuilt each tick (low)
 
-The argument list is rebuilt through map lookups and function-object calls on every tick.
+The argument list is rebuilt through map lookups and function-object calls on every tick, and
+again before every deferred walk pass, since a merge can move S into a larger slab.
 
 ### 27. Spike recording scans all neurons (low)
 
@@ -297,22 +300,6 @@ cells one call costs about 60 ticks of GPU time.
 
   `parse()` alone is also quadratic in the number of `explicitInput`s: 0.28 s at 4000 inputs and
   2.6 s at 12,000. That cause was not traced.
-
-### 32. The k²-tree build briefly uses about 60× the finished tree's memory (medium)
-
-`K2_Tree::from_adjacency_list` keeps an `Unordered_Map<u64, s32>` entry per non-empty block per
-level. It also stores every tree bit as an `s32` in a growing vector before packing. Peak memory
-during the build is about 400–530 bytes per connection, against 6–8 bytes per connection in the
-finished tree. This caps the size of network that can be built at all.
-
-- **Location:** `src/spikecorec/core/k2tree.cpp:187-225`.
-- **Measured** (`random_fixed_outdegree`, out-degree 10):
-
-  | Connections | Build time | Finished tree | Peak memory growth |
-  |---|---|---|---|
-  | 100k | 0.025 s | 0.5 MB | 34 MB |
-  | 1M | 0.7 s | 7.5 MB | 395 MB |
-  | 2.5M | 2.9 s | 21 MB | 1328 MB |
 
 ## Where to start
 

@@ -147,8 +147,10 @@ Ticks run one at a time, in order from 0: the tick must be `engine.ticks_stepped
 ## The parsed model
 
 `engine.context` is the model the engine was built from; its per-edge list
-(`simulation.network_data`) is released once the engine is built, since `engine.weights` holds
-every edge. `nml.NML_Context` parses a model on its own, with no GPU.
+(`simulation.network_data`) is released while the weight matrix is built, since `engine.weights`
+holds every edge. An engine built from an adjacency list never fills it: the connections are read
+from the adjacency itself, and `simulation.sampled_connections` holds one per synapse and target
+population. `nml.NML_Context` parses a model on its own, with no GPU.
 
 ```python
 from spikecorec import nml

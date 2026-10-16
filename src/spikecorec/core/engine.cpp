@@ -199,10 +199,6 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
 
     calibrate_zero_start_planes();
 
-    // The weight matrix and the kernel now hold every edge, and nothing reads the parsed per-edge
-    // list again; at about 80 bytes an edge it would outweigh the matrix, so it is released.
-    context.simulation.network_data = Adjacency_List(0, 0);
-
     alive = true;
     logger->info("Spike_Engine constructed from {}: {} neurons, {} edges, {} cell types, "
                  "{} synapse components, dt={} s, {} ticks, spike history {} rows",
@@ -221,11 +217,6 @@ void Spike_Engine::initialize_model_buffers() {
 }
 
 void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count) {
-    Vector<Vector<NML_Network_Edge>> edges_by_source(static_cast<usize>(total_neuron_count));
-    for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
-        for (const NML_Network_Edge &edge : row) edges_by_source[static_cast<usize>(edge.parent)].push_back(edge);
-    }
-
     // A synapse's prototype index is its position in synapse_instances, as in codegen.
     Unordered_Map<String, s32> synapse_prototype_indices;
     for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
@@ -241,28 +232,58 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
     Vector<f32> weight;
     Vector<s32> delay_ticks;
 
-    s64 ordinal = 0;
-    for (usize source = 0; source < edges_by_source.size(); source += 1) {
-        Vector<NML_Network_Edge> &edges = edges_by_source[source];
-        std::stable_sort(edges.begin(), edges.end(),
-                         [](const NML_Network_Edge &left, const NML_Network_Edge &right) {
-                             return left.child < right.child;
-                         });
+    // One source's connections at a time, from the adjacency topology or from network_data. Each
+    // network_data row is released once read, so the parsed connections (about 80 bytes each) are
+    // gone before the k^2-tree and the fits need memory; codegen keeps each synapse's largest weight.
+    struct Row_Edge {
+        s32 child;
+        s32 prototype;
+        f32 weight;
+        s32 delay_ticks;
+    };
+    Vector<Row_Edge> row;
+    Vector<Vector<NML_Network_Edge>> &edges_by_source = context.simulation.network_data.list;
+    const Vector<Vector<s32>> *adjacency = topology_connections.adjacency;
+    const usize source_count = adjacency != nullptr ? adjacency->size() : edges_by_source.size();
+    s64 topology_edge = 0;
+    usize topology_synapse = 0;
 
-        for (usize index = 0; index < edges.size(); index += 1) {
-            const NML_Network_Edge &edge = edges[index];
-            if (index > 0 && edges[index - 1].child == edge.child) {
+    Vector<f64> largest_weight_per_prototype(synapse_prototype_indices.size(), -1.0);
+    s64 ordinal = 0;
+    for (usize source = 0; source < source_count; source += 1) {
+        row.clear();
+        if (adjacency != nullptr) {
+            const Vector<s64> &first_edge_of_synapse = topology_connections.first_edge_of_synapse;
+            for (s32 target : (*adjacency)[source]) {
+                while (topology_edge >= first_edge_of_synapse[topology_synapse + 1]) topology_synapse += 1;
+                row.push_back({target, static_cast<s32>(topology_synapse), topology_connections.weight,
+                               static_cast<s32>(topology_connections.delay_ticks)});
+                topology_edge += 1;
+            }
+        } else {
+            for (const NML_Network_Edge &edge : edges_by_source[source]) {
+                auto prototype = synapse_prototype_indices.find(edge.component_id);
+                if (prototype == synapse_prototype_indices.end()) {
+                    log::throw_runtime_error(*logger,
+                            "Spike_Engine: the connection " + to_string(source) + " -> " +
+                            to_string(edge.child) + " names no synapse, so there is nothing to "
+                            "carry its current");
+                }
+                row.push_back({static_cast<s32>(edge.child), prototype->second, edge.weight,
+                               static_cast<s32>(std::min<s64>(edge.delay_ticks, Numeric_Limits<s32>::max()))});
+            }
+            Vector<NML_Network_Edge>().swap(edges_by_source[source]);
+        }
+        std::stable_sort(row.begin(), row.end(),
+                         [](const Row_Edge &left, const Row_Edge &right) { return left.child < right.child; });
+        network[source].reserve(row.size());
+
+        for (usize index = 0; index < row.size(); index += 1) {
+            const Row_Edge &edge = row[index];
+            if (index > 0 && row[index - 1].child == edge.child) {
                 logger->warn("Spike_Engine: neuron {} connects to neuron {} more than once; "
                              "keeping the first connection", source, edge.child);
                 continue;
-            }
-
-            auto prototype = synapse_prototype_indices.find(edge.component_id);
-            if (prototype == synapse_prototype_indices.end()) {
-                log::throw_runtime_error(*logger,
-                        "Spike_Engine: the connection " + to_string(source) + " -> " +
-                        to_string(edge.child) + " names no synapse, so there is nothing to "
-                        "carry its current");
             }
 
             if (!std::isfinite(edge.weight)) {
@@ -271,13 +292,15 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
                         " has the weight " + to_string(edge.weight) + ", which the weight matrix cannot hold");
             }
 
-            network[source].push_back(static_cast<s32>(edge.child));
+            network[source].push_back(edge.child);
+            f64 &largest = largest_weight_per_prototype[static_cast<usize>(edge.prototype)];
+            largest = std::max(largest, std::fabs(static_cast<f64>(edge.weight)));
 
             // The engine's synaptic latency is one tick, so every delay is at least one tick.
-            const s32 edge_delay = static_cast<s32>(std::max<s64>(1, edge.delay_ticks));
+            const s32 edge_delay = std::max<s32>(1, edge.delay_ticks);
             const bool extends_current_run =
                     !first_edge_ordinal.empty() &&
-                    synapse_prototype.back() == prototype->second &&
+                    synapse_prototype.back() == edge.prototype &&
                     weight.back() == edge.weight &&
                     delay_ticks.back() == edge_delay &&
                     first_edge_ordinal.back() + edge_count.back() == ordinal;
@@ -287,12 +310,19 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
             } else {
                 first_edge_ordinal.push_back(ordinal);
                 edge_count.push_back(1);
-                synapse_prototype.push_back(prototype->second);
+                synapse_prototype.push_back(edge.prototype);
                 weight.push_back(edge.weight);
                 delay_ticks.push_back(edge_delay);
             }
             ordinal += 1;
         }
+    }
+    Vector<Row_Edge>().swap(row);
+    context.simulation.network_data = Adjacency_List(0, 0);
+    topology_connections = Topology_Connections();
+    for (const NML_Component_Instance &synapse : context.simulation.synapse_instances) {
+        const f64 largest = largest_weight_per_prototype[static_cast<usize>(synapse_prototype_indices.at(synapse.id))];
+        if (largest >= 0.0) context.simulation.largest_connection_weight_per_synapse[synapse.id] = largest;
     }
 
     // Each run's starting value per plane: weight, delay, then its synapse's StateVariables at
@@ -328,6 +358,8 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
     weights = Weight_Matrix(gpu, network, /*rank=*/-1, /*check_indexing=*/true,
                            /*max_neighbor_count=*/-1, /*weight_seed=*/static_cast<s64>(simulation_seed),
                            matrix_count, updated_plane_count);
+    // The matrix holds the topology now; released before the fits need memory.
+    Vector<Vector<s32>>().swap(network);
     weights.fit_tolerance = fit_tolerance;
     weights.fit_method = fit_method;
     weights.expected_active_edge_fraction = expected_active_edge_fraction;
@@ -489,15 +521,34 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
     first_edge_of_synapse.back() = edge_count;
 
     const s64 delay_ticks = units::seconds_to_ticks(connection_delay_seconds, simulation.step_dt);
-    simulation.network_data = Adjacency_List(static_cast<int>(neuron_count), 0);
-    simulation.total_edge_count = 0;
+    simulation.network_data = Adjacency_List(0, 0);
+    simulation.total_edge_count = edge_count;
     simulation.maximum_edge_delay = delay_ticks;
+    topology_connections.adjacency = &adjacency;
+    topology_connections.first_edge_of_synapse = first_edge_of_synapse;
+    topology_connections.weight = static_cast<f32>(connection_weight);
+    topology_connections.delay_ticks = delay_ticks;
 
+    // One connection per synapse and target population, for codegen's checks.
+    Vector<s64> population_ends;
+    for (const NML_Component_Instance *population : network_populations(context)) {
+        population_ends.push_back((population_ends.empty() ? 0 : population_ends.back()) + context.get_population_size(population));
+    }
+    Vector<u8> sampled(synapse_component_ids.size() * population_ends.size(), 0);
+    simulation.sampled_connections.clear();
     s64 edge_ordinal = 0;
     usize synapse_index = 0;
     for (usize source = 0; source < adjacency.size(); source += 1) {
         for (s32 target : adjacency[source]) {
             while (edge_ordinal >= first_edge_of_synapse[synapse_index + 1]) synapse_index += 1;
+            edge_ordinal += 1;
+
+            const usize population = static_cast<usize>(
+                    std::upper_bound(population_ends.begin(), population_ends.end(), static_cast<s64>(target)) - population_ends.begin());
+            if (population >= population_ends.size()) continue;
+            u8 &seen = sampled[synapse_index * population_ends.size() + population];
+            if (seen != 0) continue;
+            seen = 1;
 
             NML_Network_Edge edge;
             edge.component_id = synapse_component_ids[synapse_index];
@@ -505,10 +556,7 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
             edge.delay_ticks = delay_ticks;
             edge.parent = static_cast<s64>(source);
             edge.child = target;
-            simulation.network_data.add(edge);
-
-            simulation.total_edge_count += 1;
-            edge_ordinal += 1;
+            simulation.sampled_connections.push_back(edge);
         }
     }
 }
@@ -580,11 +628,16 @@ void Spike_Engine::dispatch_tick(s64 tick, bool plasticity_fold_due) {
     rank_float4_stride_argument = static_cast<s32>(weights.rank_float4_stride);
     simulation_time_argument = static_cast<decltype(simulation_time_argument)>(time_of_tick(tick, step_dt));
 
+    // Resolved again before every walk pass: a merge can move S into a larger slab.
     Vector<Engine_Pointer> parameters;
-    parameters.reserve(kernel_parameter_names.size());
-    for (const String &name : kernel_parameter_names) {
-        parameters.push_back(name == "tick" ? inline_scalar_argument(tick) : kernel_argument_sources.at(name)());
-    }
+    const auto resolve_parameters = [&]() {
+        parameters.clear();
+        parameters.reserve(kernel_parameter_names.size());
+        for (const String &name : kernel_parameter_names) {
+            parameters.push_back(name == "tick" ? inline_scalar_argument(tick) : kernel_argument_sources.at(name)());
+        }
+    };
+    resolve_parameters();
 
     weights.begin_first_walk_pass();
     if (!gpu.run_function(kernel_function, parameters, total_neuron_count)) {
@@ -596,6 +649,7 @@ void Spike_Engine::dispatch_tick(s64 tick, bool plasticity_fold_due) {
     // the queue could not take walks in another pass of the tick, after a merge made room.
     if (weights.updated_plane_count > 0 || plasticity_fold_due) weights.compact_pending_deltas();
     for (s64 deferred = weights.begin_next_walk_pass(); deferred > 0; deferred = weights.begin_next_walk_pass()) {
+        resolve_parameters();
         if (!gpu.run_function(kernel_function, parameters, deferred)) {
             log::throw_runtime_error(*logger,
                     "Spike_Engine: a deferred walk of tick " + to_string(tick) + " failed on the GPU");
@@ -641,11 +695,15 @@ void Spike_Engine::calibrate_zero_start_planes() {
     };
     force_spikes(0);
 
+    // Every neuron spikes, so S comes to hold every edge of each plane the kernel updates. Sized for
+    // that once, S never grows by copying into a larger slab.
+    weights.resize_delta_capacity(weights.updated_plane_count * weights.total_edge_count + weights.plasticity_reserve_entries);
+
     // The values taken are those at the tick where the planes' updates are largest (by their sum of
     // squares); a tick is kept when it beats the kept one by 5%, which saves copying S every tick.
     constexpr f64 KEPT_TICK_IMPROVEMENT = 1.05;
     const s64 tick_count = spike_spread + settle_ticks;
-    Vector<Vector<Pair<s64, f32>>> kept_updates(planes.size());
+    Vector<Vector<f32>> kept_values(planes.size());
     f64 kept_energy = 0.0;
     s64 kept_tick = 0;
     for (s64 tick = 1; tick <= tick_count; tick += 1) {
@@ -656,20 +714,23 @@ void Spike_Engine::calibrate_zero_start_planes() {
         if (energy <= kept_energy * KEPT_TICK_IMPROVEMENT) continue;
         kept_energy = energy;
         kept_tick = tick;
-        for (usize index = 0; index < planes.size(); index += 1) kept_updates[index] = weights.plane_updates(planes[index]);
-    }
-
-    // The planes hold no lanes, so their values are their updates.
-    for (usize index = 0; index < planes.size(); index += 1) {
-        Vector<f32> calibration_values(static_cast<usize>(weights.total_edge_count), 0.0f);
-        for (const Pair<s64, f32> &update : kept_updates[index]) calibration_values[static_cast<usize>(update.first)] = update.second;
-        weights.calibrate_lane_budget(planes[index], calibration_values);
+        for (usize index = 0; index < planes.size(); index += 1) {
+            kept_values[index] = Vector<f32>();
+            kept_values[index] = weights.plane_update_values(planes[index]);
+        }
     }
 
     std::memcpy(model_pointer.get_contents(), saved_model.data(), saved_model.size());
     random_generator = saved_random_generator;
     weights.discard_updates(refit_occupancy_threshold_fraction);
     deferred_walk_pass_count = 0;
+
+    // The planes hold no lanes, so their values are their updates. Fitted once S is back to its
+    // usual size, since the fits need the memory.
+    for (usize index = 0; index < planes.size(); index += 1) {
+        weights.calibrate_lane_budget(planes[index], kept_values[index]);
+        Vector<f32>().swap(kept_values[index]);
+    }
     calibration_tick_count = tick_count;
     logger->debug("Spike_Engine: calibrated the lane budgets of {} planes over {} ticks after a spike on every "
                   "neuron, spread over {} ticks, from the values at tick {}", planes.size(), tick_count, spike_spread,

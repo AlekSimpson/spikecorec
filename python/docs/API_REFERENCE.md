@@ -435,6 +435,7 @@ it into the basis. S grows if the plane is full.
 |---|---|
 | `planes_awaiting_lane_budget()` | planes that hold no lanes yet (those that started at zero) |
 | `plane_updates(matrix_index)` | `(edge_ordinals, deltas)`: one plane's updates in S |
+| `plane_update_values(matrix_index)` | float32[total_edge_count]: one plane's updates in S by ordinal, `0` where none |
 | `plane_update_sum_of_squares(matrix_index)` | the sum of squares of one plane's updates in S |
 | `calibrate_lane_budget(matrix_index, calibration_values)` | sets the lane budget of a plane with no lanes from values it is expected to hold (one per edge), searched with `lane_search_fit_method`; the plane keeps the fitted V rows and reads zero until its first refit |
 | `discard_updates(occupancy_threshold_fraction)` | empties S and the queue and sizes S for the threshold |
@@ -540,7 +541,9 @@ context.parse("LEMS_model.xml")      # no GPU involved
 | `global_constants` | dict[str, float] |
 | `cell_instances` | list[`NML_Component_Instance`] |
 | `synapse_instances` | list[`NML_Component_Instance`], in prototype order: an edge's prototype is its index here |
-| `network_data` | `Adjacency_List`; an engine's own context releases it once construction is done (read an engine's edges through `engine.weights`) |
+| `network_data` | `Adjacency_List`; an engine's own context releases it while building its weight matrix, row by row (read an engine's edges through `engine.weights`) |
+| `largest_connection_weight_per_synapse` | dict: synapse id → the largest \|weight\| of its connections, kept once an engine has released `network_data` |
+| `sampled_connections` | list of `NML_Network_Edge`: with an adjacency topology, which leaves `network_data` empty, one connection per synapse and target population |
 | `input_profiles` | list[`Simulation_Input_Config`] |
 | `recording_profiles` | list[`Recording_Config`] |
 

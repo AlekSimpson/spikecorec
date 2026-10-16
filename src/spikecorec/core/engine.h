@@ -258,8 +258,9 @@ namespace spikecorec {
         // every neuron as never spiked.
         void initialize_model_buffers();
 
-        // Builds the weight matrix from network_data: planes weight, delay, then synapse state
-        // variables, fitted from each run's starting values. Also copies the runs to the device.
+        // Builds the weight matrix from network_data, or from the adjacency topology when one was
+        // given: planes weight, delay, then synapse state variables, fitted from each run's
+        // starting values. Also copies the runs to the device.
         void build_weight_matrix(s64 matrix_count, s64 updated_plane_count);
 
         // Fills kernel_argument_sources; throws on a master_step parameter with no source.
@@ -272,12 +273,26 @@ namespace spikecorec {
         [[nodiscard]] s64 cell_memory_index_of(s64 neuron_index, const String &variable_name) const;
 
         // Replaces the document's connections with `adjacency`, split across the synapses by
-        // proportion. Runs before codegen, so everything downstream sees an ordinary parse result.
+        // proportion. Runs before codegen. The connections are read from `adjacency` itself by
+        // build_weight_matrix, not copied into network_data (about 80 bytes a connection); codegen
+        // sees one sampled connection per synapse and target population.
         void apply_topology(const Vector<Vector<s32>> &adjacency,
                             const Vector<String> &synapse_component_ids,
                             const Vector<f64> &synapse_proportions,
                             f64 connection_weight,
                             f64 connection_delay_seconds);
+
+        // The connections apply_topology was given, read by build_weight_matrix during construction
+        // only (adjacency is the constructor's argument). Synapse k carries the connections
+        // [first_edge_of_synapse[k], first_edge_of_synapse[k + 1]) in adjacency order, all with the
+        // same weight and delay.
+        struct Topology_Connections {
+            const Vector<Vector<s32>> *adjacency = nullptr;
+            Vector<s64> first_edge_of_synapse;
+            f32 weight = 0.0f;
+            s64 delay_ticks = 0;
+        };
+        Topology_Connections topology_connections;
 
         // `plane`, or empty_edge_plane when the model has no such buffer.
         [[nodiscard]] Engine_Pointer resolve_edge_plane(const Engine_Pointer &plane) const;

@@ -124,6 +124,17 @@ const Vector<Vector<s32>> &Weight_Matrix::validate_network(const Vector<Vector<s
     return network;
 }
 
+// The network's k^2-tree; throws when it cannot be built (the factory's warning says why).
+static K2_Tree build_network_tree(Engine_Backend &backend, const Vector<Vector<s32>> &network) {
+    Optional<K2_Tree> tree = K2_Tree::from_adjacency_list(backend, network, static_cast<s64>(network.size()));
+    if (!tree.has_value()) {
+        log::throw_runtime_error(log::logger(),
+            "Weight_Matrix: the network's k^2-tree cannot be built (see the warning above); a network of " +
+            to_string(network.size()) + " nodes");
+    }
+    return std::move(*tree);
+}
+
 Weight_Matrix::Weight_Matrix(
     Engine_Backend &backend,
     const Vector<Vector<s32>> &network,
@@ -134,7 +145,7 @@ Weight_Matrix::Weight_Matrix(
     s64 matrix_count,
     s64 updated_plane_count
 )
-    : k2tree(*K2_Tree::from_adjacency_list(backend, validate_network(network), static_cast<s64>(network.size())))
+    : k2tree(build_network_tree(backend, validate_network(network)))
     , matrix_count(matrix_count)
     , updated_plane_count(updated_plane_count)
     , owning_backend(&backend)
@@ -636,19 +647,37 @@ void Weight_Matrix::resize_delta_capacity(s64 new_capacity) {
     if (new_capacity == sparse_delta_capacity) return;
     require_storage("resize_delta_capacity");
 
-    Vector<Vector<Pair<s64, f32>>> deltas = current_deltas();
     s64 held = 0;
-    for (const Vector<Pair<s64, f32>> &plane : deltas) held += static_cast<s64>(plane.size());
+    for (s64 entry_count : sparse_delta_entry_count) held += entry_count;
     if (held > new_capacity) {
         log::throw_runtime_error(log::logger(),
             "Weight_Matrix::resize_delta_capacity: S holds " + to_string(held) + " updates, more than the " +
             to_string(new_capacity) + " asked for");
     }
+    move_delta_storage(new_capacity);
+}
 
-    owning_backend->deallocate_slab(delta_slab);
+void Weight_Matrix::move_delta_storage(s64 new_capacity) {
+    const Engine_Pointer old_slab = delta_slab;
+    const Engine_Pointer old_row_start = sparse_delta_row_start;
+    const Engine_Pointer old_edge_ordinal = sparse_delta_edge_ordinal;
+    const Engine_Pointer old_value = sparse_delta_value;
+    const Vector<s64> entry_count = sparse_delta_entry_count;
+    s64 held = 0;
+    for (s64 count : entry_count) held += count;
+
     sparse_delta_capacity = new_capacity;
     allocate_delta_storage();
-    rebuild_sparse_deltas(deltas);
+    if (!old_row_start.is_empty() && !sparse_delta_row_start.is_empty()) {
+        memcpy(sparse_delta_row_start.get_contents(), old_row_start.get_contents(),
+               static_cast<usize>(matrix_count) * (static_cast<usize>(node_count) + 1) * sizeof(s32));
+    }
+    if (held > 0) {
+        memcpy(sparse_delta_edge_ordinal.get_contents(), old_edge_ordinal.get_contents(), static_cast<usize>(held) * sizeof(u32));
+        memcpy(sparse_delta_value.get_contents(), old_value.get_contents(), static_cast<usize>(held) * sizeof(f32));
+    }
+    sparse_delta_entry_count = entry_count;
+    owning_backend->deallocate_slab(old_slab);
 }
 
 s64 Weight_Matrix::pending_capacity_for_threshold(f32 occupancy_threshold_fraction) const {
@@ -663,10 +692,12 @@ void Weight_Matrix::resize_pending_delta_capacity(s64 new_capacity) {
 }
 
 s64 Weight_Matrix::grown_delta_capacity(s64 required_entries) const {
-    // Doubling keeps a growing S from reallocating every tick; each plane holds at most one update
-    // per edge.
+    // Doubling keeps a growing S from reallocating every tick. Each plane holds at most one update
+    // per edge, and during a run only the planes the kernel updates gain any, so doubling stops at
+    // their edges (a host update to another plane still gets the room it needs).
+    const s64 updated_planes_limit = max<s64>(updated_plane_count, 1) * total_edge_count + plasticity_reserve_entries;
     return min(matrix_count * total_edge_count + plasticity_reserve_entries,
-               max(required_entries, 2 * max<s64>(sparse_delta_capacity, 1)));
+               max(required_entries, min(2 * max<s64>(sparse_delta_capacity, 1), updated_planes_limit)));
 }
 
 void Weight_Matrix::rebuild_sparse_deltas(Vector<Vector<Pair<s64, f32>>> &deltas) {
@@ -790,40 +821,148 @@ void Weight_Matrix::compact_pending_deltas() {
     const f32 *staged_value = pending_delta_value.get_contents_as<f32>();
     const u8 *staged_matrix_index = pending_delta_matrix_index.get_contents_as<u8>();
 
-    Vector<Vector<Pair<s64, f32>>> deltas = current_deltas();
+    // The queued updates by plane, sorted by edge, with each edge's updates summed. A sum of zero
+    // changes nothing, so it is dropped. Only the queue is copied; S is merged in place.
+    Vector<Vector<Pair<u32, f32>>> queued(static_cast<usize>(matrix_count));
+    {
+        Vector<s64> queued_count(static_cast<usize>(matrix_count), 0);
+        for (s64 index = 0; index < staged; ++index) {
+            if (staged_matrix_index[index] < matrix_count) queued_count[staged_matrix_index[index]] += 1;
+        }
+        for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
+            queued[static_cast<usize>(matrix_index)].reserve(static_cast<usize>(queued_count[static_cast<usize>(matrix_index)]));
+        }
+    }
     for (s64 index = 0; index < staged; ++index) {
         const s64 matrix_index = staged_matrix_index[index];
         if (matrix_index >= matrix_count) continue;
-
-        deltas[static_cast<usize>(matrix_index)].emplace_back(static_cast<s64>(staged_ordinal[index]), staged_value[index]);
+        queued[static_cast<usize>(matrix_index)].emplace_back(staged_ordinal[index], staged_value[index]);
     }
     *pending_count = 0;
-
-    // Sum each edge's updates and drop sums of exactly zero, with the entries the device zeroed in
-    // place (it changes an S entry in place even to zero, so that no edge in S ever queues).
-    for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
-        Vector<Pair<s64, f32>> &plane = deltas[static_cast<usize>(matrix_index)];
+    for (Vector<Pair<u32, f32>> &plane : queued) {
         sort(plane.begin(), plane.end(),
-             [](const Pair<s64, f32> &left, const Pair<s64, f32> &right) {
-                 return left.first < right.first;
-             });
-
-        Vector<Pair<s64, f32>> merged;
-        for (const Pair<s64, f32> &delta : plane) {
-            if (!merged.empty() && merged.back().first == delta.first) {
-                merged.back().second += delta.second;
+             [](const Pair<u32, f32> &left, const Pair<u32, f32> &right) { return left.first < right.first; });
+        usize kept = 0;
+        for (usize index = 0; index < plane.size(); index += 1) {
+            if (kept > 0 && plane[kept - 1].first == plane[index].first) {
+                plane[kept - 1].second += plane[index].second;
             } else {
-                merged.push_back(delta);
+                plane[kept] = plane[index];
+                kept += 1;
             }
         }
-        merged.erase(remove_if(merged.begin(), merged.end(),
-                               [](const Pair<s64, f32> &delta) { return delta.second == 0.0f; }),
-                     merged.end());
-        plane = std::move(merged);
+        plane.resize(kept);
+        plane.erase(remove_if(plane.begin(), plane.end(), [](const Pair<u32, f32> &update) { return update.second == 0.0f; }),
+                    plane.end());
+    }
+
+    // An update to an edge already in S is added to its entry, leaving only edges S lacks queued.
+    u32 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<u32>();
+    f32 *entry_value = sparse_delta_value.get_contents_as<f32>();
+    {
+        s64 start = 0;
+        for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
+            const s64 entry_count = sparse_delta_entry_count[static_cast<usize>(matrix_index)];
+            Vector<Pair<u32, f32>> &updates = queued[static_cast<usize>(matrix_index)];
+            usize kept = 0;
+            for (const Pair<u32, f32> &update : updates) {
+                const u32 *found = lower_bound(entry_ordinal + start, entry_ordinal + start + entry_count, update.first);
+                if (found != entry_ordinal + start + entry_count && *found == update.first) {
+                    entry_value[found - entry_ordinal] += update.second;
+                } else {
+                    updates[kept] = update;
+                    kept += 1;
+                }
+            }
+            updates.resize(kept);
+            start += entry_count;
+        }
+    }
+
+    // Drop the entries that are now zero, with those the device zeroed in place (it changes an S
+    // entry in place even to zero, so that no edge in S ever queues). The planes stay packed from
+    // position 0.
+    Vector<s64> plane_start(static_cast<usize>(matrix_count), 0);
+    {
+        s64 read = 0;
+        s64 write = 0;
+        for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
+            s64 &entry_count = sparse_delta_entry_count[static_cast<usize>(matrix_index)];
+            plane_start[static_cast<usize>(matrix_index)] = write;
+            const s64 plane_end = read + entry_count;
+            for (; read < plane_end; read += 1) {
+                if (entry_value[read] == 0.0f) continue;
+                entry_ordinal[write] = entry_ordinal[read];
+                entry_value[write] = entry_value[read];
+                write += 1;
+            }
+            entry_count = write - plane_start[static_cast<usize>(matrix_index)];
+        }
+    }
+
+    // Each plane gains one entry per queued edge.
+    Vector<s64> merged_count(static_cast<usize>(matrix_count), 0);
+    s64 merged_total = 0;
+    for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
+        merged_count[static_cast<usize>(matrix_index)] = sparse_delta_entry_count[static_cast<usize>(matrix_index)] +
+                                                         static_cast<s64>(queued[static_cast<usize>(matrix_index)].size());
+        merged_total += merged_count[static_cast<usize>(matrix_index)];
     }
 
     // S grows rather than lose an update; the engine shrinks it after the next refit.
-    rebuild_sparse_deltas(deltas);
+    if (merged_total > sparse_delta_capacity) {
+        move_delta_storage(grown_delta_capacity(merged_total));
+        entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<u32>();
+        entry_value = sparse_delta_value.get_contents_as<f32>();
+        log::logger().debug("compact_pending_deltas: S grew to {} updates", sparse_delta_capacity);
+    }
+
+    // Planes merge last to first, each from its end. Every step writes an entry, so a plane's write
+    // position never falls below its read position; its merged entries start no earlier than its
+    // entries do and end where the next plane's merged entries start, so no entry is overwritten
+    // before it is read.
+    s64 merged_end = merged_total;
+    for (s64 matrix_index = matrix_count - 1; matrix_index >= 0; --matrix_index) {
+        const Vector<Pair<u32, f32>> &updates = queued[static_cast<usize>(matrix_index)];
+        const s64 start = plane_start[static_cast<usize>(matrix_index)];
+        const s64 merged_start = merged_end - merged_count[static_cast<usize>(matrix_index)];
+        s64 read = start + sparse_delta_entry_count[static_cast<usize>(matrix_index)];
+        s64 write = merged_end;
+        for (usize update_index = updates.size(); update_index > 0; --update_index) {
+            const Pair<u32, f32> &update = updates[update_index - 1];
+            for (; read > start && entry_ordinal[read - 1] > update.first; --read) {
+                write -= 1;
+                entry_ordinal[write] = entry_ordinal[read - 1];
+                entry_value[write] = entry_value[read - 1];
+            }
+            write -= 1;
+            entry_ordinal[write] = update.first;
+            entry_value[write] = update.second;
+        }
+        // The entries below the plane's first queued edge move as one block, if at all.
+        const s64 remaining = read - start;
+        if (merged_start != start) {
+            memmove(entry_ordinal + merged_start, entry_ordinal + start, static_cast<usize>(remaining) * sizeof(u32));
+            memmove(entry_value + merged_start, entry_value + start, static_cast<usize>(remaining) * sizeof(f32));
+        }
+        sparse_delta_entry_count[static_cast<usize>(matrix_index)] = merged_count[static_cast<usize>(matrix_index)];
+        plane_start[static_cast<usize>(matrix_index)] = merged_start;
+        merged_end = merged_start;
+    }
+
+    s32 *row_start_base = sparse_delta_row_start.get_contents_as<s32>();
+    if (row_start_base != nullptr) {
+        for (s64 matrix_index = 0; matrix_index < matrix_count; ++matrix_index) {
+            s32 *row_start = row_start_base + matrix_index * (node_count + 1);
+            const s64 plane_end = plane_start[static_cast<usize>(matrix_index)] + sparse_delta_entry_count[static_cast<usize>(matrix_index)];
+            s64 position = plane_start[static_cast<usize>(matrix_index)];
+            for (s64 node_index = 0; node_index <= node_count; ++node_index) {
+                const s64 row_first_ordinal = edge_row_offset_host[static_cast<usize>(node_index)];
+                while (position < plane_end && static_cast<s64>(entry_ordinal[position]) < row_first_ordinal) position += 1;
+                row_start[node_index] = static_cast<s32>(position);
+            }
+        }
+    }
     log::logger().debug("compact_pending_deltas: merged {} updates", staged);
 }
 
@@ -849,6 +988,18 @@ Vector<Pair<s64, f32>> Weight_Matrix::plane_updates(s64 matrix_index) const {
         updates.emplace_back(static_cast<s64>(entry_ordinal[index]), entry_value[index]);
     }
     return updates;
+}
+
+Vector<f32> Weight_Matrix::plane_update_values(s64 matrix_index) const {
+    validate_matrix_index(matrix_index);
+    Vector<f32> values(static_cast<usize>(max<s64>(total_edge_count, 0)), 0.0f);
+    const s64 entry_count = sparse_delta_entry_count[static_cast<usize>(matrix_index)];
+    if (entry_count == 0 || sparse_delta_row_start.is_empty()) return values;
+    const s64 plane_start = sparse_delta_row_start.get_contents_as<s32>()[matrix_index * (node_count + 1)];
+    const u32 *entry_ordinal = sparse_delta_edge_ordinal.get_contents_as<u32>();
+    const f32 *entry_value = sparse_delta_value.get_contents_as<f32>();
+    for (s64 index = plane_start; index < plane_start + entry_count; index += 1) values[entry_ordinal[index]] = entry_value[index];
+    return values;
 }
 
 f64 Weight_Matrix::plane_update_sum_of_squares(s64 matrix_index) const {

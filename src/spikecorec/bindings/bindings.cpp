@@ -481,6 +481,13 @@ PYBIND11_MODULE(_spikecorec, m) {
         .def_property_readonly("network_data", [](py::object self) {
             return reference_or_none(&self.cast<const NML_Context::NML_Simulation_Context &>().network_data, self);
         })
+        .def_readonly("largest_connection_weight_per_synapse",
+                      &NML_Context::NML_Simulation_Context::largest_connection_weight_per_synapse,
+                      "The largest |weight| of the connections each synapse carries, kept once an engine "
+                      "has released network_data.")
+        .def_readonly("sampled_connections", &NML_Context::NML_Simulation_Context::sampled_connections,
+                      "With an adjacency topology (network_data empty): one connection per synapse and "
+                      "target population.")
         .def_property_readonly("input_profiles", [](py::object self) {
             return references_in(self.cast<const NML_Context::NML_Simulation_Context &>().input_profiles, self);
         })
@@ -857,6 +864,10 @@ PYBIND11_MODULE(_spikecorec, m) {
             return py::make_tuple(to_numpy(ordinals.data(), static_cast<s64>(ordinals.size())),
                                   to_numpy(deltas.data(), static_cast<s64>(deltas.size())));
         }, py::arg("matrix_index"), "(edge_ordinals, deltas): one plane's updates in S, by ordinal.")
+        .def("plane_update_values", [](const Weight_Matrix &self, s64 matrix_index) {
+            const Vector<f32> values = self.plane_update_values(matrix_index);
+            return to_numpy(values.data(), static_cast<s64>(values.size()));
+        }, py::arg("matrix_index"), "float32[total_edge_count]: one plane's updates in S by ordinal, 0 where none.")
         .def("plane_update_sum_of_squares", &Weight_Matrix::plane_update_sum_of_squares, py::arg("matrix_index"),
              "The sum of squares of one plane's updates in S.")
         .def("calibrate_lane_budget", [](Weight_Matrix &self, s64 matrix_index,
