@@ -83,6 +83,22 @@ random. Because edges are ordered by source, a share is a run of source neurons,
 neuron at a boundary can carry both. `weights.get_edge_synapse_prototype` gives any
 edge's synapse, as an index into `synapse_component_ids`.
 
+```python
+Spike_Engine(lems_input_file, adjacency, synapse_component_ids, connection_values,
+            enable_hebbian_plasticity=False, fit_tolerance=FIT_TOLERANCE_STANDARD,
+            fit_method=Weight_Matrix.Fit_Method.MASKED_ALTERNATING_LEAST_SQUARES,
+            expected_active_edge_fraction=Weight_Matrix.DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION)
+```
+Each edge's synapse, weight and delay from `connection_values(source, target)`, which returns
+a `Spike_Engine.Connection_Values(synapse_index, weight, delay_seconds)`; `synapse_index` is
+an index into `synapse_component_ids`. Neurons are numbered across the document's populations
+in order. Nothing is kept per edge: `connection_values` is called twice for each edge during
+construction (once to check the topology, for the longest delay and the input checks, and once
+to build the weight matrix), so it must return the same values for an edge every time. It
+raises `RuntimeError` for a synapse index outside the list or a negative delay. Calling into
+Python for every edge is slow on large networks; in C++ the same constructor takes a
+`Spike_Engine::Connection_Values_Function`.
+
 Construction parses and validates the document, allocates the model's buffers, fits the
 weight matrix, and generates and compiles the kernel. It raises `RuntimeError` when the
 adjacency names a neuron outside the network, a named synapse is not declared, or the model

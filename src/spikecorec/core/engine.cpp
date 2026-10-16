@@ -53,6 +53,36 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
                          f32 fit_tolerance,
                          Weight_Matrix::Fit_Method fit_method,
                          f32 expected_active_edge_fraction)
+    : Spike_Engine(lems_input_file, adjacency, synapse_component_ids, synapse_proportions, connection_weight,
+                  connection_delay_seconds, Connection_Values_Function(), enable_hebbian_plasticity, fit_tolerance,
+                  fit_method, expected_active_edge_fraction) {}
+
+Spike_Engine::Spike_Engine(const String &lems_input_file,
+                         const Vector<Vector<s32>> &adjacency,
+                         const Vector<String> &synapse_component_ids,
+                         const Connection_Values_Function &connection_values,
+                         bool enable_hebbian_plasticity,
+                         f32 fit_tolerance,
+                         Weight_Matrix::Fit_Method fit_method,
+                         f32 expected_active_edge_fraction)
+    : Spike_Engine(lems_input_file, adjacency, synapse_component_ids, Vector<f64>{}, 1.0, 0.0, connection_values,
+                  enable_hebbian_plasticity, fit_tolerance, fit_method, expected_active_edge_fraction) {
+    if (!connection_values && !adjacency.empty()) {
+        log::throw_invalid_argument(*logger, "Spike_Engine: connection_values is empty, so no connection has values");
+    }
+}
+
+Spike_Engine::Spike_Engine(const String &lems_input_file,
+                         const Vector<Vector<s32>> &adjacency,
+                         const Vector<String> &synapse_component_ids,
+                         const Vector<f64> &synapse_proportions,
+                         f64 connection_weight,
+                         f64 connection_delay_seconds,
+                         const Connection_Values_Function &connection_values,
+                         bool enable_hebbian_plasticity,
+                         f32 fit_tolerance,
+                         Weight_Matrix::Fit_Method fit_method,
+                         f32 expected_active_edge_fraction)
     : logger(log::make_logger())
     , hebbian_plasticity_enabled(enable_hebbian_plasticity)
     , fit_tolerance(fit_tolerance)
@@ -73,7 +103,7 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
 
     if (!adjacency.empty()) {
         apply_topology(adjacency, synapse_component_ids, synapse_proportions,
-                       connection_weight, connection_delay_seconds);
+                       connection_weight, connection_delay_seconds, connection_values);
     }
 
     total_neuron_count = context.simulation.total_neuron_count;
@@ -252,7 +282,14 @@ void Spike_Engine::build_weight_matrix(s64 matrix_count, s64 updated_plane_count
     s64 ordinal = 0;
     for (usize source = 0; source < source_count; source += 1) {
         row.clear();
-        if (adjacency != nullptr) {
+        if (adjacency != nullptr && topology_connections.connection_values) {
+            for (s32 target : (*adjacency)[source]) {
+                const Connection_Values values = topology_connections.connection_values(static_cast<s32>(source), target);
+                const s64 edge_delay_ticks = units::seconds_to_ticks(values.delay_seconds, context.simulation.step_dt);
+                row.push_back({target, values.synapse_index, static_cast<f32>(values.weight),
+                               static_cast<s32>(std::min<s64>(edge_delay_ticks, Numeric_Limits<s32>::max()))});
+            }
+        } else if (adjacency != nullptr) {
             const Vector<s64> &first_edge_of_synapse = topology_connections.first_edge_of_synapse;
             for (s32 target : (*adjacency)[source]) {
                 while (topology_edge >= first_edge_of_synapse[topology_synapse + 1]) topology_synapse += 1;
@@ -460,12 +497,14 @@ s64 Spike_Engine::cell_memory_index_of(s64 neuron_index, const String &variable_
 }
 
 // adjacency[n] lists neuron n's targets. Every edge gets connection_weight and the delay; the
-// synapses take consecutive edges in order, by proportion (equal shares when none are given).
+// synapses take consecutive edges in order, by proportion (equal shares when none are given), or
+// connection_values gives each edge's synapse, weight and delay.
 void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
                                  const Vector<String> &synapse_component_ids,
                                  const Vector<f64> &synapse_proportions,
                                  f64 connection_weight,
-                                 f64 connection_delay_seconds) {
+                                 f64 connection_delay_seconds,
+                                 const Connection_Values_Function &connection_values) {
     NML_Context::NML_Simulation_Context &simulation = context.simulation;
     const s64 neuron_count = simulation.total_neuron_count;
 
@@ -500,47 +539,74 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
 
     // In adjacency order, synapse k takes the edges
     // [first_edge_of_synapse[k], first_edge_of_synapse[k + 1]). A share may round to no edges.
-    f64 proportion_total = 0.0;
-    for (usize index = 0; index < synapse_component_ids.size(); index += 1) {
-        const f64 proportion = synapse_proportions.empty() ? 1.0 : synapse_proportions[index];
-        if (!std::isfinite(proportion) || proportion < 0.0) {
-            log::throw_runtime_error(*logger, "apply_topology: synapse '" + synapse_component_ids[index] +
-                                     "' has the proportion " + to_string(proportion) + "; each must be finite and not negative");
-        }
-        proportion_total += proportion;
-    }
-    if (proportion_total <= 0.0) {
-        log::throw_runtime_error(*logger, "apply_topology: the synapse proportions sum to zero, so no synapse takes the edges");
-    }
+    // With connection_values every edge names its own synapse instead.
     Vector<s64> first_edge_of_synapse = {0};
-    f64 running_proportion = 0.0;
-    for (usize index = 0; index < synapse_component_ids.size(); index += 1) {
-        running_proportion += synapse_proportions.empty() ? 1.0 : synapse_proportions[index];
-        first_edge_of_synapse.push_back(std::llround(running_proportion / proportion_total * static_cast<f64>(edge_count)));
+    if (!connection_values) {
+        f64 proportion_total = 0.0;
+        for (usize index = 0; index < synapse_component_ids.size(); index += 1) {
+            const f64 proportion = synapse_proportions.empty() ? 1.0 : synapse_proportions[index];
+            if (!std::isfinite(proportion) || proportion < 0.0) {
+                log::throw_runtime_error(*logger, "apply_topology: synapse '" + synapse_component_ids[index] +
+                                         "' has the proportion " + to_string(proportion) + "; each must be finite and not negative");
+            }
+            proportion_total += proportion;
+        }
+        if (proportion_total <= 0.0) {
+            log::throw_runtime_error(*logger, "apply_topology: the synapse proportions sum to zero, so no synapse takes the edges");
+        }
+        f64 running_proportion = 0.0;
+        for (usize index = 0; index < synapse_component_ids.size(); index += 1) {
+            running_proportion += synapse_proportions.empty() ? 1.0 : synapse_proportions[index];
+            first_edge_of_synapse.push_back(std::llround(running_proportion / proportion_total * static_cast<f64>(edge_count)));
+        }
+        first_edge_of_synapse.back() = edge_count;
     }
-    first_edge_of_synapse.back() = edge_count;
 
     const s64 delay_ticks = units::seconds_to_ticks(connection_delay_seconds, simulation.step_dt);
     simulation.network_data = Adjacency_List(0, 0);
     simulation.total_edge_count = edge_count;
-    simulation.maximum_edge_delay = delay_ticks;
     topology_connections.adjacency = &adjacency;
+    topology_connections.connection_values = connection_values;
     topology_connections.first_edge_of_synapse = first_edge_of_synapse;
     topology_connections.weight = static_cast<f32>(connection_weight);
     topology_connections.delay_ticks = delay_ticks;
 
-    // One connection per synapse and target population, for codegen's checks.
+    // One pass over the connections for the longest delay, which sizes the spike history, and for
+    // one connection per synapse and target population, for codegen's checks.
     Vector<s64> population_ends;
     for (const NML_Component_Instance *population : network_populations(context)) {
         population_ends.push_back((population_ends.empty() ? 0 : population_ends.back()) + context.get_population_size(population));
     }
     Vector<u8> sampled(synapse_component_ids.size() * population_ends.size(), 0);
     simulation.sampled_connections.clear();
+    simulation.maximum_edge_delay = connection_values ? 0 : delay_ticks;
     s64 edge_ordinal = 0;
-    usize synapse_index = 0;
+    usize proportion_synapse = 0;
     for (usize source = 0; source < adjacency.size(); source += 1) {
         for (s32 target : adjacency[source]) {
-            while (edge_ordinal >= first_edge_of_synapse[synapse_index + 1]) synapse_index += 1;
+            usize synapse_index = 0;
+            f64 weight = connection_weight;
+            s64 edge_delay_ticks = delay_ticks;
+            if (connection_values) {
+                const Connection_Values values = connection_values(static_cast<s32>(source), target);
+                if (values.synapse_index < 0 || static_cast<usize>(values.synapse_index) >= synapse_component_ids.size()) {
+                    log::throw_runtime_error(*logger, "apply_topology: the connection " + to_string(source) + " -> " +
+                                             to_string(target) + " names synapse " + to_string(values.synapse_index) +
+                                             ", outside the " + to_string(synapse_component_ids.size()) + " given");
+                }
+                if (!std::isfinite(values.delay_seconds) || values.delay_seconds < 0.0) {
+                    log::throw_runtime_error(*logger, "apply_topology: the connection " + to_string(source) + " -> " +
+                                             to_string(target) + " has the delay " + to_string(values.delay_seconds) +
+                                             " s; each must be finite and not negative");
+                }
+                synapse_index = static_cast<usize>(values.synapse_index);
+                weight = values.weight;
+                edge_delay_ticks = units::seconds_to_ticks(values.delay_seconds, simulation.step_dt);
+                simulation.maximum_edge_delay = std::max(simulation.maximum_edge_delay, edge_delay_ticks);
+            } else {
+                while (edge_ordinal >= first_edge_of_synapse[proportion_synapse + 1]) proportion_synapse += 1;
+                synapse_index = proportion_synapse;
+            }
             edge_ordinal += 1;
 
             const usize population = static_cast<usize>(
@@ -552,8 +618,8 @@ void Spike_Engine::apply_topology(const Vector<Vector<s32>> &adjacency,
 
             NML_Network_Edge edge;
             edge.component_id = synapse_component_ids[synapse_index];
-            edge.weight = static_cast<f32>(connection_weight);
-            edge.delay_ticks = delay_ticks;
+            edge.weight = static_cast<f32>(weight);
+            edge.delay_ticks = edge_delay_ticks;
             edge.parent = static_cast<s64>(source);
             edge.child = target;
             simulation.sampled_connections.push_back(edge);

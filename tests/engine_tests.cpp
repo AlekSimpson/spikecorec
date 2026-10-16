@@ -2082,6 +2082,42 @@ TEST(Topology, an_empty_share_takes_no_edges_and_bad_proportions_are_refused) {
     EXPECT_THROW(Spike_Engine(lems, adjacency, synapses, Vector<f64>{1.0, -1.0, 1.0}), Runtime_Error);
 }
 
+// connection_values gives each connection its own synapse, weight and delay. It is asked twice per
+// connection, and a synapse index outside the list or a negative delay is refused.
+TEST(Topology, connection_values_give_each_connection_its_synapse_weight_and_delay) {
+    const Temporary_Directory directory;
+    const String lems = write_model(directory, torus_model(16), "torusNetwork", "10ms", "0.1ms");
+    const Vector<Vector<s32>> adjacency = random_fixed_outdegree(4, 5, 3);  // 80 edges
+    const Vector<String> synapses = {"torusSynapse", "otherSynapse"};
+
+    // Odd sources take the second synapse; the weight follows the target's half of the network
+    // and the delay the source's.
+    const auto expected_weight = [](s32 target) { return target < 8 ? 2.0 : -3.0; };
+    const auto expected_delay_ticks = [](s32 source) { return source < 8 ? 10 : 25; };
+    s64 call_count = 0;
+    const auto values_of = [&](s32 source, s32 target) {
+        call_count += 1;
+        return Spike_Engine::Connection_Values{source % 2, expected_weight(target), source < 8 ? 1.0e-3 : 2.5e-3};
+    };
+    Spike_Engine engine(lems, adjacency, synapses, values_of);
+    EXPECT_EQ(call_count, 2 * 80);
+
+    for (s32 source = 0; source < 16; source += 1) {
+        for (s32 target : adjacency[static_cast<usize>(source)]) {
+            EXPECT_EQ(engine.weights.get_edge_synapse_prototype(source, target), source % 2);
+            EXPECT_NEAR(engine.weights.get(source, target), expected_weight(target), 0.01 * 3.0)
+                << source << " -> " << target;
+            EXPECT_EQ(engine.weights.get_edge_delay_ticks(source, target), expected_delay_ticks(source))
+                << source << " -> " << target;
+        }
+    }
+
+    const auto outside_synapse = [](s32, s32) { return Spike_Engine::Connection_Values{2, 1.0, 1.0e-3}; };
+    EXPECT_THROW(Spike_Engine(lems, adjacency, synapses, outside_synapse), Runtime_Error);
+    const auto negative_delay = [](s32, s32) { return Spike_Engine::Connection_Values{0, 1.0, -1.0e-3}; };
+    EXPECT_THROW(Spike_Engine(lems, adjacency, synapses, negative_delay), Runtime_Error);
+}
+
 // ── randomness ──────────────────────────────────────────────────────────────────
 
 namespace {

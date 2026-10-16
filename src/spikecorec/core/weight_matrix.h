@@ -302,13 +302,16 @@ namespace spikecorec {
         // (calibration_values, one per edge): the fewest lanes, searched with lane_search_fit_method,
         // that hold them within fit_tolerance, times one plus expected_active_edge_fraction, within
         // what lane_cap leaves after the other planes. The plane keeps the fitted V rows and zero U,
-        // so it reads exactly zero until its first refit, which starts from those rows.
+        // so it reads exactly zero until its first refit, which starts from those rows. S is left as
+        // it is: the fit holds the nonzero values (8 bytes each) while it runs.
         void calibrate_lane_budget(s64 matrix_index, const Vector<f32> &calibration_values);
 
         // Empties S and the queue, dropping every update, and shrinks S to occupancy_threshold_fraction.
         void discard_updates(f32 occupancy_threshold_fraction);
 
-        // Refits each plane that has updates to the basis plus S with fit_method, then empties S.
+        // Refits each plane that has updates to the basis plus S with fit_method, then empties S. A
+        // plane's fit reads its S entries keyed by target node, and its values from the basis plus
+        // them, so it keeps nothing per edge.
         // A plane changes only its own lanes, starting from them and moving only the rows at either
         // end of an updated edge. Its lane count never changes: construction chose it, or, for a
         // plane with no lanes yet (a state plane starts at zero), the plane's first refit chooses
@@ -436,18 +439,59 @@ namespace spikecorec {
             Engine_Pointer slab;
         };
 
-        // Each edge's target and each node's edges out and in, as the fits read them; an edge's
-        // source is found from outgoing_offset by binary search, so no array of sources is kept. All
-        // u32: the k^2-tree's 32-bit indices keep the edge count below 2^31.
-        struct Fit_Graph {
+        // A plane's values as a fit reads them: CSR over source rows, each row's entries keyed by
+        // target node and sorted, with s32 positions as in S. A fit walks the k^2-tree for the
+        // connections and looks each one up here, so it keeps nothing per edge. With adds_to_basis
+        // set the entries are updates to what the plane's basis holds (a refit reads its S entries
+        // this way); otherwise they are the plane's values. storage is set when the entries have a
+        // slab of their own rather than being a view of S.
+        struct Fit_Values {
             Unique_Pointer<Fit_Scratch> storage;
-            Engine_Pointer edge_target;      // [total_edge_count]
-            Engine_Pointer outgoing_offset;  // [node_count + 1]: node n's edges are ordinals [n] up to [n + 1]
-            Engine_Pointer incoming_offset;  // [node_count + 1]: node n's incoming edges are incoming_edge[[n] up to [n + 1]]
-            Engine_Pointer incoming_edge;    // [total_edge_count], edge ordinals grouped by target
+            Engine_Pointer row_start;  // s32[node_count + 1]: node n's entries are positions [n] up to [n + 1]
+            Engine_Pointer target;     // u32 per entry
+            Engine_Pointer value;      // f32 per entry
+            s64 entry_count = 0;
+            bool adds_to_basis = false;
         };
 
-        [[nodiscard]] Fit_Graph build_fit_graph() const;
+        // A plane's values from one value per edge ordinal, keeping those that are not zero.
+        [[nodiscard]] Fit_Values plane_values_from(const Function<f32(s64)> &value_of_ordinal) const;
+
+        // Plane matrix_index's entries in S, as updates to its basis, once key_plane_updates_by_target
+        // has keyed them by target node.
+        [[nodiscard]] Fit_Values updates_of_plane(s64 matrix_index) const;
+
+        // Rekeys one plane's S entries between edge ordinals, which ticks read, and target nodes,
+        // which fits read. Within a row both orders are the same, so the entries stay sorted.
+        void key_plane_updates_by_target(s64 matrix_index);
+        void key_plane_updates_by_ordinal(s64 matrix_index);
+
+        // A plane's values over every edge, with values' entries in place: their root mean square over
+        // the finite ones, and how many are not finite. For updates, each value is the basis plus its
+        // update, which takes a walk over every edge; otherwise only the entries are read.
+        struct Plane_Value_Statistics {
+            f64 root_mean_square = 0.0;
+            s64 non_finite_count = 0;
+        };
+        [[nodiscard]] Plane_Value_Statistics plane_value_statistics(s64 matrix_index, const Fit_Values &values) const;
+
+        // The scalars every walking fit kernel reads, laid out as Fit_Walk_Constants in
+        // weight_fit_kernels.metal.
+        struct Fit_Walk_Constants {
+            u32 node_count;
+            u32 branching_factor;
+            u32 superblock_size_words;
+            u32 padded_node_count;
+            u32 tree_height;
+            u32 internal_bit_count;
+            u32 basis_lane_count;
+            u32 target_lane_count;
+            f32 target_lane_sign;
+            f32 inverse_scale;
+            u32 lane_count;
+            f32 ridge;
+            u32 walkers_per_row;
+        };
 
         // One plane's fit. The plane's own lanes are copied into dense working arrays, one row per
         // node and one column per own lane, scaled so that the lanes' coefficient is the plane's RMS.
@@ -455,29 +499,39 @@ namespace spikecorec {
             s64 matrix_index = 0;
             Vector<s64> own_lanes;          // basis lanes, in working-column order
             f64 scale = 0.0;                // the plane's RMS: its own lanes' coefficient
+            f64 value_root_mean_square = 0.0;  // the plane's values' RMS (the scale, unless they are all zero)
             s64 non_finite_value_count = 0;  // values no basis can hold; they get no weight
             f64 target_tolerance = 0.0;      // the worst relative error the candidates stop at
 
-            // The rows the fit may move, sources then targets, and how many edges have a moved end.
-            // When every edge does (a fit from scratch), touched_edge_buffer is not filled: the edge
-            // ordinals are the indices.
+            // The rows the fit may move, sources then targets. When every row with a connection moves
+            // (a fit from scratch), every connection is touched.
             s64 moved_source_count = 0;
             Vector<u32> moved_rows;
-            s64 touched_edge_count = 0;
             bool every_edge_is_touched = false;
 
-            // residual_target: what the own lanes must hold at each edge, in units of the scale
-            // (the value less what lanes shared with other planes give), or NaN for a value no
-            // basis can hold; an edge's weight, 1 / max(|target|, 1)^2, comes from it (none for
-            // NaN). weighted_residual: the weight times the last residual. touched_edge_buffer: the
-            // touched edges' ordinals. The partials take one reduction value per threadgroup.
+            // What the own lanes must hold at a connection (its target, fit_target in
+            // weight_fit_kernels.metal), in units of the scale: the basis over target_lanes times
+            // target_lane_sign, plus the connection's entry in values. For updates, target_lanes are
+            // the plane's own lanes, whose values before the fit the updates add to; for whole values,
+            // the lanes the plane shares with other planes, whose part the own lanes cancel. A target
+            // is NaN for a value no basis can hold; its weight, 1 / max(|target|, 1)^2, is then zero.
+            const Fit_Values *values = nullptr;
+            Vector<u32> target_lanes;
+            f32 target_lane_sign = 1.0f;
+
+            // Per node, 1 when its row moves as a source. Evaluating the touched connections, the
+            // row walks of the moved sources count theirs, and the column walks of the moved targets
+            // skip those. Device copies follow; the partials take one reduction value per threadgroup.
+            Vector<u8> source_moves;
             Unique_Pointer<Fit_Scratch> storage;
-            Engine_Pointer residual_target;
-            Engine_Pointer weighted_residual;
-            Engine_Pointer touched_edge_buffer;
+            Engine_Pointer source_move_buffer;
             Engine_Pointer moved_row_buffer;
-            Engine_Pointer first_partials;   // evaluate_edges: loss
-            Engine_Pointer second_partials;  // evaluate_edges: worst error
+            Engine_Pointer target_lane_buffer;
+            Engine_Pointer first_partials;   // evaluate_edges: loss, the row walks' then the column walks'
+            Engine_Pointer second_partials;  // evaluate_edges: worst error, likewise
+            // How many partials evaluate_edges' last row and column walks wrote, for read_edge_evaluation.
+            mutable s64 row_walk_partial_count = 0;
+            mutable s64 column_walk_partial_count = 0;
             Engine_Pointer gradient_first_partials;   // evaluate_gradient: ridge term
             Engine_Pointer gradient_second_partials;  // evaluate_gradient: slope
             Engine_Pointer dot_partials;     // dot_products, MAXIMUM_DOT_PRODUCT_LEFT_SLOT_COUNT rows
@@ -489,17 +543,32 @@ namespace spikecorec {
             Engine_Pointer working_v;
         };
 
-        // Sets up one plane's fit to targets (its value at every edge). With changed edges, only
-        // the rows at either end of one move; with none, every row with an edge moves.
-        [[nodiscard]] Plane_Fit_Problem prepare_plane_fit(s64 matrix_index, const Vector<f32> &targets,
-                                                          const Vector<s64> &changed_edge_ordinals,
-                                                          const Fit_Graph &graph);
+        // Sets up one plane's fit to values. With every_row_moves set, every row with a connection
+        // moves; otherwise (updates) only the rows at either end of an entry.
+        [[nodiscard]] Plane_Fit_Problem prepare_plane_fit(s64 matrix_index, const Fit_Values &values,
+                                                          bool every_row_moves);
+
+        // The arguments every walking fit kernel starts with, in the order weight_fit_kernels.metal
+        // takes them. constants must outlive the launch.
+        [[nodiscard]] Fit_Walk_Constants fit_walk_constants(const Plane_Fit_Problem &problem, f32 ridge_regularization) const;
+        [[nodiscard]] Vector<Engine_Pointer> fit_walk_arguments(const Plane_Fit_Problem &problem,
+                                                                const Fit_Walk_Constants &constants) const;
+
+        // Host versions of the kernels' helpers: a connection's entry in the fit's values (zero when
+        // there is none), and its target.
+        [[nodiscard]] static f32 fit_value_at(const Fit_Values &values, u32 source_node, u32 target_node);
+        [[nodiscard]] f32 fit_target(const Plane_Fit_Problem &problem, u32 source_node, u32 target_node, f32 value) const;
+
+        // Host walks: calls visit(other_end) for each of node's targets (along its row) or sources
+        // (along its column), ascending, using buffer for the walk's output.
+        template <typename Visit>
+        void for_each_connection_of(u32 node, bool along_column, Vector<u32> &buffer, const Visit &visit) const;
 
         // The rows a fit from scratch starts from: the first lane holds each source row's mean value
         // against target rows of one, the second rows of one against each target column's mean less
         // the overall mean, so values that are a source part plus a target part start next to their
         // exact fit; the other lanes hold N(0, lane_count^-1/4) values.
-        void fill_fresh_rows(const Plane_Fit_Problem &problem, const Fit_Graph &graph, unsigned seed) const;
+        void fill_fresh_rows(const Plane_Fit_Problem &problem, unsigned seed) const;
 
         // Points the problem at the plane's current own lanes, sets their coefficient to the scale
         // (rescaling U so no value changes) and copies them into fresh working arrays.
@@ -513,17 +582,17 @@ namespace spikecorec {
         // (see FIT_STALL_IMPROVEMENT) ends it. Leaves the best rows it found in the working
         // arrays and returns their worst relative error over the touched edges.
         f64 fit_plane_by_limited_memory_broyden_fletcher_goldfarb_shanno(Plane_Fit_Problem &problem,
-                                                                         const Fit_Graph &graph,
                                                                          f32 ridge_regularization);
-        f64 fit_plane_by_masked_alternating_least_squares(Plane_Fit_Problem &problem, const Fit_Graph &graph,
-                                                          f32 ridge_regularization);
+        f64 fit_plane_by_masked_alternating_least_squares(Plane_Fit_Problem &problem, f32 ridge_regularization);
 
         // Runs the candidate fit_method names.
-        f64 fit_plane_with_selected_method(Plane_Fit_Problem &problem, const Fit_Graph &graph,
-                                           f32 ridge_regularization);
+        f64 fit_plane_with_selected_method(Plane_Fit_Problem &problem, f32 ridge_regularization);
 
+        // A fit's outcome: whether it met its tolerance, and its worst relative error over every edge
+        // (infinite when the plane holds a value no basis can hold).
         struct Plane_Fit_Result {
             bool meets_tolerance = true;
+            f64 worst_error = 0.0;
         };
 
         // Construction: fits the plane from scratch at 1, 2, 4, ... own lanes until one meets
@@ -531,19 +600,18 @@ namespace spikecorec {
         // keeps the fit with the smallest error. With a required_lane_count above zero it fits at
         // exactly that many lanes instead. The probes work outside the basis, which takes only the
         // chosen lanes.
-        // A lane_limit above zero caps the lanes the search may use.
-        Plane_Fit_Result search_fewest_lanes(s64 matrix_index, const Vector<f32> &targets, const Fit_Graph &graph,
-                                             f32 ridge_regularization, f32 search_tolerance,
-                                             s64 required_lane_count = 0, s64 lane_limit = 0);
+        // A lane_limit above zero caps the lanes the search may use. The search frees the plane's
+        // lanes first, so values that add to the basis must belong to a plane that holds none.
+        Plane_Fit_Result search_fewest_lanes(s64 matrix_index, const Fit_Values &values, f32 ridge_regularization,
+                                             f32 search_tolerance, s64 required_lane_count = 0, s64 lane_limit = 0);
 
         // Refit: fits the plane within its lane budget. From its current lanes, moving only the
         // rows at either end of a changed edge; from fresh rows, moving every row, when its lanes
         // hold nothing. A plane with no lanes yet (one that started at zero) gets its budget here,
         // once, from the first values it holds: the fewest lanes that meet fit_tolerance, times one
         // plus expected_active_edge_fraction, within what lane_cap leaves after the other planes.
-        Plane_Fit_Result refit_plane(s64 matrix_index, const Vector<f32> &targets,
-                                     const Vector<s64> &changed_edge_ordinals, const Fit_Graph &graph,
-                                     f32 ridge_regularization);
+        // updates are the plane's S entries, keyed by target. Records the plane's measured_fit_error.
+        Plane_Fit_Result refit_plane(s64 matrix_index, const Fit_Values &updates, f32 ridge_regularization);
 
         // Construction: frees every lane, searches every plane with starting values for its fewest
         // lanes, sets each plane's lane budget (see expected_active_edge_fraction), cuts the largest
@@ -551,10 +619,10 @@ namespace spikecorec {
         // its budget, fitting again any plane cut below its fewest lanes. A plane that starts at zero
         // takes no lanes: it counts for the largest budget in the cut, which keeps room under the
         // cap, and gets its own budget at its first refit. Returns whether every plane meets
-        // fit_tolerance.
-        // plane_targets(m) gives plane m's value at every edge; it is called once per use, so only
-        // one plane's values are held at a time.
-        bool fit_every_plane_within_lane_budgets(const Function<Vector<f32>(s64)> &plane_targets, const Fit_Graph &graph,
+        // fit_tolerance, and records each plane's measured_fit_error.
+        // plane_values(m) gives plane m's values; it is called once per use, so only one plane's
+        // values are held at a time.
+        bool fit_every_plane_within_lane_budgets(const Function<Fit_Values(s64)> &plane_values,
                                                  f32 ridge_regularization);
 
         // The most lanes the planes may hold together: the kernel limit, and the most that keep the
@@ -609,24 +677,24 @@ namespace spikecorec {
             f64 loss = 0.0;         // the sum of 0.5 * weight * residual^2 over the touched edges
             f64 worst_error = 0.0;  // the worst relative error over them
         };
-        // Residuals of the working arrays at the touched edges; stores the weighted residuals.
-        [[nodiscard]] Edge_Evaluation evaluate_edges(const Plane_Fit_Problem &problem, const Fit_Graph &graph) const;
+        // Residuals of the working arrays at the touched edges, or at every edge with every_edge set.
+        [[nodiscard]] Edge_Evaluation evaluate_edges(const Plane_Fit_Problem &problem, bool every_edge = false) const;
         [[nodiscard]] Edge_Evaluation read_edge_evaluation(const Plane_Fit_Problem &problem) const;
 
         // Masked alternating least squares: solves every moved row on one side, given the other, by
         // QR, in batches of batch_row_count rows. The scratch holds each batch row's triangle
         // (lane_count^2) and two vectors (2 * lane_count).
-        void solve_rows(const Plane_Fit_Problem &problem, const Fit_Graph &graph, bool solving_sources,
-                        f32 ridge_regularization, const Engine_Pointer &triangle_scratch,
-                        const Engine_Pointer &vector_scratch, s64 batch_row_count) const;
+        void solve_rows(const Plane_Fit_Problem &problem, bool solving_sources, f32 ridge_regularization,
+                        const Engine_Pointer &triangle_scratch, const Engine_Pointer &vector_scratch,
+                        s64 batch_row_count) const;
 
         struct Gradient_Evaluation {
             f64 ridge_term = 0.0;  // 0.5 * ridge * |moved rows|^2
             f64 slope = 0.0;       // gradient . direction
         };
-        // The packed gradient at the working arrays, from the weighted residuals evaluate_edges stored.
-        [[nodiscard]] Gradient_Evaluation evaluate_gradient(const Plane_Fit_Problem &problem, const Fit_Graph &graph,
-                                                            f32 ridge_regularization, const Engine_Pointer &direction,
+        // The packed gradient at the working arrays, recomputing each connection's residual.
+        [[nodiscard]] Gradient_Evaluation evaluate_gradient(const Plane_Fit_Problem &problem, f32 ridge_regularization,
+                                                            const Engine_Pointer &direction,
                                                             const Engine_Pointer &gradient) const;
         [[nodiscard]] Gradient_Evaluation read_gradient_evaluation(const Plane_Fit_Problem &problem) const;
 
@@ -667,20 +735,11 @@ namespace spikecorec {
         void linear_combination(const Engine_Pointer &basis, u64 length, u32 vector_count,
                                 const Engine_Pointer &coefficients, const Engine_Pointer &output) const;
 
-        // One plane's value at every edge, from its value on each run.
-        [[nodiscard]] Vector<f32> plane_targets_from_runs(const Vector<f32> &value_per_run) const;
-
         // Merges neighbouring runs with the same prototype, once the values are in the basis.
         void merge_runs_by_prototype();
 
-        // One plane's value at every edge: the basis plus these updates. What a refit fits to.
-        [[nodiscard]] Vector<f32> plane_values_with_deltas(s64 matrix_index, const Vector<Pair<s64, f32>> &deltas,
-                                                           const Fit_Graph &graph) const;
-
-        // Fills measured_fit_error from the basis alone, against the values it was fitted to, for
-        // each plane whose targets are given (non-empty); the others keep theirs.
-        void measure_fit_error(const Vector<Vector<f32>> &targets_per_matrix, const Fit_Graph &graph);
-        void measure_plane_fit_error(s64 matrix_index, const Vector<f32> &targets, const Fit_Graph &graph);
+        // Sets one plane's measured_fit_error.
+        void record_fit_error(s64 matrix_index, f64 worst_error);
 
     public:
         // The worst of measured_fit_error over every plane.

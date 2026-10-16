@@ -215,6 +215,29 @@ namespace spikecorec {
                     Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
                     f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
+        // One connection's synapse (an index into synapse_component_ids), weight and delay in seconds.
+        struct Connection_Values {
+            s32 synapse_index = 0;
+            f64 weight = 1.0;
+            f64 delay_seconds = 0.0;
+        };
+        using Connection_Values_Function = Function<Connection_Values(s32 source_neuron, s32 target_neuron)>;
+
+        // The same, with each connection's synapse, weight and delay from connection_values instead.
+        // Neurons are numbered across the document's populations in order. Nothing is kept per
+        // connection: connection_values is called twice for each one, once while the topology is
+        // checked (for the longest delay and the input checks) and once while the weight matrix is
+        // built, so it must give the same values for a connection every time. It is not kept after
+        // construction.
+        Spike_Engine(const String &lems_input_file,
+                    const Vector<Vector<s32>> &adjacency,
+                    const Vector<String> &synapse_component_ids,
+                    const Connection_Values_Function &connection_values,
+                    bool enable_hebbian_plasticity = false,
+                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
+                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::MASKED_ALTERNATING_LEAST_SQUARES,
+                    f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
+
         ~Spike_Engine();
 
         // Steps every tick of the run not yet stepped, so it resumes a stopped run. after_each_tick,
@@ -272,22 +295,42 @@ namespace spikecorec {
         // Where one neuron's variable sits in cell_state.
         [[nodiscard]] s64 cell_memory_index_of(s64 neuron_index, const String &variable_name) const;
 
-        // Replaces the document's connections with `adjacency`, split across the synapses by
-        // proportion. Runs before codegen. The connections are read from `adjacency` itself by
-        // build_weight_matrix, not copied into network_data (about 80 bytes a connection); codegen
-        // sees one sampled connection per synapse and target population.
+        // Every public constructor runs this one. With adjacency empty the document's connections
+        // are used; otherwise adjacency's, with their values from connection_values when it is set,
+        // and from synapse_proportions, connection_weight and connection_delay_seconds when not.
+        Spike_Engine(const String &lems_input_file,
+                    const Vector<Vector<s32>> &adjacency,
+                    const Vector<String> &synapse_component_ids,
+                    const Vector<f64> &synapse_proportions,
+                    f64 connection_weight,
+                    f64 connection_delay_seconds,
+                    const Connection_Values_Function &connection_values,
+                    bool enable_hebbian_plasticity,
+                    f32 fit_tolerance,
+                    Weight_Matrix::Fit_Method fit_method,
+                    f32 expected_active_edge_fraction);
+
+        // Replaces the document's connections with `adjacency`: each connection's values come from
+        // connection_values when it is set, and otherwise the connections are split across the
+        // synapses by proportion and share one weight and delay. Runs before codegen. The
+        // connections are read from `adjacency` itself by build_weight_matrix, not copied into
+        // network_data (about 80 bytes a connection); codegen sees one sampled connection per
+        // synapse and target population, and the longest delay.
         void apply_topology(const Vector<Vector<s32>> &adjacency,
                             const Vector<String> &synapse_component_ids,
                             const Vector<f64> &synapse_proportions,
                             f64 connection_weight,
-                            f64 connection_delay_seconds);
+                            f64 connection_delay_seconds,
+                            const Connection_Values_Function &connection_values);
 
         // The connections apply_topology was given, read by build_weight_matrix during construction
-        // only (adjacency is the constructor's argument). Synapse k carries the connections
+        // only (adjacency is the constructor's argument). With connection_values set, it gives each
+        // connection's values; otherwise synapse k carries the connections
         // [first_edge_of_synapse[k], first_edge_of_synapse[k + 1]) in adjacency order, all with the
         // same weight and delay.
         struct Topology_Connections {
             const Vector<Vector<s32>> *adjacency = nullptr;
+            Connection_Values_Function connection_values;
             Vector<s64> first_edge_of_synapse;
             f32 weight = 0.0f;
             s64 delay_ticks = 0;

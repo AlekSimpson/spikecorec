@@ -237,7 +237,7 @@ kernel void master_step(
     thread uint walk_stack_row_base[MAX_K2TREE_HEIGHT];
     thread uint walk_stack_column_base[MAX_K2TREE_HEIGHT];
     thread int walk_stack_block_size[MAX_K2TREE_HEIGHT];
-    thread int walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
+    thread uint walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
     thread int walk_stack_next_column[MAX_K2TREE_HEIGHT];
     walk_stack_row_base[0] = 0;
     walk_stack_column_base[0] = 0;
@@ -293,26 +293,27 @@ __device__ inline float spikecorec_heaviside(float value) {
     return value > 0.0f ? 1.0f : 0.0f;
 }
 
-// CUDA port of the k^2-tree helpers in k2tree_device.metalinc.
-__device__ inline unsigned int k2t_get_bit(const unsigned int *words, int bit_index) {
-    return (words[bit_index >> 5] >> (unsigned int)(bit_index & 31)) & 1u;
+// CUDA port of the k^2-tree helpers in k2tree_device.metalinc. Bit positions are unsigned, so a
+// tree may hold up to 2^32 bits.
+__device__ inline unsigned int k2t_get_bit(const unsigned int *words, unsigned int bit_index) {
+    return (words[bit_index >> 5] >> (bit_index & 31u)) & 1u;
 }
 
-__device__ inline int k2t_rank1_exclusive(
+__device__ inline unsigned int k2t_rank1_exclusive(
     const unsigned int *internal_words,
     const unsigned int *superblock_table,
     const unsigned short *subblock_table,
-    int position,
+    unsigned int position,
     int superblock_size
 ) {
-    const int word_index = position >> 5;
-    const int bit_offset = position & 31;
-    const int superblock_index = word_index / superblock_size;
+    const unsigned int word_index = position >> 5;
+    const unsigned int bit_offset = position & 31u;
+    const unsigned int superblock_index = word_index / (unsigned int)superblock_size;
     const unsigned int superblock_base = superblock_table[superblock_index];
     const unsigned int subblock_base = (unsigned int)subblock_table[word_index];
-    const unsigned int partial_word_mask = (bit_offset == 0) ? 0u : ((1u << (unsigned int)bit_offset) - 1u);
+    const unsigned int partial_word_mask = (bit_offset == 0u) ? 0u : ((1u << bit_offset) - 1u);
     const unsigned int partial_word_popcount = __popc(internal_words[word_index] & partial_word_mask);
-    return (int)(superblock_base + subblock_base + partial_word_popcount);
+    return superblock_base + subblock_base + partial_word_popcount;
 }
 
 // Returns row_node's next neighbor, resuming the DFS from the caller's stack, or K2T_NO_NEIGHBOR
@@ -331,7 +332,7 @@ __device__ inline unsigned int k2t_next_neighbor(
     unsigned int *stack_row_base,
     unsigned int *stack_column_base,
     int *stack_block_size,
-    int *stack_bit_offset,
+    unsigned int *stack_bit_offset,
     int *stack_next_column,
     int &stack_top
 ) {
@@ -349,12 +350,12 @@ __device__ inline unsigned int k2t_next_neighbor(
         const unsigned int row_base = stack_row_base[level];
         const unsigned int column_base = stack_column_base[level];
         const int block_size = stack_block_size[level];
-        const int level_bit_offset = stack_bit_offset[level];
+        const unsigned int level_bit_offset = stack_bit_offset[level];
 
         const int child_block_size = block_size / branching_factor;
         const int row_offset = (int)((row_node - row_base) / (unsigned int)child_block_size);
         const int child_flat_index = row_offset * branching_factor + column_offset;
-        const int bit_position = level_bit_offset + child_flat_index;
+        const unsigned int bit_position = level_bit_offset + (unsigned int)child_flat_index;
 
         if (level == tree_height - 1) {
             if (k2t_get_bit(leaf_node_words, bit_position)) {
@@ -364,14 +365,14 @@ __device__ inline unsigned int k2t_next_neighbor(
                 }
             }
         } else if (k2t_get_bit(internal_node_words, bit_position)) {
-            const int rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
-                                                           rank_subblock_table, bit_position, superblock_size_words) + 1;
+            const unsigned int rank_inclusive = k2t_rank1_exclusive(internal_node_words, rank_superblock_table,
+                                                                    rank_subblock_table, bit_position, superblock_size_words) + 1u;
             const int child_level = stack_top + 1;
-            const int raw_offset = branching_factor_squared * rank_inclusive;
+            const unsigned int raw_offset = (unsigned int)branching_factor_squared * rank_inclusive;
             stack_row_base[child_level] = row_base + (unsigned int)(row_offset * child_block_size);
             stack_column_base[child_level] = column_base + (unsigned int)(column_offset * child_block_size);
             stack_block_size[child_level] = child_block_size;
-            stack_bit_offset[child_level] = (child_level == tree_height - 1) ? (raw_offset - internal_bit_count) : raw_offset;
+            stack_bit_offset[child_level] = (child_level == tree_height - 1) ? (raw_offset - (unsigned int)internal_bit_count) : raw_offset;
             stack_next_column[child_level] = 0;
             stack_top = child_level;
         }
@@ -590,7 +591,7 @@ extern "C" __global__ void master_step(
     unsigned int walk_stack_row_base[MAX_K2TREE_HEIGHT];
     unsigned int walk_stack_column_base[MAX_K2TREE_HEIGHT];
     int walk_stack_block_size[MAX_K2TREE_HEIGHT];
-    int walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
+    unsigned int walk_stack_bit_offset[MAX_K2TREE_HEIGHT];
     int walk_stack_next_column[MAX_K2TREE_HEIGHT];
     walk_stack_row_base[0] = 0;
     walk_stack_column_base[0] = 0;
