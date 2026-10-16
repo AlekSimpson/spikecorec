@@ -1433,12 +1433,13 @@ Kernel_Node *Codegen::translate_kernel_code() {
 
         // When every synapse delivers weighted arrivals, a neuron's edges have work only on a tick
         // one of its spikes reaches a target on the next tick: one a delay less one tick ago, for
-        // some delay in the network's range. Any other tick skips the walk.
-        if (only_weighted_arrivals()) {
+        // some delay in the network's range. Any other tick skips the walk. With a shortest delay
+        // of one tick that is every tick of the active window, which master_step already tests.
+        const s64 shortest_delay = std::max<s64>(1, context.simulation.minimum_edge_delay);
+        const s64 longest_delay = std::max<s64>(1, context.simulation.maximum_edge_delay);
+        if (only_weighted_arrivals() && shortest_delay > 1) {
             const s64 walk_stack_index = find_statement(body, "walk_stack_row_base");
             if (walk_stack_index < 0) throw Runtime_Error("translate_kernel_code: master_step declares no 'walk_stack_row_base'");
-            const s64 shortest_delay = std::max<s64>(1, context.simulation.minimum_edge_delay);
-            const s64 longest_delay = std::max<s64>(1, context.simulation.maximum_edge_delay);
 
             Kernel_Node *spike_row = new_expression("%", new_expression("-", identifier("tick"), identifier("elapsed_ticks")),
                                                     identifier("spike_history_length"));
