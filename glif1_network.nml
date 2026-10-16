@@ -1,0 +1,40 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif1Network">
+
+  <!--
+    Ten GLIF1 cells in a ring: cell i connects to cell (i + 1) % 10, every connection with the
+    same weight and delay. A 500 pA step drives cell 0; each spike fires the next cell, so
+    activity travels around the ring.
+    tau = C / gL = 10 ms and rheobase = gL * (vth - EL) = 200 pA, so the drive alone fires
+    cell 0 about every 10 ms.
+  -->
+
+  <include href="tests/fixtures/nml/glif_cell_types.nml"/>
+
+  <GLIF1Cell id="glif1Cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             t_ref="5ms"/>
+
+  <alphaCurrentSynapse id="ringSynapse" tau="2ms" ibase="1nA"/>
+
+  <pulseGenerator id="drive" delay="0ms" duration="200ms" amplitude="500pA"/>
+
+  <network id="glif1Network">
+    <population id="ring" component="glif1Cell" size="10"/>
+
+    <projection id="ringProjection" presynapticPopulation="ring" postsynapticPopulation="ring"
+                synapse="ringSynapse">
+      <connectionWD id="0" preCellId="../ring[0]" postCellId="../ring[1]" weight="1" delay="2ms"/>
+      <connectionWD id="1" preCellId="../ring[1]" postCellId="../ring[2]" weight="1" delay="2ms"/>
+      <connectionWD id="2" preCellId="../ring[2]" postCellId="../ring[3]" weight="1" delay="2ms"/>
+      <connectionWD id="3" preCellId="../ring[3]" postCellId="../ring[4]" weight="1" delay="2ms"/>
+      <connectionWD id="4" preCellId="../ring[4]" postCellId="../ring[5]" weight="1" delay="2ms"/>
+      <connectionWD id="5" preCellId="../ring[5]" postCellId="../ring[6]" weight="1" delay="2ms"/>
+      <connectionWD id="6" preCellId="../ring[6]" postCellId="../ring[7]" weight="1" delay="2ms"/>
+      <connectionWD id="7" preCellId="../ring[7]" postCellId="../ring[8]" weight="1" delay="2ms"/>
+      <connectionWD id="8" preCellId="../ring[8]" postCellId="../ring[9]" weight="1" delay="2ms"/>
+      <connectionWD id="9" preCellId="../ring[9]" postCellId="../ring[0]" weight="1" delay="2ms"/>
+    </projection>
+
+    <explicitInput target="ring[0]" input="drive"/>
+  </network>
+
+</neuroml>

@@ -47,9 +47,20 @@ MTL::Library *load_default_metal_library(MTL::Device *device) {
 
 String describe_metal_error(NS::Error *error) {
     return error
-        ? String(error->localizedDescription()->utf8String()) 
+        ? String(error->localizedDescription()->utf8String())
         : String("unknown error");
 }
+
+// Metal returns command buffers, encoders, errors and strings autoreleased: the caller does not
+// own them. This pool frees them when the scope ends, on whatever thread runs it, instead of in
+// the thread's own pool (which on the main thread never drains).
+struct Autorelease_Pool_Scope {
+    NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+    Autorelease_Pool_Scope() = default;
+    Autorelease_Pool_Scope(const Autorelease_Pool_Scope &) = delete;
+    Autorelease_Pool_Scope &operator=(const Autorelease_Pool_Scope &) = delete;
+    ~Autorelease_Pool_Scope() { pool->release(); }
+};
 
 Engine_Backend::Engine_Backend(s64 threads_per_block_) {
     threads_per_block = threads_per_block_;
@@ -108,20 +119,20 @@ Engine_Pointer Engine_Backend::allocate(Vector<Engine_Pointer> &partitions) {
 
     memory_has_been_allocated = true;
     if (max_bytes == 0) {
-        // nothing was allocated, return nullptr
         base_pointer = Engine_Pointer{};
         return base_pointer;
     }
 
     MTL::Buffer *slab = device->newBuffer(max_bytes, MTL::ResourceStorageModeShared);
     if (slab == nullptr) {
-        // its possible that newBuffer returns null when something is wrong with the device
         log::throw_runtime_error(log::logger(),
                 "Metal_Backend::allocate: the GPU could not allocate " + to_string(max_bytes) +
                 " bytes (" + to_string(max_bytes / (1024 * 1024)) + " MiB) — out of device memory");
     }
 
     slabs.push_back(slab);
+    allocated_byte_count += max_bytes;
+    peak_allocated_byte_count = std::max(peak_allocated_byte_count, allocated_byte_count);
 
     for (Engine_Pointer &partition: partitions) {
         if (partition.base_pointer != nullptr || partition.total_bytes == 0) continue;
@@ -138,17 +149,19 @@ Engine_Pointer Engine_Backend::allocate(Vector<Engine_Pointer> &partitions) {
 void Engine_Backend::deallocate_slab(const Engine_Pointer &slab) {
     if (slab.base_pointer == nullptr || slab.inline_scalar) return;
 
-    MTL::Buffer *buffer = static_cast<MTL::Buffer *>(slab.base_pointer);
+    auto *buffer = static_cast<MTL::Buffer *>(slab.base_pointer);
     const auto entry = std::find(slabs.begin(), slabs.end(), buffer);
     if (entry == slabs.end()) return;
 
     slabs.erase(entry);
+    allocated_byte_count -= std::min<u64>(allocated_byte_count, buffer->length());
     buffer->release();
 }
 
 void Engine_Backend::deallocate_all() {
     for (MTL::Buffer *slab : slabs) slab->release();
     slabs.clear();
+    allocated_byte_count = 0;
     base_pointer = Engine_Pointer{};
     memory_has_been_allocated = false;
     last_offset = 0;
@@ -157,8 +170,9 @@ void Engine_Backend::deallocate_all() {
 
 Optional<Engine_Function> Engine_Backend::create_function(
     const String &name, const String &source_code
-) {
+) const {
     log::logger().debug("create_function: name={} source_bytes={}", name, source_code.size());
+    const Autorelease_Pool_Scope autorelease_pool;
 
     MTL::CompileOptions *options = MTL::CompileOptions::alloc()->init();
     options->setLanguageVersion(MTL::LanguageVersion3_0);
@@ -195,7 +209,8 @@ Optional<Engine_Function> Engine_Backend::create_function(
     return Engine_Function{pipeline};
 }
 
-Optional<Engine_Function> Engine_Backend::load_precompiled_function(const String &name) {
+Optional<Engine_Function> Engine_Backend::load_precompiled_function(const String &name) const {
+    const Autorelease_Pool_Scope autorelease_pool;
     if (default_library == nullptr) {
         log::logger().critical("load_precompiled_function: no default.metallib was loaded");
         return std::nullopt;
@@ -228,12 +243,14 @@ void Engine_Backend::release_function(Engine_Function &function) {
 
 bool Engine_Backend::run_function(
     Engine_Function &function, Vector<Engine_Pointer> &parameters, s64 job_count
-) {
+) const {
     if (function.pipeline_state == nullptr) {
         log::logger().critical("run_function: the function has no pipeline state");
         return false;
     }
 
+    // Both are autoreleased, so this pool, not an explicit release(), frees them.
+    const Autorelease_Pool_Scope autorelease_pool;
     MTL::CommandBuffer *command_buffer = queue->commandBuffer();
     MTL::ComputeCommandEncoder *encoder = command_buffer->computeCommandEncoder();
     encoder->setComputePipelineState(function.pipeline_state);
@@ -244,17 +261,15 @@ bool Engine_Backend::run_function(
         if (parameter.inline_scalar) {
             encoder->setBytes(parameter.base_pointer, parameter.total_bytes, index);
         } else {
-            encoder->setBuffer(static_cast<MTL::Buffer *>(parameter.base_pointer),
-                               static_cast<NS::UInteger>(parameter.offset), index);
+            encoder->setBuffer(static_cast<MTL::Buffer *>(parameter.base_pointer), parameter.offset, index);
         }
     }
 
     const s64 thread_count = std::max<s64>(job_count, 1);
     const s64 group_width = std::min<s64>(threads_per_block, thread_count);
-    encoder->dispatchThreads(MTL::Size::Make(static_cast<NS::UInteger>(thread_count), 1, 1),
-                             MTL::Size::Make(static_cast<NS::UInteger>(group_width), 1, 1));
+    encoder->dispatchThreads(MTL::Size::Make(thread_count, 1, 1),
+                             MTL::Size::Make(group_width, 1, 1));
     encoder->endEncoding();
-    encoder->release();
 
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
@@ -263,13 +278,54 @@ bool Engine_Backend::run_function(
         const String description = describe_metal_error(command_buffer->error());
         log::logger().critical("run_function: command buffer failed: {} (job_count={}, parameters={})",
                                description, job_count, parameters.size());
-        command_buffer->release();
         return false;
     }
 
     log::logger().trace("run_function: dispatched {} threads in groups of {}, {} parameters",
                         thread_count, group_width, parameters.size());
-    command_buffer->release();
+    return true;
+}
+
+bool Engine_Backend::run_functions(Vector<Engine_Dispatch> &dispatches) const {
+    if (dispatches.empty()) return true;
+    for (const Engine_Dispatch &dispatch : dispatches) {
+        if (dispatch.function == nullptr || dispatch.function->pipeline_state == nullptr) {
+            log::logger().critical("run_functions: a launch has no pipeline state");
+            return false;
+        }
+    }
+
+    // One serial encoder, which runs the launches in order, with a buffer barrier between each so
+    // a launch sees what the ones before it wrote. An encoder per launch costs about 30 us each.
+    const Autorelease_Pool_Scope autorelease_pool;
+    MTL::CommandBuffer *command_buffer = queue->commandBuffer();
+    MTL::ComputeCommandEncoder *encoder = command_buffer->computeCommandEncoder(MTL::DispatchTypeSerial);
+    for (usize dispatch_index = 0; dispatch_index < dispatches.size(); dispatch_index += 1) {
+        Engine_Dispatch &dispatch = dispatches[dispatch_index];
+        if (dispatch_index > 0) encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+        encoder->setComputePipelineState(dispatch.function->pipeline_state);
+        for (usize index = 0; index < dispatch.parameters.size(); index += 1) {
+            const Engine_Pointer &parameter = dispatch.parameters[index];
+            if (parameter.inline_scalar) {
+                encoder->setBytes(parameter.base_pointer, parameter.total_bytes, index);
+            } else {
+                encoder->setBuffer(static_cast<MTL::Buffer *>(parameter.base_pointer), parameter.offset, index);
+            }
+        }
+        const s64 thread_count = std::max<s64>(dispatch.job_count, 1);
+        const s64 group_width = std::min<s64>(threads_per_block, thread_count);
+        encoder->dispatchThreads(MTL::Size::Make(thread_count, 1, 1), MTL::Size::Make(group_width, 1, 1));
+    }
+    encoder->endEncoding();
+
+    command_buffer->commit();
+    command_buffer->waitUntilCompleted();
+
+    if (command_buffer->status() == MTL::CommandBufferStatusError) {
+        const String description = describe_metal_error(command_buffer->error());
+        log::logger().critical("run_functions: command buffer of {} launches failed: {}", dispatches.size(), description);
+        return false;
+    }
     return true;
 }
 
@@ -292,8 +348,8 @@ String describe_cuda_driver_error(CUresult result) {
 Engine_Backend::Engine_Backend(s64 threads_per_block_argument) {
     threads_per_block = threads_per_block_argument;
 
-    cuInit(0); // once per process, flags must be 0
-    cuDeviceGet(&cuda_gpu_device, 0); // 0 = device ordinal
+    cuInit(0); // flags must be 0
+    cuDeviceGet(&cuda_gpu_device, 0); // device ordinal 0
     cuDevicePrimaryCtxRetain(&cuda_context, cuda_gpu_device);
     cuCtxSetCurrent(cuda_context);
 
@@ -346,6 +402,9 @@ Engine_Pointer Engine_Backend::allocate(Vector<Engine_Pointer> &partitions) {
                 " bytes: " + cudaGetErrorString(allocation_result));
     }
     slabs.push_back(slab);
+    slab_byte_counts.push_back(max_bytes);
+    allocated_byte_count += max_bytes;
+    peak_allocated_byte_count = std::max(peak_allocated_byte_count, allocated_byte_count);
 
     for (Engine_Pointer &partition_handle : partitions) {
         if (partition_handle.base_pointer != nullptr || partition_handle.total_bytes == 0) continue;
@@ -365,6 +424,9 @@ void Engine_Backend::deallocate_slab(const Engine_Pointer &slab) {
     const auto entry = std::find(slabs.begin(), slabs.end(), slab.base_pointer);
     if (entry == slabs.end()) return;
 
+    const usize slab_index = static_cast<usize>(entry - slabs.begin());
+    allocated_byte_count -= std::min<u64>(allocated_byte_count, slab_byte_counts[slab_index]);
+    slab_byte_counts.erase(slab_byte_counts.begin() + static_cast<s64>(slab_index));
     slabs.erase(entry);
     cudaFree(slab.base_pointer);
 }
@@ -372,6 +434,8 @@ void Engine_Backend::deallocate_slab(const Engine_Pointer &slab) {
 void Engine_Backend::deallocate_all() {
     for (void *slab : slabs) cudaFree(slab);
     slabs.clear();
+    slab_byte_counts.clear();
+    allocated_byte_count = 0;
     base_pointer = Engine_Pointer{};
     memory_has_been_allocated = false;
     last_offset = 0;
@@ -388,7 +452,7 @@ Optional<Engine_Function> Engine_Backend::create_function(
     nvrtcProgram program{};
     nvrtcCreateProgram(&program, source_code.c_str(), program_name.c_str(), 0, nullptr, nullptr);
 
-    // TODO: const char *options[] = { "--gpu-architecture=compute_87" };   // Orin
+    // TODO: pass --gpu-architecture (compute_87 for Orin).
     const nvrtcResult compile_result = nvrtcCompileProgram(program, 0, nullptr);
 
     size_t compile_log_size = 0;
@@ -434,11 +498,10 @@ Optional<Engine_Function> Engine_Backend::create_function(
 }
 
 Optional<Engine_Function> Engine_Backend::load_precompiled_function(const String &name) {
-    // CUDA compiles its kernels at build time into the static library rather than into a
-    // loadable module, so there is nothing to look up by name here. The CUDA counterparts
-    // of the precompiled Metal shaders are called directly.
-    log::logger().critical("load_precompiled_function: '{}' -- the CUDA backend has no "
-                           "runtime-loadable precompiled module", name);
+    // The CUDA backend has no precompiled kernels; callers fall back to their host paths, which is
+    // the normal path here, not an error.
+    log::logger().debug("load_precompiled_function: '{}' -- the CUDA backend has no "
+                        "runtime-loadable precompiled module; the caller answers on the host", name);
     return std::nullopt;
 }
 
@@ -469,9 +532,8 @@ bool Engine_Backend::run_function(
 ) {
     const s64 block_count = (job_count + threads_per_block - 1) / threads_per_block;
 
-    // cuLaunchKernel takes pointers TO each argument's value. For a slab range the value
-    // is the device address, so it needs a stable cell to point at; for an inline scalar
-    // the caller's own storage already is that cell.
+    // cuLaunchKernel takes a pointer to each argument's value. A buffer's device address needs
+    // a stable cell to point at; an inline scalar's own storage is that cell.
     Vector<void *> argument_values(parameters.size(), nullptr);
     Vector<void *> argument_pointers(parameters.size(), nullptr);
 
@@ -512,6 +574,15 @@ bool Engine_Backend::run_function(
 
     log::logger().trace("run_function: launched grid={} block={} job_count={} parameters={}",
                         block_count, threads_per_block, job_count, parameters.size());
+    return true;
+}
+
+bool Engine_Backend::run_functions(Vector<Engine_Dispatch> &dispatches) {
+    for (Engine_Dispatch &dispatch : dispatches) {
+        if (dispatch.function == nullptr || !run_function(*dispatch.function, dispatch.parameters, dispatch.job_count)) {
+            return false;
+        }
+    }
     return true;
 }
 

@@ -2,6 +2,7 @@
 // Created by Alek Simpson on 5/30/26.
 //
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 #include <cstring>
@@ -24,10 +25,10 @@ using namespace std;
 using namespace spikecorec;
 using namespace spikecorec::log;
 
-static Pair<s32, s32> compute_tree_parameters(s32 node_count, s32 branching_factor) {
+static Pair<s64, s64> compute_tree_parameters(s64 node_count, s64 branching_factor) {
     if (node_count <= 1) return {0, 1};
 
-    s32 tree_height = 0, padded_size = 1;
+    s64 tree_height = 0, padded_size = 1;
     while (padded_size < node_count) {
         padded_size *= branching_factor;
         tree_height++;
@@ -35,65 +36,65 @@ static Pair<s32, s32> compute_tree_parameters(s32 node_count, s32 branching_fact
     return {tree_height, padded_size};
 }
 
-static u64 pack_child_mask_key(s32 level, s32 block_row, s32 block_column) {
-    return (u64(u32(level)) << 56) | (u64(u32(block_row)) << 28) | u64(u32(block_column));
+static u64 pack_child_mask_key(s64 level, s64 block_row, s64 block_column) {
+    return (u64(level) << 56) | (u64(block_row) << 28) | u64(block_column);
 }
 
-static u32 get_bit(const u32 *words, s32 bit_index) {
+static u32 get_bit(const u32 *words, s64 bit_index) {
     return (words[bit_index >> 5] >> (bit_index & 31)) & 1u;
 }
 
-static s32 rank1_exclusive(const u32 *internal_node_words, const u32 *superblock_table, const u16 *subblock_table,
-                           s32 position, s32 superblock_size) {
-    s32 word_index = position >> 5;
-    s32 bit_offset = position & 31;
-    s32 superblock_index = word_index / superblock_size;
+static s64 rank1_exclusive(const u32 *internal_node_words, const u32 *superblock_table, const u16 *subblock_table,
+                           s64 position, s64 superblock_size) {
+    s64 word_index = position >> 5;
+    s64 bit_offset = position & 31;
+    s64 superblock_index = word_index / superblock_size;
     u32 superblock_base = superblock_table[superblock_index];
     u32 subblock_base = subblock_table[word_index];
     u32 partial_word_mask = (bit_offset == 0) ? 0u : ((1u << bit_offset) - 1u);
     u32 partial_word_popcount = static_cast<u32>(__builtin_popcount(internal_node_words[word_index] & partial_word_mask));
-    return static_cast<s32>(superblock_base + subblock_base + partial_word_popcount);
+    return static_cast<s64>(superblock_base) + subblock_base + partial_word_popcount;
 }
 
 static void collect_row_neighbors(
     const u32 *internal_words, const u32 *leaf_words,
     const u32 *superblock_data, const u16 *subblock_data,
-    s32 branching_factor, s32 superblock_size_words,
-    s32 node_count, s32 tree_height, s32 internal_bit_count,
-    s32 level, s32 row_base, s32 column_base, s32 block_size, s32 level_bit_offset,
-    s32 source_node, s32 *output_buffer, s64 max_neighbor_count, s64 &neighbors_found
+    s64 branching_factor, s64 superblock_size_words,
+    s64 node_count, s64 tree_height, s64 internal_bit_count,
+    s64 level, u32 row_base, u32 column_base, s64 block_size, s64 level_bit_offset,
+    u32 source_node, u32 *output_buffer, s64 max_neighbor_count, s64 &neighbors_found
 ) {
     if (neighbors_found >= max_neighbor_count) return;
 
-    s32 branching_factor_squared = branching_factor * branching_factor;
-    s32 child_block_size = block_size / branching_factor;
-    s32 row_offset = (source_node - row_base) / child_block_size;
+    s64 branching_factor_squared = branching_factor * branching_factor;
+    s64 child_block_size = block_size / branching_factor;
+    s64 row_offset = (source_node - row_base) / child_block_size;
 
-    for (s32 col_offset = 0; col_offset < branching_factor; col_offset++) {
+    for (s64 col_offset = 0; col_offset < branching_factor; col_offset++) {
         if (neighbors_found >= max_neighbor_count) return;
 
-        s32 child_flat_index = row_offset * branching_factor + col_offset;
-        s32 bit_position = level_bit_offset + child_flat_index;
+        s64 child_flat_index = row_offset * branching_factor + col_offset;
+        s64 bit_position = level_bit_offset + child_flat_index;
 
         if (level == tree_height - 1) {
             if (get_bit(leaf_words, bit_position)) {
-                s32 target_node = column_base + col_offset;
+                u32 target_node = static_cast<u32>(column_base + col_offset);
                 if (target_node < node_count)
                     output_buffer[neighbors_found++] = target_node;
             }
         } else if (get_bit(internal_words, bit_position)) {
-            s32 rank_inclusive = rank1_exclusive(internal_words, superblock_data, subblock_data,
+            s64 rank_inclusive = rank1_exclusive(internal_words, superblock_data, subblock_data,
                                                   bit_position, superblock_size_words) + 1;
-            s32 raw_offset = branching_factor_squared * rank_inclusive;
-            s32 child_level_bit_offset = (level + 1 == tree_height - 1)
+            s64 raw_offset = branching_factor_squared * rank_inclusive;
+            s64 child_level_bit_offset = (level + 1 == tree_height - 1)
                 ? (raw_offset - internal_bit_count)
                 : raw_offset;
             collect_row_neighbors(
                 internal_words, leaf_words, superblock_data, subblock_data,
                 branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
                 level + 1,
-                row_base + row_offset * child_block_size,
-                column_base + col_offset * child_block_size,
+                static_cast<u32>(row_base + row_offset * child_block_size),
+                static_cast<u32>(column_base + col_offset * child_block_size),
                 child_block_size, child_level_bit_offset,
                 source_node, output_buffer, max_neighbor_count, neighbors_found
             );
@@ -104,42 +105,42 @@ static void collect_row_neighbors(
 static void collect_column_predecessors(
     const u32 *internal_words, const u32 *leaf_words,
     const u32 *superblock_data, const u16 *subblock_data,
-    s32 branching_factor, s32 superblock_size_words,
-    s32 node_count, s32 tree_height, s32 internal_bit_count,
-    s32 level, s32 row_base, s32 column_base, s32 block_size, s32 level_bit_offset,
-    s32 target_node, s32 *output_buffer, s64 max_neighbor_count, s64 &predecessors_found
+    s64 branching_factor, s64 superblock_size_words,
+    s64 node_count, s64 tree_height, s64 internal_bit_count,
+    s64 level, u32 row_base, u32 column_base, s64 block_size, s64 level_bit_offset,
+    u32 target_node, u32 *output_buffer, s64 max_neighbor_count, s64 &predecessors_found
 ) {
     if (predecessors_found >= max_neighbor_count) return;
 
-    s32 branching_factor_squared = branching_factor * branching_factor;
-    s32 child_block_size = block_size / branching_factor;
-    s32 column_offset = (target_node - column_base) / child_block_size;
+    s64 branching_factor_squared = branching_factor * branching_factor;
+    s64 child_block_size = block_size / branching_factor;
+    s64 column_offset = (target_node - column_base) / child_block_size;
 
-    for (s32 row_offset = 0; row_offset < branching_factor; row_offset++) {
+    for (s64 row_offset = 0; row_offset < branching_factor; row_offset++) {
         if (predecessors_found >= max_neighbor_count) return;
 
-        s32 child_flat_index = row_offset * branching_factor + column_offset;
-        s32 bit_position = level_bit_offset + child_flat_index;
+        s64 child_flat_index = row_offset * branching_factor + column_offset;
+        s64 bit_position = level_bit_offset + child_flat_index;
 
         if (level == tree_height - 1) {
             if (get_bit(leaf_words, bit_position)) {
-                s32 source_node = row_base + row_offset;
+                u32 source_node = static_cast<u32>(row_base + row_offset);
                 if (source_node < node_count)
                     output_buffer[predecessors_found++] = source_node;
             }
         } else if (get_bit(internal_words, bit_position)) {
-            s32 rank_inclusive = rank1_exclusive(internal_words, superblock_data, subblock_data,
+            s64 rank_inclusive = rank1_exclusive(internal_words, superblock_data, subblock_data,
                                                   bit_position, superblock_size_words) + 1;
-            s32 raw_offset = branching_factor_squared * rank_inclusive;
-            s32 child_level_bit_offset = (level + 1 == tree_height - 1)
+            s64 raw_offset = branching_factor_squared * rank_inclusive;
+            s64 child_level_bit_offset = (level + 1 == tree_height - 1)
                 ? (raw_offset - internal_bit_count)
                 : raw_offset;
             collect_column_predecessors(
                 internal_words, leaf_words, superblock_data, subblock_data,
                 branching_factor, superblock_size_words, node_count, tree_height, internal_bit_count,
                 level + 1,
-                row_base + row_offset * child_block_size,
-                column_base + column_offset * child_block_size,
+                static_cast<u32>(row_base + row_offset * child_block_size),
+                static_cast<u32>(column_base + column_offset * child_block_size),
                 child_block_size, child_level_bit_offset,
                 target_node, output_buffer, max_neighbor_count, predecessors_found
             );
@@ -162,13 +163,13 @@ struct Tree_Arrays {
     Vector<u32> leaf_node_words;
     Vector<u32> rank_superblock_table;
     Vector<u16> rank_subblock_table;
-    s32 tree_height;
-    s32 padded_node_count;
-    s32 internal_bit_count;
+    s64 tree_height;
+    s64 padded_node_count;
+    s64 internal_bit_count;
 };
 
-static Tree_Arrays build_tree_arrays(const Vector<Pair<s32, s32> > &edges, s32 node_count, s32 branching_factor,
-                                    s32 superblock_size) {
+static Tree_Arrays build_tree_arrays(const Vector<Pair<u32, u32> > &edges, s64 node_count, s64 branching_factor,
+                                    s64 superblock_size) {
     for (auto [source_node, target_node]: edges) {
         if (source_node == target_node) {
             throw_invalid_argument(logger(),
@@ -178,7 +179,7 @@ static Tree_Arrays build_tree_arrays(const Vector<Pair<s32, s32> > &edges, s32 n
     }
 
     auto [tree_height, padded_node_count] = compute_tree_parameters(node_count, branching_factor);
-    s32 branching_factor_squared = branching_factor * branching_factor;
+    s64 branching_factor_squared = branching_factor * branching_factor;
 
     if (tree_height == 0)
         return {{}, {}, {u32(0)}, {}, tree_height, padded_node_count, 0};
@@ -186,24 +187,23 @@ static Tree_Arrays build_tree_arrays(const Vector<Pair<s32, s32> > &edges, s32 n
     // record which children are set at each (level, block_row, block_col)
     Unordered_Map<u64, s32> child_masks;
     for (auto [source_node, target_node]: edges) {
-        s32 current_row = source_node;
-        s32 current_column = target_node;
-        if (current_row < 0 || current_row >= node_count || 
-            current_column < 0 || current_column >= node_count) {
+        u32 current_row = source_node;
+        u32 current_column = target_node;
+        if (current_row >= node_count || current_column >= node_count) {
             continue;
         }
 
-        s32 block_row = 0;
-        s32 block_column = 0;
-        s32 current_size = padded_node_count;
-        for (s32 level = 0; level < tree_height; level++) {
-            s32 block_size = current_size / branching_factor;
-            s32 child_row_index = current_row / block_size;
-            s32 child_column_index = current_column / block_size;
-            s32 child_flat_index = child_row_index * branching_factor + child_column_index;
+        s64 block_row = 0;
+        s64 block_column = 0;
+        s64 current_size = padded_node_count;
+        for (s64 level = 0; level < tree_height; level++) {
+            s64 block_size = current_size / branching_factor;
+            s64 child_row_index = current_row / block_size;
+            s64 child_column_index = current_column / block_size;
+            s64 child_flat_index = child_row_index * branching_factor + child_column_index;
             child_masks[pack_child_mask_key(level, block_row, block_column)] |= (1 << child_flat_index);
-            current_row = current_row % block_size;
-            current_column = current_column % block_size;
+            current_row = static_cast<u32>(current_row % block_size);
+            current_column = static_cast<u32>(current_column % block_size);
             block_row = block_row * branching_factor + child_row_index;
             block_column = block_column * branching_factor + child_column_index;
             current_size = block_size;
@@ -212,25 +212,25 @@ static Tree_Arrays build_tree_arrays(const Vector<Pair<s32, s32> > &edges, s32 n
 
     // BFS serialization into T (internal) and L (leaf) bit lists
     Vector<s32> internal_bits, leaf_bits;
-    Vector<Pair<s32, s32> > current_level_nodes = {{0, 0}};
+    Vector<Pair<s64, s64> > current_level_nodes = {{0, 0}};
 
-    for (s32 level = 0; level < tree_height; level++) {
-        Vector<Pair<s32, s32> > next_level_nodes;
+    for (s64 level = 0; level < tree_height; level++) {
+        Vector<Pair<s64, s64> > next_level_nodes;
         for (auto [block_row, block_column]: current_level_nodes) {
             auto it = child_masks.find(pack_child_mask_key(level, block_row, block_column));
             s32 child_presence_mask = (it != child_masks.end()) ? it->second : 0;
 
             auto &target_bit_array = (level < tree_height - 1) ? internal_bits : leaf_bits;
-            for (s32 bit_index = 0; bit_index < branching_factor_squared; bit_index++)
+            for (s64 bit_index = 0; bit_index < branching_factor_squared; bit_index++)
                 target_bit_array.push_back((child_presence_mask >> bit_index) & 1);
 
             if (level < tree_height - 1 && child_presence_mask != 0) {
                 s32 remaining_children = child_presence_mask;
                 while (remaining_children) {
                     s32 least_significant_bit = remaining_children & -remaining_children;
-                    s32 child_flat_index = __builtin_ctz(static_cast<u32>(least_significant_bit));
-                    s32 child_row_offset = child_flat_index / branching_factor;
-                    s32 child_column_offset = child_flat_index - child_row_offset * branching_factor;
+                    s64 child_flat_index = __builtin_ctz(static_cast<u32>(least_significant_bit));
+                    s64 child_row_offset = child_flat_index / branching_factor;
+                    s64 child_column_offset = child_flat_index - child_row_offset * branching_factor;
                     next_level_nodes.push_back({
                         block_row * branching_factor + child_row_offset,
                         block_column * branching_factor + child_column_offset
@@ -242,7 +242,7 @@ static Tree_Arrays build_tree_arrays(const Vector<Pair<s32, s32> > &edges, s32 n
         current_level_nodes = std::move(next_level_nodes);
     }
 
-    s32 internal_bit_count = static_cast<s32>(internal_bits.size());
+    s64 internal_bit_count = static_cast<s64>(internal_bits.size());
     Vector<u32> internal_bit_words = pack_bits_to_words(internal_bits);
     Vector<u32> leaf_bit_words = pack_bits_to_words(leaf_bits);
 
@@ -273,9 +273,23 @@ static Tree_Arrays build_tree_arrays(const Vector<Pair<s32, s32> > &edges, s32 n
     };
 }
 
+// The kernels index nodes and bits with 32-bit ints, so the tree's sizes are stored as s32. A
+// leaf's bit offset is computed as internal_bit_count plus its place among the leaf bits, so
+// the two counts together must fit.
+static bool tree_fits_32_bit_indices(const Tree_Arrays &arrays, const char *factory_name) {
+    const s64 leaf_bit_count = static_cast<s64>(arrays.leaf_node_words.size()) * 32;
+    const s64 largest_index = max(arrays.padded_node_count, arrays.internal_bit_count + leaf_bit_count);
+    if (largest_index <= Numeric_Limits<s32>::max()) return true;
+
+    logger().warn("{}: rejecting a tree of {} padded nodes, {} internal bits and {} leaf bits; the GPU "
+                  "indexes them with 32-bit ints", factory_name, arrays.padded_node_count,
+                  arrays.internal_bit_count, leaf_bit_count);
+    return false;
+}
+
 static K2_Tree make_k2tree_from_arrays(
     Engine_Backend &backend, Tree_Arrays &arrays,
-    s32 node_count, s32 branching_factor, s32 superblock_size
+    s64 node_count, s64 branching_factor, s64 superblock_size
 ) {
     const usize internal_node_words_length = arrays.internal_node_words.size();
     const usize leaf_node_words_length = arrays.leaf_node_words.size();
@@ -287,10 +301,7 @@ static K2_Tree make_k2tree_from_arrays(
         .partition(internal_node_words_length * sizeof(u32), Engine_Datatype::UNSIGNED32, partitions)
         .partition(leaf_node_words_length * sizeof(u32), Engine_Datatype::UNSIGNED32, partitions)
         .partition(rank_superblock_length * sizeof(u32), Engine_Datatype::UNSIGNED32, partitions)
-        .partition(rank_subblock_length * sizeof(u16), Engine_Datatype::UNSIGNED16, partitions)
-        .partition(K2_Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), Engine_Datatype::SIGNED32, partitions)
-        .partition(K2_Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), Engine_Datatype::SIGNED32, partitions)
-        .partition(K2_Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(u8), Engine_Datatype::UNSIGNED8, partitions);
+        .partition(rank_subblock_length * sizeof(u16), Engine_Datatype::UNSIGNED16, partitions);
 
     const Engine_Pointer owning_slab = backend.allocate(partitions);
 
@@ -318,19 +329,16 @@ static K2_Tree make_k2tree_from_arrays(
         partitions[1],
         partitions[2],
         partitions[3],
-        partitions[4],
-        partitions[5],
-        partitions[6],
         internal_node_words_length,
         leaf_node_words_length,
         rank_superblock_length,
         rank_subblock_length,
-        branching_factor,
-        superblock_size,
-        node_count,
-        arrays.padded_node_count,
-        arrays.tree_height,
-        arrays.internal_bit_count
+        static_cast<s32>(branching_factor),
+        static_cast<s32>(superblock_size),
+        static_cast<s32>(node_count),
+        static_cast<s32>(arrays.padded_node_count),
+        static_cast<s32>(arrays.tree_height),
+        static_cast<s32>(arrays.internal_bit_count)
     };
 }
 
@@ -342,10 +350,6 @@ K2_Tree::K2_Tree(
     Engine_Pointer leaf_node_words,
     Engine_Pointer rank_superblock_table,
     Engine_Pointer rank_subblock_table,
-
-    Engine_Pointer query_source_staging,
-    Engine_Pointer query_target_staging,
-    Engine_Pointer query_output_staging,
 
     usize internal_node_words_length,
     usize leaf_node_words_length,
@@ -369,9 +373,6 @@ K2_Tree::K2_Tree(
       , leaf_node_words(leaf_node_words)
       , rank_superblock_table(rank_superblock_table)
       , rank_subblock_table(rank_subblock_table)
-      , query_source_staging(query_source_staging)
-      , query_target_staging(query_target_staging)
-      , query_output_staging(query_output_staging)
       , owning_backend(&backend)
       , owning_slab(owning_slab)
       , internal_node_words_length(internal_node_words_length)
@@ -401,9 +402,6 @@ K2_Tree::K2_Tree(K2_Tree &&other) noexcept
       , leaf_node_words(other.leaf_node_words)
       , rank_superblock_table(other.rank_superblock_table)
       , rank_subblock_table(other.rank_subblock_table)
-      , query_source_staging(other.query_source_staging)
-      , query_target_staging(other.query_target_staging)
-      , query_output_staging(other.query_output_staging)
       , owning_backend(other.owning_backend)
       , owning_slab(other.owning_slab)
       , internal_node_words_length(other.internal_node_words_length)
@@ -432,9 +430,6 @@ K2_Tree &K2_Tree::operator=(K2_Tree &&other) noexcept {
     leaf_node_words = other.leaf_node_words;
     rank_superblock_table = other.rank_superblock_table;
     rank_subblock_table = other.rank_subblock_table;
-    query_source_staging = other.query_source_staging;
-    query_target_staging = other.query_target_staging;
-    query_output_staging = other.query_output_staging;
     owning_backend = other.owning_backend;
     owning_slab = other.owning_slab;
     internal_node_words_length = other.internal_node_words_length;
@@ -458,59 +453,72 @@ K2_Tree::~K2_Tree() {
 Optional<K2_Tree> K2_Tree::from_adjacency_list(
     Engine_Backend &backend,
     const Vector<Vector<s32> > &adjacency_list,
-    s32 node_count,
-    s32 branching_factor,
-    s32 superblock_size
+    s64 node_count,
+    s64 branching_factor,
+    s64 superblock_size
 ) {
     logger().debug("K2_Tree::from_adjacency_list: adjacency_list.size={} node_count={} branching_factor={} "
                    "superblock_size={}", adjacency_list.size(), node_count, branching_factor, superblock_size);
-    // A tree needs at least two children per node to subdivide; 0 or 1 would never cover the nodes.
+    // Below 2 the tree never subdivides; above 5 the k^2 child bits overflow the s32 child mask.
     if (branching_factor < 2 || branching_factor > 5) {
         logger().warn("K2_Tree::from_adjacency_list: rejecting out-of-range branching_factor={} (must be 2-5)",
                       branching_factor);
         return nullopt;
     }
+    if (superblock_size < 1 || superblock_size > MAX_SUPERBLOCK_SIZE_WORDS) {
+        logger().warn("K2_Tree::from_adjacency_list: rejecting out-of-range superblock_size={} (must be 1-{})",
+                      superblock_size, MAX_SUPERBLOCK_SIZE_WORDS);
+        return nullopt;
+    }
 
-    s32 effective_node_count = (node_count >= 0) ? node_count : static_cast<s32>(adjacency_list.size());
+    s64 effective_node_count = (node_count >= 0) ? node_count : static_cast<s64>(adjacency_list.size());
 
-    Vector<Pair<s32, s32> > edges;
-    for (s32 source_node = 0; source_node < static_cast<s32>(adjacency_list.size()); source_node++)
+    // A negative target becomes a large u32, which the build skips as out of range.
+    Vector<Pair<u32, u32> > edges;
+    for (usize source_node = 0; source_node < adjacency_list.size(); source_node++)
         for (s32 target_node: adjacency_list[source_node])
-            edges.emplace_back(source_node, target_node);
+            edges.emplace_back(static_cast<u32>(source_node), static_cast<u32>(target_node));
 
     auto arrays = build_tree_arrays(edges, effective_node_count, branching_factor, superblock_size);
     logger().debug("K2_Tree::from_adjacency_list: edge_count={} tree_height={} padded_node_count={} "
                    "internal_bit_count={}", edges.size(), arrays.tree_height, arrays.padded_node_count,
                    arrays.internal_bit_count);
+    if (!tree_fits_32_bit_indices(arrays, "K2_Tree::from_adjacency_list")) return nullopt;
     return make_k2tree_from_arrays(backend, arrays, effective_node_count, branching_factor, superblock_size);
 }
 
 Optional<K2_Tree> K2_Tree::from_edges(
     Engine_Backend &backend,
-    const s32 *source_indices,
-    const s32 *target_indices,
-    s32 edge_count,
-    s32 node_count,
-    s32 branching_factor,
-    s32 superblock_size
+    const u32 *source_indices,
+    const u32 *target_indices,
+    s64 edge_count,
+    s64 node_count,
+    s64 branching_factor,
+    s64 superblock_size
 ) {
     logger().debug("K2_Tree::from_edges: edge_count={} node_count={} branching_factor={} superblock_size={}",
                    edge_count, node_count, branching_factor, superblock_size);
-    // A tree needs at least two children per node to subdivide; 0 or 1 would never cover the nodes.
+    // Below 2 the tree never subdivides; above 5 the k^2 child bits overflow the s32 child mask.
     if (branching_factor < 2 || branching_factor > 5) {
         logger().warn("K2_Tree::from_edges: rejecting out-of-range branching_factor={} (must be 2-5)",
                       branching_factor);
         return nullopt;
     }
+    if (superblock_size < 1 || superblock_size > MAX_SUPERBLOCK_SIZE_WORDS) {
+        logger().warn("K2_Tree::from_edges: rejecting out-of-range superblock_size={} (must be 1-{})",
+                      superblock_size, MAX_SUPERBLOCK_SIZE_WORDS);
+        return nullopt;
+    }
 
-    Vector<Pair<s32, s32> > edges;
-    edges.reserve(static_cast<usize>(edge_count));
-    for (s32 edge_index = 0; edge_index < edge_count; edge_index++)
+    Vector<Pair<u32, u32> > edges;
+    edges.reserve(static_cast<usize>(max<s64>(edge_count, 0)));
+    for (s64 edge_index = 0; edge_index < edge_count; edge_index++)
         edges.emplace_back(source_indices[edge_index], target_indices[edge_index]);
 
     auto arrays = build_tree_arrays(edges, node_count, branching_factor, superblock_size);
     logger().debug("K2_Tree::from_edges: tree_height={} padded_node_count={} internal_bit_count={}",
                    arrays.tree_height, arrays.padded_node_count, arrays.internal_bit_count);
+    if (!tree_fits_32_bit_indices(arrays, "K2_Tree::from_edges")) return nullopt;
     return make_k2tree_from_arrays(backend, arrays, node_count, branching_factor, superblock_size);
 }
 
@@ -542,10 +550,7 @@ K2_Tree K2_Tree::load(Engine_Backend &backend, const char *path) {
         .partition(internal_node_words_length * sizeof(u32), Engine_Datatype::UNSIGNED32, partitions)
         .partition(leaf_node_words_length * sizeof(u32), Engine_Datatype::UNSIGNED32, partitions)
         .partition(rank_superblock_length * sizeof(u32), Engine_Datatype::UNSIGNED32, partitions)
-        .partition(rank_subblock_length * sizeof(u16), Engine_Datatype::UNSIGNED16, partitions)
-        .partition(K2_Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), Engine_Datatype::SIGNED32, partitions)
-        .partition(K2_Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(s32), Engine_Datatype::SIGNED32, partitions)
-        .partition(K2_Tree::ADJACENT_BATCH_QUERY_CAP * sizeof(u8), Engine_Datatype::UNSIGNED8, partitions);
+        .partition(rank_subblock_length * sizeof(u16), Engine_Datatype::UNSIGNED16, partitions);
 
     const Engine_Pointer owning_slab = backend.allocate(partitions);
 
@@ -577,9 +582,6 @@ K2_Tree K2_Tree::load(Engine_Backend &backend, const char *path) {
         partitions[1],
         partitions[2],
         partitions[3],
-        partitions[4],
-        partitions[5],
-        partitions[6],
         internal_node_words_length,
         leaf_node_words_length,
         rank_superblock_length,
@@ -626,9 +628,8 @@ void K2_Tree::save(const char *path) const {
 
 // ── queries ───────────────────────────────────────────────────────────────────
 
-s32 K2_Tree::adjacent(s32 source_node, s32 target_node) const {
-    if (source_node < 0 || source_node >= node_count ||
-        target_node < 0 || target_node >= node_count) return 0;
+s64 K2_Tree::adjacent(u32 source_node, u32 target_node) const {
+    if (source_node >= static_cast<u32>(node_count) || target_node >= static_cast<u32>(node_count)) return 0;
     if (tree_height == 0) return 0;
 
     const u32 *internal_words = internal_node_words.get_contents_as<u32>();
@@ -636,22 +637,22 @@ s32 K2_Tree::adjacent(s32 source_node, s32 target_node) const {
     const u32 *superblock_data = rank_superblock_table.get_contents_as<u32>();
     const u16 *subblock_data = rank_subblock_table.get_contents_as<u16>();
 
-    s32 branching_factor_squared = branching_factor * branching_factor;
+    s64 branching_factor_squared = branching_factor * branching_factor;
 
     if (tree_height == 1) {
-        s32 block_size = padded_node_count / branching_factor;
-        s32 child_flat_index =
+        s64 block_size = padded_node_count / branching_factor;
+        s64 child_flat_index =
             (source_node / block_size) * branching_factor + (target_node / block_size);
-        return static_cast<s32>(get_bit(leaf_words, child_flat_index));
+        return static_cast<s64>(get_bit(leaf_words, child_flat_index));
     }
 
-    s32 level_bit_offset = 0, current_block_size = padded_node_count, rank_inclusive = 0;
+    s64 level_bit_offset = 0, current_block_size = padded_node_count, rank_inclusive = 0;
 
-    for (s32 level = 0; level < tree_height - 1; level++) {
-        s32 block_size = current_block_size / branching_factor;
-        s32 row_offset = source_node / block_size;
-        s32 column_offset = target_node / block_size;
-        s32 child_bit_position = level_bit_offset + row_offset * branching_factor + column_offset;
+    for (s64 level = 0; level < tree_height - 1; level++) {
+        s64 block_size = current_block_size / branching_factor;
+        s64 row_offset = source_node / block_size;
+        s64 column_offset = target_node / block_size;
+        s64 child_bit_position = level_bit_offset + row_offset * branching_factor + column_offset;
 
         if (!get_bit(internal_words, child_bit_position)) return 0;
 
@@ -659,25 +660,25 @@ s32 K2_Tree::adjacent(s32 source_node, s32 target_node) const {
                                          superblock_size_words) + 1;
 
         if (level == tree_height - 2) {
-            source_node = source_node % block_size;
-            target_node = target_node % block_size;
+            source_node = static_cast<u32>(source_node % block_size);
+            target_node = static_cast<u32>(target_node % block_size);
             break;
         }
 
         level_bit_offset = branching_factor_squared * rank_inclusive;
-        source_node = source_node % block_size;
-        target_node = target_node % block_size;
+        source_node = static_cast<u32>(source_node % block_size);
+        target_node = static_cast<u32>(target_node % block_size);
         current_block_size = block_size;
     }
 
-    s32 leaf_bit_offset = branching_factor_squared * rank_inclusive - internal_bit_count;
-    return static_cast<s32>(get_bit(leaf_words,
+    s64 leaf_bit_offset = branching_factor_squared * rank_inclusive - internal_bit_count;
+    return static_cast<s64>(get_bit(leaf_words,
                          leaf_bit_offset + source_node * branching_factor + target_node));
 }
 
-s64 K2_Tree::get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const {
+s64 K2_Tree::get_neighbors(u32 node_index, u32 *output_buffer, s64 max_neighbor_count) const {
     if (max_neighbor_count <= 0) return 0;
-    if (node_index < 0 || node_index >= node_count || tree_height == 0) return 0;
+    if (node_index >= static_cast<u32>(node_count) || tree_height == 0) return 0;
 
     const u32 *internal_words = internal_node_words.get_contents_as<u32>();
     const u32 *leaf_words = leaf_node_words.get_contents_as<u32>();
@@ -694,9 +695,9 @@ s64 K2_Tree::get_neighbors(s32 node_index, s32 *output_buffer, s64 max_neighbor_
     return neighbors_found;
 }
 
-s64 K2_Tree::get_predecessors(s32 node_index, s32 *output_buffer, s64 max_neighbor_count) const {
+s64 K2_Tree::get_predecessors(u32 node_index, u32 *output_buffer, s64 max_neighbor_count) const {
     if (max_neighbor_count <= 0) return 0;
-    if (node_index < 0 || node_index >= node_count || tree_height == 0) return 0;
+    if (node_index >= static_cast<u32>(node_count) || tree_height == 0) return 0;
 
     const u32 *internal_words = internal_node_words.get_contents_as<u32>();
     const u32 *leaf_words = leaf_node_words.get_contents_as<u32>();
@@ -713,83 +714,12 @@ s64 K2_Tree::get_predecessors(s32 node_index, s32 *output_buffer, s64 max_neighb
     return predecessors_found;
 }
 
-void K2_Tree::adjacent_batch(
-    const s32 *source_indices,
-    const s32 *target_indices,
-    uint8_t *output_buffer,
-    s32 query_count
-) const {
-    if (query_count <= 0) return;
-    if (owning_backend == nullptr) {
-        memset(output_buffer, 0, static_cast<usize>(query_count) * sizeof(uint8_t));
-        return;
-    }
-
-    s32 *staged_sources = query_source_staging.get_contents_as<s32>();
-    s32 *staged_targets = query_target_staging.get_contents_as<s32>();
-    uint8_t *staged_output = query_output_staging.get_contents_as<uint8_t>();
-
-    bool dispatch_is_available = false;
-#ifdef SPIKECOREC_METAL
-    dispatch_is_available = adjacent_batch_function.pipeline_state != nullptr;
-#endif
-    if (!dispatch_is_available) {
-        Optional<Engine_Function> loaded =
-                owning_backend->load_precompiled_function("k2tree_adjacent_batch_kernel");
-        if (loaded.has_value()) {
-            adjacent_batch_function = *loaded;
-            dispatch_is_available = true;
-        }
-    }
-
-    for (s32 first_query = 0; first_query < query_count; first_query += static_cast<s32>(ADJACENT_BATCH_QUERY_CAP)) {
-        const s32 chunk_size =
-                std::min<s32>(static_cast<s32>(ADJACENT_BATCH_QUERY_CAP), query_count - first_query);
-
-        memcpy(staged_sources, source_indices + first_query, static_cast<usize>(chunk_size) * sizeof(s32));
-        memcpy(staged_targets, target_indices + first_query, static_cast<usize>(chunk_size) * sizeof(s32));
-
-        bool answered_on_device = false;
-        if (dispatch_is_available) {
-            const s32 chunk_size_argument = chunk_size;
-            spikecorec::Vector<Engine_Pointer> parameters = {
-                internal_node_words,                            // 0
-                leaf_node_words,                                // 1
-                rank_superblock_table,                          // 2
-                rank_subblock_table,                            // 3
-                inline_scalar_argument(branching_factor),       // 4
-                inline_scalar_argument(superblock_size_words),  // 5
-                inline_scalar_argument(node_count),             // 6
-                inline_scalar_argument(padded_node_count),      // 7
-                inline_scalar_argument(tree_height),            // 8
-                inline_scalar_argument(internal_bit_count),     // 9
-                query_source_staging,                           // 10
-                query_target_staging,                           // 11
-                query_output_staging,                           // 12
-                inline_scalar_argument(chunk_size_argument),    // 13
-            };
-            answered_on_device = owning_backend->run_function(adjacent_batch_function,
-                                                              parameters, chunk_size);
-        }
-
-        if (!answered_on_device) {
-            for (s32 query_index = 0; query_index < chunk_size; query_index += 1) {
-                staged_output[query_index] = static_cast<uint8_t>(adjacent(staged_sources[query_index],
-                                                               staged_targets[query_index]));
-            }
-        }
-
-        memcpy(output_buffer + first_query, staged_output, static_cast<usize>(chunk_size) * sizeof(uint8_t));
-    }
-}
-
-s32 K2_Tree::trace(s32 source_node, s32 target_node) const {
+s64 K2_Tree::trace(u32 source_node, u32 target_node) const {
     logger().trace("source_node={} target_node={}  N={} H={} Npad={} k={}",
                     source_node, target_node, node_count, tree_height, padded_node_count,
                     branching_factor);
 
-    if (source_node < 0 || source_node >= node_count ||
-        target_node < 0 || target_node >= node_count) {
+    if (source_node >= static_cast<u32>(node_count) || target_node >= static_cast<u32>(node_count)) {
         logger().trace("  out of bounds => 0");
         return 0;
     }
@@ -803,29 +733,30 @@ s32 K2_Tree::trace(s32 source_node, s32 target_node) const {
     const u32 *superblock_data = rank_superblock_table.get_contents_as<u32>();
     const u16 *subblock_data = rank_subblock_table.get_contents_as<u16>();
 
-    s32 branching_factor_squared = branching_factor * branching_factor;
+    s64 branching_factor_squared = branching_factor * branching_factor;
 
     if (tree_height == 1) {
-        s32 block_size = padded_node_count / branching_factor;
-        s32 child_flat_index =
+        s64 block_size = padded_node_count / branching_factor;
+        s64 child_flat_index =
             (source_node / block_size) * branching_factor + (target_node / block_size);
-        s32 leaf_bit = static_cast<s32>(get_bit(leaf_words, child_flat_index));
+        s64 leaf_bit = static_cast<s64>(get_bit(leaf_words, child_flat_index));
         logger().trace("  tree_height==1: block_size={} child_flat_index={}  L[{}]={}",
                        block_size, child_flat_index, child_flat_index, leaf_bit);
         return leaf_bit;
     }
 
-    s32 level_bit_offset, rank_inclusive = 0; 
-    s32 current_block_size = padded_node_count;
-    s32 row_remainder = 0, column_remainder = 0;
+    s64 level_bit_offset = 0;
+    s64 rank_inclusive = 0;
+    s64 current_block_size = padded_node_count;
+    u32 row_remainder = 0, column_remainder = 0;
 
-    for (s32 level = 0; level < tree_height - 1; level++) {
-        s32 block_size = current_block_size / branching_factor;
-        s32 row_offset = source_node / block_size;
-        s32 column_offset = target_node / block_size;
-        s32 child_bit_position = level_bit_offset + row_offset * branching_factor + column_offset;
-        s32 bit_value = static_cast<s32>(get_bit(internal_words, child_bit_position));
-        s32 rank_exclusive = rank1_exclusive(internal_words, superblock_data, subblock_data, child_bit_position,
+    for (s64 level = 0; level < tree_height - 1; level++) {
+        s64 block_size = current_block_size / branching_factor;
+        s64 row_offset = source_node / block_size;
+        s64 column_offset = target_node / block_size;
+        s64 child_bit_position = level_bit_offset + row_offset * branching_factor + column_offset;
+        s64 bit_value = static_cast<s64>(get_bit(internal_words, child_bit_position));
+        s64 rank_exclusive = rank1_exclusive(internal_words, superblock_data, subblock_data, child_bit_position,
                                              superblock_size_words);
         rank_inclusive = rank_exclusive + 1;
 
@@ -840,21 +771,21 @@ s32 K2_Tree::trace(s32 source_node, s32 target_node) const {
         }
 
         if (level == tree_height - 2) {
-            row_remainder = source_node % block_size;
-            column_remainder = target_node % block_size;
+            row_remainder = static_cast<u32>(source_node % block_size);
+            column_remainder = static_cast<u32>(target_node % block_size);
             break;
         }
 
         level_bit_offset = branching_factor_squared * rank_inclusive;
-        source_node = source_node % block_size;
-        target_node = target_node % block_size;
+        source_node = static_cast<u32>(source_node % block_size);
+        target_node = static_cast<u32>(target_node % block_size);
         current_block_size = block_size;
     }
 
-    s32 leaf_bit_offset = branching_factor_squared * rank_inclusive - internal_bit_count;
-    s32 leaf_child_index = row_remainder * branching_factor + column_remainder;
-    s32 leaf_bit_index = leaf_bit_offset + leaf_child_index;
-    s32 leaf_bit = static_cast<s32>(get_bit(leaf_words, leaf_bit_index));
+    s64 leaf_bit_offset = branching_factor_squared * rank_inclusive - internal_bit_count;
+    s64 leaf_child_index = row_remainder * branching_factor + column_remainder;
+    s64 leaf_bit_index = leaf_bit_offset + leaf_child_index;
+    s64 leaf_bit = static_cast<s64>(get_bit(leaf_words, leaf_bit_index));
 
     logger().trace(
         "  leaf: rank_incl={} leaf_bit_offset={} row_remainder={} column_remainder={} leaf_child_index={} -> L[{}]={}",

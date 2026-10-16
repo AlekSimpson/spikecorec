@@ -11,22 +11,16 @@ using namespace std;
 
 namespace spikecorec {
 
-    // 4-neighbor wraparound grid (right, left, down, up). Every node has exactly
-    // 4 children. Mirrors spikecore/topologies.py's square_torus.
+    // 4-neighbor wraparound grid (right, left, down, up), without self-loops or repeats: 4
+    // distinct neighbors from a side of 3, 2 at a side of 2, none at a side of 1.
     Vector<Vector<s32>> square_torus(s64 side_length);
 
-    // square_torus plus deterministic random long-range shortcuts so activity can
-    // mix across the reservoir instead of only drifting locally. Every node ends
-    // up with the same out-degree (4 + random_fanout, capped by reservoir size).
-    // seed < 0 seeds from std::random_device (non-deterministic); seed >= 0 is
-    // used directly. Mirrors spikecore/topologies.py's small_world_torus — output
-    // is structurally equivalent but not bit-identical to the NumPy PCG64 version.
+    // square_torus plus random_fanout distinct random long-range shortcuts per node, capped by
+    // node count. seed < 0 seeds from std::random_device; seed >= 0 is deterministic.
     Vector<Vector<s32>> small_world_torus(s64 side_length, s32 random_fanout = 4, s64 seed = -1);
 
-    // Directed random graph with the same out-degree (no self-loops, no repeats)
-    // for every node — removes the torus/local-grid edges entirely. Mirrors
-    // spikecore/topologies.py's random_fixed_outdegree — output is structurally
-    // equivalent but not bit-identical to the NumPy PCG64 version.
+    // Random directed graph: each node gets fanout distinct targets, at most node count - 1,
+    // with no self-loops. seed < 0 seeds from std::random_device.
     Vector<Vector<s32>> random_fixed_outdegree(s64 side_length, s32 fanout = 8, s64 seed = -1);
 
 } // namespace spikecorec

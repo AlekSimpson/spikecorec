@@ -3,6 +3,14 @@
 State as of 2026-10-05, branch `agent_integration_2`. The refit and construction changes described
 here are in the working tree and not yet committed.
 
+**Superseded on 2026-10-14:** `fit_plane`, its exact solve, `fit_every_plane` and
+`fit_basis_from_connections` are removed. Construction and refit now run one of two candidate
+fits, masked alternating least squares or limited-memory BFGS (`Weight_Matrix::fit_method`), in
+f32 on the GPU. Construction searches each plane for the fewest lanes that meet `fit_tolerance`;
+a refit starts from the current lanes, moves only the rows of updated edges, and doubles the
+lanes while it misses. See `python/docs/API_REFERENCE.md`. The sections below on `fit_plane`, the
+exact solve and their measurements describe the removed code.
+
 ## What it stores
 
 Every per-edge value of the network's synapses lives in the `Weight_Matrix`, one **plane** per
@@ -51,10 +59,10 @@ up to 500 ticks stays on its exact tick.
 
 ## How fitting works
 
-**Construction** (`declare_projections`):
-- **Few distinct combinations.** When the projection runs carry at most 256 distinct
+**Construction** (`declare_runs`):
+- **Few distinct combinations.** When the runs carry at most 256 distinct
   combinations of initial values, the fit is exact: one lane per combination, shared by the
-  planes that use it (`fit_basis_from_projections`).
+  planes that use it (`fit_basis_from_connections`).
 - **Otherwise.** All coefficients are cleared, so every lane is free, and each plane is fitted on
   lanes of its own (`fit_plane`).
 

@@ -27,7 +27,7 @@ struct NML_Component_Type {
     // The nearest <Structure> in the extends chain, like dynamics.
     Vector<NML_Structure_Entry> structure;
 
-    // Per-neuron state slots in order, inherited ones first. Filled by parse_component_types.
+    // State variable names in slot order, inherited ones first. Filled by parse_component_types.
     Vector<String> state_variable_names;
 
     NML_Component_Type() = default;
@@ -42,17 +42,15 @@ struct NML_Component_Type {
     NML_Component_Type(String name)
         : name(std::move(name)) {};
 
-    // The declaration this type resolves `namespace_key` (see NML_Tag::namespace_key)
-    // to: the first match in its own element, searched depth-first in document order,
-    // otherwise the nearest ancestor's. A subtype's declaration therefore shadows an
-    // ancestor's of the same key. nullptr when no type in the chain declares it, and for
-    // an empty key, which accumulating tags such as OnCondition have.
+    // The declaration namespace_key names (see NML_Tag::namespace_key): the first depth-first
+    // match in this type's element, else the nearest ancestor's, so a subtype shadows its
+    // ancestors. nullptr when nothing matches or the key is empty (as for OnCondition).
     const NML_Node *find_declaration(const String &namespace_key) const;
 };
 
 struct NML_Component_Instance {
     Unordered_Map<String, String> instance_data;
-    Vector<String> data_order; // list of child instance ids, in source order
+    Vector<String> data_order; // child instance ids, in document order
 
     const NML_Component_Instance *parent_instance = nullptr;
     const NML_Component_Type *component_type = nullptr;

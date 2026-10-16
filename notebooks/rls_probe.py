@@ -3,25 +3,11 @@ from scipy.linalg.blas import ssyr, ssymv
 
 
 class OnlineRLSProbe:
-    """Multi-output RLS readout (shared-P recursive least squares with
-    forgetting), tuned for fast streaming (batch-size-1) updates.
+    """Multi-output recursive least squares readout with forgetting and a shared P, in float32.
 
-    Same math as the reference implementation, but the precision matrix P is
-    kept symmetric *by construction* so the per-step cost collapses to two
-    BLAS calls over a single triangle of P:
-
-    - P is stored Fortran-ordered; only its lower triangle is semantically
-      valid (the upper triangle is ignored). Every read of P goes through the
-      symmetric matvec ssymv(lower=1).
-    - The B=1 update is the Sherman-Morrison rank-1 downdate applied in place
-      with ssyr (symmetric rank-1 update) — one triangle touched, no (d, d)
-      temporary, and P stays exactly symmetric, so no re-symmetrization pass is
-      needed. (The previous version spent ~80% of its time in a transposed
-      full-matrix copy, `copyto(buf, P.T)`, re-symmetrizing P every step.)
-    - B>1 falls back to the mini-batch matrix form, also reading P
-      symmetrically and skipping the symmetrization pass (the rank-B downdate
-      is itself symmetric).
-    - all state stays float32; standardization uses precomputed 1/std.
+    Only P's lower triangle is valid; it is Fortran-ordered and read with ssymv(lower=1).
+    A one-example update is a Sherman-Morrison rank-1 downdate done in place with ssyr, so
+    P needs no re-symmetrization. Batches use the matrix form.
     """
 
     def __init__(self, n_features, n_classes=10, delta=1e-2, forgetting=1.0):
@@ -50,9 +36,7 @@ class OnlineRLSProbe:
             self.delta = float(delta)
         prior = max(self.delta, 1e-8)
         self.weights = np.zeros((self._d, self.n_classes), dtype=np.float32)
-        # Fortran-ordered so the symmetric BLAS routines (ssyr/ssymv) read and
-        # update P in place without copying. Only the lower triangle is kept
-        # valid; every read goes through ssymv(lower=1).
+        # Fortran order lets ssyr/ssymv work on P in place without copying.
         self.P = np.asfortranarray(np.eye(self._d, dtype=np.float32))
         self.P *= np.float32(1.0 / prior)
         self.updates = 0
@@ -131,10 +115,7 @@ class OnlineRLSProbe:
         return self.last_loss, self.last_batch_acc
 
     def _update_rank1(self, x, y, lam):
-        # Streaming Sherman-Morrison update. x: (d,) augmented feature,
-        # y: (C,) one-hot target. P's lower triangle is read with ssymv and
-        # downdated in place with ssyr, so P stays exactly symmetric — the
-        # dominant cost is just these two single-triangle BLAS calls.
+        # Sherman-Morrison update for one example. x: (d,) augmented features, y: (C,) one-hot.
         P = self.P
         Px = ssymv(1.0, P, x, lower=1)                       # P @ x  (lower tri)
         denom = np.float32(lam + float(x @ Px))              # > 0, P is PD
@@ -146,9 +127,8 @@ class OnlineRLSProbe:
             self.P *= np.float32(1.0 / lam)
 
     def _update_batch(self, X, Y, lam):
-        # Mini-batch (B>1) matrix form. P is read symmetrically (one ssymv per
-        # row) and the symmetrization pass is dropped: the rank-B downdate
-        # K_T.T @ XP is itself symmetric, so P's lower triangle stays exact.
+        # Mini-batch (B > 1) matrix form. The rank-B downdate K_T.T @ XP is symmetric, so P's
+        # lower triangle stays valid without re-symmetrizing.
         B, d = X.shape
         if self._buf is None or self._buf.shape[0] != d:
             self._buf = np.empty((d, d), dtype=np.float32)

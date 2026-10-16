@@ -1,9 +1,5 @@
 <Lems>
-    <!--
-      Drives iaf_single_cell.nml. This is what SpikeEngine is handed: the Simulation
-      instance carries dt, the run length and what to record, none of which live in the
-      NeuroML document itself.
-    -->
+    <!-- Runs iaf_single_cell.nml; the Simulation sets dt, run length and recordings. -->
     <Include file="Cells.xml"/>
     <Include file="Networks.xml"/>
     <Include file="Inputs.xml"/>

@@ -1,17 +1,10 @@
-"""Recording and rendering helpers shared by the demos.
+"""Recording and rendering helpers for the demo notebook.
 
-This is the one module a demo imports. Everything else a demo needs is written out in
-the demo's own function, so each one reads top to bottom without following a call into
-another file.
+Spike_Engine.record_membrane_video() writes a .spire file: a 4-byte big-endian neuron
+count, then one frame of `neuron_count` native float32 membrane potentials per recorded
+tick. render_membrane_video() animates it as a grid with traces and a spike raster.
 
-A .spire file is what Spike_Engine.record_membrane_video() writes: a 4-byte big-endian
-neuron count, then one frame per recorded tick, each frame being `neuron_count` native
-float32 membrane potentials. render_membrane_video() turns that into an animation of the
-population as a grid, one cell per neuron, with membrane traces and a spike raster
-beside it.
-
-Requires numpy and matplotlib. Writing .mp4 needs ffmpeg on PATH; an .gif output path
-uses Pillow instead.
+Requires numpy and matplotlib. An .mp4 needs ffmpeg on PATH; a .gif uses Pillow.
 """
 
 import math
@@ -38,13 +31,10 @@ __all__ = [
 
 SPIRE_HEADER_BYTES = 4
 
-# Membrane potentials are volts in the engine and millivolts everywhere a person reads
-# them. Every number this module displays is converted once, at the point it is read.
+# The engine records volts; this module displays millivolts.
 VOLTS_TO_MILLIVOLTS = 1000.0
 
-# The axis a membrane trace is drawn against, in millivolts. Fixed rather than fitted to
-# the data so a trace reads as a membrane potential at a glance and so two demos are
-# comparable side by side. Widened, never narrowed, when a model leaves it.
+# Trace axis in millivolts. Fixed so demos are comparable; widened, never narrowed, to fit the data.
 DEFAULT_MILLIVOLT_RANGE = (-80.0, -40.0)
 
 _GROUND = "#0e1416"
@@ -57,7 +47,7 @@ _TRACE_COLOURS = ["#63b3c2", "#e0824e", "#9ccf7a", "#c98bd0"]
 
 
 def demo_directory():
-    """Where demo artefacts are written, created on first use."""
+    """build/demos under the repository root, created on first use."""
     directory = Path(__file__).resolve().parent.parent / "build" / "demos"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
@@ -69,7 +59,7 @@ def demo_path(filename):
 
 
 def read_spire_recording(path):
-    """Returns (frames, neuron_count) with frames shaped [frame_count][neuron_count]."""
+    """Returns (frames, neuron_count), frames [frame_count][neuron_count]. Uncompressed only."""
     with open(path, "rb") as recording_file:
         header = recording_file.read(SPIRE_HEADER_BYTES)
         if len(header) < SPIRE_HEADER_BYTES:
@@ -134,17 +124,9 @@ def render_membrane_video(recording_path,
                           title=None):
     """Renders a .spire recording to a video and returns the path written.
 
-    trace_neurons selects which cells get a membrane trace, as (neuron_index, label)
-    pairs -- normally one excitatory cell and one inhibitory one. Two traces read as
-    two cells; six read as a thicket. Defaults to the first neuron alone.
-
-    duration is the simulated length of the whole recording in seconds, used to label
-    the time axis. Without it the axis counts recorded frames.
-
-    spikes_path is a TIME_ID spike file. Its spikes fill the raster panel, and the ones
-    belonging to a traced neuron are marked above that neuron's trace -- a spike is
-    followed immediately by a reset, so the trace alone dips where a person expects a
-    peak.
+    trace_neurons: (neuron_index, label) pairs that get a membrane trace; default neuron 0.
+    duration: the recording's simulated length in seconds; without it the time axis counts
+    frames. spikes_path: a TIME_ID spike file for the raster and the markers over each trace.
     """
     recording_path = str(recording_path)
     frames, neuron_count = read_spire_recording(recording_path)
@@ -158,14 +140,10 @@ def render_membrane_video(recording_path,
         return (indices * seconds_per_frame if seconds_per_frame is not None
                 else indices.astype(float))
 
-    # The traces are drawn from every recorded frame; only the animated grid is
-    # subsampled. Plotting the subsampled frames instead would sample a 10 ms sawtooth
-    # every 1.7 ms and draw peaks that wander between -56 and -52 mV, which is an
-    # artefact of the sampling rather than anything the cell did.
+    # Traces use every recorded frame; only the animated grid is subsampled, to at most
+    # max_frames. Subsampled traces would alias the spike sawtooth.
     trace_times = times_for(numpy.arange(frame_count))
 
-    # Subsample the animation: a 500 ms run recorded every 5 ticks is 1,000 frames, and
-    # 300 frames at 30 fps is already 10 seconds of watching.
     if frame_count > max_frames:
         selected = numpy.linspace(0, frame_count - 1, max_frames).astype(int)
         grid_source = frames[selected]
@@ -199,18 +177,15 @@ def render_membrane_video(recording_path,
     padded[:, :neuron_count] = grid_source
     grid_frames = padded.reshape(grid_source.shape[0], side, side)
 
-    # The grid panel is about 40% of the figure's width, so the figure is sized to give
-    # it roughly one pixel per neuron rather than letting the resampler decide what
-    # survives. Floored so small grids still get a readable figure, capped so a very
-    # large one stays a sane video size.
+    # The grid panel is about 40% of the figure's width; size the figure (1100 to 2600
+    # pixels wide) to give it about one pixel per neuron.
     grid_panel_pixels = min(side, 1100)
     figure_width_pixels = int(min(max(grid_panel_pixels / 0.40, 1100), 2600))
     figure_width_inches = figure_width_pixels / 100.0
 
     figure = pyplot.figure(figsize=(figure_width_inches, figure_width_inches * 0.636),
                            facecolor=_GROUND)
-    # Generous wspace: the grid's colour bar sits between the two top panels, and a
-    # tighter column gap puts its tick labels on top of the trace axis's.
+    # Wide column gap so the colour bar's tick labels clear the trace axis.
     layout = gridspec.GridSpec(2, 2, height_ratios=[3, 1.4], width_ratios=[1.15, 1],
                                hspace=0.34, wspace=0.34,
                                left=0.06, right=0.96, top=0.90, bottom=0.09)
@@ -227,9 +202,8 @@ def render_membrane_video(recording_path,
         axes.xaxis.label.set_color(_LABEL)
         axes.yaxis.label.set_color(_LABEL)
 
-    # The grid is the squarest rectangle that holds every neuron, so the last row is
-    # usually short. Those cells are NaN and are painted as background rather than as
-    # the bottom of the colour scale, which would read as resting neurons.
+    # Padding cells at the end of the grid are NaN; paint them as background, not as the
+    # low end of the scale, where they would look like resting neurons.
     colour_map = matplotlib.colormaps["magma"].copy()
     colour_map.set_bad(_PANEL)
 
@@ -241,15 +215,12 @@ def render_membrane_video(recording_path,
                         color=_TEXT, fontsize=10)
 
     colour_bar = figure.colorbar(image, ax=grid_axes, fraction=0.046, pad=0.06)
-    # As a title rather than a rotated axis label: the rotated glyph lands on top of the
-    # tick labels at this figure size.
+    # A title, because a rotated axis label overlaps the tick labels at this size.
     colour_bar.ax.set_title("mV", color=_LABEL, fontsize=7, pad=6)
     colour_bar.ax.tick_params(colors=_LABEL, labelsize=7)
     colour_bar.outline.set_edgecolor(_EDGE)
 
-    # One trace per named cell, and a row of spike markers above the traces. The reset
-    # is what the trace shows at a spike, so without the markers the moment a cell fires
-    # reads as a downward step rather than an event.
+    # Spike markers above the traces, because at a spike a trace shows only the reset.
     spike_row_height = (high - low) * 0.04
     for offset, (neuron_index, label) in enumerate(trace_neurons):
         colour = _TRACE_COLOURS[offset % len(_TRACE_COLOURS)]
@@ -277,9 +248,7 @@ def render_membrane_video(recording_path,
     trace_marker = trace_axes.axvline(frame_times[0], color=_MARKER, linewidth=1.0)
 
     if spike_times.size:
-        # A size tuned for 20,000 spikes is invisible at 30. Scaled to the count so a
-        # small network's raster is legible and a large one does not become a solid
-        # block.
+        # Marker size shrinks as the spike count grows, so small and large rasters stay legible.
         marker_size = float(numpy.clip(2000.0 / max(spike_times.size, 1), 0.6, 12.0))
         raster_axes.scatter(spike_times, spike_indices, s=marker_size, c="#63b3c2",
                             marker=".", linewidths=0)

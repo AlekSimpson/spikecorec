@@ -29,41 +29,45 @@ namespace spikecorec::nml {
 
 namespace {
 
-// Names the generated dynamics read from master_step. A LEMS name equal to one of these
-// would be captured by the substitutions, so it is refused.
+// Names the generated cell dynamics declare or read in master_step. A LEMS name equal to one
+// would be captured, so it is refused.
 const Set<String> ENGINE_NAMES = {
     "cell_state", "neuron_index", "network_input", "spiked", "refractory", "last_spiked", "tick", "true", "random_values",
-    "event_arrivals", "arrival"};
+    "walk_pass",
+    "event_arrivals", "arrival", "simulation_time"};
 
-// Names the generated synapse dynamics read from the propagate walk, on top of ENGINE_NAMES.
+// Names the generated synapse dynamics use in the propagate walk, on top of ENGINE_NAMES.
 const Set<String> SYNAPSE_ENGINE_NAMES = {
     "target", "current_edge", "arrived", "next_row", "network_inputs", "neuron_count", "synapse_prototype",
     "basis_u", "basis_v", "edge_coefficients", "rank_float4_stride", "sparse_delta_row_start",
-    "sparse_delta_edge_ordinal", "sparse_delta_value", "sparse_delta_capacity", "pending_delta_edge_ordinal",
-    "pending_delta_value", "pending_delta_matrix_index", "pending_delta_count", "pending_delta_capacity",
-    "projection_first_edge_ordinal", "projection_synapse_prototype", "projection_run_count", "synapse_active_ticks"};
+    "sparse_delta_edge_ordinal", "sparse_delta_value", "pending_delta_edge_ordinal",
+    "pending_delta_value", "pending_delta_matrix_index", "pending_delta_control", "pending_delta_capacity",
+    "updated_plane_count", "walk_pass",
+    "run_first_edge_ordinal", "run_synapse_prototype", "run_count", "synapse_active_ticks"};
 
 // Names the generated input code declares or reads in master_step. A LEMS name in an input
 // equal to one of these, or starting with INPUT_PART_PREFIX, would be captured, so it is refused.
 const Set<String> INPUT_ENGINE_NAMES = {
     "cell_state", "neuron_index", "network_input", "tick", "true", "random_values", "input_row_start",
     "input_entry_prototype", "input_values", "input_spike_counts", "input_entry", "input_base", "input_weight",
-    "input_prototype", "input_kicks", "train_spikes", "arrival"};
-// input_part<k>_<name> holds the value part k's parent reads from it.
+    "input_prototype", "input_kicks", "train_spikes", "arrival", "simulation_time"};
+// input_part<k>_<name> holds part k's <name> for its parent (for part 0, the cell) to read.
 const String INPUT_PART_PREFIX = "input_part";
 
 const String DERIVED_PREFIX = "derived_";
 const String DERIVATIVE_PREFIX = "derivative_";
-// The refractory regime's own derivatives, which may be of the same variables as the integrating regime's.
+// The refractory regime's derivatives, which may share variables with the integrating regime's.
 const String REFRACTORY_DERIVATIVE_PREFIX = "refractory_derivative_";
 // rest_<name> stands for a synapse state variable's OnStart value until the instance fills it in.
 const String REST_PREFIX = "rest_";
-// random_slot_<n> stands for random() call n's slot in random_values until the population
-// that runs it is placed.
+// change_<name> sums a synapse state variable's changes in one tick, so S gets one update per plane.
+const String CHANGE_PREFIX = "change_";
+// random_slot_<n> stands for random() call n's slot in random_values until the population or
+// input that runs it is placed.
 const String RANDOM_SLOT_PREFIX = "random_slot_";
 
-// A synapse has settled once every state variable is this close to rest, against the largest
-// deviation from rest it reached after the spike.
+// A synapse has settled once every state variable is within this fraction of its largest
+// deviation from rest since the spike.
 constexpr f64 REST_FRACTION = 1e-6;
 
 // LEMS function name -> neutral kernel function name. LEMS log is the natural log, like ln.
@@ -98,10 +102,8 @@ bool starts_with(const String &text, const String &prefix) {
 
 Kernel_List_Node *function_call(const String &name, const Vector<Kernel_Node *> &arguments);
 
-// The time `ticks` ticks span, as an f32 rounded once from the exact value: a correctly rounded
-// division by the steps per second when dt splits a second into a whole number of steps. (ticks
-// times dt in f32 is off by one unit in the last place on about a third of ticks, which moves a
-// comparison like t >= delay by a whole tick.) Otherwise ticks times dt.
+// ticks * dt as an f32. When 1 / dt is a whole number, divides by it instead: rounded once,
+// where f32 ticks * dt is one ulp off on about a third of ticks and can shift t >= delay a tick.
 Kernel_Node *time_of_ticks(Kernel_Node *ticks, f64 step_dt) {
     Kernel_Node *tick_count = new_cast(new_type("f32"), ticks);
     const f64 steps_per_second = std::round(1.0 / step_dt);
@@ -111,7 +113,7 @@ Kernel_Node *time_of_ticks(Kernel_Node *ticks, f64 step_dt) {
     return new_expression("*", tick_count, literal(float_literal(step_dt)));
 }
 
-// A float literal's value, or false when the node is no float literal.
+// Reads a float literal's value; false when node is not one.
 bool float_literal_value(const Kernel_Node *node, f64 &value) {
     if (!node || node->body.syntax_type != Kernel_Node_Type::LITERAL) return false;
     const String &token = node->body.token;
@@ -133,7 +135,7 @@ Kernel_List_Node *function_call(const String &name, const Vector<Kernel_Node *> 
 
 // The walking thread's neuron is the edge's source.
 Kernel_Node *edge_source() {
-    return new_cast(new_type("s32"), identifier("neuron_index"));
+    return new_cast(new_type("u32"), identifier("neuron_index"));
 }
 
 // The current edge's value in plane, read through the weight matrix.
@@ -141,7 +143,7 @@ Kernel_Node *load_edge(s64 plane) {
     return function_call("spikecorec_load_edge", {
         identifier("basis_u"), identifier("basis_v"), identifier("edge_coefficients"), identifier("rank_float4_stride"),
         identifier("sparse_delta_row_start"), identifier("sparse_delta_edge_ordinal"), identifier("sparse_delta_value"),
-        identifier("neuron_count"), identifier("sparse_delta_capacity"), literal(std::to_string(plane)),
+        identifier("neuron_count"), literal(std::to_string(plane)),
         edge_source(), identifier("target"), identifier("current_edge")});
 }
 
@@ -150,15 +152,16 @@ Kernel_Node *accumulate_edge(s64 plane, Kernel_Node *delta) {
     return function_call("spikecorec_accumulate_edge", {
         identifier("sparse_delta_row_start"), identifier("sparse_delta_edge_ordinal"), identifier("sparse_delta_value"),
         identifier("pending_delta_edge_ordinal"), identifier("pending_delta_value"),
-        identifier("pending_delta_matrix_index"), identifier("pending_delta_count"), identifier("pending_delta_capacity"),
-        identifier("neuron_count"), identifier("sparse_delta_capacity"), literal(std::to_string(plane)),
+        identifier("pending_delta_matrix_index"), identifier("pending_delta_control"), identifier("pending_delta_capacity"),
+        identifier("neuron_count"), literal(std::to_string(plane)),
         edge_source(), identifier("current_edge"), delta});
 }
 
-// A name the generated synapse dynamics use themselves.
+// A name the generated synapse code reserves.
 bool is_synapse_engine_name(const String &name) {
     return ENGINE_NAMES.count(name) || SYNAPSE_ENGINE_NAMES.count(name) || starts_with(name, DERIVED_PREFIX) ||
-           starts_with(name, DERIVATIVE_PREFIX) || starts_with(name, REST_PREFIX) || starts_with(name, RANDOM_SLOT_PREFIX);
+           starts_with(name, DERIVATIVE_PREFIX) || starts_with(name, REST_PREFIX) || starts_with(name, CHANGE_PREFIX) ||
+           starts_with(name, RANDOM_SLOT_PREFIX);
 }
 
 // Every name a LEMS expression reads; function names are not reads.
@@ -182,7 +185,6 @@ void collect_lems_identifiers(const Lems_Parse_Node *node, Set<String> &names) {
     }
 }
 
-// Whether a LEMS expression calls function_name anywhere.
 bool calls_function(const Lems_Parse_Node *node, const String &function_name) {
     if (!node) return false;
     if (node->body.syntax_type == Lems_Node_Subtype::FUNCTION_CALL) {
@@ -203,7 +205,6 @@ bool calls_function(const Lems_Parse_Node *node, const String &function_name) {
 
 } // namespace
 
-// Host-side value of a LEMS expression, for OnStart values and derived parameters.
 f64 evaluate_lems(const Lems_Parse_Node *node, const Unordered_Map<String, f64> &values, const String &owner_name,
                   Random_Generator *random_generator) {
     const String &lexeme = node->body.token.lexeme;
@@ -289,8 +290,7 @@ f64 evaluate_lems(const String &expression, const Unordered_Map<String, f64> &va
     return evaluate_lems(tree.get(), values, owner_name, random_generator);
 }
 
-// Every Parameter, Constant and DerivedParameter the cell's type resolves, in SI units. An
-// unset parameter is left out; using one fails as an unresolved name.
+// An unset parameter is left out, so using one fails as an unresolved name.
 Unordered_Map<String, f64> component_parameter_values(const NML_Context &context, const NML_Component_Instance &cell) {
     const NML_Component_Type &component_type = *cell.component_type;
     Unordered_Map<String, f64> values;
@@ -307,12 +307,18 @@ Unordered_Map<String, f64> component_parameter_values(const NML_Context &context
             if (component_type.find_declaration(tag.namespace_key()) != element) continue;
 
             const String name = tag.get_attribute("name");
-            if (tag.tag_type == NML_Declaration_Type::Parameter) {
-                if (cell.has_value(name)) values[name] = context.resolve_quantity(cell.value_or(name));
-            } else if (tag.tag_type == NML_Declaration_Type::Constant) {
-                values[name] = context.resolve_quantity(tag.get_attribute("value"));
-            } else if (tag.has_attribute("value")) {
-                derived_parameters.push_back(element);
+            try {
+                if (tag.tag_type == NML_Declaration_Type::Parameter) {
+                    if (cell.has_value(name)) {
+                        values[name] = context.resolve_quantity_of_dimension(cell.value_or(name), tag.get_attribute("dimension"));
+                    }
+                } else if (tag.tag_type == NML_Declaration_Type::Constant) {
+                    values[name] = context.resolve_quantity_of_dimension(tag.get_attribute("value"), tag.get_attribute("dimension"));
+                } else if (tag.has_attribute("value")) {
+                    derived_parameters.push_back(element);
+                }
+            } catch (const Runtime_Error &error) {
+                throw Runtime_Error("'" + cell.id + "' (" + component_type.name + ") " + name + ": " + error.what());
             }
         }
     }
@@ -362,7 +368,6 @@ Unordered_Map<String, f64> starting_values(const NML_Context &context, const NML
     return values;
 }
 
-// The target network's populations, in document order.
 Vector<const NML_Component_Instance *> network_populations(const NML_Context &context) {
     Vector<const NML_Component_Instance *> populations;
     const NML_Component_Instance *network = context.find_instance(context.simulation.target_network_id);
@@ -375,8 +380,8 @@ Vector<const NML_Component_Instance *> network_populations(const NML_Context &co
     return populations;
 }
 
-// Rows in the spike_history ring. Every delay is at least one tick and a row written this
-// tick is never one a delayed arrival reads, so the ring is never shorter than two.
+// Longest delay + 1 rows, so this tick's row is never one a delayed arrival reads; at least
+// two, since every delay is at least one tick.
 s64 spike_history_length(const NML_Context &context) {
     return std::max<s64>(2, context.simulation.maximum_edge_delay + 1);
 }
@@ -469,7 +474,7 @@ const NML_Component_Instance &population_cell(const NML_Context &context, const 
 
 namespace {
 
-// True when the type reacts to arriving spikes itself, with an OnEvent in its own dynamics.
+// True when the type's dynamics have an OnEvent, so it reacts to arriving spikes.
 bool has_on_event(const NML_Component_Type &component_type) {
     for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
         if (entry.source_tag == NML_Declaration_Type::OnEvent) return true;
@@ -477,8 +482,8 @@ bool has_on_event(const NML_Component_Type &component_type) {
     return false;
 }
 
-// The child slots of node that hold uses of names. Declared names, parameters, types,
-// function names and member names are left out.
+// The child slots of node that hold uses of names; declared names, parameters, types,
+// function names and member names are not uses.
 Vector<Kernel_Node **> use_slots(Kernel_Node *node) {
     Vector<Kernel_Node **> slots;
     switch (node->body.syntax_type) {
@@ -544,8 +549,8 @@ Input_Tree Codegen::flatten_input_tree(const NML_Component_Instance &input) cons
     Input_Tree tree;
     const s64 tick_count = context.simulation.total_tick_count;
 
-    // A With's instance, seen from one part: "this", "parent", a Path attribute naming one of
-    // its parts ("./syn0"), or one of its Child roles.
+    // A With's instance, seen from one part: "this", "parent", a Path attribute naming a child
+    // part ("./syn0"), or a child's role.
     auto resolve_instance = [&](s64 part_index, const String &instance_name) -> s64 {
         const Input_Part &part = tree.parts[static_cast<usize>(part_index)];
         if (instance_name == "this") return part_index;
@@ -696,8 +701,7 @@ bool Codegen::cells_receive_events() const {
 }
 
 void Codegen::allocate_cell_model_memory() {
-    // Two rows like network_inputs, but only for a model whose cells have an OnEvent; otherwise
-    // one slot, so there is still a buffer to bind.
+    // Two rows like network_inputs when some cell has an OnEvent; otherwise one slot to bind.
     const s64 event_arrival_slots = cells_receive_events() ? 2 * context.simulation.total_neuron_count : 1;
 
     // Every input buffer has at least one slot, so there is always one to bind.
@@ -740,8 +744,7 @@ void Codegen::initialize_input_state(Random_Generator &random_generator) {
     f32 *values = data_partitions[8].get_contents_as<f32>();
     u8 *spike_counts = data_partitions[9].get_contents_as<u8>();
 
-    // Each neuron's entries are input_row_start[n] up to input_row_start[n + 1]; entries are
-    // sorted by neuron.
+    // Neuron n's entries are input_row_start[n] up to input_row_start[n + 1].
     const s64 neuron_count = context.simulation.total_neuron_count;
     std::fill(row_start, row_start + neuron_count + 1, 0);
     for (const Input_Entry &entry : input_entries) row_start[entry.neuron_index + 1] += 1;
@@ -749,7 +752,7 @@ void Codegen::initialize_input_state(Random_Generator &random_generator) {
         row_start[neuron_index + 1] += row_start[neuron_index];
     }
 
-    // A part starts every entry the same, unless its OnStart calls random(); then each draws its own.
+    // A part starts every entry the same unless its OnStart calls random().
     auto draws_on_start = [](const NML_Component_Type &component_type) {
         for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
             if (entry.source_tag != NML_Declaration_Type::OnStart) continue;
@@ -805,9 +808,9 @@ void Codegen::initialize_cell_state(Random_Generator &random_generator) {
         const Vector<String> &variable_names = component_type.state_variable_names;
         const s64 population_base = context.simulation.population_base_indices.at(population->id);
         const s64 population_size = context.get_population_size(population);
-        const s64 variable_count = static_cast<s64>(variable_names.size());
+        const s64 slot_count = NML_Context::cell_slot_count(component_type);
 
-        // Every neuron starts the same, unless an OnStart calls random(); then each draws its own.
+        // Every neuron starts the same unless an OnStart calls random().
         bool draws_on_start = false;
         for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
             if (entry.source_tag != NML_Declaration_Type::OnStart) continue;
@@ -822,8 +825,10 @@ void Codegen::initialize_cell_state(Random_Generator &random_generator) {
                 starting_state.clear();
                 for (const String &name : variable_names) starting_state.push_back(static_cast<f32>(values.at(name)));
             }
+            // A cell with no state variables keeps one slot, which stays zero.
+            std::fill_n(cell_state + population_base + local_index * slot_count, slot_count, 0.0f);
             std::copy(starting_state.begin(), starting_state.end(),
-                      cell_state + population_base + local_index * variable_count);
+                      cell_state + population_base + local_index * slot_count);
         }
     }
 }
@@ -1026,8 +1031,8 @@ Kernel_Node *Codegen::create_kernel_root() {
     const char *boilerplate = backend == Kernel_Backend::METAL ? METAL_KERNEL_BOILERPLATE : CUDA_KERNEL_BOILERPLATE;
     Unique_Pointer<Kernel_List_Node> program(Kernel_Parser(tokenize_kernel(boilerplate, backend), backend).parse_program());
 
-    // Metal's k^2-tree helpers are shared with the precompiled kernels, so they stay in their own
-    // file and go in ahead of the first function that calls them.
+    // Metal's k^2-tree helpers are shared with the precompiled kernels, so they live in their own
+    // file and go in ahead of the boilerplate's first function.
     if (backend == Kernel_Backend::METAL) {
         const String helpers_path = String(SPIKECOREC_METAL_DEVICE_DIR) + "/k2tree_device.metalinc";
         Input_File_Stream helpers_file(helpers_path);
@@ -1058,8 +1063,8 @@ Kernel_Node *Codegen::translate_kernel_code() {
     if (!master_step) throw Runtime_Error("translate_kernel_code: the boilerplate has no master_step");
     Kernel_List_Node *body = static_cast<Kernel_List_Node *>(master_step->children[3]);
 
-    // One branch per population, over its range of neurons. Its inputs come first, translated
-    // after every cell so the cells' random() slots come first.
+    // One branch per population, over its range of neurons. Its inputs run first but are
+    // translated after every cell, so the cells' random() slots come first.
     Kernel_List_Node *dispatch = new_conditional();
     s64 first_neuron = 0;
     try {
@@ -1090,9 +1095,8 @@ Kernel_Node *Codegen::translate_kernel_code() {
         throw Runtime_Error("translate_kernel_code: master_step declares no 'spiked'");
     }
 
-    // Spikes that reached each cell are counted like network_inputs: two rows by tick parity.
-    // A neuron takes this tick's count from current_row while this tick's arrivals are counted
-    // into next_row.
+    // Arrivals are counted like network_inputs, in two rows by tick parity: a neuron reads its
+    // count from current_row while this tick's arrivals go into next_row.
     const bool receives_events = cells_receive_events();
     if (receives_events) {
         Kernel_Node *arrival_slot = new_expression("[]", identifier("event_arrival_count"), identifier("input_slot"));
@@ -1102,14 +1106,19 @@ Kernel_Node *Codegen::translate_kernel_code() {
         spiked_index += 2;
     }
 
+    // The cells run in a tick's first walk pass only; a later pass only walks deferred neurons' edges.
     if (dispatch->children.empty()) {
         delete dispatch;
     } else {
-        insert_statements(body, static_cast<usize>(spiked_index) + 1, {dispatch});
+        Kernel_List_Node *first_pass_body = new_block();
+        first_pass_body->children.push_back(dispatch);
+        Kernel_List_Node *first_pass_only = new_conditional();
+        add_branch(first_pass_only, new_expression("==", identifier("walk_pass"), literal("0")), first_pass_body);
+        insert_statements(body, static_cast<usize>(spiked_index) + 1, {first_pass_only});
     }
 
-    // Each edge runs its prototype's synapse, numbered in synapse_instances order as the
-    // engine numbers the projection runs.
+    // Each edge runs its prototype's synapse; prototypes are numbered in synapse_instances order,
+    // as the engine numbers the runs.
     const Vector<NML_Component_Instance> &synapses = context.simulation.synapse_instances;
     if (!synapses.empty()) {
         Kernel_List_Node *walk = nullptr;
@@ -1145,8 +1154,8 @@ Kernel_Node *Codegen::translate_kernel_code() {
             statements.push_back(new_declaration(
                     new_type("const s32"), "synapse_prototype",
                     function_call("spikecorec_synapse_prototype",
-                                  {identifier("projection_first_edge_ordinal"), identifier("projection_synapse_prototype"),
-                                   identifier("projection_run_count"), identifier("current_edge")})));
+                                  {identifier("run_first_edge_ordinal"), identifier("run_synapse_prototype"),
+                                   identifier("run_count"), identifier("current_edge")})));
             statements.push_back(prototypes);
         }
         insert_statements(walk, static_cast<usize>(arrived_index) + 1, statements);
@@ -1164,8 +1173,8 @@ Kernel_Node *Codegen::translate_kernel_code() {
         }
     }
 
-    // Constant for the whole run, so baked in rather than bound. Last, so the inserted
-    // dynamics' uses are baked too.
+    // Constant for the run, so baked in rather than bound. Last, so the inserted dynamics'
+    // uses are baked too.
     const Unique_Pointer<Kernel_Node> neuron_count(literal(std::to_string(context.simulation.total_neuron_count)));
     const Unique_Pointer<Kernel_Node> history_length(literal(std::to_string(spike_history_length(context))));
     bake_parameter(master_step, "neuron_count", neuron_count.get());
@@ -1176,8 +1185,8 @@ Kernel_Node *Codegen::translate_kernel_code() {
 
 namespace {
 
-// Each derived variable declared once as derived_<name>, placed so a variable comes after
-// the ones it reads. A select's value comes from selected_value.
+// Declares each derived variable once as derived_<name>, after the ones it reads. A select's
+// value comes from selected_value.
 void place_derived_variables(Kernel_List_Node *body, const Vector<String> &derived_names,
                              const Unordered_Map<String, Vector<const NML_Dynamics_Expression *>> &derived_entries,
                              const Function<Kernel_Node *(const String &)> &translate,
@@ -1233,11 +1242,10 @@ void place_derived_variables(Kernel_List_Node *body, const Vector<String> &deriv
     for (const String &name : derived_names) place_derived(name);
 }
 
-// Ticks a synapse needs after a spike arrives to settle back at rest: every state variable within
-// REST_FRACTION of the largest deviation from rest it reached. Simulated on the host the way the
-// kernel integrates it, with the given weight. -1 when it cannot be skipped at rest: its OnStart
-// values are not a rest state (a derivative or the current is not zero there), or it has not
-// settled within the run.
+// Ticks after an arrival until every state variable is within REST_FRACTION of its largest
+// deviation from rest, simulated on the host as the kernel integrates it. -1 when its OnStart
+// values are not a rest state (a nonzero derivative or current), its derived variables form a
+// cycle, or it does not settle within the run.
 s64 synapse_settle_ticks(const NML_Context &context, const NML_Component_Instance &synapse, f64 weight) {
     const NML_Component_Type &component_type = *synapse.component_type;
     const String &owner_name = component_type.name;
@@ -1355,11 +1363,10 @@ s64 synapse_settle_ticks(const NML_Context &context, const NML_Component_Instanc
 
 } // namespace
 
-// LEMS attaches every synapse on an incoming edge and every current input to the target cell,
-// and the cell reads them through its select DerivedVariables (synapses[*]/i). The engine sums
-// them all into network_input, so each one has to expose what those selects read, in the
-// dimension they read it. A spike train is the engine's own kick into network_input; it only
-// needs a cell that reads its input.
+// The cell reads its synapses and inputs through a select DerivedVariable (synapses[*]/i), and
+// the engine sums them all into network_input. So the cell may have only one select, each must
+// go to the attachment it reads, and each must expose what it reads, in the same dimension. A
+// spike source's kicks only need a cell that reads its input.
 void Codegen::check_cell_inputs() const {
     Vector<Pair<s64, const NML_Component_Type *>> population_ends;
     s64 first_neuron = 0;
@@ -1377,13 +1384,37 @@ void Codegen::check_cell_inputs() const {
     // A synapse's spikes also reach a cell with an OnEvent, so that cell takes a synapse even
     // when it reads no current.
     auto check_attached = [](const NML_Component_Type &cell_type, const NML_Component_Instance &attached,
-                             const String &role, bool must_expose_input, bool delivers_arrivals) {
+                             const String &role, bool must_expose_input, bool delivers_arrivals,
+                             const String &destination) {
         const String described = role + " '" + attached.id + "' (" + attached.component_type->name + ") into a '" +
                                  cell_type.name + "'";
-        bool reads_input = delivers_arrivals && has_on_event(cell_type);
+
+        // Every synapse and input lands in one network_input, which only one select can read.
+        Vector<const NML_Dynamics_Expression *> selects;
         for (const NML_Dynamics_Expression &entry : cell_type.dynamics) {
-            if (entry.select.empty()) continue;
+            if (!entry.select.empty()) selects.push_back(&entry);
+        }
+        if (selects.size() > 1) {
+            String select_names;
+            for (const NML_Dynamics_Expression *entry : selects) {
+                select_names += (select_names.empty() ? "" : ", ") + entry->target + " (" + entry->select + ")";
+            }
+            throw Runtime_Error(described + ": the cell reads its inputs through " + std::to_string(selects.size()) +
+                                " selects, " + select_names + ", but the engine sums every synapse and input of a "
+                                "cell into one current, so it cannot give each select its own");
+        }
+
+        bool reads_input = delivers_arrivals && has_on_event(cell_type);
+        for (const NML_Dynamics_Expression *select : selects) {
+            const NML_Dynamics_Expression &entry = *select;
             reads_input = true;
+            // What goes to an attachment the select does not read never reaches the cell.
+            const String attachment = destination.empty() ? "synapses" : destination;
+            const String read_attachment = entry.select.substr(0, entry.select.find_first_of("[/"));
+            if (read_attachment != attachment) {
+                throw Runtime_Error(described + ": it goes to the cell's '" + attachment + "', but the cell reads only '" +
+                                    read_attachment + "' (" + entry.target + ")");
+            }
             if (!must_expose_input) continue;
 
             const String exposure_name = entry.select.substr(entry.select.rfind('/') + 1);
@@ -1403,16 +1434,16 @@ void Codegen::check_cell_inputs() const {
         if (!reads_input) throw Runtime_Error(described + ": the cell reads no input");
     };
 
-    // Each synapse against each cell type it reaches, once.
-    Unordered_Map<String, Set<const NML_Component_Type *>> checked_cell_types_per_synapse;
+    // Each synapse against each cell type and destination it reaches, once.
+    Unordered_Map<String, Ordered_Set<Pair<const NML_Component_Type *, String>>> checked_per_synapse;
     for (const Vector<NML_Network_Edge> &row : context.simulation.network_data.list) {
         for (const NML_Network_Edge &edge : row) {
             const NML_Component_Type *cell_type = cell_type_of(edge.child);
-            if (!cell_type || !checked_cell_types_per_synapse[edge.component_id].insert(cell_type).second) continue;
+            if (!cell_type || !checked_per_synapse[edge.component_id].insert({cell_type, edge.destination}).second) continue;
 
             const NML_Component_Instance *synapse = context.find_instance(edge.component_id);
             if (!synapse || !synapse->component_type) continue;
-            check_attached(*cell_type, *synapse, "Synapse", true, true);
+            check_attached(*cell_type, *synapse, "Synapse", true, true, edge.destination);
         }
     }
 
@@ -1420,25 +1451,21 @@ void Codegen::check_cell_inputs() const {
         const NML_Component_Instance *input = context.find_instance(profile.input_component_id);
         if (!input || !input->component_type) continue;
 
-        Set<const NML_Component_Type *> checked_cell_types;
+        Ordered_Set<Pair<const NML_Component_Type *, String>> checked;
         for (const Input_Target &target : profile.targets) {
             const NML_Component_Type *cell_type = cell_type_of(context.neuron_index_of(target.neuron_index));
-            if (!cell_type || !checked_cell_types.insert(cell_type).second) continue;
-            // A spike source's spikes become kicks into the cell's input; every other input delivers
-            // the exposure the cell reads.
-            check_attached(*cell_type, *input, "Input", !context.is_instance_of(input, "baseSpikeSource"), false);
+            if (!cell_type || !checked.insert({cell_type, target.destination}).second) continue;
+            // A spike source delivers kicks; any other input delivers the exposure the cell reads.
+            check_attached(*cell_type, *input, "Input", !context.is_instance_of(input, "baseSpikeSource"), false,
+                           target.destination);
         }
     }
 }
 
-// The type's dynamics with LEMS names still in them: per population, translate_component_instance
-// puts each state variable's cell_state slot and each parameter's value in their place.
-//
-// Order: on the tick the cell leaves refractory, the exit's assignments and the integrating
-// regime's OnEntry; the OnEvents, once per spike that arrived this tick (event_arrivals); derived
-// variables (by dependency); the refractory flag; every derivative into a temporary; the Euler
-// steps, each regime's only in that regime; then the OnConditions. All derivatives read the
-// state from before the step, and all conditions see the state after it.
+// The type's dynamics with LEMS names still in them; translate_component_instance fills in each
+// population's cell_state slots and parameter values. Order: on leaving refractory, the exit and
+// OnEntry assignments; the OnEvents per arrival; derived variables; every derivative from the
+// pre-step state; the Euler steps (each regime's only in it); then the OnConditions.
 Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &component_type) {
     auto cached = component_type_templates.find(component_type.name);
     if (cached != component_type_templates.end()) return cached->second;
@@ -1517,9 +1544,9 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
         }
     }
 
-    // Regimes: the integrating / refractory pair, lowered to a test on last_spiked. The refractory
-    // regime's timer and both Transitions collapse into that test; each OnEntry runs with the
-    // Transition into its regime, and the refractory regime's own dynamics run while the test holds.
+    // The integrating / refractory regime pair is lowered to a test on last_spiked, which replaces
+    // the timer and both Transitions. Each OnEntry runs with the Transition into its regime, and
+    // the refractory regime's own dynamics run while the test holds.
     String active_regime;
     String refractory_regime;
     String timer_name;
@@ -1547,7 +1574,7 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
         }
         exit_handler = exits[0];
 
-        // The exit test is timer .geq. duration (or .gt.).
+        // The exit test must compare a timer to a duration with >= or >.
         Unique_Pointer<Lems_Parse_Node> exit_test(parse_lems_expression(exits[0]->test, owner_name));
         const auto *comparison = dynamic_cast<const Binary_Node<Lems_Parse_Body> *>(exit_test.get());
         const String comparison_operator = exit_test->body.token.lexeme;
@@ -1557,7 +1584,7 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
             throw unsupported("the refractory exit must test a timer against a duration");
         }
         timer_name = comparison->left->body.token.lexeme;
-        // The exit is elapsed > duration or elapsed >= duration; refractory is its negation.
+        // Refractory is the exit test's negation.
         refractory_comparison = comparison_operator == ">" ? "<=" : "<";
 
         // The test has to measure the time since the spike that entered the regime, which is what
@@ -1637,6 +1664,23 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
     const bool has_refractory = !refractory_regime.empty();
     auto is_gated = [&](const String &regime_name) { return has_refractory && regime_name == active_regime; };
 
+    // The OnEvents and the refractory exit run before the derived variables are computed, so
+    // they cannot read one.
+    auto refuse_derived_reads = [&](const Vector<const NML_Dynamics_Expression *> &assignments, const String &where) {
+        for (const NML_Dynamics_Expression *assignment : assignments) {
+            const Unique_Pointer<Lems_Parse_Node> tree(parse_lems_expression(assignment->expression, owner_name));
+            Set<String> read_names;
+            collect_lems_identifiers(tree.get(), read_names);
+            for (const String &name : read_names) {
+                if (derived_entries.count(name) == 0) continue;
+                throw unsupported(where + " reads derived variable '" + name + "', which is computed after it runs");
+            }
+        }
+    };
+    for (const Event_Handler &handler : arrival_handlers) refuse_derived_reads(handler.assignments, "an OnEvent");
+    if (exit_handler) refuse_derived_reads(exit_handler->assignments, "the refractory exit");
+    if (has_refractory) refuse_derived_reads(entry_assignments[active_regime], "the OnEntry of '" + active_regime + "'");
+
     Set<String> lems_names;
     auto translate = [&](const String &expression) {
         const Unique_Pointer<Lems_Parse_Node> tree(parse_lems_expression(expression, owner_name));
@@ -1645,7 +1689,7 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
     };
     const String step_dt = float_literal(context.simulation.step_dt);
 
-    // Phase 1 synapses are current-based, so a summed select is the drained input.
+    // Synapses and inputs sum their currents into network_input, which an add select reads.
     auto selected_value = [&unsupported](const NML_Dynamics_Expression &entry) -> Kernel_Node * {
         if (entry.reduce != "add") throw unsupported("DerivedVariable '" + entry.target + "' selects without reduce=\"add\"");
         return identifier("network_input");
@@ -1668,8 +1712,8 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
         refractory_declaration = new_declaration(
                 new_type("const bool"), "refractory", new_expression("&&", has_spiked, within_duration));
 
-        // Leaving refractory is the tick it stops holding after it held on the tick before. The
-        // exit OnCondition's assignments and the integrating regime's OnEntry run then.
+        // Leaving refractory is the first tick the test fails after it held. The exit
+        // OnCondition's assignments and the integrating regime's OnEntry run then.
         Vector<const NML_Dynamics_Expression *> exit_assignments = exit_handler->assignments;
         for (const NML_Dynamics_Expression *assignment : entry_assignments[active_regime]) exit_assignments.push_back(assignment);
         if (exit_assignments.empty()) {
@@ -1724,8 +1768,8 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
         arrival_loop = loop;
     }
 
-    // Leaving refractory and the OnEvents come first, so the derived variables and derivatives
-    // below see what they changed; the refractory flag moves up ahead of them when they test it.
+    // Leaving refractory and the OnEvents come first, so derived variables and derivatives see
+    // their changes; the refractory flag moves ahead of them when they test it.
     if (leaving_refractory || arrivals_test_regime) {
         body->children.push_back(refractory_declaration);
         refractory_declaration = nullptr;
@@ -1806,21 +1850,21 @@ Kernel_List_Node *Codegen::translate_component_type(const NML_Component_Type &co
         }
     }
 
-    // Derived variables are read through their declared locals, and t is the tick's time.
+    // Derived variables are read through their declared locals, and t is the tick's time from the host.
     Kernel_Node *body_node = body;
     for (const String &name : derived_names) {
         const Unique_Pointer<Kernel_Node> local(identifier(DERIVED_PREFIX + name));
         replace_identifier(body_node, name, local.get());
     }
-    const Unique_Pointer<Kernel_Node> tick_time(time_of_ticks(identifier("tick"), context.simulation.step_dt));
+    const Unique_Pointer<Kernel_Node> tick_time(identifier("simulation_time"));
     replace_identifier(body_node, "t", tick_time.get());
 
     component_type_templates[component_type.name] = body;
     return body;
 }
 
-// The population's dynamics: the type's template with every state variable replaced by its
-// slot in cell_state and every parameter by its value.
+// The type's template with each state variable replaced by its cell_state slot and each
+// parameter by its value.
 Kernel_List_Node *Codegen::translate_component_instance(const NML_Component_Instance &population, s64 first_neuron) {
     const NML_Component_Instance &cell = population_cell(context, population);
     const NML_Component_Type &component_type = *cell.component_type;
@@ -1841,16 +1885,16 @@ Kernel_List_Node *Codegen::translate_component_instance(const NML_Component_Inst
             random_values_count += population_size;
         }
 
-        // Neuron n's variable at offset is cell_state[n * count + base - first_neuron * count + offset].
+        // Neuron n's variable is cell_state[n * count + base - first_neuron * count + offset].
         const Vector<String> &variable_names = component_type.state_variable_names;
-        const s64 variable_count = static_cast<s64>(variable_names.size());
+        const s64 slot_count = NML_Context::cell_slot_count(component_type);
         const s64 population_base = context.simulation.population_base_indices.at(population.id);
         for (usize offset = 0; offset < variable_names.size(); offset += 1) {
-            const s64 constant_part = population_base - first_neuron * variable_count + static_cast<s64>(offset);
+            const s64 constant_part = population_base - first_neuron * slot_count + static_cast<s64>(offset);
             const Unique_Pointer<Kernel_Node> slot(new_expression(
                     "[]", identifier("cell_state"),
                     new_expression(constant_part < 0 ? "-" : "+",
-                                   new_expression("*", identifier("neuron_index"), literal(std::to_string(variable_count))),
+                                   new_expression("*", identifier("neuron_index"), literal(std::to_string(slot_count))),
                                    literal(std::to_string(std::llabs(constant_part))))));
             replace_identifier(body, variable_names[offset], slot.get());
         }
@@ -1877,9 +1921,8 @@ Kernel_List_Node *Codegen::translate_component_instance(const NML_Component_Inst
     return static_cast<Kernel_List_Node *>(body);
 }
 
-// The loop over this neuron's input entries, dispatching each to its prototype's code. Run in the
-// population's branch before the cell's dynamics, so the cell reads what its inputs added to
-// network_input this tick.
+// Loops over this neuron's input entries, each running its prototype's code. Runs before the
+// cell's dynamics, so the cell reads what its inputs added to network_input this tick.
 Kernel_List_Node *Codegen::translate_input_entries(const NML_Component_Instance &population, s64 first_neuron) {
     const s64 population_size = context.get_population_size(&population);
     Vector<bool> reaches_population(input_prototypes.size(), false);
@@ -1927,15 +1970,10 @@ Kernel_List_Node *Codegen::translate_input_entries(const NML_Component_Instance 
     return block;
 }
 
-// One input's dynamics for the current entry (input_base, input_weight, input_entry), on a cell of
-// the population. Each part keeps its state in the entry's block of input_values. Order:
-//   - each spike train runs its receiver's OnEvents once per spike on this tick;
-//   - every part from the leaves up, so a part reads what its children export: its derived
-//     variables, its derivatives into temporaries, its Euler steps, its OnConditions, then the
-//     values its parent selects from it into input_part<k>_<name>;
-//   - delivery: an input that produces a current adds the exposure the cell reads to
-//     network_input; a spike source adds a kick per spike it emits that no Structure routes on.
-// An EventOut runs the OnEvents of the parts its Structure routes it to, at once.
+// One input's dynamics for the current entry; each part's state is in the entry's block of
+// input_values. Order: spike trains run their receiver's OnEvents once per spike; each part
+// steps from the leaves up (derived, derivatives, Euler steps, OnConditions, exports); then the
+// input adds its current, or a kick per unrouted spike, to network_input.
 Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Component_Instance &population,
                                                    s64 first_neuron) {
     const Input_Tree &tree = input_trees[static_cast<usize>(prototype)];
@@ -1957,13 +1995,13 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
         const Vector<String> &variable_names = cell_type.state_variable_names;
         auto variable = std::find(variable_names.begin(), variable_names.end(), variable_name);
         if (variable == variable_names.end()) return nullptr;
-        const s64 variable_count = static_cast<s64>(variable_names.size());
+        const s64 slot_count = NML_Context::cell_slot_count(cell_type);
         const s64 constant_part = context.simulation.population_base_indices.at(population.id) -
-                                  first_neuron * variable_count + static_cast<s64>(variable - variable_names.begin());
+                                  first_neuron * slot_count + static_cast<s64>(variable - variable_names.begin());
         return new_expression("[]", identifier("cell_state"),
                               new_expression(constant_part < 0 ? "-" : "+",
                                              new_expression("*", identifier("neuron_index"),
-                                                            literal(std::to_string(variable_count))),
+                                                            literal(std::to_string(slot_count))),
                                              literal(std::to_string(std::llabs(constant_part)))));
     };
 
@@ -2060,7 +2098,7 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
             }
         }
         if (used_names.count("t")) {
-            const Unique_Pointer<Kernel_Node> tick_time(time_of_ticks(identifier("tick"), context.simulation.step_dt));
+            const Unique_Pointer<Kernel_Node> tick_time(identifier("simulation_time"));
             replace_identifier(node, "t", tick_time.get());
         }
         for (const String &name : used_names) {
@@ -2076,20 +2114,23 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
     auto check_part_names = [&](s64 part_index, const Set<String> &names) {
         for (const String &name : names) {
             if (INPUT_ENGINE_NAMES.count(name) || starts_with(name, INPUT_PART_PREFIX) || starts_with(name, DERIVED_PREFIX) ||
-                starts_with(name, DERIVATIVE_PREFIX)) {
+                starts_with(name, DERIVATIVE_PREFIX) || starts_with(name, RANDOM_SLOT_PREFIX)) {
                 throw unsupported(part_name(part_index) + " uses the name '" + name + "', which the generated kernel reserves");
             }
         }
     };
 
-    // An EventOut from source: the OnEvents of the parts it is routed to, run at once; for a
-    // spike source's own unrouted spike, a kick.
+    // An EventOut from source runs the OnEvents of the parts it is routed to, at once. A spike
+    // source's own unrouted spike is a kick.
     Function<Kernel_List_Node *(s64, usize)> deliver_event;
     Function<Kernel_List_Node *(s64, usize)> on_event_body = [&](s64 part_index, usize depth) {
         const NML_Component_Type &component_type = *tree.parts[static_cast<usize>(part_index)].instance->component_type;
         Kernel_List_Node *body = new_block();
         bool in_event = false;
         bool emits_spike = false;
+        // The LEMS names the handler uses, taken before translation turns random() into
+        // random_values[random_slot_N].
+        Set<String> used_names;
         for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
             switch (entry.source_tag) {
                 case NML_Declaration_Type::OnEvent:
@@ -2097,8 +2138,11 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
                     break;
                 case NML_Declaration_Type::StateAssignment:
                     if (in_event) {
+                        const Unique_Pointer<Lems_Parse_Node> tree_node(parse_lems_expression(entry.expression, component_type.name));
+                        used_names.insert(entry.target);
+                        collect_lems_identifiers(tree_node.get(), used_names);
                         body->children.push_back(new_assignment(identifier(entry.target), "=",
-                                                                translate(entry.expression, component_type.name)));
+                                                                translate_expression(tree_node.get())));
                     }
                     break;
                 case NML_Declaration_Type::EventOut:
@@ -2112,8 +2156,6 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
                     break;
             }
         }
-        Set<String> used_names;
-        collect_identifiers(body, used_names);
         for (const NML_Dynamics_Expression &entry : component_type.dynamics) {
             if (entry.source_tag != NML_Declaration_Type::DerivedVariable && entry.source_tag != NML_Declaration_Type::Case) continue;
             if (used_names.count(entry.target)) {
@@ -2331,15 +2373,12 @@ Kernel_List_Node *Codegen::translate_input_prototype(s32 prototype, const NML_Co
     return block;
 }
 
-// The synapse's dynamics for the current edge, with LEMS names still in them. Each state
-// variable lives in its own weight-matrix plane, so a read is a load_edge and a write is an
-// accumulate_edge of the change.
-//
-// It runs on every edge of a neuron whose synapses are in their active window (see
-// synapse_active_ticks). Order: derived variables, every derivative into a temporary, the Euler
-// steps, the OnEvent on an arrival, then the current into the target. On the window's last tick
-// the synapse has settled, and instead of the Euler steps it is put exactly back at rest, where
-// it stays while the walk is skipped.
+// The synapse's dynamics for one edge, with LEMS names still in them. Each state variable is a
+// plane: reads are load_edge, and the tick's changes to it (its Euler step or return to rest, plus
+// the OnEvent on arrival) sum into change_<name>, which one accumulate_edge adds, so an edge
+// queues at most one update per plane per tick. Order: derived variables, derivatives, the step,
+// the OnEvent on arrival, the updates, the current into the target. On the active window's last
+// tick it is set exactly to rest instead of stepped, and stays there while skipped.
 Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &component_type) {
     auto cached = synapse_type_templates.find(component_type.name);
     if (cached != synapse_type_templates.end()) return cached->second;
@@ -2427,9 +2466,12 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
         lems_names.insert(derivative->target);
         body->children.push_back(new_declaration(
                 new_type("const f32"), DERIVATIVE_PREFIX + derivative->target, translate(derivative->expression)));
-        updates.push_back(accumulate_edge(
-                plane_of(derivative->target),
+        updates.push_back(new_assignment(
+                identifier(CHANGE_PREFIX + derivative->target), "=",
                 new_expression("*", literal(step_dt), identifier(DERIVATIVE_PREFIX + derivative->target))));
+    }
+    for (const String &variable_name : variable_names) {
+        body->children.push_back(new_declaration(new_type("f32"), CHANGE_PREFIX + variable_name, literal(float_literal(0.0))));
     }
     Kernel_List_Node *steps = new_block();
     for (Kernel_Node *update : updates) steps->children.push_back(update);
@@ -2437,8 +2479,8 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
     Kernel_List_Node *return_to_rest = new_block();
     for (const String &variable_name : variable_names) {
         lems_names.insert(variable_name);
-        return_to_rest->children.push_back(accumulate_edge(
-                plane_of(variable_name),
+        return_to_rest->children.push_back(new_assignment(
+                identifier(CHANGE_PREFIX + variable_name), "=",
                 new_expression("-", identifier(REST_PREFIX + variable_name), identifier(variable_name))));
     }
     Kernel_Node *last_active_tick = new_expression(
@@ -2454,12 +2496,18 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
     Kernel_List_Node *on_arrival = new_block();
     for (const NML_Dynamics_Expression *assignment : event_assignments) {
         lems_names.insert(assignment->target);
+        plane_of(assignment->target);
         Kernel_Node *increment = new_expression("-", translate(assignment->expression), identifier(assignment->target));
-        on_arrival->children.push_back(accumulate_edge(plane_of(assignment->target), increment));
+        on_arrival->children.push_back(new_assignment(identifier(CHANGE_PREFIX + assignment->target), "+=", increment));
     }
     Kernel_List_Node *arrival = new_conditional();
     add_branch(arrival, identifier("arrived"), on_arrival);
     body->children.push_back(arrival);
+
+    // One update per plane; a change of zero queues nothing.
+    for (const String &variable_name : variable_names) {
+        body->children.push_back(accumulate_edge(plane_of(variable_name), identifier(CHANGE_PREFIX + variable_name)));
+    }
 
     // The current, into the target's next input row.
     Kernel_Node *input_slot = new_expression(
@@ -2474,13 +2522,13 @@ Kernel_List_Node *Codegen::translate_synapse_type(const NML_Component_Type &comp
         }
     }
 
-    // Derived variables are read through their declared locals, and t is the tick's time.
+    // Derived variables are read through their declared locals, and t is the tick's time from the host.
     Kernel_Node *body_node = body;
     for (const String &name : derived_names) {
         const Unique_Pointer<Kernel_Node> local(identifier(DERIVED_PREFIX + name));
         replace_identifier(body_node, name, local.get());
     }
-    const Unique_Pointer<Kernel_Node> tick_time(time_of_ticks(identifier("tick"), context.simulation.step_dt));
+    const Unique_Pointer<Kernel_Node> tick_time(identifier("simulation_time"));
     replace_identifier(body_node, "t", tick_time.get());
 
     synapse_type_templates[component_type.name] = body;
@@ -2646,7 +2694,7 @@ Vector<String> Codegen::kernel_parameter_names() const {
     return names;
 }
 
-// code generation
+// Code generation
 
 const Unordered_Map<String, String> &kernel_type_spellings(Kernel_Backend backend) {
     static const Unordered_Map<String, String> metal_spellings = {
@@ -2786,7 +2834,7 @@ String Codegen::function_call_to_string(Kernel_Node *node) {
         return "atomicAdd(&(" + compile_unparenthesized(arguments[0]) + "), " + compile_unparenthesized(arguments[1]) + ")";
     }
 
-    // exact_divide(numerator, denominator): an IEEE correctly rounded division even under fast math.
+    // exact_divide(numerator, denominator): a correctly rounded division even under fast math.
     if (name == "exact_divide") {
         if (arguments.size() != 2) throw Runtime_Error("exact_divide takes a numerator and a denominator");
         const String numerator = compile_unparenthesized(arguments[0]);
@@ -2873,7 +2921,7 @@ String Codegen::jump_to_string(Kernel_Node *node) {
     return jump->body.token + " " + compile_unparenthesized(jump->child);
 }
 
-// Metal buffer indices come from position, so inserting a parameter never renumbers anything by hand.
+// Metal buffer indices follow position, so adding a parameter needs no manual renumbering.
 String Codegen::parameters_to_string(Kernel_Node *node, bool number_buffers) {
     String source;
     s64 buffer_index = 0;

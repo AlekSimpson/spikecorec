@@ -28,7 +28,7 @@ const Set<String> CUDA_QUALIFIERS = {
     "const", "constexpr", "static", "inline", "extern", "__global__", "__device__", "__forceinline__",
     "__restrict__", "__shared__", "__constant__"};
 
-// longest first, so "<<=" is never read as "<<" then "="
+// Longest first, so "<<=" is never read as "<<" then "=".
 const Vector<String> OPERATORS = {
     "<<=", ">>=",
     "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::",
@@ -72,7 +72,7 @@ void push_preprocessor(Kernel_Lexer &lexer) {
     lexer.position = end;
 }
 
-// metal only: "[[ buffer(5) ]]" is one token, lexeme "buffer(5)"
+// Metal only: "[[ buffer(5) ]]" is one token, lexeme "buffer(5)".
 bool starts_attribute(Kernel_Lexer &lexer, char character) { 
     return character == '[' && next_character(lexer) == '['; 
 }
@@ -104,7 +104,7 @@ void push_number(Kernel_Lexer &lexer) {
             while (position < text.size() && isdigit(static_cast<u8>(text[position]))) position += 1;
         }
     }
-    // Suffixes, e.g. 0.0f, 1u, 20ul
+    // Suffixes, e.g. 0.0f, 1u, 20ul.
     while (position < text.size() && String("fFuUlL").find(text[position]) != String::npos) position += 1;
     lexer.tokens.push_back({Kernel_Token::Kind::Number, text.substr(start, position - start)});
 }
@@ -149,7 +149,7 @@ void push_cuda_word(Kernel_Lexer &lexer) {
     push_word(lexer, CUDA_TYPE_WORDS, CUDA_QUALIFIERS); 
 }
 
-// every operator character is itself a one-character operator, so this always advances
+// Every operator character is also a one-character operator, so push_operator always advances.
 bool starts_operator(Kernel_Lexer &, char character) { 
     return OPERATOR_CHARACTERS.find(character) != String::npos; 
 }

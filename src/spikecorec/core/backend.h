@@ -71,6 +71,14 @@ struct Engine_Function {
 #endif
 };
 
+// One kernel launch for Engine_Backend::run_functions: the function, its positional arguments and
+// its thread count. Inline scalars are read when the launch is encoded, inside run_functions.
+struct Engine_Dispatch {
+    Engine_Function *function = nullptr;
+    Vector<Engine_Pointer> parameters;
+    s64 job_count = 0;
+};
+
 static const Unordered_Map<Engine_Datatype, u64> TYPE_ALIGNMENTS = {
     {Engine_Datatype::SIGNED32, 4},
     {Engine_Datatype::SIGNED64, 8},
@@ -88,8 +96,7 @@ static const Unordered_Map<Engine_Datatype, u64> TYPE_ALIGNMENTS = {
 
 
 struct Engine_Backend {
-    // Metal wants a 256-byte offset for a buffer bound to a `constant` kernel parameter,
-    // and float4 reads need 16.
+    // Metal needs 256-byte offsets for buffers bound to `constant` parameters; float4 needs 16.
     static constexpr u64 PARTITION_ALIGNMENT = 256;
 
     s64 last_offset = 0;
@@ -103,6 +110,11 @@ struct Engine_Backend {
     MTL::Library *default_library = nullptr;
     Vector<MTL::Buffer *> slabs;
 
+    // Bytes held by the live slabs, and the most they have held since the last reset.
+    u64 allocated_byte_count = 0;
+    u64 peak_allocated_byte_count = 0;
+    void reset_peak_allocated_byte_count() { peak_allocated_byte_count = allocated_byte_count; }
+
     explicit Engine_Backend(s64 threads_per_block_argument = 256);
     ~Engine_Backend();
 
@@ -111,22 +123,22 @@ struct Engine_Backend {
     Engine_Backend(Engine_Backend &&) = delete;
     Engine_Backend &operator=(Engine_Backend &&) = delete;
 
-    Optional<Engine_Function> create_function(const String &name, const String &source_code);
-    Optional<Engine_Function> load_precompiled_function(const String &name);
-    void release_function(Engine_Function &function);
-    bool run_function(Engine_Function &function, Vector<Engine_Pointer> &parameters, s64 job_count);
+    Optional<Engine_Function> create_function(const String &name, const String &source_code) const;
+    Optional<Engine_Function> load_precompiled_function(const String &name) const;
+    static void release_function(Engine_Function &function);
+    bool run_function(Engine_Function &function, Vector<Engine_Pointer> &parameters, s64 job_count) const;
+    // Runs the launches in order in one command buffer and waits once; each sees the writes of
+    // those before it. False when the command buffer fails.
+    bool run_functions(Vector<Engine_Dispatch> &dispatches) const;
 
     Engine_Backend &partition(u64 bytes, Engine_Datatype datatype, Vector<Engine_Pointer> &partitions);
     Engine_Pointer allocate(Vector<Engine_Pointer> &partitions);
 
-    // Releases one chunk, named by the handle allocate() returned for it.
+    // Releases one slab, named by the handle allocate() returned for it.
     void deallocate_slab(const Engine_Pointer &slab);
     void deallocate_all();
 
-    // Placement hints. No-ops here: Metal buffers already live in host-visible shared
-    // storage, so there is nothing to migrate and nothing to replicate. They exist so
-    // callers that know their access pattern -- the k^2-tree's arrays are immutable once
-    // built, for instance -- can say so once and have it matter on CUDA.
+    // Placement hints: no-ops, since Metal buffers use shared storage. They take effect on CUDA.
     void advise_read_mostly(const Engine_Pointer &, u64) {}
     void prefetch_to_gpu(const Engine_Pointer &, u64) {}
     void prefetch_to_cpu(const Engine_Pointer &, u64) {}
@@ -135,8 +147,7 @@ struct Engine_Backend {
 #elif defined(SPIKECOREC_CUDA)
 
 struct Engine_Backend {
-    // Metal wants a 256-byte offset for a buffer bound to a `constant` kernel parameter,
-    // and float4 reads need 16.
+    // Matches the Metal backend, so both lay out partitions alike.
     static constexpr u64 PARTITION_ALIGNMENT = 256;
 
     s64 last_offset = 0;
@@ -148,6 +159,12 @@ struct Engine_Backend {
     CUdevice cuda_gpu_device = 0;
     CUcontext cuda_context = nullptr;
     Vector<void *> slabs;
+    Vector<u64> slab_byte_counts;  // parallel to slabs
+
+    // Bytes held by the live slabs, and the most they have held since the last reset.
+    u64 allocated_byte_count = 0;
+    u64 peak_allocated_byte_count = 0;
+    void reset_peak_allocated_byte_count() { peak_allocated_byte_count = allocated_byte_count; }
 
     explicit Engine_Backend(s64 threads_per_block_argument = 256);
     ~Engine_Backend();
@@ -162,6 +179,8 @@ struct Engine_Backend {
     void release_function(Engine_Function &function);
 
     bool run_function(Engine_Function &function, Vector<Engine_Pointer> &parameters, s64 job_count);
+    // Runs the launches in order, each through run_function. False at the first that fails.
+    bool run_functions(Vector<Engine_Dispatch> &dispatches);
 
     Engine_Backend &partition(u64 bytes, Engine_Datatype datatype, Vector<Engine_Pointer> &partitions);
     Engine_Pointer allocate(Vector<Engine_Pointer> &partitions);
@@ -169,10 +188,8 @@ struct Engine_Backend {
     void deallocate_slab(const Engine_Pointer &slab);
     void deallocate_all();
 
-    // Managed-memory placement hints. read_mostly keeps per-device read-only replicas of
-    // a range that is written once and read constantly (the k^2-tree's arrays), instead
-    // of migrating it to whichever processor touched it last. The prefetches turn a
-    // page-by-page fault-in, driven one touch at a time, into a single bulk copy.
+    // Managed-memory hints. read_mostly replicates a write-once range (such as the k^2-tree)
+    // on each device instead of migrating it; a prefetch replaces page faults with one bulk copy.
     void advise_read_mostly(const Engine_Pointer &range, u64 byte_count);
     void prefetch_to_gpu(const Engine_Pointer &range, u64 byte_count);
     void prefetch_to_cpu(const Engine_Pointer &range, u64 byte_count);

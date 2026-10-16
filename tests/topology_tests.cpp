@@ -41,26 +41,34 @@ TEST(Topologies, topology_initialization) {
 }
 
 TEST(Topologies, square_torus_edge_cases) {
-    // k == 1: all four torus-wraparound directions point back to the single cell
-    // itself; since self-loops are not supported, square_torus omits them rather
-    // than reporting node 0 as its own neighbor, so node 0 has no neighbors at all.
+    // side_length 1: every direction wraps back to node 0, and self-loops are dropped.
     auto one = square_torus(1);
     EXPECT_EQ(static_cast<s64>(one.size()), 1);
     EXPECT_EQ(static_cast<s64>(one[0].size()), 0);
 
-    // k == 3: exact 4-neighbor torus wrapping for node 0 → {right=1,left=2,down=3,up=6}.
+    // side_length 3: node 0's neighbors are right 1, left 2, down 3 and up 6.
     auto three = square_torus(3);
     EXPECT_EQ(static_cast<s64>(three.size()), 9);
     EXPECT_EQ((Set<s32>(three[0].begin(), three[0].end())),
               (Set<s32>{1, 2, 3, 6}));
 
-    // k < 1 is rejected.
+    // side_length 2: left and right (and up and down) are the same node, so each row has 2.
+    auto two = square_torus(2);
+    EXPECT_EQ(two[0], (Vector<s32>{1, 2}));
+    for (const Vector<s32> &row : two) EXPECT_EQ(Set<s32>(row.begin(), row.end()).size(), row.size());
+    for (const Vector<s32> &row : small_world_torus(2, /*random_fanout=*/1, /*seed=*/7)) {
+        EXPECT_EQ(row.size(), 3u);
+        EXPECT_EQ(Set<s32>(row.begin(), row.end()).size(), 3u);
+    }
+    for (const Vector<s32> &row : small_world_torus(2, /*random_fanout=*/0, /*seed=*/7)) EXPECT_EQ(row.size(), 2u);
+
+    // side_length < 1 throws.
     EXPECT_THROW(square_torus(0), Invalid_Argument);
     EXPECT_THROW(square_torus(-2), Invalid_Argument);
 }
 
 TEST(Topologies, small_world_determinism) {
-    // Same seed → byte-identical structure.
+    // The same seed gives the same graph.
     auto first = small_world_torus(4, /*random_fanout=*/3, /*seed=*/123);
     auto second = small_world_torus(4, /*random_fanout=*/3, /*seed=*/123);
     EXPECT_EQ(first, second);
@@ -86,11 +94,11 @@ TEST(Topologies, random_fixed_outdegree_edge_cases) {
     EXPECT_EQ(static_cast<s64>(zero_fanout.size()), 9);
     for (auto &row : zero_fanout) EXPECT_TRUE(row.empty());
 
-    // Determinism.
+    // The same seed gives the same graph.
     EXPECT_EQ(random_fixed_outdegree(4, 5, 99), random_fixed_outdegree(4, 5, 99));
 
-    // fanout clamped to node_count - 1; requesting more → exactly node_count - 1 distinct, no self-loops.
-    auto full = random_fixed_outdegree(3, /*fanout=*/100, /*seed=*/3); // node_count=9 → clamp to 8
+    // A fanout above node_count - 1 is capped: 9 nodes give 8 distinct targets, no self-loops.
+    auto full = random_fixed_outdegree(3, /*fanout=*/100, /*seed=*/3);
     for (s64 index = 0; index < static_cast<s64>(full.size()); ++index) {
         EXPECT_EQ(static_cast<s64>(full[static_cast<usize>(index)].size()), 8);
         Set<s32> seen(full[static_cast<usize>(index)].begin(), full[static_cast<usize>(index)].end());
@@ -98,6 +106,6 @@ TEST(Topologies, random_fixed_outdegree_edge_cases) {
         EXPECT_EQ(seen.count(static_cast<s32>(index)), 0u);
     }
 
-    // k < 1 throws.
+    // side_length < 1 throws.
     EXPECT_THROW(random_fixed_outdegree(0, 4, 1), Invalid_Argument);
 }

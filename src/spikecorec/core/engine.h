@@ -21,9 +21,7 @@ using namespace spikecorec::nml;
 
 namespace spikecorec {
 
-    // last_spiked holds this for a neuron that has never fired. Negative rather than a
-    // large negative magic number: the refractory gate branches on the sign, so "never
-    // fired" is a state rather than "fired so long ago the arithmetic works out".
+    // last_spiked of a neuron that never fired. The kernel detects it by sign (last_spiked < 0).
     constexpr s64 NEVER_SPIKED_TICK = -1;
 
     struct Recorded_Spike {
@@ -44,68 +42,68 @@ namespace spikecorec {
 
         Engine_Function kernel_function;
 
-        // master_step's parameters in binding order, and where each one's buffer or value
-        // comes from. tick is bound per dispatch.
+        // master_step's parameters in binding order and their sources; tick is bound per dispatch.
         Vector<String> kernel_parameter_names;
         Unordered_Map<String, Function<Engine_Pointer()>> kernel_argument_sources;
-        // The generated master kernel exactly as it was compiled, every constant baked in.
+        // The master kernel source as compiled, with its constants baked in.
         String master_kernel_source;
-        // Ticks after a neuron spikes during which its outgoing synapses run: the longest delay
-        // plus the slowest synapse's settle time (Codegen::synapse_active_ticks). -1 when every
-        // synapse runs every tick.
+        // Ticks after a spike during which a neuron's outgoing synapses run: the longest delay
+        // plus the slowest synapse's settle time. -1 runs every synapse every tick.
         s64 synapse_active_ticks = -1;
         s32 rank_float4_stride_argument = 0;
-        // Bound per tick rather than baked: S is resized after a refit when the threshold changed.
-        s64 sparse_delta_capacity_argument = 0;
-        s32 projection_run_count = 0;
+        // Extra walk passes the run has needed because the update queue was full.
+        s64 deferred_walk_pass_count = 0;
+        // The tick's time in seconds, computed on the host each tick. f32 on Metal, which has no f64.
+#ifdef SPIKECOREC_CUDA
+        f64 simulation_time_argument = 0.0;
+#else
+        f32 simulation_time_argument = 0.0f;
+#endif
+        s32 run_count = 0;
 
-        // The one allocation every model buffer below is carved from.
+        // The slab Codegen::allocate_cell_model_memory carves the model buffers from.
         Engine_Pointer model_pointer;
 
-        // The weight matrix's projection runs, on the device, so the kernel can find each
-        // edge's synapse prototype. Carved from projection_run_pointer.
-        Engine_Pointer projection_run_pointer;
-        Engine_Pointer projection_first_edge_ordinal;  // s64[run count]
-        Engine_Pointer projection_synapse_prototype;   // s32[run count]
+        // The slab holding the device copy of the runs, for the per-edge synapse prototype lookup.
+        Engine_Pointer run_pointer;
+        Engine_Pointer run_first_edge_ordinal;  // s64[run count]
+        Engine_Pointer run_synapse_prototype;   // s32[run count]
 
         Engine_Pointer cell_state;
 
-        // Two rows, alternating by tick parity: a thread drains its slot in one row while
-        // this tick's scatters accumulate into the other. That is what makes the synaptic
-        // latency exactly one tick rather than one-or-two depending on thread order.
+        // Two rows alternating by tick parity: a neuron drains one row while this tick's scatters
+        // land in the other, so synaptic latency is exactly one tick whatever the thread order.
         Engine_Pointer network_inputs;     // [2][total_neuron_count]
 
         Engine_Pointer empty_edge_plane;
 
-        // Spikes that reached each cell, for cells with an OnEvent: two rows alternating by
-        // tick parity like network_inputs. One slot when no cell type has an OnEvent.
+        // Spikes that reached each cell, for cells with an OnEvent: two rows by tick parity like
+        // network_inputs. One slot when no cell type has an OnEvent.
         Engine_Pointer event_arrival_count;  // u32[2][total_neuron_count]
 
-        // [spike_history_length][total_neuron_count]. A delayed arrival is answered by
-        // asking whether the source spiked `delay` ticks ago, so every spike in flight is
-        // remembered, not just the most recent one.
+        // [spike_history_length][total_neuron_count] spike flags. A delayed arrival checks
+        // whether the source spiked `delay` ticks ago.
         Engine_Pointer spike_history;
         Engine_Pointer last_spiked;        // [total_neuron_count]
 
-        // Draws every random() the run calls, seeded with simulation_seed: OnStart values at
-        // construction, then random_values before every tick.
+        // Seeded with simulation_seed; draws OnStart random() values, then random_values per tick.
         Random_Generator random_generator;
-        // This tick's uniform draws, one slot per random() call per neuron that runs it
-        // (Codegen::random_values_count). Carved from random_values_pointer.
+        // Slab for this tick's uniform draws: one per random() call per neuron or input entry.
         Engine_Pointer random_values_pointer;
         Engine_Pointer random_values;      // f32[max(1, random_values_count)]
         s64 random_values_count = 0;
 
-        // Inputs, run by the kernel from their own dynamics (Codegen::translate_input_entries).
-        // An entry is one input on one target cell. Carved from model_pointer.
-        Engine_Pointer input_row_start;        // s64[total_neuron_count + 1]: neuron n's entries start here
+        // Kernel-run inputs, carved from model_pointer. An entry is one input on one target cell.
+        Engine_Pointer input_row_start;        // s64[total_neuron_count + 1]: neuron n's first entry
         Engine_Pointer input_entry_prototype;  // s32[entries]: which input each entry runs
-        Engine_Pointer input_values;           // f32[entries][input_value_stride]: its weight, then its state
+        Engine_Pointer input_values;           // f32[entries][input_value_stride]: weight, then state
         Engine_Pointer input_spike_counts;     // u8: each spike train's spikes per tick
         s64 input_entry_count = 0;
         s64 input_value_stride = 1;
         s64 input_spike_count_size = 0;
 
+        // The results below grow during a run; another thread reads them only under results_mutex.
+        mutable Mutex results_mutex;
         Vector<s64> spike_counts_per_neuron;
         Vector<Recorded_Spike> recorded_spikes;
         // row-major [recorded tick][traced quantity]
@@ -115,14 +113,16 @@ namespace spikecorec {
 
         Unique_Pointer<Simulation_Recorder> membrane_video_recorder;
         s64 membrane_video_frame_stride = 1;
-        // Where each neuron's `v` sits in cell_state, precomputed so a frame is a gather
-        // rather than a per-neuron name lookup.
+        // Each neuron's `v` index in cell_state, so a frame is a gather, not a name lookup.
         Vector<s64> membrane_offset_per_neuron;
         Vector<f32> membrane_frame_scratch;
 
         s64 total_neuron_count = 0;
         s64 spike_history_row_count = 0;
         s64 lifetime = 0;
+        // Ticks stepped so far, which is also the next tick step_simulation accepts. Written under
+        // results_mutex, with the tick's results.
+        s64 ticks_stepped = 0;
         f64 step_dt = 0.0f;
         u64 simulation_seed = 0;
 
@@ -132,30 +132,34 @@ namespace spikecorec {
 
         static constexpr s64 DEFAULT_PLASTICITY_DELTA_CAPACITY = 1 << 16;
 
-        // Presets for fit_tolerance: the worst relative error the weight matrix may leave on any
-        // per-edge value of a synapse, against the larger of the value and its plane's RMS.
-        // Tighter costs rank (memory) and fitting time. A delay stays on its exact tick while
-        // tolerance * delay is under half a tick, so each lists the longest delay it keeps exact.
-        static constexpr f32 FIT_TOLERANCE_PRECISE = 1e-5f;   // comparisons against reference simulators; 50000 ticks
-        static constexpr f32 FIT_TOLERANCE_ACCURATE = 1e-4f;  // validation runs and reported results; 5000 ticks
-        static constexpr f32 FIT_TOLERANCE_STANDARD = Weight_Matrix::DEFAULT_FIT_TOLERANCE;  // the default; 500 ticks
-        static constexpr f32 FIT_TOLERANCE_COMPACT = 1e-2f;   // the largest networks, where memory matters most; 50 ticks
+        // Presets for fit_tolerance: the worst relative error a fit may leave on a per-edge value,
+        // against the larger of the value and its plane's RMS. Tighter costs rank and fit time.
+        // A delay stays exact while tolerance * delay < 0.5, so each lists its longest exact delay.
+        static constexpr f32 FIT_TOLERANCE_PRECISE = 1e-5f;   // reference simulators; 50000 ticks
+        static constexpr f32 FIT_TOLERANCE_ACCURATE = 1e-4f;  // validation runs; 5000 ticks
+        static constexpr f32 FIT_TOLERANCE_STANDARD = Weight_Matrix::DEFAULT_FIT_TOLERANCE;  // default; 500 ticks
+        static constexpr f32 FIT_TOLERANCE_COMPACT = 1e-2f;   // the largest networks; 50 ticks
 
-        // Applies to the fit at construction and to every refit after it.
+        // Used by the construction fit and every refit.
         f32 fit_tolerance = FIT_TOLERANCE_STANDARD;
 
-        // When the weight matrix refits during a run, folding the updates in S into the basis
-        // and emptying S. Both are checked after each tick's merge, and 0 disables either:
-        // every this many ticks, and once the fullest plane of S holds updates on this
-        // fraction of the edge set -- which is also the size S is kept at between refits. Set
-        // the threshold with set_refit_occupancy_threshold_fraction, which resizes S to it.
+        // The candidate fit the construction fit and every refit use.
+        Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO;
+
+        // The expected fraction of edges whose values change between refits (0 to 1), which sizes
+        // every plane's fixed lane budget at construction; see Weight_Matrix.
+        f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION;
+
+        // Refit triggers, checked after each tick's merge; 0 disables either. A refit runs every
+        // refit_every_n_ticks, or once the fullest plane of S covers this fraction of the edges,
+        // which also sizes S. Set the fraction with set_refit_occupancy_threshold_fraction.
         s64 refit_every_n_ticks = 0;
         f32 refit_occupancy_threshold_fraction = Weight_Matrix::DEFAULT_REFIT_OCCUPANCY_THRESHOLD_FRACTION;
 
-        // Refits are at least this many ticks apart, so a busy network whose S refills every
-        // tick does not refit every tick; S grows in between instead. 0 allows any spacing.
+        // Minimum ticks between refits, so an S that refills every tick grows instead of
+        // refitting every tick. 0 allows any spacing.
         s64 minimum_ticks_between_refits = 1000;
-        // The construction fit counts as the first.
+        // The construction fit counts as a refit at tick 0.
         s64 last_refit_tick = 0;
         s64 plasticity_fold_every_n_ticks = 64;
         f32 plasticity_learning_rate = 0.01f;
@@ -172,7 +176,9 @@ namespace spikecorec {
 
         explicit Spike_Engine(const String &lems_input_file,
                              bool enable_hebbian_plasticity = false,
-                             f32 fit_tolerance = FIT_TOLERANCE_STANDARD);
+                             f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
+                             Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+                             f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
         Spike_Engine(const String &lems_input_file,
                     const Vector<Vector<s32>> &adjacency,
@@ -180,7 +186,9 @@ namespace spikecorec {
                     f64 connection_weight = 1.0,
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false,
-                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD);
+                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
+                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+                    f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
         Spike_Engine(const String &lems_input_file,
                     const Vector<Vector<s32>> &adjacency,
@@ -189,56 +197,58 @@ namespace spikecorec {
                     f64 connection_weight = 1.0,
                     f64 connection_delay_seconds = 0.0,
                     bool enable_hebbian_plasticity = false,
-                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD);
+                    f32 fit_tolerance = FIT_TOLERANCE_STANDARD,
+                    Weight_Matrix::Fit_Method fit_method = Weight_Matrix::Fit_Method::LIMITED_MEMORY_BROYDEN_FLETCHER_GOLDFARB_SHANNO,
+                    f32 expected_active_edge_fraction = Weight_Matrix::DEFAULT_EXPECTED_ACTIVE_EDGE_FRACTION);
 
         ~Spike_Engine();
 
-        void run();
+        // Steps every tick of the run not yet stepped, so it resumes a stopped run. after_each_tick,
+        // when given, is called with each tick once it is done; an exception it throws stops the
+        // run. Throws once every tick has run: the engine holds one run's state.
+        void run(const Function<void(s64)> &after_each_tick = nullptr);
 
+        // Ticks run in order: tick must be ticks_stepped, below lifetime. The kernel's parity rows,
+        // rings and spike trains assume it. Throws otherwise, and after shutdown().
         void step_simulation(s64 tick);
 
-        // Sets the refit threshold, which is also the size S is kept at per plane, and resizes S
-        // to it now. S keeps the updates it holds, so it never shrinks below them.
+        // Sets the refit threshold and resizes S to match, never below the updates it holds.
         void set_refit_occupancy_threshold_fraction(f32 fraction);
 
         // The state variable named `variable_name` for one neuron, read back from the GPU.
         [[nodiscard]] f32 read_state_variable(s64 neuron_index, const String &variable_name) const;
 
-        // The weight-matrix plane that holds `variable_name`, one of the named synapse's LEMS
-        // StateVariables, on every edge that synapse carries.
+        // The weight-matrix plane holding StateVariable `variable_name` of the named synapse.
         [[nodiscard]] s64 synapse_state_variable_plane(const String &synapse_component_id,
                                                        const String &variable_name) const;
 
-        // Spikes per neuron per second over the whole run, and the fraction of neurons that
-        // spiked at least once. What a demo has to clear to count as alive.
+        // Spikes per neuron per second over the ticks stepped so far, and the fraction of neurons
+        // that spiked at least once.
         [[nodiscard]] f64 mean_firing_rate_hertz() const;
         [[nodiscard]] f64 fraction_of_neurons_that_spiked() const;
 
+        // Writes every OutputFile and EventOutputFile the document declares, a relative fileName
+        // relative to the LEMS file. Throws when a file cannot be written.
         void write_recordings();
 
         void record_membrane_video(const String &path, s64 frame_stride = 1);
 
-        // Every spike of the run as "time<tab>neuron", which is the TIME_ID form an
-        // EventOutputFile writes. Here for the same reason record_membrane_video is: LEMS
-        // names its recorded cells one EventSelection at a time, and a million of those is
-        // a million elements to express "all of them". Call after run().
+        // Writes every spike as "time<tab>neuron" (an EventOutputFile's TIME_ID format) without
+        // needing one EventSelection per neuron. Call after run(). Throws when it cannot write.
         void write_spike_file(const String &path) const;
 
         void shutdown();
 
     private:
-        // Zeroes and seeds what Codegen::allocate_cell_model_memory only reserved. A slab
-        // is uninitialized memory and every one of these is read before it is written on
-        // the first tick.
+        // The slab starts uninitialized: zeroes the accumulators and spike history, and marks
+        // every neuron as never spiked.
         void initialize_model_buffers();
 
-        // Builds the k^2-tree and the weight and delay basis from network_data, with
-        // matrix_count planes: weight, delay and one per synapse state variable. Also writes
-        // the synapse planes' starting state and the device copy of the projection runs.
+        // Builds the weight matrix from network_data: planes weight, delay, then synapse state
+        // variables, fitted from each run's starting values. Also copies the runs to the device.
         void build_weight_matrix(s64 matrix_count, s64 updated_plane_count);
 
-        // Fills kernel_argument_sources, and refuses a master_step parameter the engine has
-        // nothing to bind to.
+        // Fills kernel_argument_sources; throws on a master_step parameter with no source.
         void register_kernel_arguments();
 
         // The population neuron_index belongs to, with its first neuron, or nullptr.
@@ -247,9 +257,8 @@ namespace spikecorec {
         // Where one neuron's variable sits in cell_state.
         [[nodiscard]] s64 cell_memory_index_of(s64 neuron_index, const String &variable_name) const;
 
-        // Replaces whatever connections the document declared with `adjacency`, all
-        // carrying one synapse prototype. Runs before the layout is computed, so
-        // everything downstream sees an ordinary parse result.
+        // Replaces the document's connections with `adjacency`, split across the synapses by
+        // proportion. Runs before codegen, so everything downstream sees an ordinary parse result.
         void apply_topology(const Vector<Vector<s32>> &adjacency,
                             const Vector<String> &synapse_component_ids,
                             const Vector<f64> &synapse_proportions,

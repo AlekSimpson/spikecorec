@@ -1,9 +1,5 @@
 <Lems>
-    <!--
-      Drives two_cell_synapse.nml. Records the target's membrane trace and every cell's
-      spikes, so a run can be checked both for "did the synapse deliver anything at all"
-      and for "did it deliver the right amount".
-    -->
+    <!-- Runs two_cell_synapse.nml, recording the target's v and every cell's spikes. -->
     <Include file="Cells.xml"/>
     <Include file="Networks.xml"/>
     <Include file="Synapses.xml"/>

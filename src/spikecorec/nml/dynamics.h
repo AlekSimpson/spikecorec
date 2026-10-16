@@ -18,34 +18,33 @@ namespace spikecorec::nml {
 enum class Kernel_Node_Type {
     LITERAL,              // leaf: token emitted verbatim
     IDENTIFIER,           // leaf: token is the name
-    EXPRESSION,           // Binary_Node: token is the operator, "[]" indexes left by right. Unary_Node: prefix operator. Trinary_Node: "?:"
+    EXPRESSION,           // token the operator; Binary ("[]" indexes), Unary (prefix) or Trinary
     BLOCK,                // List_Node of statements
-    DEVICE_FUNCTION_IMPL, // List_Node of exactly four: return type, name, PARAMETER_LIST, body BLOCK
-    FUNCTION_CALL,        // List_Node: token is the function name, children the arguments
+    DEVICE_FUNCTION_IMPL, // List_Node: return type, name, PARAMETER_LIST, body BLOCK
+    FUNCTION_CALL,        // List_Node: token the function name, children the arguments
     KERNEL_FUNCTION_IMPL, // List_Node: same shape as DEVICE_FUNCTION_IMPL
-    DECLARATION,          // Trinary_Node: left the type, middle the name, right the initial value (nullptr for none)
-    ASSIGNMENT,           // Binary_Node: token is the operator ("=", "+="), left the target, right the value
-    CONDITIONAL,          // List_Node of CONDITIONAL_BRANCH children, emitted as one if / else if / else chain
-    CONDITIONAL_BRANCH,   // Binary_Node: left the test (nullptr for the final else), right the body BLOCK
-    CAST,                 // Binary_Node: left the type, right the value
-    FOR,                  // List_Node of exactly four: initializer, test, step (each nullptr for none), body BLOCK
-    WHILE,                // Binary_Node: left the test, right the body BLOCK
-    JUMP,                 // Unary_Node: token is "return", "break" or "continue", child the returned value (nullptr for none)
-    PARAMETER,            // Trinary_Node: left the type, middle the name, right an ATTRIBUTE (nullptr for none)
+    DECLARATION,          // Trinary_Node: type, name (or name[size]), initial value or nullptr
+    ASSIGNMENT,           // Binary_Node: token the operator ("=", "+="), target, value
+    CONDITIONAL,          // List_Node of CONDITIONAL_BRANCH: one if / else if / else chain
+    CONDITIONAL_BRANCH,   // Binary_Node: test (nullptr for the final else), body BLOCK
+    CAST,                 // Binary_Node: type, value
+    FOR,                  // List_Node: initializer, test, step (each may be nullptr), body BLOCK
+    WHILE,                // Binary_Node: test, body BLOCK
+    JUMP,                 // Unary_Node: token return, break or continue; child the value or nullptr
+    PARAMETER,            // Trinary_Node: type, name, ATTRIBUTE or nullptr
     PARAMETER_LIST,       // List_Node of PARAMETER
-    ATTRIBUTE,            // leaf: token is the Metal attribute text, e.g. "thread_position_in_grid"
+    ATTRIBUTE,            // leaf: token the Metal attribute text, e.g. "thread_position_in_grid"
     PROGRAM,              // List_Node: top-level items
-    TYPE,                 // leaf: token is the qualifiers and base type, e.g. "const device f32"
-    POINTER,              // Unary_Node: child the pointee type, token the qualifiers on the pointer itself (usually empty)
+    TYPE,                 // leaf: token the qualifiers and base type, e.g. "const device f32"
+    POINTER,              // Unary_Node: child the pointee type, token any qualifiers after the "*"
     REFERENCE,            // Unary_Node: child the referenced type
-    INCLUDE,              // leaf: token is the header with its delimiters, e.g. "<metal_stdlib>"
-    DEFINE,               // Binary_Node: left the macro name, right its replacement LITERAL (nullptr for none)
-    USING_NAMESPACE       // leaf: token is the namespace, e.g. "metal"
+    INCLUDE,              // leaf: token the header with its delimiters, e.g. "<metal_stdlib>"
+    DEFINE,               // Binary_Node: macro name, replacement LITERAL or nullptr
+    USING_NAMESPACE       // leaf: token the namespace, e.g. "metal"
 };
 
-// A TYPE token spells its base type neutrally ("f32", "s64", "u8") after any qualifiers;
-// type_to_string maps it to the backend. Pointers and references are POINTER and
-// REFERENCE nodes around the TYPE, never part of its token.
+// A TYPE token is any qualifiers, then a neutral base type ("f32", "s64", "u8") that
+// type_to_string maps per backend. Pointers and references are POINTER / REFERENCE nodes.
 
 enum class Kernel_Backend { METAL, CUDA };
 
@@ -56,7 +55,7 @@ using Kernel_Binary_Node = Binary_Node<Kernel_Parse_Body>;
 using Kernel_Trinary_Node = Trinary_Node<Kernel_Parse_Body>;
 using Kernel_List_Node = List_Node<Kernel_Parse_Body>;
 
-// neutral type name -> the backend's spelling.
+// Neutral type name -> the backend's spelling.
 const Unordered_Map<String, String> &kernel_type_spellings(Kernel_Backend backend);
 
 // The predefined kernel code, in each backend's own syntax. Metal's k^2-tree helpers are
@@ -96,8 +95,8 @@ Kernel_Node *clone(const Kernel_Node *node);
 void replace_identifier(Kernel_Node *&node, const String &name, const Kernel_Node *replacement);
 // Every name used under node.
 void collect_identifiers(const Kernel_Node *node, Set<String> &names);
-// Replaces every +, -, * and / of float literals alone, and every negated float literal, with the
-// literal of its value, worked out in double precision: rounded once instead of per operation.
+// Folds +, -, *, / of two float literals, and negated float literals, into one literal computed
+// in double precision.
 void fold_constants(Kernel_Node *&node);
 // Removes the parameter from function and puts value in place of every use of it.
 void bake_parameter(Kernel_List_Node *function, const String &name, const Kernel_Node *value);
@@ -105,13 +104,12 @@ void bake_parameter(Kernel_List_Node *function, const String &name, const Kernel
 struct NML_Dynamics_Expression {
     NML_Declaration_Type source_tag;
 
-    // For Regime: target is the regime name and expression is its initial= value.
-    // OnCondition and OnEntry start a group; the StateAssignment, EventOut and
+    // OnCondition, OnEntry and OnEvent start a group; the StateAssignment, EventOut and
     // Transition entries after them belong to it.
-    String target;       // variable written, or exposure / port / regime name
-    String expression;   // value= / test= source expression, verbatim
-    String regime_name;  // owning Regime, empty when the instruction is regime-free
-    String condition;    // expression condition gate
+    String target;       // variable written or derived, port, or regime name
+    String expression;   // value=, test= or (for a Regime) initial=, verbatim
+    String regime_name;  // owning Regime, empty outside any regime
+    String condition;    // the owning OnCondition's test, or a Case's condition
     String select;       // DerivedVariable select=, empty when value= is used
     String reduce;       // DerivedVariable reduce=, with select
 
@@ -120,10 +118,9 @@ struct NML_Dynamics_Expression {
 };
 
 // One entry of a ComponentType's <Structure>, in document order.
-//   ChildInstance:   component names the ComponentReference instantiated once per instance of the type.
+//   ChildInstance:   component names the ComponentReference each instance gets its own copy of.
 //   With:            instance ("this", "parent", or a Path or child name) is bound to alias.
-//   EventConnection: source and target are the aliases in its from= and to=; receiver and the
-//                    ports are empty when not given.
+//   EventConnection: source and target are the from= and to= aliases; unset fields are empty.
 struct NML_Structure_Entry {
     NML_Declaration_Type source_tag;
     String component;
@@ -330,15 +327,13 @@ const NML_Component_Instance &population_cell(const NML_Context &context, const 
 // Rows in the spike_history ring.
 s64 spike_history_length(const NML_Context &context);
 
-// What one spike from a spike-source input adds to a cell's input for one tick when the input
-// gives no amplitude: enough to lift the membrane from the lowest value it starts or resets to,
-// to 5% past its threshold, through the cell's capacitance.
+// A spike-source input's kick when it gives no amplitude: the one-tick current that, through
+// the cell's capacitance, lifts the membrane from its lowest start or reset value to 5% past
+// threshold.
 f64 default_kick_amplitude(const NML_Context &context, const NML_Component_Instance &cell);
 
-// One part of an input's component tree: the input itself, a child it declares (a Child, or a
-// member of a Children collection), or a component it instantiates with ChildInstance, such as
-// its own copy of the synapse it references. Every entry (one input on one target cell) has its
-// own copy of every part's state.
+// One part of an input's component tree: the input, a Child or Children member, or a
+// ChildInstance copy (such as of the synapse it references). Each entry has its own part state.
 struct Input_Part {
     const NML_Component_Instance *instance = nullptr;
     s64 parent = -1;            // the part it belongs to; -1 for the input itself
@@ -391,11 +386,11 @@ struct Codegen {
     // The same per synapse type; each synapse prototype clones it.
     Unordered_Map<String, Kernel_List_Node *> synapse_type_templates;
 
-    // random() calls translated so far. Each one reads its own placeholder slot in the type's
-    // template until translate_component_instance places it.
+    // random() calls translated so far. Each reads a placeholder slot until the population or
+    // input that runs it is placed.
     s64 random_call_count = 0;
-    // The size of the random_values buffer the kernel reads each tick: one slot per random()
-    // call per neuron that runs it.
+    // Size of the random_values buffer, refilled each tick: one slot per random() call per neuron
+    // or input entry that runs it.
     s64 random_values_count = 0;
 
     Codegen(NML_Context &context, Engine_Backend *device): context(context), device(device) {};
@@ -414,7 +409,7 @@ struct Codegen {
     // input's state. Filled by collect_inputs.
     Vector<const NML_Component_Instance *> input_prototypes;
     Vector<Input_Tree> input_trees;                     // per prototype
-    Vector<Vector<s64>> input_spike_train_offsets;     // per prototype, per spike train: where it starts in input_spike_counts
+    Vector<Vector<s64>> input_spike_train_offsets;     // [prototype][train] in input_spike_counts
     s64 input_spike_count_size = 0;
     Vector<Input_Entry> input_entries;                  // sorted by neuron_index
     // Floats per entry in input_values: its weight, then the largest prototype's state.
@@ -449,8 +444,8 @@ struct Codegen {
     Kernel_List_Node *translate_component_type(const NML_Component_Type &component_type);
     Kernel_List_Node *translate_component_instance(const NML_Component_Instance &population, s64 first_neuron);
 
-    // A synapse type's dynamics for one edge, with LEMS names still in it. Runs on every edge
-    // every tick; each state variable lives in its own weight-matrix plane.
+    // A synapse type's dynamics for one edge, with LEMS names still in it. Runs on a neuron's
+    // edges while they are active (see synapse_active_ticks); each state variable is a plane.
     Kernel_List_Node *translate_synapse_type(const NML_Component_Type &component_type);
     // The type's template with every state variable read from its plane, weight from the
     // weight plane and every parameter by its value.
@@ -459,7 +454,7 @@ struct Codegen {
     // Weight-matrix planes the kernel uses: weight, delay, then one per state variable of the
     // largest synapse type.
     s64 edge_plane_count() const;
-    // How many of those planes the generated kernel writes each tick.
+    // How many of those planes the generated kernel writes: the state-variable planes.
     s64 updated_edge_plane_count() const;
     // Ticks after a neuron spikes during which its outgoing synapses can be away from rest: the
     // longest delay plus the slowest synapse's settle time. -1 when some synapse cannot be left

@@ -39,11 +39,12 @@ namespace spikecorec {
             s64 down  = ((row + 1) % side_length) * side_length + column;
             s64 up    = (((row - 1) + side_length) % side_length) * side_length + column;
 
+            // Below a side of 3, opposite directions wrap to the same node, so each is kept once.
             Vector<s32> neighbors;
             for (s64 candidate : {right, left, down, up}) {
-                if (candidate != i) {
-                    neighbors.push_back(static_cast<s32>(candidate));
-                }
+                const s32 neighbor = static_cast<s32>(candidate);
+                if (candidate == i || std::find(neighbors.begin(), neighbors.end(), neighbor) != neighbors.end()) continue;
+                neighbors.push_back(neighbor);
             }
             result[static_cast<usize>(i)] = std::move(neighbors);
         }
@@ -71,7 +72,7 @@ namespace spikecorec {
             used.insert(static_cast<s32>(i));
 
             s64 target_count = std::min<s64>(
-                4 + random_fanout,
+                static_cast<s64>(children.size()) + random_fanout,
                 static_cast<s64>(children.size()) + std::max<s64>(0, cell_count - static_cast<s64>(used.size()))
             );
             while (static_cast<s64>(children.size()) < target_count) {

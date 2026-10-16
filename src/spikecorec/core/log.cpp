@@ -264,8 +264,7 @@ Format_Specification parse_specification(String_View specification) {
     return parsed;
 }
 
-// Pads a number to the width: with zeros between the sign/prefix and the digits when the
-// specification asks for it, otherwise with spaces on the left.
+// Zero padding goes between the sign/prefix and the digits; space padding goes on the left.
 String pad_number(const Format_Specification &parsed, const String &sign_and_prefix, const String &digits) {
     const size_t length = sign_and_prefix.size() + digits.size();
     if (length >= parsed.width) return sign_and_prefix + digits;

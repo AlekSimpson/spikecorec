@@ -19,11 +19,11 @@ union Real {
 struct Input_Target {
     s64 neuron_index = -1;   // the target's cell-memory index, from resolve_path
     f64 weight = 1.0;        // from <inputW weight="..."/>, 1.0 when unweighted
+    String destination;      // the cell's attachment it goes to; "" means "synapses"
 };
 
-// One input component and the cells it is attached to. Each target gets its own copy of the
-// input, as an explicitInput or inputList gives it in NeuroML; the kernel runs the input's own
-// dynamics (Codegen::flatten_input_tree).
+// One input component and its targets. Each target runs its own copy of the input's dynamics
+// in the kernel (see Codegen::flatten_input_tree).
 struct Simulation_Input_Config {
     String input_component_id;
     Vector<Input_Target> targets;
@@ -35,6 +35,7 @@ struct NML_Network_Edge {
     s64 delay_ticks;
     s64 parent;
     s64 child;
+    String destination;  // the target's attachment the synapse goes to; "" means "synapses"
 };
 
 struct Adjacency_List {

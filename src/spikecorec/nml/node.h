@@ -61,7 +61,7 @@ enum class Parse_Node_Type {
 template <typename Syntax_Type, typename Token_Type>
 struct Parse_Body {
     Parse_Node_Type parse_type{};
-    Syntax_Type syntax_type{}; // sub type is all the types within the meta "Parse_Node_Type" set
+    Syntax_Type syntax_type{}; // the node's kind within parse_type, ex: a Kernel_Node_Type
     Token_Type token{};
 
     Parse_Body() = default;
@@ -152,7 +152,7 @@ struct NML_Tag {
     String get_attribute(const String &name) const;
     String get_attribute_or(const String &name, const String &fallback) const;
 
-    // Identity of this declaration within its ComponentType, ex: "<namespace>:<name>".
+    // The key a subtype's declaration overrides this one by, ex: "var:tau"; empty if none.
     String namespace_key() const;
 
     bool is_declaration_type() const;
@@ -160,8 +160,7 @@ struct NML_Tag {
 
 using NML_Node = Node<NML_Tag>;
 
-// Copies an XML element and every element nested in it. An element with element
-// children becomes a List_Node<NML_Tag>; any other element is a plain Node<NML_Tag>.
+// Copies an XML element tree. Elements with element children become List_Nodes, others leaves.
 NML_Node *build_nml_tree(xmlNodePtr xml_node);
 
 

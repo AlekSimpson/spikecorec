@@ -1,14 +1,14 @@
-// expCurrSynapse and alphaCurrSynapse: against their closed forms on a pure-integrator target, and
-// against jNeuroML on the PyNN cells they were written for. Against jNeuroML, a single postsynaptic
-// potential is compared as a waveform, and network activity statistically; spike times are never
-// compared one for one (regression_tests.cpp holds the engine to its own recorded spikes).
+// expCurrSynapse and alphaCurrSynapse against their closed forms on a pure-integrator target, and
+// against jNeuroML on PyNN cells. Against jNeuroML, one postsynaptic potential is compared as a
+// waveform and network activity statistically, never spike for spike.
 //
 // The integrator is an iafCell with no leak and an unreachable threshold, so its v rises by
-// i * dt / C every tick and the total change is the charge the synapse delivered, divided by C.
+// i * dt / C every tick and its total change is the delivered charge divided by C.
 //
-// A refit runs as soon as the first update reaches S, which here is the arrival, and may leave up to
-// fit_tolerance of relative error on the state it refits. Runs shorter than the refit spacing are
-// exact; the others are held to fit_tolerance.
+// Every weight reads back within fit_tolerance (see fit_allowance), so every current carries that
+// on top of the integration's own error. S passes the refit threshold from the first arrival on, so
+// refits run as often as minimum_ticks_between_refits (1000 ticks) allows, each leaving up to
+// fit_tolerance of relative error in the synapse state.
 
 #include <algorithm>
 #include <cmath>
@@ -36,7 +36,7 @@ struct Edge {
 };
 
 // Neuron 0 is a spikeGenerator firing every `period` (first at `period`); neurons 1.. are
-// integrators, one per edge, each fed by the generator through `synapse_id`.
+// integrators, one per edge, each fed through `synapse_id`.
 String synapse_model(const String &synapse_declaration, const String &synapse_id, const Vector<Edge> &edges,
                      const String &period) {
     Output_String_Stream document;
@@ -105,7 +105,7 @@ Vector<f64> integrator_changes(Spike_Engine &engine, s64 target_count) {
 
 // ── expCurrSynapse ──────────────────────────────────────────────────────────────
 
-// An arrival adds the weight to I; forward Euler then takes I_n = w (1 - dt/tau)^n.
+// An arrival adds the weight to I; forward Euler then gives I_n = w (1 - dt/tau)^n.
 TEST(ExpCurrSynapse, decays_geometrically_from_its_weight) {
     const Temporary_Directory directory;
     Unique_Pointer<Spike_Engine> engine =
@@ -115,12 +115,13 @@ TEST(ExpCurrSynapse, decays_geometrically_from_its_weight) {
     const s64 arrival = first_nonzero_index(current);
     ASSERT_GE(arrival, 0) << "the arrival never came";
     const f64 ratio = 1.0 - engine->step_dt / SYNAPSE_TIME_CONSTANT;
+    const f64 allowance = 1e-5 * 2.5 + fit_allowance(engine->weights.fit_tolerance, 2.5, {2.5f});
     for (s64 elapsed = 0; elapsed <= 100; elapsed += 1) {
-        EXPECT_NEAR(current[static_cast<usize>(arrival + elapsed)], 2.5 * pow(ratio, static_cast<f64>(elapsed)), 1e-5 * 2.5) << "tick " << elapsed;
+        EXPECT_NEAR(current[static_cast<usize>(arrival + elapsed)], 2.5 * pow(ratio, static_cast<f64>(elapsed)), allowance) << "tick " << elapsed;
     }
 }
 
-// The whole charge is w nA tau, and half of it has arrived tau ln 2 after the current starts.
+// The total charge is w nA tau, and half of it has arrived tau ln 2 after the current starts.
 TEST(ExpCurrSynapse, delivers_its_charge_with_the_exponential_time_course) {
     const Temporary_Directory directory;
     Unique_Pointer<Spike_Engine> engine =
@@ -152,15 +153,24 @@ TEST(ExpCurrSynapse, responses_are_linear_in_the_weight_and_superpose) {
             "199ms", "0.1ms");
     const Vector<f64> changes = integrator_changes(*engine, 3);
 
-    EXPECT_NEAR(changes[1] / changes[0], 2.0, 1e-5);
-    EXPECT_NEAR(changes[2] / changes[0], -1.0, 1e-5);
+    // Each weight reads within its allowance, so a ratio of two responses moves by up to the
+    // numerator's allowance plus the ratio times the denominator's, over the denominator.
+    const Vector<f32> weights = {1.0f, 2.0f, -1.0f};
+    auto ratio_allowance = [&](usize numerator, usize denominator) {
+        const f32 tolerance = engine->weights.fit_tolerance;
+        const f64 ratio = static_cast<f64>(weights[numerator]) / static_cast<f64>(weights[denominator]);
+        return 1e-5 + (fit_allowance(tolerance, weights[numerator], weights) +
+                       fabs(ratio) * fit_allowance(tolerance, weights[denominator], weights)) / fabs(weights[denominator]);
+    };
+    EXPECT_NEAR(changes[1] / changes[0], 2.0, ratio_allowance(1, 0));
+    EXPECT_NEAR(changes[2] / changes[0], -1.0, ratio_allowance(2, 0));
     // Arrivals at about 41, 81, 121 and 161 ms; the last one's tail past 199 ms is e^-7.6 of it.
     const f64 single_arrival = NANOAMPERE * SYNAPSE_TIME_CONSTANT / INTEGRATOR_CAPACITANCE;
     EXPECT_NEAR(changes[0], 4.0 * single_arrival, (1e-3 + 4.0 * engine->weights.fit_tolerance) * single_arrival);
 }
 
-// Two edges from one source, with their own weights and delays, keep their own state: the later
-// edge is untouched until its own arrival, then follows the same curve scaled by its weight.
+// Two edges from one source keep separate state: the later edge is untouched until its own
+// arrival, then follows the same curve scaled by its weight.
 TEST(ExpCurrSynapse, each_edge_keeps_its_own_state) {
     const Temporary_Directory directory;
     Unique_Pointer<Spike_Engine> engine = make_engine(
@@ -178,8 +188,12 @@ TEST(ExpCurrSynapse, each_edge_keeps_its_own_state) {
     const s64 second_arrival = first_nonzero_index(second_edge);
     ASSERT_GE(first_arrival, 0);
     EXPECT_EQ(second_arrival - first_arrival, 30) << "3 ms more delay at 0.1 ms";
+    // Both weights read within their allowance, and the current never exceeds its weight.
+    const Vector<f32> weights = {1.0f, 3.0f};
+    const f32 tolerance = engine->weights.fit_tolerance;
+    const f64 allowance = 3e-5 + fit_allowance(tolerance, 3.0, weights) + 3.0 * fit_allowance(tolerance, 1.0, weights);
     for (s64 elapsed = 0; elapsed <= 100; elapsed += 1) {
-        EXPECT_NEAR(second_edge[static_cast<usize>(second_arrival + elapsed)], 3.0 * first_edge[static_cast<usize>(first_arrival + elapsed)], 3e-5)
+        EXPECT_NEAR(second_edge[static_cast<usize>(second_arrival + elapsed)], 3.0 * first_edge[static_cast<usize>(first_arrival + elapsed)], allowance)
             << "tick " << elapsed;
     }
 }
@@ -210,8 +224,8 @@ TEST(AlphaCurrSynapse, peaks_at_its_weight_one_time_constant_after_arrival) {
     EXPECT_NEAR(time_to_peak, SYNAPSE_TIME_CONSTANT, 0.01 * SYNAPSE_TIME_CONSTANT);
 }
 
-// The alpha function integrates to e w tau; Euler's own recurrence gives exactly the same sum. Sign
-// and size scale with the weight.
+// The alpha function integrates to e w tau, and the Euler recurrence gives the same sum. Sign and
+// size scale with the weight.
 TEST(AlphaCurrSynapse, delivers_e_times_weight_times_time_constant) {
     const Temporary_Directory directory;
     Unique_Pointer<Spike_Engine> engine = make_engine(
@@ -229,7 +243,7 @@ TEST(AlphaCurrSynapse, delivers_e_times_weight_times_time_constant) {
 namespace {
 
 // tests/fixtures/nml/LEMS_pynn_synapses.xml: neuron 0 is the spikeGenerator, 1 expPsp, 2 alphaPsp,
-// 3 expSpiking, 4 alphaSpiking. Reference outputs are from regenerate_references.sh.
+// 3 expSpiking, 4 alphaSpiking. regenerate_references.sh writes the reference outputs.
 struct Pynn_Run {
     f64 step = 0.0;
     Vector<Vector<f64>> potentials;     // [neuron 1..4][row]; row k is t = k * step
@@ -281,8 +295,8 @@ struct Postsynaptic_Potential {
     s64 peak_row = 0;
 };
 
-// The first postsynaptic potential: its height above rest and the row it peaks on, looking no
-// further than the next presynaptic spike.
+// The first postsynaptic potential's height above rest and peak row, searching rows before
+// last_row.
 Postsynaptic_Potential first_potential(const Vector<f64> &trace, s64 last_row) {
     const auto peak = max_element(trace.begin(), trace.begin() + last_row);
     return {*peak - trace.front(), static_cast<s64>(peak - trace.begin())};
@@ -296,7 +310,7 @@ TEST(Reference, pynn_postsynaptic_potentials_match_jneuroml) {
     ASSERT_FALSE(reference.potentials[1].empty());
     ASSERT_FALSE(reference.spike_ticks[0].empty());
 
-    // The first presynaptic spike, and the row just before the second one's arrival.
+    // The first presynaptic spike's tick, and the second's, which ends the peak search.
     const s64 presynaptic_tick = reference.spike_ticks[0][0];
     const s64 last_row = reference.spike_ticks[0][1];
     for (s64 neuron : {1, 2}) {
@@ -309,11 +323,9 @@ TEST(Reference, pynn_postsynaptic_potentials_match_jneuroml) {
     }
 }
 
-// A Poisson-driven network against jNeuroML. The two draw their Poisson trains from different
-// generators, so spikes cannot line up one for one; the activity has to be alike in distribution.
-// Per population, the per-neuron rates and the pooled interspike intervals must not differ
-// significantly (two-sample Kolmogorov-Smirnov, alpha 0.001), and the mean rate and interval CV
-// must be close.
+// A Poisson-driven network against jNeuroML. Their random generators differ, so only the
+// distributions are compared: per population, per-neuron rates and pooled interspike intervals must
+// pass a two-sample Kolmogorov-Smirnov test (alpha 0.001), and mean rate and interval CV be close.
 TEST(Reference, pynn_network_activity_matches_jneuroml_statistically) {
     Spike_Engine engine(fixture_path("nml/LEMS_pynn_poisson_network.xml"));
     engine.run();

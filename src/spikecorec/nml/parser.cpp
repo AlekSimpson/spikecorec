@@ -3,8 +3,6 @@
 #include <libxml/xmlschemas.h>
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
 #include <filesystem>
 
 #include "log.h"
@@ -24,6 +22,54 @@ using namespace std::filesystem;
 
 
 namespace spikecorec::nml {
+
+// A count or index written as a whole, non-negative number ("3", "3.0"); nullopt for anything else
+// ("2.6", "two", "-1", "3 cells").
+static Optional<s64> parse_whole_number(const String &text) {
+    const usize first = text.find_first_not_of(" \t\n\r");
+    const usize last = text.find_last_not_of(" \t\n\r");
+    if (first == String::npos) return nullopt;
+    const String trimmed = text.substr(first, last - first + 1);
+    if (!isdigit(static_cast<unsigned char>(trimmed.front()))) return nullopt;
+
+    f64 value = 0.0;
+    usize consumed = 0;
+    try {
+        value = std::stod(trimmed, &consumed);
+    } catch (const Exception &) {
+        return nullopt;
+    }
+    if (consumed != trimmed.size() || !std::isfinite(value) || value != std::floor(value) ||
+        value > static_cast<f64>(Numeric_Limits<s32>::max())) {
+        return nullopt;
+    }
+    return static_cast<s64>(value);
+}
+
+// One attribute's quantity, checked against its dimension, with the element named in any error.
+static f64 resolve_attribute(const NML_Context &context, const NML_Component_Instance &element,
+                             const String &attribute, const String &dimension) {
+    try {
+        return context.resolve_quantity_of_dimension(element.value_or(attribute), dimension);
+    } catch (const Runtime_Error &error) {
+        throw Runtime_Error("'" + element.id + "' " + attribute + ": " + error.what());
+    }
+}
+
+// The name of the state variable at one cell-memory index, or "" when no cell holds it.
+static String variable_name_at(const NML_Context &context, s64 cell_memory_index) {
+    for (const NML_Component_Instance *population : network_populations(context)) {
+        const NML_Component_Type &cell_type = *population_cell(context, *population).component_type;
+        const s64 slot_count = NML_Context::cell_slot_count(cell_type);
+        const s64 base = context.simulation.population_base_indices.at(population->id);
+        if (cell_memory_index < base || cell_memory_index >= base + context.get_population_size(population) * slot_count) {
+            continue;
+        }
+        const usize offset = static_cast<usize>((cell_memory_index - base) % slot_count);
+        return offset < cell_type.state_variable_names.size() ? cell_type.state_variable_names[offset] : "";
+    }
+    return "";
+}
 
 bool is_document_scope_directive(const String &tag_name) {
     static const Set<String> directives = {
@@ -84,8 +130,7 @@ void collect_structure(const NML_Node *element, Vector<NML_Structure_Entry> &str
 }
 
 // Flattens a <Dynamics> or <Regime> element into dynamics entries, in document order.
-// OnStart assignments are entries of their own (source_tag OnStart); OnCondition, OnEntry
-// and OnEvent are followed by the entries of their actions.
+// Each OnStart assignment is an OnStart entry; an event handler's entry precedes its actions.
 void collect_dynamics(const NML_Node *element, const String &regime_name,
                       Vector<NML_Dynamics_Expression> &dynamics) {
     for (const NML_Node *child : children_of(element)) {
@@ -160,21 +205,17 @@ void collect_dynamics(const NML_Node *element, const String &regime_name,
     }
 }
 
-NML_Node *NML_Context::parse_neuroml(const String &filepath) {
-    xmlNodePtr xml_root = get_xml_root(filepath);
-    if (!xml_root) return nullptr;
-
-    NML_Node *root = build_nml_tree(xml_root);
-    xmlFreeDoc(xml_root->doc);
-    return root;
-}
-
 NML_Node *NML_Context::parse_neuroml_file(const String &filepath, Vector<String> &files_to_parse) {
     Error_Code path_error;
     Path canonical = weakly_canonical(Path(filepath), path_error);
     String canonical_text = path_error ? filepath : canonical.string();
 
-    NML_Node *root = parse_neuroml(filepath);
+    xmlNodePtr xml_root = get_xml_root(filepath);
+    if (!xml_root) return nullptr;
+
+    NML_Node *root = build_nml_tree(xml_root);
+    xmlFreeDoc(xml_root->doc);
+
     if (!root) return nullptr;
 
     Path containing_directory = Path(canonical_text).parent_path();
@@ -246,97 +287,108 @@ void NML_Context::parse(const String &main_filepath) {
     const Path canonical_main = weakly_canonical(Path(main_filepath), main_path_error);
     const String canonical_main_file = main_path_error ? main_filepath : canonical_main.string();
 
-    // Resolved after every document is read: a <Constant> may be written in a <Unit> that
-    // a later file in the queue, such as one its own document includes, declares.
+    // Resolved once every file is read: a <Constant> may use a <Unit> that a later file declares.
     Vector<const NML_Node *> constant_nodes;
+    String main_target_component_id;
+    String included_target_component_id;
 
-    String current_file;
-    while (files_to_parse.size() > 0) {
-        current_file = files_to_parse.front();
+    // A failed parse leaves no half-built context behind for a later query to walk.
+    try {
+        String current_file;
+        while (!files_to_parse.empty()) {
+            current_file = files_to_parse.front();
 
-        Error_Code path_error;
-        const Path canonical = weakly_canonical(Path(current_file), path_error);
-        const String canonical_file = path_error ? current_file : canonical.string();
+            Error_Code path_error;
+            const Path canonical = weakly_canonical(Path(current_file), path_error);
+            const String canonical_file = path_error ? current_file : canonical.string();
 
-        if (parsed_files.count(canonical_file) != 0) {
+            if (parsed_files.count(canonical_file) != 0) {
+                files_to_parse.erase(files_to_parse.begin());
+                continue;
+            }
+            parsed_files.insert(canonical_file);
+
+            auto *root = parse_neuroml_file(current_file, files_to_parse);
             files_to_parse.erase(files_to_parse.begin());
-            continue;
-        }
-        parsed_files.insert(canonical_file);
+            if (!root) continue;
 
-        auto *root = parse_neuroml_file(current_file, files_to_parse);
-        files_to_parse.erase(files_to_parse.begin());
-        if (!root) continue;
+            for (NML_Node *child : children_of(root)) {
+                const NML_Tag &tag = child->body;
+                if (tag.tag_name == "Unit") {
+                    String symbol = tag.get_attribute("symbol");
+                    if (symbol.empty()) continue;
 
-        for (NML_Node *child : children_of(root)) {
-            const NML_Tag &tag = child->body;
-            if (tag.tag_name == "Unit") {
-                String symbol = tag.get_attribute("symbol");
-                if (symbol.empty()) continue;
+                    // LEMS: si = raw * scale * 10^power + offset; power is folded into scale.
+                    units::Unit_Definition definition;
+                    definition.scale = 1.0;
+                    definition.offset = 0.0;
+                    definition.dimension = tag.get_attribute("dimension");
 
-                // LEMS: si = raw * scale * 10^power + offset. power is folded into scale here
-                // so resolution stays a single multiply-add.
-                units::Unit_Definition definition;
-                definition.scale = 1.0;
-                definition.offset = 0.0;
+                    if (tag.has_attribute("scale")) {
+                        auto [scale_magnitude, scale_suffix] = units::split_quantity(tag.get_attribute("scale"));
+                        static_cast<void>(scale_suffix);
+                        if (scale_magnitude != 0.0) definition.scale = scale_magnitude;
+                    }
+                    if (tag.has_attribute("power")) {
+                        auto [power_magnitude, power_suffix] = units::split_quantity(tag.get_attribute("power"));
+                        static_cast<void>(power_suffix);
+                        definition.scale *= std::pow(10.0, power_magnitude);
+                    }
+                    if (tag.has_attribute("offset")) {
+                        auto [offset_magnitude, offset_suffix] =
+                                units::split_quantity(tag.get_attribute("offset"));
+                        static_cast<void>(offset_suffix);
+                        definition.offset = offset_magnitude;
+                    }
 
-                if (tag.has_attribute("scale")) {
-                    auto [scale_magnitude, scale_suffix] = units::split_quantity(tag.get_attribute("scale"));
-                    static_cast<void>(scale_suffix);
-                    if (scale_magnitude != 0.0) definition.scale = scale_magnitude;
-                }
-                if (tag.has_attribute("power")) {
-                    auto [power_magnitude, power_suffix] = units::split_quantity(tag.get_attribute("power"));
-                    static_cast<void>(power_suffix);
-                    definition.scale *= std::pow(10.0, power_magnitude);
-                }
-                if (tag.has_attribute("offset")) {
-                    auto [offset_magnitude, offset_suffix] =
-                            units::split_quantity(tag.get_attribute("offset"));
-                    static_cast<void>(offset_suffix);
-                    definition.offset = offset_magnitude;
+                    model_units[symbol] = definition;
+                    continue;
                 }
 
-                model_units[symbol] = definition;
-                continue;
+                if (tag.tag_name == "Constant") {
+                    constant_nodes.push_back(child);
+                    continue;
+                }
+
+                // The main file's <Target> wins; without one, the first an included file declares.
+                if (tag.tag_name == "Target") {
+                    if (canonical_file == canonical_main_file) {
+                        main_target_component_id = tag.get_attribute("component");
+                    } else if (included_target_component_id.empty()) {
+                        included_target_component_id = tag.get_attribute("component");
+                    }
+                    continue;
+                }
             }
 
-            if (tag.tag_name == "Constant") {
-                constant_nodes.push_back(child);
-                continue;
-            }
-
-            if (tag.tag_name == "Target") {
-                target_component_id = tag.get_attribute("component");
-                continue;
+            document_roots.push_back(root);
+            document_filepaths.push_back(canonical_file);
+            if (canonical_file == canonical_main_file) {
+                main_document_root = root;
             }
         }
+        target_component_id = main_target_component_id.empty() ? included_target_component_id : main_target_component_id;
 
-        document_roots.push_back(root);
-        document_filepaths.push_back(canonical_file);
-        if (canonical_file == canonical_main_file) {
-            main_document_root = root;
+        for (const NML_Node *constant_node : constant_nodes) {
+            const String constant_name = constant_node->body.get_attribute("name");
+            if (constant_name.empty()) continue;
+
+            Real resolved;
+            resolved.float64 = resolve_quantity(constant_node->body.get_attribute("value"));
+            model_constants[constant_name] = resolved;
         }
+
+        parse_component_types();
+        parse_component_instances();
+        parse_simulation_details(main_document_root);
+    } catch (...) {
+        reset();
+        throw;
     }
-
-    for (const NML_Node *constant_node : constant_nodes) {
-        const String constant_name = constant_node->body.get_attribute("name");
-        if (constant_name.empty()) continue;
-
-        Real resolved;
-        resolved.float64 = resolve_quantity(constant_node->body.get_attribute("value"));
-        model_constants[constant_name] = resolved;
-    }
-
-    parse_component_types();
-    parse_component_instances();
-    parse_simulation_details(main_document_root);
 }
 
-// Records the <ComponentType> element type_node, read from source_filepath, in
-// component_types and returns its entry. Its extends link is left unset because the parent
-// may not be recorded yet; parse_component_types links every type once all are recorded.
-// nullptr when the element has no name.
+// Records type_node in component_types; nullptr when it has no name. extends stays unset
+// because the parent may not be recorded yet; parse_component_types links it.
 NML_Component_Type *NML_Context::create_component_type(
         const NML_Node *type_node, const String &source_filepath) {
     const String type_name = type_node->body.get_attribute("name");
@@ -379,8 +431,7 @@ void NML_Context::parse_component_types() {
     }
     std::sort(type_names.begin(), type_names.end());
 
-    // a parent need not be linked before its children: each link is only an address, and
-    // component_types never moves an element once it is inserted.
+    // Link order is free: a link is only an address, and component_types never moves an element.
     for (const String &type_name : type_names) {
         NML_Component_Type &component_type = component_types.at(type_name);
 
@@ -397,8 +448,7 @@ void NML_Context::parse_component_types() {
         component_type.extends = &parent->second;
     }
 
-    // a cycle would send every walk up the chain, find_declaration's included, around it
-    // forever, so each chain is walked once here to its root.
+    // A cycle would make every walk up an extends chain loop forever, so each chain is checked.
     for (const String &type_name : type_names) {
         String chain;
         Set<String> visited_type_names;
@@ -452,8 +502,7 @@ void NML_Context::parse_component_types() {
         }
     }
 
-    // A type's own <Dynamics> replaces its ancestors'; without one it inherits the nearest. The
-    // same goes for <Structure>.
+    // A type's own <Dynamics> replaces its ancestors'; without one it inherits the nearest.
     for (const String &type_name : type_names) {
         NML_Component_Type &component_type = component_types.at(type_name);
 
@@ -568,6 +617,17 @@ void NML_Context::parse_component_instances() {
     // Depth first in document order, so elements are pushed in reverse.
     Vector<Pending_Instance> pending;
 
+    auto lowercase = [](String text) {
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        return text;
+    };
+    Unordered_Map<String, String> lowercase_type_names;
+    for (const auto &[type_name, component_type] : component_types) {
+        static_cast<void>(component_type);
+        lowercase_type_names[lowercase(type_name)] = type_name;
+    }
+
     for (const NML_Node *root : document_roots) {
         const Vector<NML_Node *> &top_level_elements = children_of(root);
         for (usize index = top_level_elements.size(); index > 0; index -= 1) {
@@ -580,9 +640,22 @@ void NML_Context::parse_component_instances() {
             const Pending_Instance current = pending.back();
             pending.pop_back();
 
+            // <Component type="spike" .../> is the generic spelling of <spike .../>.
             const String &tag_name = current.node->body.tag_name;
-            auto type_entry = component_types.find(tag_name);
+            const String type_name = tag_name == "Component" ? current.node->body.get_attribute("type") : tag_name;
+            auto type_entry = component_types.find(type_name);
             if (type_entry == component_types.end()) {
+                if (tag_name == "Component") {
+                    throw Runtime_Error("<Component id=\"" + current.node->body.get_attribute("id") + "\"> names type '" +
+                                        type_name + "', which no ComponentType declares");
+                }
+                // An annotation is skipped, but a ComponentType's name in the wrong case is a typo
+                // that would silently drop the element.
+                auto case_typo = lowercase_type_names.find(lowercase(tag_name));
+                if (case_typo != lowercase_type_names.end()) {
+                    throw Runtime_Error("<" + tag_name + "> is no ComponentType; ComponentType names are case "
+                                        "sensitive, and this one is '" + case_typo->second + "'");
+                }
                 log::logger().warn("Ignoring <{}>: no such ComponentType is declared", tag_name);
                 continue;
             }
@@ -626,6 +699,8 @@ s64 NML_Context::resolve_path(
         : current;
     const NML_Component_Instance *population = nullptr;
     s64 component_index = -1;
+    // "pop0/3/cellId/v" names the cell's id after an <instance>; "pop0[3]/v" does not.
+    bool indexed_by_instance = false;
 
     while (walk && start < path.size()) {
         const String token = path.substr(start, end - start);
@@ -637,7 +712,11 @@ s64 NML_Context::resolve_path(
             String name = token;
             const usize bracket = token.find('[');
             if (bracket != String::npos) {
-                component_index = stoll(token.substr(bracket + 1));
+                // The index in "pop[3]" must be a whole number closing the segment.
+                if (token.back() != ']') return -1;
+                const Optional<s64> index = parse_whole_number(token.substr(bracket + 1, token.size() - bracket - 2));
+                if (!index.has_value()) return -1;
+                component_index = *index;
                 name = token.substr(0, bracket);
             }
 
@@ -646,7 +725,13 @@ s64 NML_Context::resolve_path(
             if (child == nullptr) break;
 
             if (is_instance_of(child, "population")) population = child;
-            if (is_instance_of(child, "instance")) component_index = stoll(name);
+            if (is_instance_of(child, "instance")) {
+                // An instance's id is only a name; its place among the population's instances is the index.
+                auto position = simulation.instance_positions.find(child->id);
+                if (position == simulation.instance_positions.end()) return -1;
+                component_index = position->second;
+                indexed_by_instance = true;
+            }
             walk = child;
         }
 
@@ -662,15 +747,19 @@ s64 NML_Context::resolve_path(
     const String cell_id = population->value_or("component");
     const Vector<String> &variable_names = find_instance(cell_id)->component_type->state_variable_names;
     const s64 cell_index = simulation.population_base_indices.at(population->id) +
-            component_index * static_cast<s64>(variable_names.size());
+            component_index * cell_slot_count(*find_instance(cell_id)->component_type);
 
-    // TODO: we dont have to do this case handling if we could identify ahead of time what kind of token each token is 
-    // because for things like pop0/3/cellId/v, cellId is redundant
+    // TODO: classify each path segment up front so the redundant cell id needs no special case.
   
-    // What is left names a variable; "pop0/3/cellId/v" repeats the cell's id first.
+    // What is left names a variable; "pop0/3/cellId/v" repeats the cell's id first. A lone cell id
+    // names the cell, unless the bracket form left it, where it can only be a variable of that name.
     String remainder = start < path.size() ? path.substr(start) : "";
-    if (remainder == cell_id || remainder.rfind(cell_id + "/", 0) == 0) {
+    const bool cell_id_is_a_variable =
+            std::find(variable_names.begin(), variable_names.end(), cell_id) != variable_names.end();
+    if (remainder.rfind(cell_id + "/", 0) == 0) {
         remainder.erase(0, cell_id.size() + 1);
+    } else if (remainder == cell_id && (indexed_by_instance || !cell_id_is_a_variable)) {
+        remainder.clear();
     }
     if (remainder.empty()) return cell_index;
 
@@ -685,7 +774,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
     }
 
     // ── simulation data ──────────────────────────────────────────────────────────────
-    // get target component for simulation and capture simulation data
+    // The <Target> component, otherwise the main document's first <Simulation>.
     const NML_Component_Instance *simulation_instance = nullptr;
     if (!target_component_id.empty()) {
         simulation_instance = find_instance(target_component_id);
@@ -709,13 +798,13 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
     simulation.simulation_component_id = simulation_instance->id;
     simulation.target_network_id = simulation_instance->value_or("target");
     if (simulation_instance->has_value("step")) {
-        simulation.step_dt = resolve_quantity(simulation_instance->value_or("step"));
+        simulation.step_dt = resolve_attribute(*this, *simulation_instance, "step", "time");
     }
-    if (simulation_instance->has_value("length")) {
-        simulation.simulation_duration = resolve_quantity(simulation_instance->value_or("length"));
+    if (!simulation_instance->has_value("length")) {
+        throw Runtime_Error("Simulation '" + simulation_instance->id + "' states no length");
     }
-    // Every time in the model is converted to ticks with the step, and the conversion
-    // divides by it.
+    simulation.simulation_duration = resolve_attribute(*this, *simulation_instance, "length", "time");
+    // Every time converts to ticks by dividing by the step.
     if (simulation.step_dt <= 0.0) {
         throw Runtime_Error("Simulation '" + simulation_instance->id + "' has no usable step (parsed " +
                             std::to_string(simulation.step_dt) + " s)");
@@ -745,20 +834,15 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
         const NML_Component_Instance *population = find_instance(child_id);
         if (!is_instance_of(population, "population")) continue;
 
-        // A populationList enumerates its members as <instance> children, and that count
-        // is authoritative; a plain population states a size.
-        s64 neuron_count = 0;
+        // A populationList's <instance> children are its cells, in document order, whatever their
+        // ids; a plain population states a size.
+        s64 instance_position = 0;
         for (const String &member_id : population->data_order) {
             if (!is_instance_of(find_instance(member_id), "instance")) continue;
-            neuron_count += 1;
+            simulation.instance_positions[member_id] = instance_position;
+            instance_position += 1;
         }
-        if (neuron_count == 0 && population->has_value("size")) {
-            neuron_count = static_cast<s64>(
-                    std::llround(resolve_quantity(population->value_or("size"))));
-        }
-        if (neuron_count < 0) {
-            throw Runtime_Error("Population '" + population->id + "' has a negative size");
-        }
+        const s64 neuron_count = get_population_size(population);
 
         const String component_id = population->value_or("component");
         const NML_Component_Instance *cell = find_instance(component_id);
@@ -768,9 +852,8 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
         }
 
         simulation.cell_instances.push_back(*cell);
-        s64 cell_state_size = cell->component_type->state_variable_names.size();
-        simulation.population_base_indices[population->id] = current_cell_base; 
-        current_cell_base += neuron_count * cell_state_size;
+        simulation.population_base_indices[population->id] = current_cell_base;
+        current_cell_base += neuron_count * cell_slot_count(*cell->component_type);
         simulation.total_neuron_count += neuron_count;
     }
 
@@ -785,6 +868,13 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
     for (const String &child_id : network->data_order) {
         const NML_Component_Instance *projection = find_instance(child_id);
+        // Connections come only from a <projection>; these would contribute no edges.
+        for (const char *unread_type : {"explicitConnection", "electricalProjection", "continuousProjection"}) {
+            if (!is_instance_of(projection, unread_type)) continue;
+            throw Runtime_Error("Network '" + network->id + "' holds '" + projection->id + "', a " +
+                                projection->component_type->name + ", which the engine does not simulate: it "
+                                "takes connections only from a <projection> of event-driven synapses");
+        }
         if (!is_instance_of(projection, "projection")) continue;
 
         const String synapse_id = projection->value_or("synapse");
@@ -809,6 +899,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
             NML_Network_Edge edge;
             edge.component_id = synapse_id;
+            edge.destination = connection->value_or("destination");
             edge.parent = neuron_index_of(resolve_path(presynaptic_path, projection));
             edge.child = neuron_index_of(resolve_path(postsynaptic_path, projection));
 
@@ -819,14 +910,21 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
                                     postsynaptic_path + "'");
             }
 
-            // A plain <connection> states neither; a connectionWD states both.
+            // A plain <connection> states neither; a connectionWD must state both.
+            const String described_connection = "Connection '" + connection->id + "' in projection '" + projection->id + "'";
+            if (is_instance_of(connection, "connectionWD") &&
+                (!connection->has_value("weight") || !connection->has_value("delay"))) {
+                throw Runtime_Error(described_connection + " is a connectionWD, which must state both its weight and delay");
+            }
             edge.weight = connection->has_value("weight")
-                    ? static_cast<f32>(resolve_quantity(connection->value_or("weight")))
+                    ? static_cast<f32>(resolve_attribute(*this, *connection, "weight", "none"))
                     : 1.0f;
-            edge.delay_ticks = connection->has_value("delay")
-                    ? units::seconds_to_ticks(resolve_quantity(connection->value_or("delay")),
-                                              simulation.step_dt)
-                    : 0;
+            const f64 delay_seconds = connection->has_value("delay") ? resolve_attribute(*this, *connection, "delay", "time") : 0.0;
+            if (!std::isfinite(delay_seconds) || delay_seconds < 0.0) {
+                throw Runtime_Error(described_connection + " has the delay '" + connection->value_or("delay") +
+                                    "'; a delay must be finite and not negative");
+            }
+            edge.delay_ticks = units::seconds_to_ticks(delay_seconds, simulation.step_dt);
 
             simulation.network_data.add(edge);
             simulation.total_edge_count += 1;
@@ -835,8 +933,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
     }
 
     // ── inputs ───────────────────────────────────────────────────────────────────
-    // The wiring (explicitInput, inputList) names the targets; the input component it
-    // references is compiled from its own dynamics, so only its id is kept here.
+    // Only the input's id is kept: the kernel runs the input component's own dynamics.
     auto build_input_profile = [&](const String &input_component_id,
                                    Vector<Input_Target> targets) {
         const NML_Component_Instance *input = find_instance(input_component_id);
@@ -858,6 +955,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
             const String target_path = child->value_or("target");
 
             Input_Target target;
+            target.destination = child->value_or("destination");
             target.neuron_index = resolve_path(target_path, network);
             if (target.neuron_index < 0) {
                 throw Runtime_Error("explicitInput '" + child->id + "' targets '" +
@@ -878,6 +976,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
             const String target_path = input->value_or("target");
 
             Input_Target target;
+            target.destination = input->value_or("destination");
             target.neuron_index = resolve_path(target_path, child);
             if (target.neuron_index < 0) {
                 throw Runtime_Error("Input '" + input->id + "' in inputList '" + child->id +
@@ -885,7 +984,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
                                     "', which resolves to no neuron");
             }
             if (input->has_value("weight")) {
-                target.weight = resolve_quantity(input->value_or("weight"));
+                target.weight = resolve_attribute(*this, *input, "weight", "none");
             }
             targets.push_back(std::move(target));
         }
@@ -894,6 +993,12 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
     }
 
     // ── recordings ───────────────────────────────────────────────────────────────
+    // A relative fileName is relative to the LEMS file, or to the element's path inside it.
+    Path lems_directory;
+    for (usize index = 0; index < document_roots.size(); index += 1) {
+        if (document_roots[index] == lems_root) lems_directory = Path(document_filepaths[index]).parent_path();
+    }
+
     for (const String &output_id : simulation_instance->data_order) {
         const NML_Component_Instance *output = find_instance(output_id);
 
@@ -911,11 +1016,25 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
                               : output_format_for_filename(filename));
         profile.recordings_count = 0;
 
+        const Path output_path = output->value_or("path");
+        profile.output_directory = (output_path.empty() ? lems_directory
+                                    : output_path.is_absolute() ? output_path
+                                    : lems_directory / output_path).string();
+
+        if (is_event_file) {
+            profile.event_format = output->has_value("format") ? output->value_or("format") : "TIME_ID";
+            if (profile.event_format != "TIME_ID" && profile.event_format != "ID_TIME") {
+                throw Runtime_Error("EventOutputFile '" + output->id + "' has format '" + profile.event_format +
+                                    "'; it must be TIME_ID or ID_TIME");
+            }
+        }
+
         for (const String &selection_id : output->data_order) {
             const NML_Component_Instance *selection = find_instance(selection_id);
 
             Recording_Selection recorded;
-            if (is_instance_of(selection, "OutputColumn")) {
+            const bool is_column = is_instance_of(selection, "OutputColumn");
+            if (is_column) {
                 recorded.quantity_path = selection->value_or("quantity");
             } else if (is_instance_of(selection, "EventSelection")) {
                 recorded.quantity_path = selection->value_or("select");
@@ -923,12 +1042,15 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
             } else {
                 continue;
             }
+            recorded.selection_id = selection->id.substr(selection->id.rfind('/') + 1);
 
+            // The engine refuses a selection that resolves to nothing it can record.
             recorded.neuron_index = resolve_path(recorded.quantity_path);
-
             if (recorded.neuron_index < 0) {
                 log::logger().warn("Recording '{}' in {} resolves to no neuron; recorded "
                                    "with index -1", recorded.quantity_path, filename);
+            } else if (is_column) {
+                recorded.variable_name = variable_name_at(*this, recorded.neuron_index);
             }
 
             profile.selections.push_back(std::move(recorded));
@@ -939,16 +1061,9 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
     }
 }
 
-// Accumulates each schema validation error's line number and message (libxml2's messages
-// already name the offending element, e.g. "Element 'thisTagDoesNotExistInSchema': No
-// matching global declaration available for the validation root.") into `*user_data`,
-// joined by " | " -- see validate_against_schema's own comment for why this replaces
-// libxml2's default, stderr-only error handler.
-// libxml2 2.12 made xmlStructuredErrorFunc take a `const xmlError *`; before that it took
-// a mutable xmlErrorPtr. This machine has both 2.9 (pkg-config, what the Makefile picks)
-// and 2.13 (xml2-config) installed, so the signature is selected rather than assumed.
-// static: utilities.cpp defines a function of the same name, and two external definitions
-// would collide at link time.
+// Appends "line N: message" for each schema error to *user_data, joined by " | ".
+// libxml2 2.12 changed the error parameter to `const xmlError *`.
+// static: utilities.cpp defines an external function of the same name.
 #if LIBXML_VERSION >= 21200
 static void collect_schema_validation_error(void *user_data, const xmlError *error) {
 #else
@@ -959,7 +1074,7 @@ static void collect_schema_validation_error(void *user_data, xmlErrorPtr error) 
     String message(error->message);
     while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) message.pop_back();
 
-    String *destination = static_cast<String *>(user_data);
+    auto *destination = static_cast<String *>(user_data);
     if (!destination->empty()) *destination += " | ";
     *destination += "line " + std::to_string(error->line) + ": " + message;
 }
@@ -1009,8 +1124,7 @@ bool NML_Context::validate_lems_schema(const String &lems_filepath) {
     xmlSchemaSetValidStructuredErrors(
             valid_context, collect_schema_validation_error, &last_schema_validation_errors);
 
-    // xmlSchemaValidateFile: 0 = valid, >0 = validation errors (captured above, by element and line
-    // number), <0 = internal/API error.
+    // 0 = valid, > 0 = schema errors (collected above), < 0 = internal error.
     int result = xmlSchemaValidateFile(valid_context, lems_filepath.c_str(), 0);
 
     xmlSchemaFreeValidCtxt(valid_context);
@@ -1040,52 +1154,131 @@ NML_Context::~NML_Context() {
     for (NML_Node *root : document_roots) delete root;
 }
 
+// Splits "-60 mV" into its number and unit symbol. False unless the whole text is one finite
+// number, optionally followed by a symbol: "-60mV;", "3 mV extra", "1.2.3mV", "abc" and "1e400"
+// are all refused.
+static bool split_strict_quantity(const String &value, f64 &magnitude, String &suffix) {
+    usize cursor = value.find_first_not_of(" \t\n\r");
+    if (cursor == String::npos) return false;
+    const usize number_start = cursor;
+    auto is_digit_at = [&value](usize position) {
+        return position < value.size() && isdigit(static_cast<unsigned char>(value[position]));
+    };
+
+    if (value[cursor] == '-' || value[cursor] == '+') cursor += 1;
+    usize digit_count = 0;
+    while (is_digit_at(cursor)) { cursor += 1; digit_count += 1; }
+    if (cursor < value.size() && value[cursor] == '.') {
+        cursor += 1;
+        while (is_digit_at(cursor)) { cursor += 1; digit_count += 1; }
+    }
+    if (digit_count == 0) return false;
+    if (cursor < value.size() && (value[cursor] == 'e' || value[cursor] == 'E')) {
+        usize exponent = cursor + 1;
+        if (exponent < value.size() && (value[exponent] == '-' || value[exponent] == '+')) exponent += 1;
+        if (is_digit_at(exponent)) {
+            cursor = exponent;
+            while (is_digit_at(cursor)) cursor += 1;
+        }
+    }
+
+    try {
+        magnitude = std::stod(value.substr(number_start, cursor - number_start));
+    } catch (const Exception &) {
+        return false;
+    }
+    if (!std::isfinite(magnitude)) return false;
+
+    const usize suffix_start = value.find_first_not_of(" \t\n\r", cursor);
+    const usize suffix_end = value.find_last_not_of(" \t\n\r");
+    suffix = suffix_start == String::npos ? "" : value.substr(suffix_start, suffix_end - suffix_start + 1);
+    if (suffix.empty()) return true;
+    if (!isalpha(static_cast<unsigned char>(suffix.front())) && suffix.front() != '_') return false;
+    return std::all_of(suffix.begin(), suffix.end(), [](char character) {
+        return isalnum(static_cast<unsigned char>(character)) || character == '_';
+    });
+}
+
 f64 NML_Context::resolve_quantity(const String &value) const {
-    auto [magnitude, suffix] = units::split_quantity(value);
+    f64 magnitude = 0.0;
+    String suffix;
+    if (!split_strict_quantity(value, magnitude, suffix)) {
+        throw Runtime_Error("'" + value + "' is not a quantity: a quantity is a finite number, optionally followed by a unit");
+    }
     if (suffix.empty()) return magnitude;
 
-    // A <Unit> the document declared wins: it is authoritative for this model, and it is
-    // the only source that can express an offset (degC -> K).
+    // A declared <Unit> wins over the built-in table; only it can carry an offset (degC -> K).
     auto declared = model_units.find(suffix);
     if (declared != model_units.end()) {
         return magnitude * declared->second.scale + declared->second.offset;
+    }
+    if (!units::unit_suffix_is_known(suffix)) {
+        throw Runtime_Error("'" + value + "' has the unit '" + suffix + "', which neither the document nor the "
+                            "NeuroML standard units declare");
     }
 
     return magnitude * units::unit_suffix_scale(suffix);
 }
 
-// The number of per-neuron state slots a cell needs.
+f64 NML_Context::resolve_quantity_of_dimension(const String &value, const String &dimension) const {
+    const f64 resolved = resolve_quantity(value);
+    // "*" accepts any dimension; with no dimension stated there is nothing to check.
+    if (dimension.empty() || dimension == "*") return resolved;
+
+    f64 magnitude = 0.0;
+    String suffix;
+    split_strict_quantity(value, magnitude, suffix);
+    if (suffix.empty()) {
+        if (dimension == "none") return resolved;
+        throw Runtime_Error("'" + value + "' has no unit, but it is a " + dimension);
+    }
+    auto declared = model_units.find(suffix);
+    if (declared != model_units.end() && !declared->second.dimension.empty() && declared->second.dimension != dimension) {
+        throw Runtime_Error("'" + value + "' is a " + declared->second.dimension + ", but it should be a " + dimension);
+    }
+    return resolved;
+}
+
+s64 NML_Context::cell_slot_count(const NML_Component_Type &cell_type) {
+    return std::max<s64>(1, static_cast<s64>(cell_type.state_variable_names.size()));
+}
+
+// The number of state variables a cell declares; cell_slot_count gives the slots it takes.
 s64 NML_Context::get_cell_variable_count(s64 cell_instance_index) {
     const NML_Component_Type *cell_type =
             simulation.cell_instances.at(static_cast<usize>(cell_instance_index)).component_type;
     return static_cast<s64>(cell_type->state_variable_names.size());
 }
 
-// A populationList's <instance> children are its cells; a plain population states a size.
 s64 NML_Context::neuron_index_of(s64 cell_memory_index) const {
     s64 first_neuron = 0;
     for (const NML_Component_Instance *population : network_populations(*this)) {
         const s64 population_size = get_population_size(population);
-        const s64 variable_count =
-                static_cast<s64>(population_cell(*this, *population).component_type->state_variable_names.size());
+        const s64 slot_count = cell_slot_count(*population_cell(*this, *population).component_type);
         const s64 base = simulation.population_base_indices.at(population->id);
 
-        if (variable_count > 0 && cell_memory_index >= base &&
-            cell_memory_index < base + population_size * variable_count) {
-            return first_neuron + (cell_memory_index - base) / variable_count;
+        if (cell_memory_index >= base && cell_memory_index < base + population_size * slot_count) {
+            return first_neuron + (cell_memory_index - base) / slot_count;
         }
         first_neuron += population_size;
     }
     return -1;
 }
 
+// A populationList's <instance> children are its cells; a plain population states a size.
 s64 NML_Context::get_population_size(const NML_Component_Instance *population) const {
+    if (population == nullptr) throw Invalid_Argument("get_population_size: no population was given");
     s64 population_size = 0;
     for (const String &member_id : population->data_order) {
         if (is_instance_of(find_instance(member_id), "instance")) population_size += 1;
     }
     if (population_size == 0 && population->has_value("size")) {
-        population_size = std::llround(resolve_quantity(population->value_or("size")));
+        const Optional<s64> size = parse_whole_number(population->value_or("size"));
+        if (!size.has_value()) {
+            throw Runtime_Error("Population '" + population->id + "' has the size '" + population->value_or("size") +
+                                "', which is not a whole number of cells");
+        }
+        population_size = *size;
     }
     return population_size;
 }
@@ -1100,17 +1293,9 @@ s64 NML_Context::get_cell_state_size() const {
         const NML_Component_Instance *population = find_instance(child_id);
         if (!is_instance_of(population, "population")) continue;
 
-        // A populationList's <instance> children are its cells; a plain population states a size.
-        s64 population_size = 0;
-        for (const String &member_id : population->data_order) {
-            if (is_instance_of(find_instance(member_id), "instance")) population_size += 1;
-        }
-        if (population_size == 0 && population->has_value("size")) {
-            population_size = std::llround(resolve_quantity(population->value_or("size")));
-        }
-
         const NML_Component_Instance *cell = find_instance(population->value_or("component"));
-        cell_state_size += population_size * static_cast<s64>(cell->component_type->state_variable_names.size());
+        if (cell == nullptr || cell->component_type == nullptr) continue;
+        cell_state_size += get_population_size(population) * cell_slot_count(*cell->component_type);
     }
     return cell_state_size;
 }

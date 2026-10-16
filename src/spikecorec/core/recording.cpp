@@ -159,10 +159,14 @@ Raw_Sink::Raw_Sink(const String &filename) : file_(filename, Stream_Base::binary
 
 void Raw_Sink::write(const u8 *data, usize byte_count) {
     file_.write(reinterpret_cast<const char *>(data), static_cast<streamsize>(byte_count));
+    if (!file_) log::throw_runtime_error(log::logger(), "Raw_Sink: write failed");
 }
 
 void Raw_Sink::close() {
+    // Closing flushes what the stream still buffers, so a full disk can fail here too.
+    const bool failed_before = !file_;
     file_.close();
+    if (failed_before || !file_) log::throw_runtime_error(log::logger(), "Raw_Sink: close failed");
 }
 
 Raw_Source::Raw_Source(const String &filename) : file_(filename, Stream_Base::binary) {
@@ -181,18 +185,22 @@ usize Raw_Source::read(u8 *out, usize byte_count) {
 
 Gzip_Sink::Gzip_Sink(const String &filename, int compression_level) {
     log::logger().debug("Gzip_Sink: filename={} compression_level={}", filename, compression_level);
+    // zlib reads the level one digit at a time from the mode string, so it must be one digit.
     char mode[8];
-    snprintf(mode, sizeof(mode), "wb%d", compression_level);
+    snprintf(mode, sizeof(mode), "wb%d", std::clamp(compression_level, 0, 9));
     gz_file_ = gzopen(filename.c_str(), mode);
     if (gz_file_ == nullptr)
         log::throw_runtime_error(log::logger(), log::format("Failed to open gzip file for writing: {}", filename));
 }
 
-Gzip_Sink::~Gzip_Sink() { if (!closed_) close(); }
+// A destructor must not throw: a close that fails after a failed write is only logged.
+Gzip_Sink::~Gzip_Sink() {
+    if (closed_) return;
+    try { close(); } catch (const Exception &error) { log::logger().error("~Gzip_Sink: {}", error.what()); }
+}
 
 void Gzip_Sink::write(const u8 *data, usize byte_count) {
-    // gzwrite takes an `unsigned` length; write in bounded slices so a chunk
-    // larger than UINT_MAX can't silently truncate to its low 32 bits.
+    // gzwrite takes an `unsigned` length; slicing keeps a huge chunk from being truncated.
     constexpr usize MAX_IO = usize(1) << 30; // 1 GiB per call
     usize offset = 0;
     while (offset < byte_count) {
@@ -257,7 +265,10 @@ Xz_Sink::Xz_Sink(const String &filename, int compression_level)
     if (rc != LZMA_OK) throw_lzma_error("lzma_easy_encoder", rc);
 }
 
-Xz_Sink::~Xz_Sink() { if (!closed_) close(); }
+Xz_Sink::~Xz_Sink() {
+    if (closed_) return;
+    try { close(); } catch (const Exception &error) { log::logger().error("~Xz_Sink: {}", error.what()); }
+}
 
 void Xz_Sink::flush_stream(bool finish) {
     Vector<u8> output_buffer(LZMA_CHUNK_SIZE);
@@ -272,6 +283,7 @@ void Xz_Sink::flush_stream(bool finish) {
         usize produced = output_buffer.size() - stream_->stream.avail_out;
         if (produced > 0) {
             file_.write(reinterpret_cast<const char *>(output_buffer.data()), static_cast<streamsize>(produced));
+            if (!file_) log::throw_runtime_error(log::logger(), "Xz_Sink: write failed");
             stream_->stream.next_out = output_buffer.data();
             stream_->stream.avail_out = output_buffer.size();
         }
@@ -292,9 +304,15 @@ void Xz_Sink::close() {
     closed_ = true;
     stream_->stream.next_in = nullptr;
     stream_->stream.avail_in = 0;
-    flush_stream(/*finish=*/true);
+    try {
+        flush_stream(/*finish=*/true);
+    } catch (...) {
+        lzma_end(&stream_->stream);
+        throw;
+    }
     lzma_end(&stream_->stream);
     file_.close();
+    if (!file_) log::throw_runtime_error(log::logger(), "Xz_Sink: close failed");
 }
 
 Xz_Source::Xz_Source(const String &filename)
@@ -361,11 +379,13 @@ Bz2_Sink::Bz2_Sink(const String &filename, int compression_level) {
     if (bz_error != BZ_OK) throw_bz2_error("BZ2_bzWriteOpen", bz_error);
 }
 
-Bz2_Sink::~Bz2_Sink() { if (!closed_) close(); }
+Bz2_Sink::~Bz2_Sink() {
+    if (closed_) return;
+    try { close(); } catch (const Exception &error) { log::logger().error("~Bz2_Sink: {}", error.what()); }
+}
 
 void Bz2_Sink::write(const u8 *data, usize byte_count) {
-    // BZ2_bzWrite takes an `int` length; write in bounded slices so a chunk
-    // larger than INT_MAX can't overflow to a negative length.
+    // BZ2_bzWrite takes an `int` length; slicing keeps a huge chunk from overflowing it.
     constexpr usize MAX_IO = usize(1) << 30; // 1 GiB per call
     usize offset = 0;
     while (offset < byte_count) {
@@ -438,13 +458,8 @@ Async_Spire_Writer::~Async_Spire_Writer() {
 }
 
 void Async_Spire_Writer::run() {
-    // Once the sink has thrown, it may be in an unrecoverable state — for some
-    // backends (e.g. libbz2) calling write()/close() again after an error is
-    // undefined behavior. So after the first failure we stop touching the sink
-    // entirely: we keep draining the queue (discarding chunks) so the producer's
-    // blocking write()/close() calls observe the captured error rather than
-    // deadlocking, but we never re-enter the failed sink. Resource cleanup is
-    // left to the sink's own destructor.
+    // A sink that has thrown is not called again (libbz2, for one, is undefined after an error).
+    // The queue keeps draining so a blocked producer sees the error instead of deadlocking.
     bool sink_failed = false;
 
     for (;;) {
@@ -457,7 +472,7 @@ void Async_Spire_Writer::run() {
         }
         not_full_.notify_one();
 
-        if (!chunk.has_value()) { // sentinel — flush and exit
+        if (!chunk.has_value()) { // sentinel: close the sink and exit
             if (!sink_failed) {
                 try {
                     sink_->close();
@@ -469,7 +484,7 @@ void Async_Spire_Writer::run() {
             return;
         }
 
-        if (sink_failed) continue; // already errored — discard without re-entering the sink
+        if (sink_failed) continue; // discard; never re-enter a failed sink
 
         try {
             sink_->write(chunk->data(), chunk->size());
@@ -495,8 +510,7 @@ void Async_Spire_Writer::write(Vector<u8> chunk) {
 
     {
         Unique_Lock<Mutex> lock(mutex_);
-        // max_queued_chunks_ == 0 means "unbounded" (matching the Python
-        // reference's queue.Queue(maxsize=0)) — never block the producer.
+        // max_queued_chunks_ == 0 means unbounded.
         not_full_.wait(lock, [this] {
             return max_queued_chunks_ == 0 || queue_.size() < max_queued_chunks_ || error_;
         });
@@ -624,7 +638,23 @@ Spire_Writer::Spire_Writer(const String &filename, s64 neuron_count)
 
 void Spire_Writer::write_frame(const f32 *membrane_potentials) {
     log::logger().trace("Spire_Writer::write_frame: neuron_count={}", neuron_count_);
+    if (closed_) log::throw_runtime_error(log::logger(), "Spire_Writer::write_frame called after close()");
     file_.write(reinterpret_cast<const char *>(membrane_potentials), static_cast<streamsize>(neuron_count_ * sizeof(f32)));
+    if (!file_) log::throw_runtime_error(log::logger(), "Spire_Writer: write failed");
+}
+
+void Spire_Writer::flush() {
+    if (closed_) return;
+    file_.flush();
+    if (!file_) log::throw_runtime_error(log::logger(), "Spire_Writer: flush failed");
+}
+
+void Spire_Writer::close() {
+    if (closed_) return;
+    closed_ = true;
+    const bool failed_before = !file_;
+    file_.close();
+    if (failed_before || !file_) log::throw_runtime_error(log::logger(), "Spire_Writer: close failed");
 }
 
 // ── Spire_Reader ──────────────────────────────────────────────────────────────
@@ -671,9 +701,7 @@ Spire_Recording spikecorec::read_spire_recording(const String &filename) {
     Spire_Compression compression = resolve_spire_compression(filename, nullopt).first;
     Unique_Pointer<Spire_Source> source = make_spire_source(filename, compression);
 
-    // Spire_Source::read may return short reads (e.g. compressed streams hand
-    // back chunks as they decode), so loop until `byte_count` bytes are
-    // collected or the source reaches a clean EOF.
+    // Spire_Source::read may return fewer bytes than asked, so loop until full or end of stream.
     auto read_fully = [&](u8 *out, usize byte_count) -> usize {
         usize total = 0;
         while (total < byte_count) {

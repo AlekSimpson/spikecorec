@@ -93,8 +93,7 @@ String NML_Tag::get_attribute_or(const String &name, const String &fallback) con
 }
 
 String NML_Tag::namespace_key() const {
-    // The namespaces a ComponentType keeps names unique within, per
-    // docs/nml_general_notes.md. Several tags share the variable namespace, so a subtype
+    // Names are unique per namespace. Several tags share the variable namespace, so a subtype
     // declaring StateVariable "tau" overrides an inherited Parameter "tau".
     switch (tag_type) {
         case NML_Declaration_Type::Parameter:
@@ -125,13 +124,11 @@ String NML_Tag::namespace_key() const {
         case NML_Declaration_Type::Regime:
             return "regime:" + get_attribute("name");
 
-        // A subtype restating a derivative for the same variable replaces it rather than
-        // integrating the variable twice.
+        // A subtype's derivative of the same variable replaces the parent's, not adds to it.
         case NML_Declaration_Type::TimeDerivative:
             return "derivative:" + get_attribute("variable");
 
-        // Everything else accumulates: a subtype adding an OnCondition adds a condition,
-        // it does not replace the parent's.
+        // Everything else accumulates: a subtype's OnCondition adds to the parent's.
         default:
             return "";
     }

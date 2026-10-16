@@ -17,16 +17,14 @@ import pybind11
 
 
 class CudaBuildExt(_build_ext):
-    """build_ext that compiles .cu sources with nvcc and everything else with the
-    default host compiler. setuptools/distutils has no native CUDA rule, so we
-    intercept per-file compilation and route .cu files through nvcc."""
+    """build_ext that routes .cu sources through nvcc, since setuptools has no CUDA rule."""
 
     def build_extensions(self):
         cuda_path = os.environ.get("CUDA_PATH", "/usr/local/cuda")
         nvcc = os.path.join(cuda_path, "bin", "nvcc")
         if not os.path.exists(nvcc):
             nvcc = shutil.which("nvcc") or nvcc
-        arch = os.environ.get("SPIKECOREC_CUDA_ARCH")  # e.g. "sm_87"; default lets nvcc pick + JIT
+        arch = os.environ.get("SPIKECOREC_CUDA_ARCH")  # e.g. "sm_87"; unset lets nvcc choose
 
         self.compiler.src_extensions.append(".cu")
         default_compile = self.compiler._compile
@@ -37,8 +35,7 @@ class CudaBuildExt(_build_ext):
                        "-Xcompiler", "-fPIC"]
                 if arch:
                     cmd += ["-arch=" + arch]
-                # pp_opts carries the -I include dirs and -D macros; keep nvcc-safe
-                # entries from extra_postargs (-std/-O...) and drop host-only -f flags.
+                # pp_opts holds the -I and -D flags; extra_postargs loses its host-only -f flags.
                 cmd += pp_opts
                 cmd += [a for a in extra_postargs if not a.startswith("-f")]
                 cmd += ["-c", src, "-o", obj]
@@ -85,8 +82,7 @@ SRCS = [
     "src/spikecorec/core/types.cpp",
     "src/spikecorec/core/units.cpp",
     "src/spikecorec/core/weight_matrix.cpp",
-    # engine.cpp calls into the NML front-end and the kernel codegen, so both have to be
-    # in the extension or it fails to link.
+    # The NML front-end and kernel codegen, which engine.cpp links against.
     "src/spikecorec/nml/components.cpp",
     "src/spikecorec/nml/dynamics.cpp",
     "src/spikecorec/nml/kernel_boilerplate.cpp",
@@ -104,10 +100,8 @@ EXTRA_LINK_ARGS = []
 DEFINE_MACROS = [("SPDLOG_ACTIVE_LEVEL", "SPDLOG_LEVEL_TRACE")]  # spdlog is header-only by default
 
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ──────────────
-# Mirrors the Makefile's HAS_ZLIB/HAS_LZMA/HAS_BZ2 probing: query pkg-config
-# for cflags/libs and define SPIKECOREC_HAVE_* only when found. Missing
-# libraries degrade gracefully — Spire_Writer/Reader throw a clear
-# runtime_error for compressed variants whose library wasn't available here.
+# Optional, as in the Makefile: without a codec's library, raw .spire still works and that
+# compressed format throws at runtime.
 for _macro, _package in (
     ("SPIKECOREC_HAVE_ZLIB", "zlib"),
     ("SPIKECOREC_HAVE_LZMA", "liblzma"),
@@ -126,9 +120,8 @@ for _macro, _package in (
         EXTRA_LINK_ARGS.append(_flag)
 
 # ── XML parsing (libxml2 — the NML/LEMS front-end) ────────────────────────────
-# Not optional: every NML source includes libxml2's headers. Mirrors the Makefile's
-# HAS_LIBXML2 probing. A Python extension on macOS links with -undefined dynamic_lookup,
-# so leaving -lxml2 out does not fail the build -- it fails the import, on a missing symbol.
+# Required by the NML sources. On macOS the extension links with -undefined dynamic_lookup,
+# so a missing -lxml2 fails at import, not at build.
 _libxml2_libs = _pkg_config("--libs", package="libxml-2.0")
 if _libxml2_libs is None:
     raise RuntimeError("libxml2 not found through pkg-config (libxml-2.0); the NML front-end needs it.")
@@ -144,9 +137,8 @@ EXTRA_LINK_ARGS += _libxml2_libs
 if BACKEND == "cuda":
     CUDA_PATH = os.environ.get("CUDA_PATH", "/usr/local/cuda")
     INC.append(f"{CUDA_PATH}/include")
-    # backend.cpp uses the driver API (cuInit/cuCtxCreate/cuModuleLoadData) and
-    # NVRTC in addition to the runtime API, so link -lcuda and -lnvrtc too. The
-    # driver stub satisfies the link; the real libcuda loads at runtime.
+    # backend.cpp also uses the driver API (cuInit, cuModuleLoadData) and NVRTC. The driver
+    # stub satisfies the link; the real libcuda loads at runtime.
     EXTRA_LINK_ARGS += [f"-L{CUDA_PATH}/lib64", f"-L{CUDA_PATH}/lib64/stubs",
                         "-lcudart", "-lcuda", "-lnvrtc"]
     DEFINE_MACROS.append(("SPIKECOREC_CUDA", None))
@@ -165,15 +157,9 @@ elif BACKEND == "metal":
     DEFINE_MACROS.append(("SPIKECOREC_METAL", None))
 
 # ── Compile-time paths ───────────────────────────────────────
-# The engine reads three paths out of the source tree at runtime, and all reach it as
-# compile-time defines rather than as a search: the NeuroML standard library, without
-# which every document resolves to zero known ComponentTypes and so to zero neurons; the
-# NeuroML XSD, which validate_lems_schema checks a NeuroML document against; and
-# src/spikecorec/metal, whose k2tree_device.metalinc is parsed into every generated kernel.
-#
-# The Makefile passes all three, and an extension built without them is not obviously
-# broken: it imports and constructs cleanly, then reports that the model declares no
-# neurons, which reads as a bad document rather than as a missing define.
+# Source-tree paths the engine reads at runtime: the NeuroML standard library, the XSD, and
+# (Metal) the directory of k2tree_device.metalinc, which the codegen parses into each kernel.
+# Without them the extension imports but cannot load a model.
 _source_root = os.path.abspath(os.path.dirname(__file__))
 DEFINE_MACROS.append(
     ("SPIKECOREC_NML_STD_LIB_DIR",
