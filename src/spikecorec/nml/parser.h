@@ -131,6 +131,21 @@ struct NML_Context {
     // The neuron whose state slots include cell_memory_index (a resolve_path result), or -1.
     [[nodiscard]] s64 neuron_index_of(s64 cell_memory_index) const;
     s64 resolve_path(const String &path, const NML_Component_Instance *current = nullptr) const;
+
+private:
+    // Per parent path and type name, where create_component_instance resumes its search for the
+    // ordinal that names an element with no id.
+    Unordered_Map<String, usize> unnamed_instance_ordinals;
+
+    // Each population's cells, in network order, so neuron_index_of does not walk every child of
+    // the network (one per explicitInput) on each call. Filled with population_base_indices.
+    struct Population_Cell_Range {
+        s64 cell_memory_base = 0;
+        s64 cell_count = 0;
+        s64 slot_count = 1;
+        s64 first_neuron = 0;
+    };
+    Vector<Population_Cell_Range> population_cell_ranges;
 };
 
 }

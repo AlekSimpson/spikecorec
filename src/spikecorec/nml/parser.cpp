@@ -258,6 +258,8 @@ void NML_Context::reset() {
     model_units.clear();
     model_constants.clear();
     target_component_id.clear();
+    unnamed_instance_ordinals.clear();
+    population_cell_ranges.clear();
     simulation = NML_Simulation_Context();
 }
 
@@ -549,10 +551,12 @@ NML_Component_Instance *NML_Context::create_component_instance(
     const NML_Tag &tag = instance_node->body;
     const String prefix = parent_instance ? parent_instance->id + "/" : "";
 
-    // An element with no id is named by its type and an ordinal, e.g. "member0".
+    // An element with no id is named by its type and the smallest free ordinal, e.g. "member0".
+    // Instances are never removed, so every ordinal below the last one given is still taken and
+    // the search resumes there: otherwise naming n such siblings takes n^2 / 2 lookups.
     String name = tag.get_attribute("id");
     if (name.empty()) {
-        usize ordinal = 0;
+        usize &ordinal = unnamed_instance_ordinals[prefix + component_type->name];
         while (component_instances.count(prefix + component_type->name + std::to_string(ordinal)) != 0) {
             ordinal += 1;
         }
@@ -608,6 +612,7 @@ NML_Component_Instance *NML_Context::create_component_instance(
 void NML_Context::parse_component_instances() {
     // Rebuilt, not appended to: a second pass would append every child to its parent twice.
     component_instances.clear();
+    unnamed_instance_ordinals.clear();
 
     struct Pending_Instance {
         const NML_Node *node;
@@ -830,6 +835,7 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
     // ── populations ──────────────────────────────────────────────────────────────
     s64 current_cell_base = 0;
+    population_cell_ranges.clear();
     for (const String &child_id : network->data_order) {
         const NML_Component_Instance *population = find_instance(child_id);
         if (!is_instance_of(population, "population")) continue;
@@ -853,6 +859,8 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
         simulation.cell_instances.push_back(*cell);
         simulation.population_base_indices[population->id] = current_cell_base;
+        population_cell_ranges.push_back(
+                {current_cell_base, neuron_count, cell_slot_count(*cell->component_type), simulation.total_neuron_count});
         current_cell_base += neuron_count * cell_slot_count(*cell->component_type);
         simulation.total_neuron_count += neuron_count;
     }
@@ -1253,16 +1261,11 @@ s64 NML_Context::get_cell_variable_count(s64 cell_instance_index) {
 }
 
 s64 NML_Context::neuron_index_of(s64 cell_memory_index) const {
-    s64 first_neuron = 0;
-    for (const NML_Component_Instance *population : network_populations(*this)) {
-        const s64 population_size = get_population_size(population);
-        const s64 slot_count = cell_slot_count(*population_cell(*this, *population).component_type);
-        const s64 base = simulation.population_base_indices.at(population->id);
-
-        if (cell_memory_index >= base && cell_memory_index < base + population_size * slot_count) {
-            return first_neuron + (cell_memory_index - base) / slot_count;
+    for (const Population_Cell_Range &range : population_cell_ranges) {
+        if (cell_memory_index >= range.cell_memory_base &&
+            cell_memory_index < range.cell_memory_base + range.cell_count * range.slot_count) {
+            return range.first_neuron + (cell_memory_index - range.cell_memory_base) / range.slot_count;
         }
-        first_neuron += population_size;
     }
     return -1;
 }
