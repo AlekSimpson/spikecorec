@@ -169,6 +169,12 @@ Spike_Engine::Spike_Engine(const String &lems_input_file,
     for (const auto &[synapse_id, delivery] : compiler.synapse_deliveries) {
         synapse_edge_state_variable_names[synapse_id] = delivery.edge_state_variable_names;
     }
+    compiler.collect_inputs();
+    compiler.collect_tracked_totals();
+    // A tracked total's tracker that no recording reads is read by nothing: it takes no slot.
+    for (const auto &[cell_type_name, tracked] : compiler.tracked_totals) {
+        if (!tracked.tracker_kept) context.drop_state_variable(cell_type_name, tracked.tracker_variable);
+    }
 
     compiler.allocate_cell_model_memory();
     cell_state = compiler.data_partitions[0];

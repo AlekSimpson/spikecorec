@@ -29,6 +29,10 @@ struct NML_Component_Type {
 
     // State variable names in slot order, inherited ones first. Filled by parse_component_types.
     Vector<String> state_variable_names;
+    // StateVariables of a cell type that the engine keeps no slot for, taken out of
+    // state_variable_names because nothing reads them: the tracker of a tracked total (see
+    // Tracked_Total) that no recording observes.
+    Vector<String> dropped_state_variable_names;
 
     NML_Component_Type() = default;
     ~NML_Component_Type() = default;

@@ -859,8 +859,8 @@ void NML_Context::parse_simulation_details(NML_Node *lems_root) {
 
         simulation.cell_instances.push_back(*cell);
         simulation.population_base_indices[population->id] = current_cell_base;
-        population_cell_ranges.push_back(
-                {current_cell_base, neuron_count, cell_slot_count(*cell->component_type), simulation.total_neuron_count});
+        population_cell_ranges.push_back({current_cell_base, neuron_count, cell_slot_count(*cell->component_type),
+                                          simulation.total_neuron_count, cell->component_type});
         current_cell_base += neuron_count * cell_slot_count(*cell->component_type);
         simulation.total_neuron_count += neuron_count;
     }
@@ -1258,6 +1258,73 @@ s64 NML_Context::get_cell_variable_count(s64 cell_instance_index) {
     const NML_Component_Type *cell_type =
             simulation.cell_instances.at(static_cast<usize>(cell_instance_index)).component_type;
     return static_cast<s64>(cell_type->state_variable_names.size());
+}
+
+void NML_Context::drop_state_variable(const String &component_type_name, const String &variable_name) {
+    NML_Component_Type &component_type = component_types.at(component_type_name);
+    Vector<String> &variable_names = component_type.state_variable_names;
+    const auto dropped = std::find(variable_names.begin(), variable_names.end(), variable_name);
+    if (dropped == variable_names.end()) {
+        throw Runtime_Error("drop_state_variable: '" + component_type_name + "' has no state variable '" + variable_name + "'");
+    }
+
+    // Every resolved cell-memory index, as its neuron (and for a column, its variable) in the
+    // layout before. Input targets and event selections name a cell, columns a variable.
+    struct Resolved_Index {
+        s64 *cell_memory_index;
+        s64 neuron;
+        String variable;
+    };
+    Vector<Resolved_Index> resolved;
+    for (Simulation_Input_Config &profile : simulation.input_profiles) {
+        for (Input_Target &target : profile.targets) {
+            if (target.neuron_index >= 0) resolved.push_back({&target.neuron_index, neuron_index_of(target.neuron_index), ""});
+        }
+    }
+    for (Recording_Config &profile : simulation.recording_profiles) {
+        for (Recording_Selection &selection : profile.selections) {
+            if (selection.neuron_index < 0) continue;
+            const s64 neuron = neuron_index_of(selection.neuron_index);
+            const bool is_column = selection.event_port.empty();
+            for (const Population_Cell_Range &range : population_cell_ranges) {
+                if (neuron < range.first_neuron || neuron >= range.first_neuron + range.cell_count) continue;
+                if (is_column && range.component_type == &component_type && selection.variable_name == variable_name) {
+                    throw Runtime_Error("drop_state_variable: '" + selection.quantity_path + "' records '" +
+                                        variable_name + "'");
+                }
+            }
+            resolved.push_back({&selection.neuron_index, neuron, is_column ? selection.variable_name : ""});
+        }
+    }
+
+    component_type.dropped_state_variable_names.push_back(variable_name);
+    variable_names.erase(dropped);
+
+    // The populations in the smaller layout, in the same order.
+    s64 cell_memory_base = 0;
+    for (Population_Cell_Range &range : population_cell_ranges) {
+        range.cell_memory_base = cell_memory_base;
+        range.slot_count = cell_slot_count(*range.component_type);
+        cell_memory_base += range.cell_count * range.slot_count;
+    }
+    usize range_index = 0;
+    for (const NML_Component_Instance *population : network_populations(*this)) {
+        simulation.population_base_indices[population->id] = population_cell_ranges.at(range_index).cell_memory_base;
+        range_index += 1;
+    }
+
+    for (const Resolved_Index &index : resolved) {
+        for (const Population_Cell_Range &range : population_cell_ranges) {
+            if (index.neuron < range.first_neuron || index.neuron >= range.first_neuron + range.cell_count) continue;
+            s64 offset = 0;
+            if (!index.variable.empty()) {
+                const Vector<String> &names = range.component_type->state_variable_names;
+                offset = static_cast<s64>(std::find(names.begin(), names.end(), index.variable) - names.begin());
+            }
+            *index.cell_memory_index = range.cell_memory_base + (index.neuron - range.first_neuron) * range.slot_count + offset;
+            break;
+        }
+    }
 }
 
 s64 NML_Context::neuron_index_of(s64 cell_memory_index) const {

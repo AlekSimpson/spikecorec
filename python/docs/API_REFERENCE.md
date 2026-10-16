@@ -590,7 +590,8 @@ context.parse("LEMS_model.xml")      # no GPU involved
 (`NML_Node`), `dynamics` (list of `NML_Dynamics_Expression`), `structure` (list of
 `NML_Structure_Entry`, from the nearest `<Structure>` in the `extends` chain), `state_variable_names`
 (inherited first; for a synapse these are its per-edge planes, in order, unless it delivers weighted
-arrivals, which keep none), and
+arrivals, which keep none), `dropped_state_variable_names` (a cell type's StateVariables with no
+slot, since nothing reads them: see Tracked totals), and
 `find_declaration(namespace_key)`, which searches up the `extends` chain and returns an
 `NML_Node` or `None`.
 
@@ -648,11 +649,13 @@ input runs those.
 `iafRefCellDeltaInput` does with `total_jump - applied_jump`). When everything reaching its cells
 delivers increments that start at 0 (weighted arrivals, and inputs whose exposure only accumulates,
 such as `poissonDeltaVoltageInput`), the kernel keeps only the difference, in `network_inputs` row
-4: each tick's increments add to it, and `tracker = total` becomes `tracker += difference;
-difference = 0`. Neither lifetime total is formed, so a jump keeps its f32 precision however long
-the run. The tracker then reads the total applied so far, which no longer feeds the dynamics, and
-such an input's own exposure stays at its starting value. Any other read of the total or the
-tracker keeps the whole total, as before.
+4: each tick's increments add to it, and `tracker = total` becomes `difference = 0`. Neither
+lifetime total is formed, so a jump keeps its f32 precision however long the run, and such an
+input's own exposure stays at its starting value. Nothing reads the tracker then, so it is dropped:
+it takes no `cell_state` slot, `read_state_variable` does not know it, and it moves from the type's
+`state_variable_names` to `dropped_state_variable_names`. Only when an `OutputColumn` records it
+is it kept, as the total applied so far (`tracker += difference` before `difference = 0`). Any other
+read of the total or the tracker keeps the whole total, as before.
 
 ### Functions
 

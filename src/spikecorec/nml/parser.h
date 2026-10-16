@@ -16,6 +16,10 @@
 using namespace spikecorec;
 using namespace std;
 
+namespace spikecorec {
+class Spike_Engine;
+}
+
 namespace spikecorec::nml {
 #ifndef SPIKECOREC_NML_STD_LIB_DIR
 #define SPIKECOREC_NML_STD_LIB_DIR ""
@@ -133,6 +137,15 @@ struct NML_Context {
     s64 resolve_path(const String &path, const NML_Component_Instance *current = nullptr) const;
 
 private:
+    // The engine drops a cell StateVariable that nothing reads, once codegen has found one.
+    friend class spikecorec::Spike_Engine;
+
+    // Takes a StateVariable of a cell type out of cell memory: the type keeps no slot for it (it
+    // moves to dropped_state_variable_names), the populations' cells move to the smaller layout, and
+    // so do the cell-memory indices the document resolved, the input targets and recordings. Throws
+    // when a recording reads the variable.
+    void drop_state_variable(const String &component_type_name, const String &variable_name);
+
     // Per parent path and type name, where create_component_instance resumes its search for the
     // ordinal that names an element with no id.
     Unordered_Map<String, usize> unnamed_instance_ordinals;
@@ -144,6 +157,7 @@ private:
         s64 cell_count = 0;
         s64 slot_count = 1;
         s64 first_neuron = 0;
+        const NML_Component_Type *component_type = nullptr;
     };
     Vector<Population_Cell_Range> population_cell_ranges;
 };

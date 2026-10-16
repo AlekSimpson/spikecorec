@@ -366,6 +366,9 @@ PYBIND11_MODULE(_spikecorec, m) {
         }, "The nearest <Structure> in the extends chain, as NML_Structure_Entry items.")
         .def_readonly("state_variable_names", &NML_Component_Type::state_variable_names,
                       "Per-neuron (or, for a synapse, per-edge) state slots in order, inherited ones first.")
+        .def_readonly("dropped_state_variable_names", &NML_Component_Type::dropped_state_variable_names,
+                      "A cell type's StateVariables the engine keeps no slot for, since nothing reads them: a "
+                      "tracked total's tracker that no recording observes.")
         .def("find_declaration", [](py::object self, const String &namespace_key) {
             return reference_or_none(self.cast<const NML_Component_Type &>().find_declaration(namespace_key), self);
         }, py::arg("namespace_key"),
