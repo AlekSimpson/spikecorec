@@ -512,19 +512,47 @@ void Engine_Backend::release_function(Engine_Function &function) {
     function.cuda_function = nullptr;
 }
 
+// CUDA 13 names the device of a hint by a cudaMemLocation; CUDA 12 by its ordinal.
+#if CUDART_VERSION >= 13000
+cudaMemLocation managed_memory_location(int device_ordinal) {
+    cudaMemLocation location{};
+    if (device_ordinal == cudaCpuDeviceId) {
+        location.type = cudaMemLocationTypeHost;
+        location.id = 0;
+    } else {
+        location.type = cudaMemLocationTypeDevice;
+        location.id = device_ordinal;
+    }
+    return location;
+}
+#endif
+
 void Engine_Backend::advise_read_mostly(const Engine_Pointer &range, u64 byte_count) {
     if (range.is_empty() || byte_count == 0) return;
+#if CUDART_VERSION >= 13000
+    // The location is ignored for read-mostly.
+    cudaMemAdvise(range.get_contents(), byte_count, cudaMemAdviseSetReadMostly, managed_memory_location(0));
+#else
     cudaMemAdvise(range.get_contents(), byte_count, cudaMemAdviseSetReadMostly, 0);
+#endif
 }
 
 void Engine_Backend::prefetch_to_gpu(const Engine_Pointer &range, u64 byte_count) {
     if (range.is_empty() || byte_count == 0) return;
+#if CUDART_VERSION >= 13000
+    cudaMemPrefetchAsync(range.get_contents(), byte_count, managed_memory_location(0), 0);
+#else
     cudaMemPrefetchAsync(range.get_contents(), byte_count, 0);
+#endif
 }
 
 void Engine_Backend::prefetch_to_cpu(const Engine_Pointer &range, u64 byte_count) {
     if (range.is_empty() || byte_count == 0) return;
+#if CUDART_VERSION >= 13000
+    cudaMemPrefetchAsync(range.get_contents(), byte_count, managed_memory_location(cudaCpuDeviceId), 0);
+#else
     cudaMemPrefetchAsync(range.get_contents(), byte_count, cudaCpuDeviceId);
+#endif
 }
 
 bool Engine_Backend::run_function(

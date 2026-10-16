@@ -818,14 +818,14 @@ TEST(Simulation, cell_parameters_resolve_to_si) {
     ASSERT_NE(cell, nullptr);
     EXPECT_EQ(cell->value_or("leakReversal"), "-50mV");
 
-    const auto si_value = [&](const String &parameter) {
+    const auto value_in_si_units = [&](const String &parameter) {
         return model.context.resolve_quantity(cell->value_or(parameter));
     };
-    EXPECT_DOUBLE_EQ(si_value("leakReversal"), -0.05);
-    EXPECT_DOUBLE_EQ(si_value("thresh"), -0.055);
-    EXPECT_DOUBLE_EQ(si_value("reset"), -0.07);
-    EXPECT_DOUBLE_EQ(si_value("C"), 0.2e-9);
-    EXPECT_DOUBLE_EQ(si_value("leakConductance"), 0.01e-6);
+    EXPECT_DOUBLE_EQ(value_in_si_units("leakReversal"), -0.05);
+    EXPECT_DOUBLE_EQ(value_in_si_units("thresh"), -0.055);
+    EXPECT_DOUBLE_EQ(value_in_si_units("reset"), -0.07);
+    EXPECT_DOUBLE_EQ(value_in_si_units("C"), 0.2e-9);
+    EXPECT_DOUBLE_EQ(value_in_si_units("leakConductance"), 0.01e-6);
 }
 
 TEST(Simulation, connections_resolve_to_neurons_with_their_weight_and_delay) {
