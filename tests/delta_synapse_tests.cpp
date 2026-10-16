@@ -192,6 +192,43 @@ TEST(Delta_Synapse, spike_to_spike_latency_is_the_delay) {
     EXPECT_EQ(tick_of(postsynaptic[0] - presynaptic[0], step_dt), tick_of(1.5e-3, step_dt));
 }
 
+// Different delays from one source each arrive exactly: with a shortest delay above one tick the
+// kernel walks a neuron's edges only on ticks one of its spikes is due somewhere.
+TEST(Delta_Synapse, each_delay_of_a_source_arrives_exactly) {
+    const Temporary_Directory directory;
+    const String lems = directory.write("LEMS.xml", R"(<Lems>
+  <Target component="delay_simulation"/>
+  <Include file=")" + fixture_path("nml/Brunel2000_ModelA_Components.xml") + R"("/>
+  <deltaVoltageSynapse id="suprathreshold_delta_synapse" jump="25mV"/>
+  <spikeArray id="trigger_spikes">
+    <spike id="0" time="10ms"/>
+    <spike id="1" time="20ms"/>
+  </spikeArray>
+  <iafCell id="trigger_cell" leakConductance="10nS" leakReversal="-70mV" thresh="-50mV" reset="-70mV" C="200pF"/>
+  <network id="delay_network">
+    <population id="trigger" component="trigger_cell" size="1"/>
+    <population id="targets" component="brunel_model_a_neuron" size="3"/>
+    <projection id="delay_projection" presynapticPopulation="trigger" postsynapticPopulation="targets"
+                synapse="suprathreshold_delta_synapse">
+      <connectionWD id="0" preCellId="../trigger[0]" postCellId="../targets[0]" weight="1" delay="0.5ms"/>
+      <connectionWD id="1" preCellId="../trigger[0]" postCellId="../targets[1]" weight="1" delay="1.2ms"/>
+      <connectionWD id="2" preCellId="../trigger[0]" postCellId="../targets[2]" weight="1" delay="2ms"/>
+    </projection>
+    <explicitInput target="trigger[0]" input="trigger_spikes"/>
+  </network>
+  <Simulation id="delay_simulation" length="30ms" step="0.1ms" target="delay_network" seed="1"/>
+</Lems>
+)");
+    Spike_Engine engine(lems);
+    engine.run();
+    const f64 step_dt = engine.step_dt;
+
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 0), step_dt), ticks_of({10e-3, 20e-3}, step_dt));
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 1), step_dt), ticks_of({10.5e-3, 20.5e-3}, step_dt));
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 2), step_dt), ticks_of({11.2e-3, 21.2e-3}, step_dt));
+    EXPECT_EQ(ticks_of(spike_times_of(engine, 3), step_dt), ticks_of({12e-3, 22e-3}, step_dt));
+}
+
 // A weighted arrival keeps no state per connection, so the weight matrix has only the weight and
 // delay planes, the kernel updates none, and a neuron's edges run only until its last arrival is
 // sent: the longest delay less a tick. Nothing has to settle.
