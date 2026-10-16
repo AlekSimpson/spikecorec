@@ -67,6 +67,7 @@ Set on the command line, for example `make test BACKEND=metal`:
 |---|---|
 | `BACKEND` | `metal` on macOS, `cuda` elsewhere |
 | `CUDA_PATH` | `/usr/local/cuda` |
+| `CUDA_ARCH` | `native`: the build machine's GPUs, for the precompiled CUDA kernels |
 | `DEBUG` | `0`; `1` for a debug build |
 | `CLI_SOURCE` | `main.cpp` |
 | `CXX` | `clang++` on macOS, `g++` elsewhere |

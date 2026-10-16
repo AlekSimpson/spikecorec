@@ -17,6 +17,9 @@
 #include "backend.h"
 #include "log.h"
 #include "types.h"
+#ifdef SPIKECOREC_CUDA
+#include "precompiled_kernels.h"
+#endif
 
 using namespace std;
 
@@ -396,6 +399,7 @@ Engine_Backend::Engine_Backend(s64 threads_per_block_argument) {
 
 Engine_Backend::~Engine_Backend() {
     deallocate_all();
+    if (inline_argument_staging != nullptr) cudaFree(inline_argument_staging);
     cuDevicePrimaryCtxRelease(cuda_gpu_device);
 }
 
@@ -560,11 +564,34 @@ Optional<Engine_Function> Engine_Backend::create_function(
 }
 
 Optional<Engine_Function> Engine_Backend::load_precompiled_function(const String &name) {
-    // The CUDA backend has no precompiled kernels; callers fall back to their host paths, which is
-    // the normal path here, not an error.
-    log::logger().debug("load_precompiled_function: '{}' -- the CUDA backend has no "
-                        "runtime-loadable precompiled module; the caller answers on the host", name);
-    return std::nullopt;
+    // The kernels' warp shuffles and votes take every thread of a warp.
+    constexpr s64 WARP_WIDTH = 32;
+    if (threads_per_block % WARP_WIDTH != 0) {
+        log::logger().debug("load_precompiled_function: '{}' needs whole warps, and threads_per_block={} is not; "
+                            "the caller answers on the host", name, threads_per_block);
+        return std::nullopt;
+    }
+    const void *symbol = cuda::kernels_symbol(name.c_str());
+    if (symbol == nullptr) symbol = cuda::weight_fit_kernels_symbol(name.c_str());
+    if (symbol == nullptr) {
+        log::logger().debug("load_precompiled_function: no precompiled CUDA kernel is named '{}'", name);
+        return std::nullopt;
+    }
+
+    cuCtxSetCurrent(cuda_context);
+    cudaFunction_t runtime_function = nullptr;
+    const cudaError_t lookup_result = cudaGetFuncBySymbol(&runtime_function, symbol);
+    if (lookup_result != cudaSuccess || runtime_function == nullptr) {
+        log::logger().warn("load_precompiled_function: '{}' does not load on this device ({}); "
+                           "the caller answers on the host", name, cudaGetErrorString(lookup_result));
+        return std::nullopt;
+    }
+
+    Engine_Function function{};
+    function.cuda_function = reinterpret_cast<CUfunction>(runtime_function);
+    function.inline_arguments_by_reference = true;
+    log::logger().debug("load_precompiled_function: '{}' loaded", name);
+    return function;
 }
 
 void Engine_Backend::release_function(Engine_Function &function) {
@@ -638,9 +665,55 @@ bool Engine_Backend::run_function(
     Vector<void *> argument_values(parameters.size(), nullptr);
     Vector<void *> argument_pointers(parameters.size(), nullptr);
 
+    // A precompiled kernel reads its inline arguments through pointers, into device memory the
+    // staging below fills; the lock keeps that memory to this launch until it has run.
+    Unique_Lock<Mutex> staging_lock(inline_argument_mutex, std::defer_lock);
+    Vector<u64> staged_offsets(parameters.size(), 0);
+    if (function.inline_arguments_by_reference) {
+        staging_lock.lock();
+        constexpr u64 STAGED_ARGUMENT_ALIGNMENT = 16;
+        u64 staged_byte_count = 0;
+        for (usize index = 0; index < parameters.size(); index += 1) {
+            if (!parameters[index].inline_scalar) continue;
+            staged_offsets[index] = aligned_partition_offset(staged_byte_count, STAGED_ARGUMENT_ALIGNMENT);
+            staged_byte_count = staged_offsets[index] + parameters[index].total_bytes;
+        }
+        if (staged_byte_count > inline_argument_staging_capacity) {
+            if (inline_argument_staging != nullptr) cudaFree(inline_argument_staging);
+            inline_argument_staging = nullptr;
+            inline_argument_staging_capacity = 0;
+            const u64 capacity = std::max<u64>(staged_byte_count, 4096);
+            const cudaError_t allocation_result = cudaMalloc(&inline_argument_staging, capacity);
+            if (allocation_result != cudaSuccess) {
+                log::logger().critical("run_function: cudaMalloc of {} bytes for inline arguments failed: {}",
+                                       capacity, cudaGetErrorString(allocation_result));
+                return false;
+            }
+            inline_argument_staging_capacity = capacity;
+        }
+        if (staged_byte_count > 0) {
+            inline_argument_host_bytes.assign(staged_byte_count, 0);
+            for (usize index = 0; index < parameters.size(); index += 1) {
+                if (!parameters[index].inline_scalar) continue;
+                std::memcpy(inline_argument_host_bytes.data() + staged_offsets[index], parameters[index].base_pointer,
+                            parameters[index].total_bytes);
+            }
+            const cudaError_t copy_result = cudaMemcpy(inline_argument_staging, inline_argument_host_bytes.data(),
+                                                       staged_byte_count, cudaMemcpyHostToDevice);
+            if (copy_result != cudaSuccess) {
+                log::logger().critical("run_function: copying {} bytes of inline arguments failed: {}",
+                                       staged_byte_count, cudaGetErrorString(copy_result));
+                return false;
+            }
+        }
+    }
+
     for (usize index = 0; index < parameters.size(); index += 1) {
         const Engine_Pointer &parameter = parameters[index];
-        if (parameter.inline_scalar) {
+        if (parameter.inline_scalar && function.inline_arguments_by_reference) {
+            argument_values[index] = static_cast<u8 *>(inline_argument_staging) + staged_offsets[index];
+            argument_pointers[index] = &argument_values[index];
+        } else if (parameter.inline_scalar) {
             argument_pointers[index] = parameter.base_pointer;
         } else {
             argument_values[index] = parameter.get_contents();

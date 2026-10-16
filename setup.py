@@ -24,7 +24,8 @@ class CudaBuildExt(_build_ext):
         nvcc = os.path.join(cuda_path, "bin", "nvcc")
         if not os.path.exists(nvcc):
             nvcc = shutil.which("nvcc") or nvcc
-        arch = os.environ.get("SPIKECOREC_CUDA_ARCH")  # e.g. "sm_87"; unset lets nvcc choose
+        # e.g. "sm_87"; by default the build machine's GPUs, as the Makefile's CUDA_ARCH.
+        arch = os.environ.get("SPIKECOREC_CUDA_ARCH", "native")
 
         self.compiler.src_extensions.append(".cu")
         default_compile = self.compiler._compile
@@ -32,9 +33,7 @@ class CudaBuildExt(_build_ext):
         def cuda_compile(obj, src, ext, cc_args, extra_postargs, pp_opts):
             if src.endswith(".cu"):
                 cmd = [nvcc, "-std=c++17", "-O2", "--expt-relaxed-constexpr",
-                       "-Xcompiler", "-fPIC"]
-                if arch:
-                    cmd += ["-arch=" + arch]
+                       "-Xcompiler", "-fPIC", "-arch=" + arch]
                 # pp_opts holds the -I and -D flags; extra_postargs loses its host-only -f flags.
                 cmd += pp_opts
                 cmd += [a for a in extra_postargs if not a.startswith("-f")]
@@ -142,6 +141,8 @@ if BACKEND == "cuda":
     EXTRA_LINK_ARGS += [f"-L{CUDA_PATH}/lib64", f"-L{CUDA_PATH}/lib64/stubs",
                         "-lcudart", "-lcuda", "-lnvrtc"]
     DEFINE_MACROS.append(("SPIKECOREC_CUDA", None))
+    # The precompiled kernels (the fits, neighbor_weights), built by nvcc through CudaBuildExt.
+    SRCS += ["src/spikecorec/cuda/kernels.cu", "src/spikecorec/cuda/weight_fit_kernels.cu"]
 
 # ── Metal backend ────────────────────────────────────────────
 elif BACKEND == "metal":

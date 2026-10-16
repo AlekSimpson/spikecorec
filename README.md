@@ -38,6 +38,7 @@ spikecorec/
 │   ├── core/               # CPU-side logic: Engine main loop, weight matrix, k²-tree, Metal/CUDA dispatch
 │   ├── nml/                # NeuroML parsing, resolution and kernel codegen (Metal and CUDA source)
 │   ├── metal/              # metal-cpp implementation file + fixed Metal kernels (.metal, .metalinc)
+│   ├── cuda/               # the same fixed kernels for CUDA (.cu, .cuh), built by nvcc
 │   └── bindings/           # pybind11 Python bindings
 ├── python/spikecorec/      # Python package
 ├── tests/
@@ -57,6 +58,8 @@ spikecorec/
 - **`src/spikecorec/nml/`** generates the model's `master_step` kernel, as Metal or CUDA source
 - **`src/spikecorec/metal/`** contains `metal_cpp_impl.cpp` (instantiates metal-cpp once), the
   k²-tree device helpers and the fixed kernels (the weight-matrix fits), built into `default.metallib`
+- **`src/spikecorec/cuda/`** holds the CUDA versions of the fixed kernels and the k²-tree helpers,
+  built by nvcc into the CUDA library
 - Metal host code uses **metal-cpp** (pure C++, no Objective-C++)
 - Backend selected at compile time via `-DSPIKECOREC_METAL` or `-DSPIKECOREC_CUDA`
 
@@ -161,7 +164,8 @@ See **[`BUILDME.md`](BUILDME.md)** for every build target and variable.
   `Engine_Backend::create_function` compiles; `Engine_Backend::run_function` launches it every
   tick. `Spike_Engine::master_kernel_source` holds it as compiled.
 - **The fixed kernels** (the weight-matrix fits, the read-back of a plane) are in
-  `src/spikecorec/metal/*.metal`, built into `default.metallib`. Each has a host fallback, which is
-  what runs on CUDA.
+  `src/spikecorec/metal/*.metal`, built into `default.metallib`, and in `src/spikecorec/cuda/*.cu`,
+  built by nvcc for `CUDA_ARCH`. `Engine_Backend::load_precompiled_function` finds them by name.
+  Each has a host fallback, which runs when its kernel does not load.
 - Expose anything new to Python in `src/spikecorec/bindings/bindings.cpp`, under its C++ name.
 - Run `make compdb` to keep IDE tooling current.

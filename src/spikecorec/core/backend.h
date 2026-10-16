@@ -65,7 +65,10 @@ template <typename Value_Type>
 struct Engine_Function {
 #ifdef SPIKECOREC_CUDA
     CUfunction cuda_function{};
-    CUmodule cuda_module{};
+    CUmodule cuda_module{};  // null for a precompiled kernel, which the CUDA runtime owns
+    // Set for the precompiled kernels, which read every inline argument through a pointer, as their
+    // Metal versions read a constant-address-space argument (see cuda/precompiled_kernels.h).
+    bool inline_arguments_by_reference = false;
 #elif defined(SPIKECOREC_METAL)
     MTL::ComputePipelineState *pipeline_state = nullptr;
 #endif
@@ -166,6 +169,14 @@ struct Engine_Backend {
     u64 peak_allocated_byte_count = 0;
     void reset_peak_allocated_byte_count() { peak_allocated_byte_count = allocated_byte_count; }
 
+    // For a launch of a kernel with inline_arguments_by_reference: run_function packs its inline
+    // arguments into inline_argument_host_bytes, copies them to the device memory at
+    // inline_argument_staging, and passes their addresses. The mutex keeps one such launch at a time.
+    void *inline_argument_staging = nullptr;
+    u64 inline_argument_staging_capacity = 0;
+    Vector<u8> inline_argument_host_bytes;
+    Mutex inline_argument_mutex;
+
     explicit Engine_Backend(s64 threads_per_block_argument = 256);
     ~Engine_Backend();
 
@@ -175,6 +186,9 @@ struct Engine_Backend {
     Engine_Backend &operator=(Engine_Backend &&) = delete;
 
     Optional<Engine_Function> create_function(const String &name, const String &source_code);
+    // The kernel `name` from the library's precompiled kernels (cuda/precompiled_kernels.h), or
+    // nothing when there is none by the name or threads_per_block is not a whole number of warps.
+    // The caller then answers on the host.
     Optional<Engine_Function> load_precompiled_function(const String &name);
     void release_function(Engine_Function &function);
 
