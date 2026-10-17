@@ -3,8 +3,9 @@
 Implemented 2026-10-16. A refit keeps no array per connection: it reads the connections by walking
 the k²-tree and computes each connection's target where it reads it. Construction and calibration
 read a temporary list of the connections instead (12 bytes per connection, freed when the plane's
-fit ends), because walking made construction fits 13 to 15 times slower and construction memory
-matters least.
+fit ends; a lane-search probe adds a 4-byte residual per connection while it fits its new lanes),
+because walking made construction fits 13 to 15 times slower and construction memory matters
+least.
 
 ## What a fit reads
 
@@ -12,11 +13,14 @@ A fit works on one plane's own lanes, copied into working arrays (one row per no
 connection it needs the connection's ends and the value the own lanes must hold there.
 
 - **Connections:** a fit walks a source's row of the k²-tree for its outgoing connections (the U
-  side) and a target's column for its incoming ones (the V side). The column walk is
-  `k2t_next_predecessor` in `k2tree_device.metalinc`, the mirror of `k2t_next_neighbor`.
+  side) and a target's column for its incoming ones (the V side). The kernels walk both with
+  `fit_walk_next` (`weight_fit_kernels.metal`, `weight_fit_kernels.cu`): the descent of
+  `k2t_next_neighbor` along a row, or of `k2t_next_predecessor` along a column, split among
+  walkers. The host fallback uses `get_neighbors` and `get_predecessors`.
 - **Target:** what the own lanes must hold at `(source, target)`, in units of the plane's scale:
   the basis over `target_lanes` plus the connection's entry in the fit's values (`fit_target` in
-  `weight_fit_kernels.metal`, `Weight_Matrix::fit_target` on the host).
+  `weight_fit_kernels.metal` and `weight_fit_kernels.cu`, `Weight_Matrix::fit_target` on the
+  host).
 - **The fit's values** (`Weight_Matrix::Fit_Values`) are CSR over source rows, each row keyed by
   target node and sorted, so a row walk reads them with a cursor and a column walk by binary
   search.
@@ -59,8 +63,10 @@ connections of an average row, as a power of two from 1 to 32: 32 for M1 and M3,
 `search_fewest_lanes` doubles the lanes until a fit meets the tolerance, then bisects. It also
 stops doubling once two doublings in a row each cut the worst error by less than 5%, and keeps
 the closest fit. Values that more lanes barely help, random per-connection spread for example,
-would otherwise run to the lane cap with ever costlier probes. A probe's starting rows (each row's
-and column's mean target) are taken once per plane rather than once per probe.
+would otherwise run to the lane cap with ever costlier probes. The first probe starts from fresh
+rows (each row's and column's mean target). Every later probe, doubling or bisecting, starts from
+the fit at the last lane count that missed the tolerance: its lanes as they are, and the new lanes
+first fitted alone to what that fit leaves (commits `642dc7d` and `a15a542`).
 
 ## Measurements (M5 Max)
 
@@ -85,13 +91,14 @@ list:
 | M2 stand-in | 9.5 s | 26.9 s | 10.4 s |
 | M1 stand-in | 7.5 s, device peak 0.30 GB | 7.4 s, 0.19 GB | 5.8 s, 0.25 GB |
 
-On a weight matrix of 10M connections in eight Potjans-Diesmann populations, a limited-memory
+Measured before the warm start (`642dc7d`) and the residual pre-fit (`a15a542`): on a weight
+matrix of 10M connections in eight Potjans-Diesmann populations, a limited-memory
 BFGS iteration costs about 9 ms with the list against 61 ms walking. With 10% weight spread and
 50% delay spread at a 10% tolerance, construction takes 7.8 s: the lane search stops at 8 lanes
 on the weight plane (76% worst error) and 1 on the delay plane (86%), where it used to double
 toward its 1,496-lane cap. No fit reaches 10% there: the exact population means already leave
 86%, since a few connections sit that far from any smooth fit.
 
-The walk is the same one the tick's connection loop uses (performance review, item 8), so making
-it faster speeds up refits and the tick alike. Replacing its runtime divisions with shifts
+The fit walk is the same descent as the tick's `k2t_next_neighbor` (performance review, item 8),
+but separate code, so a faster walk must go into both. Replacing its runtime divisions with shifts
 (branching factor 4) saved 20 to 25% in a test.

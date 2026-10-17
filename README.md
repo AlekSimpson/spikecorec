@@ -9,7 +9,8 @@ per-connection value compressed, and is importable as a Python package via pybin
 | Tool | Purpose |
 |---|---|
 | C++17 compiler (`clang++` / `g++`) | Core and binding compilation |
-| [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) | CUDA backend (`nvcc`) |
+| [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) (built and tested with CUDA 13 and GCC; `nvcc` on `PATH`) | CUDA backend (`nvcc`, NVRTC) |
+| `libxml2` (via `pkg-config`, `libxml-2.0`) | Required: NeuroML/LEMS parsing and XSD validation. Linux: `libxml2-dev`; for a copy outside `pkg-config`'s search path, set `PKG_CONFIG_PATH` |
 | macOS 13+ with Xcode CLI tools | Metal backend |
 | [uv](https://docs.astral.sh/uv/) | Python bindings: `make python` builds into a uv-managed `.venv` |
 | `zlib` / `liblzma` / `libbz2` (optional, via `pkg-config`) | gzip/xz/bz2 support for `.spire` recordings — auto-detected at build time (`make info` shows what was found); uncompressed `.spire` always works |
@@ -20,7 +21,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # uv, for the Python bindings
 brew install bear                                 # optional, for IDE setup
 ```
 
-Clone with submodules to get metal-cpp:
+Clone with submodules to get metal-cpp and GoogleTest:
 ```bash
 git clone --recurse-submodules <repo-url>
 # or after cloning:
@@ -44,7 +45,11 @@ spikecorec/
 ├── tests/
 ├── docs/                   # design notes and reviews
 ├── examples/
-├── third_party/metal-cpp/  # metal-cpp submodule
+├── third_party/
+│   ├── metal-cpp/          # metal-cpp submodule
+│   ├── googletest/         # GoogleTest submodule
+│   └── neuroml2/           # NeuroML2 XSD schema and LEMS standard library, read at runtime
+├── main.cpp                # source of make cli
 ├── Makefile
 ├── pyproject.toml
 └── setup.py
@@ -99,8 +104,8 @@ Output static libraries:
 
 ```bash
 make python                         # auto-detect backend
-SPIKECOREC_BACKEND=metal make python
-SPIKECOREC_BACKEND=cuda  make python
+make python BACKEND=metal
+make python BACKEND=cuda
 ```
 
 It creates `.venv` with uv on first use, installs `pybind11`, `numpy`, `setuptools` and
@@ -165,7 +170,7 @@ See **[`BUILDME.md`](BUILDME.md)** for every build target and variable.
   tick. `Spike_Engine::master_kernel_source` holds it as compiled.
 - **The fixed kernels** (the weight-matrix fits, the read-back of a plane) are in
   `src/spikecorec/metal/*.metal`, built into `default.metallib`, and in `src/spikecorec/cuda/*.cu`,
-  built by nvcc for `CUDA_ARCH`. `Engine_Backend::load_precompiled_function` finds them by name.
+  built by nvcc for `CUDA_ARCH` (for the Python extension, `SPIKECOREC_CUDA_ARCH`). `Engine_Backend::load_precompiled_function` finds them by name.
   Each has a host fallback, which runs when its kernel does not load.
 - Expose anything new to Python in `src/spikecorec/bindings/bindings.cpp`, under its C++ name.
 - Run `make compdb` to keep IDE tooling current.
