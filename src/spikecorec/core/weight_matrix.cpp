@@ -2435,13 +2435,65 @@ Weight_Matrix::Plane_Fit_Result Weight_Matrix::search_fewest_lanes(s64 matrix_in
         Vector<f32> working_v;
     };
 
+    // The new lanes alone, fitted to what the start fit leaves: each connection's value less the
+    // start fit's product, in a buffer of one float per connection held only for this probe. Each
+    // iteration then costs in proportion to the new lanes rather than all of them. Returns the
+    // new lanes' rows, in the joint fit's units (the plane's scale).
+    auto fit_new_lanes_to_residual = [&](s64 new_lane_count, const Kept_Fit &start, Vector<f32> &new_u, Vector<f32> &new_v) {
+        Fit_Values residual_values;
+        residual_values.entry_count = values.entry_count;
+        residual_values.lists_every_connection = values.lists_every_connection;
+        residual_values.row_start = values.row_start;
+        residual_values.target = values.target;
+        residual_values.incoming_offset = values.incoming_offset;
+        residual_values.incoming_entry = values.incoming_entry;
+        residual_values.storage = make_unique<Fit_Scratch>(*owning_backend, Vector<u64>{static_cast<u64>(values.entry_count) * sizeof(f32)});
+        residual_values.value = residual_values.storage->buffers[0];
+        const s32 *row_start = values.row_start.get_contents_as<s32>();
+        const u32 *entry_target = values.target.get_contents_as<u32>();
+        const f32 *entry_value = values.value.get_contents_as<f32>();
+        f32 *residual = residual_values.value.get_contents_as<f32>();
+        const s64 start_lanes = start.lane_count;
+        const f64 scale = problem.scale;
+        for_each_index_in_parallel(node_count, [&](s64 source_node) {
+            const f32 *u_row = start.working_u.data() + source_node * start_lanes;
+            for (s32 entry = row_start[source_node]; entry < row_start[source_node + 1]; entry += 1) {
+                const f32 *v_row = start.working_v.data() + static_cast<s64>(entry_target[entry]) * start_lanes;
+                f64 product = 0.0;
+                for (s64 lane = 0; lane < start_lanes; lane += 1) product += static_cast<f64>(u_row[lane]) * v_row[lane];
+                residual[entry] = static_cast<f32>(static_cast<f64>(entry_value[entry]) - scale * product);
+            }
+        });
+
+        Plane_Fit_Problem residual_problem = prepare_plane_fit(matrix_index, residual_values, true);
+        residual_problem.target_tolerance = static_cast<f64>(search_tolerance);
+        residual_problem.own_lanes.assign(static_cast<usize>(new_lane_count), -1);
+        const u64 working_bytes = static_cast<u64>(node_count * new_lane_count) * sizeof(f32);
+        residual_problem.working_storage = make_unique<Fit_Scratch>(*owning_backend, Vector<u64>{working_bytes, working_bytes});
+        residual_problem.working_u = residual_problem.working_storage->buffers[0];
+        residual_problem.working_v = residual_problem.working_storage->buffers[1];
+        fill_fresh_rows(residual_problem, basis_seed + 7919u * static_cast<unsigned>(matrix_index + 1) + static_cast<unsigned>(start_lanes + new_lane_count) + 104729u);
+        if (residual_problem.scale > 0.0) (void)fit_plane_with_selected_method(residual_problem, ridge_regularization);
+
+        // The residual fit's products are in units of its own scale; the joint fit's in the plane's.
+        const f32 unit_change = scale > 0.0 ? static_cast<f32>(sqrt(residual_problem.scale / scale)) : 0.0f;
+        const usize value_count = static_cast<usize>(node_count * new_lane_count);
+        new_u.assign(residual_problem.working_u.get_contents_as<f32>(), residual_problem.working_u.get_contents_as<f32>() + value_count);
+        new_v.assign(residual_problem.working_v.get_contents_as<f32>(), residual_problem.working_v.get_contents_as<f32>() + value_count);
+        for (usize index = 0; index < value_count; index += 1) {
+            new_u[index] *= unit_change;
+            new_v[index] *= unit_change;
+        }
+    };
+
     // A probe with a smaller fit already made starts from it: its lanes as they are, and the new
-    // lanes from fresh rows scaled by WARM_START_NEW_LANE_SCALE, so the fit starts at that fit's
-    // error and only has to place what the new lanes add.
+    // lanes as fitted alone to what it leaves, so the joint fit starts below that fit's error.
     auto fit_warm = [&](s64 lane_count, const Kept_Fit &start) {
         if (start.lane_count == 0 || start.lane_count >= lane_count) return fit_fresh(lane_count);
+        const s64 new_lane_count = lane_count - start.lane_count;
+        Vector<f32> new_u, new_v;
+        fit_new_lanes_to_residual(new_lane_count, start, new_u, new_v);
         use_working_arrays(lane_count);
-        fill_fresh_rows(problem, basis_seed + 7919u * static_cast<unsigned>(matrix_index + 1) + static_cast<unsigned>(lane_count));
         f32 *working_u = problem.working_u.get_contents_as<f32>();
         f32 *working_v = problem.working_v.get_contents_as<f32>();
         for_each_index_in_parallel(node_count, [&](s64 node_index) {
@@ -2452,8 +2504,9 @@ Weight_Matrix::Plane_Fit_Result Weight_Matrix::search_fewest_lanes(s64 matrix_in
                     working_u[index] = start.working_u[start_index];
                     working_v[index] = start.working_v[start_index];
                 } else {
-                    working_u[index] *= WARM_START_NEW_LANE_SCALE;
-                    working_v[index] *= WARM_START_NEW_LANE_SCALE;
+                    const usize new_index = static_cast<usize>(node_index * new_lane_count + column - start.lane_count);
+                    working_u[index] = new_u[new_index];
+                    working_v[index] = new_v[new_index];
                 }
             }
         });
