@@ -33,7 +33,7 @@ SpikeCore's model and drivers: `~/Documents/neurocomputation/spikecore_runs/M3/`
 - It doubles the lane count (1, 2, 4, ...) until a fit meets `fit_tolerance`, then bisects between the last count that missed and the first that met.
 - Each probe stops at the tolerance, at a stall (less than 5% better over 100 iterations), or at 2,000 iterations.
 - Doubling also stops after two doublings that each cut the worst error by less than 5%.
-- The plane's budget is then the lanes found × (1 + `expected_active_edge_fraction`, default 0.5), within the cap. The cap: total lanes never exceed one float per connection per plane.
+- The plane's budget is then the lanes found × (1 + `expected_active_edge_fraction`, default 0.2), within the cap. The cap: total lanes never exceed one float per connection per plane.
 - L-BFGS was chosen here because it holds structured planes on fewer lanes than ALS, and the runtime footprint comes first.
 
 **Refits** use ALS within the fixed budgets:
@@ -47,7 +47,7 @@ SpikeCore's model and drivers: `~/Documents/neurocomputation/spikecore_runs/M3/`
 ## Measurements
 
 **Full size** (t3b_structured, 285M connections): stopped after 1 h 40 min on the Mac (Metal), and after 1 h 15 min on spark (CUDA). Both were still in the lane search.
-- Log lines printed nothing during it: spdlog's console output is block-buffered when it goes to a file. Run diagnostics under `script` to see them line by line.
+- Log lines printed nothing during it: the engine's console log goes through stdio's `stdout`, which is block-buffered when it goes to a file. Run diagnostics under `script` to see them line by line.
 
 **3% of the network** (8,955,733 connections, `fit_diagnostic.py rounded 0.03`, Mac, sharing the GPU with M1 runs):
 
@@ -144,7 +144,7 @@ Every connection's weight and delay is an independent draw, so neither plane has
 | Idea | Status | Effect at 3% |
 |---|---|---|
 | Warm-start each probe from the last fit that missed | committed `642dc7d` | weight plane 4x faster with half the lanes; delay plane half the lanes, about as slow; build 22% faster |
-| 1. Residual pre-fit: fit only the new lanes against the values less the start fit (a construction-only buffer, 4 B a connection), then the joint fit | implemented in the working tree, **uncommitted**; test suites not yet run on the final version | spark, 3%: build 1,017 s -> 688 s (-32%); weights 6 -> 4 lanes, delays 66 -> 69 lanes, same basis size |
+| 1. Residual pre-fit: fit only the new lanes against the values less the start fit (a construction-only buffer, 4 B a connection), then the joint fit | committed `a15a542`; test suites not yet run on it | spark, 3%: build 1,017 s -> 688 s (-32%); weights 6 -> 4 lanes, delays 66 -> 69 lanes, same basis size |
 | 2. Estimated probes: the next bisection probe where the last two failing errors, on a log scale, reach the tolerance | tried and dropped (code removed) | alone 927 s (-9%) but 2 more delay lanes; together with idea 1, 755 s, slower than idea 1 alone |
 | Truncate the passing fit to the probe's lane count (best rank-n approximation of its product, from QR of U and V and a small SVD) and start there | not tried | might cut the iterations of each bisection probe |
 | Search with ALS (fast), then let L-BFGS refine near the count it finds | not tried | |
@@ -163,32 +163,28 @@ Every connection's weight and delay is an independent draw, so neither plane has
 - Logs: spark `~/neurocomputation_benchmarks/spikecore_M3/logs/lane_search_experiment/`.
 - Spark's fits run about 2-2.5x slower than the Mac's at equal lanes. Its fits also start from a different basis (the libstdc++ normal distribution), so its lane counts differ from the Mac's (weights 6 there against 4 on the Mac with warm probes).
 
-## Paused here (end of 2026-10-16)
+## Where to pick up (2026-10-17)
 
-- **Working tree:** the residual pre-fit in `weight_matrix.cpp` is uncommitted. Its experiment switch and the estimated-probe code are already removed. Next:
-  1. run `make test` and `make test-python`;
-  2. commit and push;
-  3. measure the full-size build again.
-- **M1 runs:** stopped by hand.
-  - 15 of 40 spike files are done: point A complete, point B seeds 1-5.
-  - Restart with `bash M1/run_all_points.sh <run_tree python>`; it skips finished seeds.
-  - Point B seeds 2-4 ran at about 19 min each against 3.5 min for seed 1, with no job of ours on the GPU. 77% of the time was waiting on the kernel. Cause not found.
-  - The run tree (`scratchpad/run_tree`, at `bc2da36`) lives in the session scratchpad. If it is gone, recreate it from `bc2da36`, or use `642dc7d` and note the commit.
+- **Residual pre-fit** (`a15a542`, branch `development`): run `make test` and `make test-python` on it, then measure the full-size build again.
+- **M1 runs** moved to spark: `~/neurocomputation_benchmarks/spikecore_M1/`.
+  - 15 of 40 spike files are done (point A, point B seeds 1-5; Mac, Metal, `bc2da36`).
+  - The other 25 run on spark (CUDA) from the worktree `~/spikecore_run_tree` (`a15a542`); the task is in `AGENT_TASK.md`, the progress in `RESULTS.md`.
+  - Point B seeds 2-4 ran at about 19 min each on the Mac against 3.5 min for seed 1, with no job of ours on the GPU. 77% of the time was waiting on the kernel. Cause not found.
 - **Decisions waiting for the user:**
   - the unclipped structured delays (above);
   - what to do about the random-spread conditions' delay planes (measure at 3% first).
 
-## Where the other work stands (2026-10-16)
+## Where the other work stands (2026-10-17)
 
-- **spikecorec** `agent_integration_2` at `642dc7d` holds:
+- **spikecorec** `development` at `a15a542` holds:
   - self-connections;
   - the numpy array constructor;
   - exact delta-synapse (weighted) arrivals, with tracked totals;
   - the CUDA fit kernels;
-  - the warm-start lane search.
+  - the warm-start lane search, with the residual pre-fit.
 
-  Tests pass on Metal and CUDA.
+  Tests pass on Metal and CUDA up to `642dc7d`; `a15a542` is not yet tested.
 - **Benchmark runs:** `~/Documents/neurocomputation/spikecore_runs/` (README, RESULTS_LOG, PRESENTATION_PLAN).
   - M2 is done and scored, with figures.
-  - M1 is running (40 runs; point A done).
+  - M1: point A is scored; the remaining runs are on spark (above).
   - M3 has its model and its cell checked against NEST, but no full runs: they are blocked on this construction time.

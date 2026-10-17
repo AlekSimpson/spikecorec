@@ -76,7 +76,8 @@ Each slide only uses ideas introduced on earlier ones.
 ### Slide 8: What happens when you create an engine
 - Parse the LEMS file, the NeuroML files it includes, and the standard library types they use
 - Allocate GPU memory for every cell's state
-- Build the compressed connectivity and fit every per-connection value
+- Build the compressed connectivity and fit every per-connection value; a short calibration
+  run, after which every state is restored, sizes the synapse-state planes
 - Generate the GPU program for this model and compile it
 - Construction is the expensive step; ticks after it are fast
 - Unsupported models fail here, with a message naming the component and the reason
@@ -90,7 +91,7 @@ Each slide only uses ideas introduced on earlier ones.
   - several cell types in one network, one per population
   - excitatory and inhibitory populations, with several synapse types in one network
   - any sparse connectivity, recurrent or feedforward: grids, small-world, random or
-    hand-specified, with a weight and delay on every connection
+    hand-specified, self-connections included, with a weight and delay on every connection
   - driven by constant-current pulses (`pulseGenerator`), spike lists (`spikeArray`) and
     populations of random spike sources (for example `spikeGeneratorPoisson`)
 - **Neurons:**
@@ -104,6 +105,9 @@ Each slide only uses ideas introduced on earlier ones.
 - **Synapses:**
   - current-based, with their own LEMS kinetics (for example exponential or alpha-shaped
     current), and separate state on every connection
+  - instantaneous (delta) synapses, whose state only an `OnEvent` increments by the weight:
+    each spike adds its jump to the target exactly one delay later, with no state kept per
+    connection
 - The next slides give the exact constraints a model has to fit
 
 ### Slide 10: Cell models
@@ -127,10 +131,11 @@ Each slide only uses ideas introduced on earlier ones.
 - A synapse can have its own state and time derivatives, and react to each arriving spike
   (`OnEvent`)
 - Every connection has its own synapse state: two connections of the same type evolve
-  independently
+  independently (except delta synapses, which keep none)
 - Per-connection weight and delay; delays in whole ticks, at least one tick
 - Several synapse types in one network (e.g. excitatory and inhibitory)
-- Connectivity from the NeuroML document, or from Python as an adjacency list
+- Connectivity from the NeuroML document, or from Python as an adjacency list, a
+  per-connection function, or five numpy arrays
 
 ### Slide 12: Stimulus and recording
 - Every NeuroML input, wired with `explicitInput` or `inputList`, compiled from its own
@@ -151,19 +156,20 @@ Each slide only uses ideas introduced on earlier ones.
 - Ion channels, concentrations, multicompartment morphologies and kinetic schemes
 - A synapse or input that does not provide what its target cell reads, for example a current
   into a cell whose input is dimensionless
+- A population of `spikeArray` cells: the engine runs a `spikeArray` only as an input
 - These are refused when the engine is created, with the component and the reason, so
   they never run silently wrong
 - Plasticity: the flag exists, but nothing changes weights during a run yet
-- Platform: macOS with Metal runs today. CUDA code is generated and launched through
-  `Engine_Backend::run_function`, but the CUDA path has not been run on hardware yet
+- Platform: Metal on macOS and CUDA on Linux with NVIDIA GPUs; the weight-matrix fits run on
+  the GPU on both, with a host fallback
 
 ---
 
 ## Part 4: The Python API, step by step
 
 ### Slide 14: Installing
-- `make python` builds the extension into a uv-managed `.venv` (macOS, Metal)
-- Needs uv and libxml2; `make python` installs pybind11, numpy and matplotlib into `.venv`;
+- `make python` builds the extension into a uv-managed `.venv` (Metal on macOS, CUDA elsewhere)
+- Needs uv and libxml2; `make python` installs pybind11, numpy, setuptools and matplotlib into `.venv`;
   ffmpeg for videos
 - `import spikecorec as spc`
 - Docs: `python/docs/README.md` (guide) and `python/docs/API_REFERENCE.md` (every name)
@@ -196,6 +202,12 @@ Each slide only uses ideas introduced on earlier ones.
   and stimulus
 - Three-cell chain A→B→C: first spikes at 20.0, 26.6 and 33.2 ms
 - Discussion point: the synapse's rise time, not the 1 ms wire delay, dominates the lag
+- Per-connection synapse, weight and delay: `Spike_Engine(lems_file, adjacency, synapse_ids,
+  connection_values)`, where `connection_values(source, target)` returns
+  `spc.Spike_Engine.Connection_Values(synapse_index, weight, delay_seconds)`
+- Large networks: five numpy arrays, `Spike_Engine(lems_file, synapse_ids, source_neurons=...,
+  target_neurons=..., synapse_indices=..., weights=..., delays_seconds=...)`, in any order,
+  read in place as uint32/uint32/int32/float32/float32
 
 ### Slide 19: Topology generators
 - `spc.square_torus(side)`: a grid with 4 neighbours each, edges wrapped
@@ -214,9 +226,10 @@ Each slide only uses ideas introduced on earlier ones.
 - Example: a 5×5 GLIF1 torus, 20 excitatory and 5 inhibitory cells, 55.9 Hz
 
 ### Slide 21: Driving the clock yourself
-- `run()` is a loop over `engine.step_simulation(tick)`
-- Step manually to sample state during a run, or stop early
-- Pass increasing tick numbers: the engine uses them for delays and refractory periods
+- `run()` steps every tick not yet stepped; `run(after_each_tick)` calls a function after each
+  tick, to sample state or stop early by raising
+- Or call `engine.step_simulation(tick)` yourself: ticks run one at a time from 0, and the tick
+  must be `engine.ticks_stepped` or it raises
 - Reading state copies from the GPU, so sample every Nth tick rather than every tick
 
 ### Slide 22: Recording and visualization
@@ -229,12 +242,13 @@ Each slide only uses ideas introduced on earlier ones.
 
 ### Slide 23: Inspecting the model: `spikecorec.nml`
 - `engine.context` is the parsed model the engine was built from
-- `spc.nml.NML_Context().parse(path)` inspects a model with no GPU at all
+- `context = spc.nml.NML_Context(); context.parse(path)` inspects a model with no GPU at all
 - Populations and their cells: `nml.network_populations`, `nml.population_cell`
 - Types: `component_types[...]` with `state_variable_names` and `dynamics` (the LEMS
   equations, as written)
 - Values in SI units: `nml.starting_values`, `nml.component_parameter_values`, `resolve_quantity`
-- Connectivity and inputs: `simulation.network_data.edge_arrays()`, `simulation.input_profiles`
+- Connectivity and inputs: `simulation.network_data.edge_arrays()` on a context you parsed
+  yourself (the engine's copy is released after construction), `simulation.input_profiles`
 - `spikecorec.units`: `parse_quantity("-60mV")`, `seconds_to_ticks(...)`
 
 ### Slide 24: Looking at raw engine state
@@ -255,11 +269,11 @@ Each slide only uses ideas introduced on earlier ones.
 - Reachable from Python: `engine.weights.k2tree` (`adjacent`, `get_neighbors`, ...)
 
 ### Slide 26: Connectivity storage, part 2: every value on every connection
-- Each connection carries values: weight, delay and each synapse state variable. Each kind
-  of value is one **plane**
+- Each connection carries values: weight, delay and each synapse state variable kept per
+  connection (a delta synapse keeps none). Each kind of value is one **plane**
 - No plane is stored as one number per connection. Each is a low-rank factorization:
-  plane k = `U · diag(Ck) · Vᵀ`, with `U` and `V` shared by all planes and one small
-  coefficient row `Ck` per plane
+  plane k = `U · diag(Ck) · Vᵀ`, where `U` and `V` hold every plane's lanes and each plane
+  reads only its own, through its coefficient row `Ck`
 - A read is a short computation, not a lookup
 
 ### Slide 27: Reading connection values from Python
@@ -271,15 +285,21 @@ Each slide only uses ideas introduced on earlier ones.
 - Basis inspection: `w.rank`, `w.U_matrix`, `w.V_matrix`, `w.coefficients`
 
 ### Slide 28: How accurate is the compression?
-- The fit is made to a stated tolerance: the worst relative error allowed on any value
+- The fit is made to a stated tolerance: the worst error allowed on any value, relative to the
+  larger of the value and its plane's RMS
 - Presets on `Spike_Engine`: `FIT_TOLERANCE_PRECISE` (1e-5), `ACCURATE` (1e-4), `STANDARD`
   (1e-3, the default), `COMPACT` (1e-2)
 - Tighter means more memory and longer fitting
 - Delays stay on their exact tick while tolerance × delay is under half a tick: up to 500
   ticks at the default
-- Each plane gets the fewest lanes that meet the tolerance, found by fitting at 1, 2, 4, ...
-  lanes and then bisecting; `w.measured_fit_error` reports what each plane actually got
-- Networks built from a few uniform projections are stored exactly
+- Each plane's lanes are searched at 1, 2, 4, ... then bisected to the fewest that meet the
+  tolerance; doubling stops once two doublings each cut the worst error by under 5%, and each
+  probe starts from the last fit that missed
+- Each plane keeps that count times 1 + `expected_active_edge_fraction` (0.2) as a fixed
+  budget; together the budgets keep the basis below one float per connection per plane
+- Synapse-state planes start at zero, so a short calibration, in which every neuron spikes
+  once, sizes their budgets; `w.measured_fit_error` reports what each plane got
+- Networks built from a few uniform projections need only a few lanes
 
 ### Slide 29: Values that change during a run
 - Synapse state changes every tick; the changes go into a sparse update buffer **S**, which
@@ -296,6 +316,8 @@ Each slide only uses ideas introduced on earlier ones.
 ### Slide 30: Built-in efficiency
 - Synapses only run while they can be active: from a presynaptic spike until the synapse has
   settled back to rest (`engine.synapse_active_ticks`); quiet parts of the network cost little
+- Delta synapses do no work between spikes: a neuron walks its connections only on ticks an
+  arrival is due
 - Everything fixed for a run (neuron count, the connectivity tree's shape, the spike-history
   length, the synapse activity window) is compiled into the GPU program as constants
 - Delays use a ring of recent spikes instead of a queue of events in flight
@@ -309,19 +331,17 @@ Each slide only uses ideas introduced on earlier ones.
 ## Part 6: Wrapping up
 
 ### Slide 31: Current limitations
-- macOS/Metal is the only tested platform; the CUDA path has not been run on hardware yet
+- Metal (macOS) and CUDA (Linux, NVIDIA) both build and pass the test suite
 - Model constraints: point neurons, current-based synapses, at most an
   integrating/refractory regime pair
 - No synaptic plasticity during a run yet
 - Fitting large networks at construction can take minutes; tuning is ongoing
 
 ### Slide 32: Roadmap
-- Next: richer point-neuron dynamics (more regime shapes, events into cells), synapses that
-  read the target cell (conductance-based), on-device stimulus generators, heterogeneous
-  populations, plasticity
+- Next: richer point-neuron dynamics (more regime shapes), synapses that read the target cell
+  (conductance-based), heterogeneous populations, plasticity
 - Later: biophysical models: ion channels, concentrations, multicompartment morphologies,
   kinetic schemes, stiff integrators
-- CUDA backend for Linux and NVIDIA GPUs
 - Faster fitting and refitting for large, busy networks
 
 ### Slide 33: Resources

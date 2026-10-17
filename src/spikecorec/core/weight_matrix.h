@@ -373,8 +373,8 @@ namespace spikecorec {
         // Mutable because the const reads that need it only cache it.
         mutable Engine_Function neighbor_weights_function;
 
-        // Loads the precompiled kernel `name` into `function` once. False (always on CUDA) means
-        // the caller uses the host path; a failed load is not retried.
+        // Loads the precompiled kernel `name` into `function` once. False means the caller uses
+        // the host path; a failed load is not retried.
         [[nodiscard]] bool ensure_function(Engine_Function &function, const String &name) const;
         mutable bool precompiled_functions_unavailable = false;
 

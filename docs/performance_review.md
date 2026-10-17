@@ -1,8 +1,8 @@
 # Performance review
 
-Made on 2026-10-07, branch `agent_integration_2`, commit `843fb03`, as a read-only review, and
-brought up to date on 2026-10-15: items 15, 28, 31 and 32 were fixed and are gone, the others keep
-their numbers, and items 3, 4, 5, 24 and 26 describe the current S and update queue. The measurements are the
+Made on 2026-10-07 at commit `843fb03`, as a read-only review, and brought up to date on
+2026-10-15, 2026-10-16 and 2026-10-17: items 15, 28, 31 and 32 were fixed and are gone, the others
+keep their numbers, and items 3, 4, 5, 24 and 26 describe the current S and update queue. The measurements are the
 baseline from before any speed work. It is based on:
 - the generated master kernels of nine models;
 - the shared device helpers;
@@ -15,8 +15,8 @@ The impact ratings are estimates from reading the code; nothing has been profile
 
 ### Test suite
 
-`make test` takes 3 min 45 s for 177 tests. Ten network-scale tests account for about 194 s of
-that:
+On 2026-10-07 `make test` took 3 min 45 s for 177 tests (the suite has about 230 now). Ten
+network-scale tests accounted for about 194 s of that:
 
 | Test | Time |
 |---|---|
@@ -25,7 +25,7 @@ that:
 | The two 200-neuron PyNN network runs (golden run and jNeuroML comparison) | 15 s each |
 | Seed reproducibility, 400 neurons | 10 s |
 
-`make test-python` takes 3.4 s.
+`make test-python` took 3.4 s.
 
 The C++ runner used 18% of one CPU core over the whole run, so it spends most of its time waiting
 on the GPU.
@@ -54,8 +54,9 @@ What the table shows:
 - **Cells and inputs are cheap.** 10,000 neurons with their inputs but no connections take 0.18 ms per tick.
 - **Connections dominate.** Adding 200,000 connections takes the same 10,000 neurons from 0.18 ms to 4.1 ms per tick.
 - **Cost grows faster than size.** From 10,000 to 100,000 neurons the time per tick rises about 20×, not 10×. Neuron-updates per second fall from 2.5 million to 1.2 million.
-- **Construction times predate the fit rewrite** and every connection had the same weight. With
-  per-connection values, construction now runs lane searches and calibration and takes longer.
+- **Construction times predate the fit rewrite**, when every connection had the same weight.
+  Construction now runs a lane search per plane and, for a synapse that keeps state, a calibration
+  run, so it takes longer. Per-connection values lengthen the lane searches further.
 
 ### Models reviewed
 
@@ -75,9 +76,11 @@ What the table shows:
 
 ### 1. Repeated edge reads (high)
 
-Each connection calls `spikecorec_load_edge` 5 times per tick, and up to 10 on arrival or settle
-ticks, though a synapse type touches at most 4 distinct planes. In `pynn_synapses` the alpha
-synapse reads plane 3 four times in one iteration. Every call:
+A synapse that keeps state calls `spikecorec_load_edge` once per read of a plane: 5 times per
+connection per tick for the alpha synapse in `pynn_synapses`, and more on arrival and settle ticks,
+though it touches only 4 distinct planes. On an arrival tick it reads plane 3 four times. (A
+synapse that delivers weighted arrivals keeps no planes: it reads the delay every tick and the
+weight on arrival.) Every call:
 - rebuilds the value from the factorization;
 - searches the sparse update buffer.
 
@@ -103,7 +106,9 @@ A plane's changes in one tick (its Euler step or return to rest, plus the `OnEve
 are summed into one `spikecorec_accumulate_edge`, so each plane is written once per tick. The
 `OnEvent` change itself is still emitted as the new value minus the old one: `(I + weight) - I`.
 That is two extra reads that cancel out, and in 32-bit floats the subtraction loses precision when
-`I` is large. For an assignment of the form `x = x + something`, the change is just `something`.
+`I` is large. Weighted arrivals already take the increment directly (`accumulator_increment`); a
+synapse that keeps state could use the same function for any assignment of the form
+`x = x + something`.
 
 ### 5. Global atomic counters for queued updates (medium)
 
@@ -143,10 +148,16 @@ saved 20–25%.
 
 ### 9. The loop covers the whole active window (medium)
 
-A neuron walks its connections for `synapse_active_ticks` after each spike. That window is the
-longest delay plus the slowest synapse's settle time, taken across every synapse type: 887 ticks in
-the GLIF network, 3,610 in `pynn_synapses`. A neuron firing more often than that walks every
-connection every tick. That includes synapses still at rest because their spike hasn't arrived yet.
+A neuron walks its connections for `synapse_active_ticks` after each spike. When any synapse keeps
+state per connection, that window is the longest delay plus the slowest such synapse's settle time:
+887 ticks in the GLIF network, 3,610 in `pynn_synapses`. A neuron firing more often than that walks
+every connection every tick. That includes synapses still at rest because their spike hasn't
+arrived yet.
+
+When every synapse delivers weighted arrivals, the window is the longest delay less one tick. With
+a shortest delay above one tick, the walk then runs only on ticks when one of the neuron's spikes
+reaches a target on the next tick. On those ticks it still walks every connection, including those
+whose delay does not match.
 
 ### 10. Atomic scatter into targets (medium)
 
@@ -171,8 +182,9 @@ The group runs for as long as its slowest member.
 
 ### 13. Strided memory layout (high)
 
-`cell_state` and `input_values` are laid out per neuron: `neuron_index * count + offset`. Adjacent
-threads read addresses `count` floats apart instead of consecutive ones, which wastes memory
+`cell_state` is laid out per neuron (`neuron_index * slot_count + offset`) and `input_values` per
+input entry (`input_entry * input_value_stride + offset`, a stride set by the largest input type).
+Adjacent threads read addresses a stride of floats apart instead of consecutive ones, which wastes memory
 bandwidth. Storing each variable as its own array per population would make those reads
 consecutive.
 
@@ -234,7 +246,8 @@ The Metal `Engine_Backend::run_function` (`src/spikecorec/core/backend.cpp`) com
 buffer per tick and calls `waitUntilCompleted`.
 That is a full CPU–GPU round trip every tick, and it is the 0.15–0.2 ms floor seen even in tiny
 models. The GPU sits idle while the CPU does its per-tick work and the reverse, and ticks are never
-batched into one submission.
+batched into one submission. The CUDA `run_function` likewise calls `cudaDeviceSynchronize`
+after every launch.
 
 ### 24. Merging updates every tick (high)
 
@@ -246,13 +259,14 @@ connection. Each run still touches all of S on the CPU:
 - every plane's row starts are recomputed over all neurons.
 
 That is O(S + neurons) work per walk pass, with S up to about 90% of connections while synapses are
-active. (Until 2026-10-15 each run also copied all of S and fully sorted every plane, O(S log S);
+active. (Until commit `dd1362d`, 2026-10-16, each run also copied all of S and fully sorted every plane, O(S log S);
 that was the most likely cause of the faster-than-linear growth measured here, 84 ms per tick at
 2 million connections.)
 
 ### 25. Random numbers drawn on the CPU for every slot (medium)
 
-`Spike_Engine::step_simulation` refills `random_values` with one draw per slot on every tick. A
+`Spike_Engine::dispatch_tick`, which `step_simulation` calls, refills `random_values` with one
+draw per slot on every tick. A
 Poisson source only uses its draw on the tick it fires, so with 100,000 Poisson cells that is
 100,000 draws per tick, almost all of them unused.
 
@@ -270,42 +284,47 @@ again before every deferred walk pass, since a merge can move S into a larger sl
 ### 29. Planes sized for the largest synapse type (low–medium)
 
 Every connection carries the planes of the largest synapse type in the model. In
-`pynn_poisson_network`, the `expCurrSynapse` connections carry a fourth plane they never use.
+`pynn_poisson_network`, the `expCurrSynapse` connections carry a fourth plane they never use. (A
+synapse that delivers weighted arrivals takes no plane.)
 
 ## E. Outside the tick loop
 
-Items 30 and 32 were added on 2026-10-12 by the resilience review, at commit `04d1b3d`. Unlike
-the items above, they were measured.
+Item 30 was added on 2026-10-12 by the resilience review, at commit `04d1b3d`. Unlike the items
+above, it was measured.
 
 ### 30. Per-neuron lookups rescan the network (medium)
 
-Several host helpers look up a neuron's population or memory index by rescanning the network's
-children. `get_population_size` also recounts a population's `<instance>` children on every call.
-Each lookup is O(N), and they are called once per neuron or once per input target, so the helpers
-are O(N²):
-- `state_variable_array`;
-- the setup for `record_membrane_video`;
-- engine construction.
+`Spike_Engine::population_of_neuron` finds a neuron's population by rescanning the network's
+children (`network_populations`). `get_population_size` also recounts a population's `<instance>`
+children on every call. Each lookup is O(N) when the network has a child per cell (one
+`explicitInput` per cell) or the population lists its instances. Two helpers make one lookup per
+neuron, so they are O(N²):
+- `state_variable_array`, through `read_state_variable` and `cell_memory_index_of`;
+- the setup for `record_membrane_video`.
+
+`resolve_path` calls `get_population_size` once per connection, input target and recording, so
+building a `populationList` model is O(N) per path (read from the code, not measured).
+`variable_name_at` rescans the network once per `OutputColumn`.
 
 The documented `Simulation_Recorder` example calls `state_variable_array` every 5 ticks. At 4000
 cells one call costs about 60 ticks of GPU time.
 
 - **Location:**
-  - `src/spikecorec/core/engine.cpp:346-376` (`population_of_neuron`, `cell_memory_index_of`);
-  - `src/spikecorec/nml/dynamics.cpp:366-376` (`network_populations`);
-  - `src/spikecorec/nml/parser.cpp:1065-1091` (`neuron_index_of`, `get_population_size`), called
-    per input target at `dynamics.cpp:676`.
-- **Measured:** times in ms; ticks stay at about 2.7 ms throughout.
+  - `src/spikecorec/core/engine.cpp:516-546` (`population_of_neuron`, `cell_memory_index_of`);
+  - `src/spikecorec/nml/dynamics.cpp:381-391` (`network_populations`);
+  - `src/spikecorec/nml/parser.cpp:1341-1356` (`get_population_size`), called by `resolve_path` at
+    `parser.cpp:750`;
+  - `src/spikecorec/nml/parser.cpp:60-72` (`variable_name_at`).
+- **Measured:** `state_variable_array` times in ms; ticks stay at about 2.7 ms throughout.
 
-  | Model | Measured | 500 | 1000 | 2000 | 4000 cells |
-  |---|---|---|---|---|---|
-  | One `explicitInput` per cell | `state_variable_array` | 2.4 | 10 | 43 | 181 |
-  | | Construction | 39 | 68 | 185 | 666 |
-  | `populationList` population | `state_variable_array` | 1.7 | 7.7 | 35 | 158 |
-  | Plain population | `state_variable_array` | 0.1–0.3 | | | |
+  | Model | 500 | 1000 | 2000 | 4000 cells |
+  |---|---|---|---|---|
+  | One `explicitInput` per cell | 2.4 | 10 | 43 | 181 |
+  | `populationList` population | 1.7 | 7.7 | 35 | 158 |
+  | Plain population | 0.1–0.3 | | | |
 
-  `parse()` alone is also quadratic in the number of `explicitInput`s: 0.28 s at 4000 inputs and
-  2.6 s at 12,000. That cause was not traced.
+  Construction and `parse()` were also quadratic in `explicitInput`s until commit `cab73d1`
+  (2026-10-16), which made them linear.
 
 ## Where to start
 

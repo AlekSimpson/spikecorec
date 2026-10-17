@@ -7,8 +7,8 @@ that number. This page walks through the pieces in the order they are used. The 
 ## Terms
 
 - **Edge ordinal:** a connection's position in the fixed order of all connections.
-- **Plane:** one quantity stored for every connection: the weight, the delay, or one synapse
-  state variable.
+- **Plane:** one quantity stored for every connection: the weight, the delay, or one state
+  variable the synapse keeps per connection.
 - **Lane:** one of the shared building blocks that the compression combines to rebuild every
   plane. A lane has no meaning of its own; more lanes give more detail.
 - **Run:** a consecutive block of connections that start with the same declared values.
@@ -18,8 +18,9 @@ that number. This page walks through the pieces in the order they are used. The 
 The k²-tree stores which neurons connect to which: "i connects to j", with no values. Given a
 neuron, it lists that neuron's targets in ascending order.
 
-It can also list a neuron's sources (`get_predecessors`), but only on the CPU. Nothing in the
-engine uses that yet, and the GPU helpers only walk targets.
+It can also list a neuron's sources: `get_predecessors` on the CPU, a column walk on the GPU. The
+weight-matrix fits use them to reach a neuron's incoming connections (see `k2tree_fit_walk.md`);
+the tick walks only targets.
 
 ## 2. Numbering the connections: edge ordinals
 
@@ -43,8 +44,9 @@ edge_row_offset[source] + its position among that source's targets
 
 ## 3. The values each connection carries: planes
 
-Each connection has a weight, a delay and one value per synapse state variable. Each of these is a
-plane. Keeping one array per plane, with a value for every connection, is too big for large
+Each connection has a weight, a delay and one value per state variable its synapse keeps per
+connection. Each of these is a plane. A synapse whose state only an `OnEvent` increments (a
+weighted arrival) keeps none. Keeping one array per plane, with a value for every connection, is too big for large
 networks, so all the planes are compressed into three tables:
 - **U:** one row per neuron, as a source;
 - **V:** one row per neuron, as a target;
@@ -94,7 +96,9 @@ ordinal finds its run, and from that its synapse type.
 The runs give every connection's starting values. U, V and C are then chosen to reproduce them,
 one plane at a time, each on lanes of its own:
 - **Lane budgets:** each plane gets a fixed number of lanes: the fewest that hold its starting
-  values within `fit_tolerance` (found by fitting at 1, 2, 4, ... lanes, then bisecting), times
+  values within `fit_tolerance` (found by fitting at 1, 2, 4, ... lanes, then bisecting; doubling
+  stops when it stops helping, and each probe after the first starts from the last fit that
+  missed; see `k2tree_fit_walk.md`), times
   one plus `expected_active_edge_fraction`. Together they stay below one float per connection per
   plane.
 - **Planes that start at zero** (synapse state) take no lanes at first. The engine spikes every
@@ -103,14 +107,18 @@ one plane at a time, each on lanes of its own:
 - **Methods:** the lane searches use limited-memory BFGS, which needs fewer lanes; every refit
   during the run uses masked alternating least squares, which needs far less scratch memory. Both
   minimize the same weighted, ridge-regularized squared error over the connections, in f32, on
-  the GPU.
+  the GPU (Metal or CUDA), with a host fallback.
 
 ## 7. One tick on the GPU
 
 Each neuron's thread:
-1. walks its k²-tree row to get its targets in order, counting ordinals as it goes;
-2. for each connection, finds the synapse type from the runs;
-3. reads the weight, delay and synapse state from U, V and C plus S;
+1. walks its k²-tree row to get its targets in order, counting ordinals as it goes (when every
+   synapse delivers weighted arrivals, only on ticks an arrival is due);
+2. for each connection, reads its delay to tell whether a spike arrives, and, with more than one
+   synapse type, finds the type from the runs;
+3. reads the weight and synapse state from U, V and C plus S;
 4. sums each state variable's change for the tick, and writes it once: in place in S, or through
    the queue;
-5. adds the synapse's current to the target's `network_inputs`.
+5. adds the value its target reads to the target's `network_inputs`. A weighted arrival instead
+   adds its increment to the target's input for the next tick, so it reaches the target exactly a
+   delay after the spike.

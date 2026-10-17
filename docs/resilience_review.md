@@ -1,7 +1,6 @@
 # Resilience review
 
-A review of defects in the engine, made on 2026-10-12 and 2026-10-13 (branch
-`agent_integration_2`, commit `04d1b3d`). It confirmed 51 findings, each reproduced with a scratch
+A review of defects in the engine, made on 2026-10-12 and 2026-10-13 (commit `04d1b3d`). It confirmed 51 findings, each reproduced with a scratch
 program or document, or traced through the code. All but the ones below were fixed in October
 2026; their fixes and the tests that cover them are in the code.
 

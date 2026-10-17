@@ -5,10 +5,15 @@ Run everything from the repo root. The backend is Metal on macOS and CUDA elsewh
 ## Prerequisites
 
 - `git submodule update --init`: metal-cpp (Metal builds) and googletest (tests).
-- **libxml2**, required; found through `pkg-config`.
+- **libxml2**, required; found through `pkg-config` (`libxml-2.0`). The Makefile does not stop when
+  it is missing; the compile fails at `<libxml/parser.h>`. Install the development package
+  (`libxml2-dev`), or point `PKG_CONFIG_PATH` at the directory holding its `libxml-2.0.pc`.
+  `make info` shows whether it was found.
 - **uv**, for the Python extension.
 - **Metal:** macOS with the Metal Toolchain component.
-- **CUDA:** the CUDA toolkit (`nvcc`, NVRTC).
+- **CUDA:** the CUDA toolkit (`nvcc`, NVRTC), built and tested with CUDA 13 and GCC. `nvcc` must be
+  on `PATH` (`export PATH=/usr/local/cuda/bin:$PATH`); `CUDA_PATH` only locates its headers and
+  libraries.
 - **Optional:** zlib, liblzma and libbz2, for compressed `.spire` recordings. They are detected
   through `pkg-config`.
 
@@ -45,7 +50,7 @@ The kernel the engine generates at runtime is compiled without debug info either
 1. creates `.venv` with uv (Python 3.13);
 2. installs pybind11, numpy, setuptools and matplotlib into it;
 3. installs the extension in editable mode;
-4. copies `default.metallib` into the package.
+4. copies `default.metallib` into the package (Metal).
 
 Run Python with `.venv/bin/python`. Use `make python` rather than `pip install -e .`, which skips
 the metallib copy.
@@ -68,6 +73,7 @@ Set on the command line, for example `make test BACKEND=metal`:
 | `BACKEND` | `metal` on macOS, `cuda` elsewhere |
 | `CUDA_PATH` | `/usr/local/cuda` |
 | `CUDA_ARCH` | `native`: the build machine's GPUs, for the precompiled CUDA kernels |
+| `SPIKECOREC_CUDA_ARCH` (environment) | `native`: `CUDA_ARCH` for the Python extension; `make python` does not pass `CUDA_ARCH` on |
 | `DEBUG` | `0`; `1` for a debug build |
 | `CLI_SOURCE` | `main.cpp` |
 | `CXX` | `clang++` on macOS, `g++` elsewhere |

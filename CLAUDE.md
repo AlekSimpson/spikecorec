@@ -26,8 +26,8 @@ src/spikecorec/cuda/      — the same fixed kernels and k²-tree device helpers
 src/spikecorec/bindings/  — pybind11 Python bindings
 python/spikecorec/    — Python package
 tests/                — C++ tests
-examples/             — example programs
-third_party/          — vendored dependencies (metal-cpp submodule)
+examples/             — example NeuroML/LEMS models (`models/`), notebooks, video helpers
+third_party/          — vendored dependencies (metal-cpp and googletest submodules; NeuroML2 schema and standard library in `neuroml2/`)
 docs/                 — design notes and reviews
 ```
 
@@ -52,17 +52,21 @@ These are the fixed engine facts any codegen/simulation work must respect:
   9 Advance. Stages 1/6/8/9 are engine-owned; 2–5 are the per-cell/synapse dynamics. LEMS events
   (`OnCondition`/`OnEvent`/`EventOut`) are **per-tick conditionals**, not an async scheduler.
 - **Runtime kernel compilation already exists on both backends** via `Engine_Backend::create_function(name, source_code)`
-  in `src/spikecorec/core/backend.cpp` (Metal `newLibrary`; CUDA NVRTC → PTX → `cuModuleGetFunction`). Codegen
+  in `src/spikecorec/core/backend.cpp` (Metal `newLibrary`; CUDA NVRTC → CUBIN for the device's architecture, or PTX for a virtual one → `cuModuleGetFunction`). Codegen
   output is fundamentally "a device-code string" the engine compiles and runs.
 - **Generic kernel launcher.** `Engine_Backend::run_function(function, parameters, job_count)` in
   `src/spikecorec/core/backend.cpp` launches any compiled function with positional arguments on both
-  backends (Metal compute encoder; CUDA `cuLaunchKernel`). The CUDA path has not been run on
-  hardware yet.
+  backends (Metal compute encoder; CUDA `cuLaunchKernel`). The CUDA path runs on hardware (NVIDIA
+  GB10, DGX Spark, CUDA 13), and the C++ and Python suites pass there.
 - **Every cell integrates exactly one `dt` per tick** (forward Euler). Synapses run only in their
   source's active window (`synapse_active_ticks` after its spike: the longest delay plus the
-  slowest synapse's settle time) and are set exactly back to rest when it ends.
+  slowest synapse's settle time, or the longest delay less one tick when every synapse delivers
+  weighted arrivals) and are set exactly back to rest when it ends.
 - **`network_inputs`** is the per-neuron synaptic input accumulator: a source scatters its weight
-  into `network_inputs[target]`; the target drains it at its next step (an implicit ≥1-tick latency).
+  into `network_inputs[target]`; the target drains it at its next step. Two rows alternate by tick
+  parity, so the latency is exactly one tick. A synapse whose state only an `OnEvent` increments
+  delivers weighted arrivals instead (rows 2–4, sent the tick before they are due, so each reaches
+  its target exactly a delay after the spike); it keeps no per-edge state and takes no plane.
   Inputs (`explicitInput`/`inputList`) run in the kernel, in their target cell's thread, before the
   cell's own dynamics.
 

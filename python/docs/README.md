@@ -10,14 +10,16 @@ conversion. [API_REFERENCE.md](API_REFERENCE.md) lists everything.
 ## Install
 
 ```bash
-make python                     # builds the extension into .venv (Metal on macOS)
+make python                     # builds the extension into .venv (Metal on macOS, CUDA elsewhere)
 .venv/bin/python -c "import spikecorec; print('ok')"
 ```
 
 Needs [uv](https://docs.astral.sh/uv/) and libxml2 (found through `pkg-config`). The first
 `make python` creates `.venv` with Python 3.13 (`PYTHON_VERSION=3.12 make python` picks
 another) and installs `pybind11`, `numpy`, `setuptools` and `matplotlib` into it. Run
-scripts with `.venv/bin/python`, or `source .venv/bin/activate` first.
+scripts with `.venv/bin/python`, or `source .venv/bin/activate` first. On CUDA it also needs
+the CUDA toolkit (`nvcc` on `PATH`); `SPIKECOREC_CUDA_ARCH` (default `native`) picks the GPU
+architecture.
 
 ## Quick start
 
@@ -85,6 +87,25 @@ w.get_edge_synapse_prototype(0, 1)    # 0: excitatorySynapse, the first in the l
 
 Omit `synapse_proportions` for equal shares.
 
+### Per-connection synapses, weights and delays
+
+Give every connection as one entry of five arrays, in any order:
+
+```python
+import numpy as np
+engine = spc.Spike_Engine("examples/models/LEMS_three_cell_chain.xml", ["chainSynapse"],
+                         source_neurons=np.array([0, 1], dtype=np.uint32),
+                         target_neurons=np.array([1, 2], dtype=np.uint32),
+                         synapse_indices=np.array([0, 0], dtype=np.int32),
+                         weights=np.array([1.0, 1.0], dtype=np.float32),
+                         delays_seconds=np.array([1e-3, 1e-3], dtype=np.float32))
+```
+
+`synapse_indices` index into the synapse list. Each ordered pair may appear once, a neuron's
+connection to itself included. Arrays of these dtypes are read in place. For smaller networks,
+`Spike_Engine(lems_file, adjacency, synapse_ids, connection_values)` takes a function
+`connection_values(source, target)` that returns a `Spike_Engine.Connection_Values`.
+
 ## Reading results
 
 ```python
@@ -135,6 +156,8 @@ Writes `out.mp4` (needs ffmpeg; a `.gif` output path uses Pillow).
 ## Driving the tick loop yourself
 
 ```python
+engine = spc.Spike_Engine("examples/models/LEMS_single_cell.xml")
+trace = []
 for tick in range(engine.lifetime):
     engine.step_simulation(tick)
     if tick % 10 == 0:
@@ -148,7 +171,8 @@ Ticks run one at a time, in order from 0: the tick must be `engine.ticks_stepped
 
 `engine.context` is the model the engine was built from; its per-edge list
 (`simulation.network_data`) is released while the weight matrix is built, since `engine.weights`
-holds every edge. An engine built from an adjacency list never fills it: the connections are read
+holds every edge. An engine built from an adjacency list, a per-connection function or connection arrays never
+fills it: the connections are read
 from the adjacency itself, and `simulation.sampled_connections` holds one per synapse and target
 population. `nml.NML_Context` parses a model on its own, with no GPU.
 
@@ -219,7 +243,10 @@ standard or your own:
   every call, seeded by the `<Simulation>`'s `seed`, so spike sources such as
   `spikeGeneratorPoisson` run as populations.
 - **Synapses:** current-based. The equations can use the synapse's own state, its
-  parameters and the connection's weight, and can react to arriving spikes with `OnEvent`.
+  parameters and the connection's weight, and can react to arriving spikes with `OnEvent`. A
+  synapse whose state only its `OnEvent` increments (for example
+  `accumulated_jump = accumulated_jump + weight * jump`) keeps no state per connection: each
+  spike's increment reaches the target exactly one delay after the spike.
 - **Stimulus:** every NeuroML input, wired with `explicitInput` or `inputList`, runs on the
   GPU from its own LEMS dynamics, in its target cell's thread before the cell's own; each
   target gets its own copy of the input's state:
