@@ -1,64 +1,51 @@
 """
-spike_validation.py — validates that the Metal spike engine actually spikes.
+Checks that a small small-world-torus network spikes under its drive.
 
-Builds a small small-world-torus reservoir, drives a few input neurons with
-random stimulus for a handful of ticks via start_static_record, then reads back
-per-neuron spike times (last_spiked) and the recorded membrane-potential trace
-to confirm the network produced spikes (rather than sitting at its resting
-potential the whole time).
+The 25 GLIF1 cells and their drive come from examples/models/LEMS_glif1_torus.xml; the
+connectivity is a small-world torus with an excitatory synapse on every edge. Every cell's
+membrane potential is recorded to a .spire file and read back.
 """
-from spikecorec import SpikeEngine
-import spikecorec as spc
-import numpy as np
 import os
 import tempfile
 
+import numpy as np
+
+import spikecorec as spc
+
+MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples", "models")
+
 seed = 1042
-side_length = 4
-lifetime = 10
+side_length = 5  # the example sheet has 25 cells
 
-network = spc.small_world_torus(side_length, seed=seed)
-engine = SpikeEngine(
+network = spc.small_world_torus(side_length, random_fanout=4, seed=seed)
+engine = spc.Spike_Engine(
+    os.path.join(MODELS, "LEMS_glif1_torus.xml"),
     network,
-    [side_length, side_length],
-    rank=1,
-    resting_mp=0.1,
-    decay_rate=0.22,
-    learning_rate=0.00222,
+    "excitatorySynapse",
+    connection_weight=1.0,
+    connection_delay_seconds=1e-3,
 )
 
-inputs = [1, 4, 12]
-
-rng = np.random.default_rng(seed)
-random_inputs = rng.normal(size=(lifetime, 3))
-
-engine.set_input_neurons(inputs)
-
-# start_static_record drives the engine for `lifetime` ticks: it forces the
-# input neurons into the active set each tick, applies that tick's stimulus row,
-# steps the network, and writes one membrane-potential frame per tick.
 record_path = os.path.join(tempfile.gettempdir(), "spike_validation.spire")
-engine.start_static_record(
-    random_inputs.tolist(),
-    lifetime,
-    record_path,
-    compression=None,
-)
+engine.record_membrane_video(record_path)
+engine.run()
+engine.write_recordings()
 
-last_spiked = engine.get_last_spiked()
 recording = spc.read_spire_recording(record_path)
 os.remove(record_path)
 
-spiked_neurons = np.flatnonzero(last_spiked != 0)
-num_spiked = int(spiked_neurons.size)
+spike_counts = engine.spike_counts_per_neuron
+num_spiked = int(np.count_nonzero(spike_counts))
 
-print(f"neurons:             {engine.neuron_count}")
-print(f"input neurons:       {inputs}")
-print(f"ticks simulated:     {lifetime}")
-print(f"neurons that spiked: {num_spiked} / {engine.neuron_count}")
-print(f"last_spiked tick:    {last_spiked.tolist()}")
+print(f"neurons:             {engine.total_neuron_count}")
+print(f"edges:               {engine.weights.total_edge_count}")
+print(f"ticks simulated:     {engine.ticks_stepped}")
+print(f"neurons that spiked: {num_spiked} / {engine.total_neuron_count}")
+print(f"mean rate:           {engine.mean_firing_rate_hertz():.1f} Hz")
 print(f"recording shape:     {recording.shape}")
 print(f"peak |membrane|:     {np.abs(recording).max():.3f}")
 
-assert num_spiked > 0, "VALIDATION FAILED: no neuron spiked — engine is not spiking"
-print("\nVALIDATION PASSED: the Metal spike engine spikes.")
+engine.shutdown()
+
+assert num_spiked > 0, "VALIDATION FAILED: no neuron spiked; the engine is not spiking"
+print("\nVALIDATION PASSED: the spike engine spikes.")

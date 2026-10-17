@@ -21,4 +21,4 @@ where = ["python"]
 "spikecorec" = ["*.so", "*.pyd"]
 
 [tool.pytest.ini_options]
-testpaths = ["python/tests"]
+testpaths = ["tests/python"]

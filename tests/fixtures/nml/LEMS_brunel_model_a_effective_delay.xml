@@ -1,0 +1,49 @@
+<Lems>
+
+    <!--
+    The spike-to-spike latency through one delta synapse, as in
+    Brunel2000_ModelA_reference_scripts/refractory_test/effective_delay_test.py: a trigger reaches
+    the presynaptic model A neuron with a 25 mV jump after 0.1 ms, which fires it; that neuron
+    reaches the postsynaptic one with a 25 mV jump after 1.5 ms, which fires it. NEST gives the
+    presynaptic spike at 10.1 ms and the postsynaptic one at 11.6 ms: a latency of exactly the delay.
+    The trigger is a cell fired at 10 ms by a spikeArray.
+    -->
+
+    <Target component="delay_simulation"/>
+
+    <Include file="Brunel2000_ModelA_Components.xml"/>
+
+    <deltaVoltageSynapse id="suprathreshold_delta_synapse" jump="25mV"/>
+
+    <spikeArray id="trigger_spikes">
+        <spike id="0" time="10ms"/>
+    </spikeArray>
+
+    <iafCell id="trigger_cell" leakConductance="10nS" leakReversal="-70mV" thresh="-50mV" reset="-70mV" C="200pF"/>
+
+    <network id="delay_network">
+        <population id="trigger" component="trigger_cell" size="1"/>
+        <population id="presynaptic" component="brunel_model_a_neuron" size="1"/>
+        <population id="postsynaptic" component="brunel_model_a_neuron" size="1"/>
+
+        <projection id="trigger_projection" presynapticPopulation="trigger" postsynapticPopulation="presynaptic"
+                    synapse="suprathreshold_delta_synapse">
+            <connectionWD id="0" preCellId="../trigger[0]" postCellId="../presynaptic[0]" weight="1" delay="0.1ms"/>
+        </projection>
+        <projection id="delay_projection" presynapticPopulation="presynaptic" postsynapticPopulation="postsynaptic"
+                    synapse="suprathreshold_delta_synapse">
+            <connectionWD id="0" preCellId="../presynaptic[0]" postCellId="../postsynaptic[0]" weight="1" delay="1.5ms"/>
+        </projection>
+
+        <explicitInput target="trigger[0]" input="trigger_spikes"/>
+    </network>
+
+    <Simulation id="delay_simulation" length="30ms" step="0.1ms" target="delay_network" seed="1">
+        <EventOutputFile id="spikes" fileName="brunel_model_a_effective_delay_spikes.dat" format="TIME_ID">
+            <EventSelection id="0" select="trigger[0]" eventPort="spike"/>
+            <EventSelection id="1" select="presynaptic[0]" eventPort="spike"/>
+            <EventSelection id="2" select="postsynaptic[0]" eventPort="spike"/>
+        </EventOutputFile>
+    </Simulation>
+
+</Lems>

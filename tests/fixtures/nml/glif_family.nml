@@ -1,0 +1,44 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="GlifFamily">
+
+  <!--
+    One cell of each GLIF type under the same 500 pA step, so their traces can be compared.
+    Five cell types in one network exercise the kernel's per-population dispatch.
+    All five: C = 100 pF, gL = 10 nS, so tau = 10 ms and rheobase = gL * (vth - EL) = 200 pA.
+    The drive is 2.5x rheobase; t_ref = 5 ms caps the rate at 200 Hz.
+  -->
+
+  <include href="glif_cell_types.nml"/>
+
+  <GLIF1Cell id="glif1Cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             t_ref="5ms"/>
+
+  <GLIF2Cell id="glif2Cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             resetScale="0.3" t_ref="5ms"/>
+
+  <GLIF3Cell id="glif3Cell" C="100pF" gL="10nS" EL="-70mV" vth="-50mV" vreset="-70mV"
+             t_ref="5ms" tauAsc1="100ms" tauAsc2="10ms" ascAdd1="-100pA" ascAdd2="-200pA"/>
+
+  <GLIF4Cell id="glif4Cell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
+             thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="5mV"/>
+
+  <GLIF5Cell id="glif5Cell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV" t_ref="5ms"
+             thetaInf="-50mV" tauTheta="50ms" thetaSpikeAdd="5mV" tauAsc1="100ms"
+             tauAsc2="10ms" ascAdd1="-100pA" ascAdd2="-200pA"/>
+
+  <pulseGenerator id="stepCurrent" delay="0ms" duration="500ms" amplitude="500pA"/>
+
+  <network id="glifFamilyNetwork">
+    <population id="popGlif1" component="glif1Cell" size="1"/>
+    <population id="popGlif2" component="glif2Cell" size="1"/>
+    <population id="popGlif3" component="glif3Cell" size="1"/>
+    <population id="popGlif4" component="glif4Cell" size="1"/>
+    <population id="popGlif5" component="glif5Cell" size="1"/>
+
+    <explicitInput target="popGlif1[0]" input="stepCurrent"/>
+    <explicitInput target="popGlif2[0]" input="stepCurrent"/>
+    <explicitInput target="popGlif3[0]" input="stepCurrent"/>
+    <explicitInput target="popGlif4[0]" input="stepCurrent"/>
+    <explicitInput target="popGlif5[0]" input="stepCurrent"/>
+  </network>
+
+</neuroml>
