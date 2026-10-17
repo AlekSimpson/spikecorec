@@ -63,6 +63,9 @@ namespace spikecorec {
         static constexpr f32 DEFAULT_FIT_TOLERANCE = 1.0e-3f;
 
         static constexpr f32 DEFAULT_FIT_RIDGE = 1.0e-7f;
+        // A lane search's probe starts from the fit at the last lane count that missed the tolerance;
+        // its new lanes start from fresh rows times this, so they barely move that fit's values.
+        static constexpr f32 WARM_START_NEW_LANE_SCALE = 0.1f;
 
         // The two candidate fits. Both fit one plane's own lanes in f32, on the GPU when its
         // kernels load and on the host otherwise, and both minimize the same objective: over the
