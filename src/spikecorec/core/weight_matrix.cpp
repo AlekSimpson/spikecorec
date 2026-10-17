@@ -2434,6 +2434,31 @@ Weight_Matrix::Plane_Fit_Result Weight_Matrix::search_fewest_lanes(s64 matrix_in
         Vector<f32> working_u;
         Vector<f32> working_v;
     };
+
+    // A probe with a smaller fit already made starts from it: its lanes as they are, and the new
+    // lanes from fresh rows scaled by WARM_START_NEW_LANE_SCALE, so the fit starts at that fit's
+    // error and only has to place what the new lanes add.
+    auto fit_warm = [&](s64 lane_count, const Kept_Fit &start) {
+        if (start.lane_count == 0 || start.lane_count >= lane_count) return fit_fresh(lane_count);
+        use_working_arrays(lane_count);
+        fill_fresh_rows(problem, basis_seed + 7919u * static_cast<unsigned>(matrix_index + 1) + static_cast<unsigned>(lane_count));
+        f32 *working_u = problem.working_u.get_contents_as<f32>();
+        f32 *working_v = problem.working_v.get_contents_as<f32>();
+        for_each_index_in_parallel(node_count, [&](s64 node_index) {
+            for (s64 column = 0; column < lane_count; column += 1) {
+                const usize index = static_cast<usize>(node_index * lane_count + column);
+                if (column < start.lane_count) {
+                    const usize start_index = static_cast<usize>(node_index * start.lane_count + column);
+                    working_u[index] = start.working_u[start_index];
+                    working_v[index] = start.working_v[start_index];
+                } else {
+                    working_u[index] *= WARM_START_NEW_LANE_SCALE;
+                    working_v[index] *= WARM_START_NEW_LANE_SCALE;
+                }
+            }
+        });
+        return fit_plane_with_selected_method(problem, ridge_regularization);
+    };
     auto keep = [&](Kept_Fit &kept, s64 lane_count, f64 error) {
         kept.lane_count = lane_count;
         kept.error = error;
@@ -2443,9 +2468,11 @@ Weight_Matrix::Plane_Fit_Result Weight_Matrix::search_fewest_lanes(s64 matrix_in
     };
 
     // Double until a lane count meets the tolerance, then bisect between it and the last that did
-    // not; or, with a required count, fit at that count alone.
+    // not; or, with a required count, fit at that count alone. Each probe after the first starts
+    // from the fit at the last lane count that did not meet it (failing).
     Kept_Fit passing;
     Kept_Fit closest;
+    Kept_Fit failing;
     s64 failing_lane_count = 0;
     Vector<Pair<s64, f64>> attempts;
     if (required_lane_count > 0) {
@@ -2460,13 +2487,14 @@ Weight_Matrix::Plane_Fit_Result Weight_Matrix::search_fewest_lanes(s64 matrix_in
     s32 unhelpful_doublings = 0;
     for (s64 lane_count = 1; required_lane_count <= 0; lane_count *= 2) {
         lane_count = min(lane_count, available);
-        const f64 error = fit_fresh(lane_count);
+        const f64 error = fit_warm(lane_count, failing);
         attempts.push_back({lane_count, error});
         if (error <= static_cast<f64>(search_tolerance)) {
             keep(passing, lane_count, error);
             break;
         }
         failing_lane_count = lane_count;
+        keep(failing, lane_count, error);
         if (closest.lane_count == 0 || error < closest.error) keep(closest, lane_count, error);
         if (lane_count >= available) break;
         unhelpful_doublings = (isfinite(previous_error) && error > (1.0 - FIT_STALL_IMPROVEMENT) * previous_error)
@@ -2482,10 +2510,14 @@ Weight_Matrix::Plane_Fit_Result Weight_Matrix::search_fewest_lanes(s64 matrix_in
     }
     while (required_lane_count <= 0 && passing.lane_count > 0 && passing.lane_count - failing_lane_count > 1) {
         const s64 middle = (passing.lane_count + failing_lane_count) / 2;
-        const f64 error = fit_fresh(middle);
+        const f64 error = fit_warm(middle, failing);
         attempts.push_back({middle, error});
-        if (error <= static_cast<f64>(search_tolerance)) keep(passing, middle, error);
-        else failing_lane_count = middle;
+        if (error <= static_cast<f64>(search_tolerance)) {
+            keep(passing, middle, error);
+        } else {
+            failing_lane_count = middle;
+            keep(failing, middle, error);
+        }
     }
 
     // Puts the chosen fit back into the basis. Every edge was touched, so its error is the plane's.
