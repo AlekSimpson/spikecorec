@@ -2,10 +2,13 @@ CompileFlags:
   Compiler: clang++
   Add:
     - "-std=c++17"
-    - "-Iinclude"
+    - "-Isrc"
+    - "-Isrc/spikecorec/core"
+    - "-Isrc/spikecorec/nml"
+    - "-Isrc/spikecorec/cuda"
+    - "-Isrc/spikecorec/metal"
     - "-Ithird_party/metal-cpp"
     - "-DSPIKECOREC_METAL"
-    - "-DSPIKECOREC_CUDA"
 
 Diagnostics:
   UnusedIncludes: None

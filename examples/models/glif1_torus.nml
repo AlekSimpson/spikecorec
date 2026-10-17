@@ -1,0 +1,44 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="Glif1Torus">
+
+    <include href="glif_cell_types.nml"/>
+
+    <GLIF1Cell id="sheetCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV"
+               t_ref="5ms" vth="-50mV"/>
+
+    <alphaCurrentSynapse id="excitatorySynapse" tau="5ms" ibase="60pA"/>
+    <alphaCurrentSynapse id="inhibitorySynapse" tau="5ms" ibase="-240pA"/>
+
+    <pulseGenerator id="seedDrive" delay="0ms" duration="500ms" amplitude="260pA"/>
+    <pulseGenerator id="backgroundDrive" delay="0ms" duration="500ms" amplitude="160pA"/>
+
+    <network id="sheetNetwork">
+        <population id="sheet" component="sheetCell" size="25"/>
+
+        <explicitInput target="sheet[0]" input="seedDrive"/>
+        <explicitInput target="sheet[1]" input="backgroundDrive"/>
+        <explicitInput target="sheet[2]" input="backgroundDrive"/>
+        <explicitInput target="sheet[3]" input="backgroundDrive"/>
+        <explicitInput target="sheet[4]" input="backgroundDrive"/>
+        <explicitInput target="sheet[5]" input="backgroundDrive"/>
+        <explicitInput target="sheet[6]" input="seedDrive"/>
+        <explicitInput target="sheet[7]" input="backgroundDrive"/>
+        <explicitInput target="sheet[8]" input="backgroundDrive"/>
+        <explicitInput target="sheet[9]" input="backgroundDrive"/>
+        <explicitInput target="sheet[10]" input="backgroundDrive"/>
+        <explicitInput target="sheet[11]" input="backgroundDrive"/>
+        <explicitInput target="sheet[12]" input="seedDrive"/>
+        <explicitInput target="sheet[13]" input="backgroundDrive"/>
+        <explicitInput target="sheet[14]" input="backgroundDrive"/>
+        <explicitInput target="sheet[15]" input="backgroundDrive"/>
+        <explicitInput target="sheet[16]" input="backgroundDrive"/>
+        <explicitInput target="sheet[17]" input="backgroundDrive"/>
+        <explicitInput target="sheet[18]" input="seedDrive"/>
+        <explicitInput target="sheet[19]" input="backgroundDrive"/>
+        <explicitInput target="sheet[20]" input="backgroundDrive"/>
+        <explicitInput target="sheet[21]" input="backgroundDrive"/>
+        <explicitInput target="sheet[22]" input="backgroundDrive"/>
+        <explicitInput target="sheet[23]" input="backgroundDrive"/>
+        <explicitInput target="sheet[24]" input="seedDrive"/>
+    </network>
+
+</neuroml>

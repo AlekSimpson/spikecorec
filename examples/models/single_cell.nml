@@ -1,0 +1,15 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="SingleCell">
+
+    <include href="glif_cell_types.nml"/>
+
+    <GLIF1Cell id="singleCell" C="100pF" gL="10nS" EL="-70mV" vreset="-70mV"
+               t_ref="5ms" vth="-50mV"/>
+
+    <pulseGenerator id="stepDrive" delay="0ms" duration="500ms" amplitude="500pA"/>
+
+    <network id="singleCellNetwork">
+        <population id="cellPopulation" component="singleCell" size="1"/>
+        <explicitInput target="cellPopulation[0]" input="stepDrive"/>
+    </network>
+
+</neuroml>

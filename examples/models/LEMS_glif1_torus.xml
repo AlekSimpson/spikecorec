@@ -1,0 +1,12 @@
+<Lems>
+    <Include file="Cells.xml"/>
+    <Include file="Synapses.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Inputs.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="glif1_torus.nml"/>
+
+    <Simulation id="sim1" length="500ms" step="0.1ms" target="sheetNetwork"/>
+
+    <Target component="sim1"/>
+</Lems>

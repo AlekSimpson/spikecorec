@@ -5,9 +5,12 @@
 #   make              — auto-detect backend and build
 #   make cuda         — build CUDA backend
 #   make metal        — build Metal backend
-#   make python       — build Python extension (pip editable install)
+#   make python       — build Python extension (editable install into .venv, via uv)
 #   make test         — build and run C++ tests
+#   make test-python  — run the Python tests in tests/python (pytest, in .venv)
 #   make examples     — build examples
+#   make cli          — build main.cpp into build/cli
+#   make metal-debug, cuda-debug, cli-debug — the same with debug info, into build/debug
 #   make clean        — remove build artifacts
 #   make info         — show detected platform/toolchain
 # ============================================================
@@ -20,16 +23,37 @@ CXX        := g++
 NVCC       := nvcc
 AR         := ar
 
+# DEBUG=1 (or a *-debug target) builds with -g -O0 into build/debug, apart from optimised ones.
+DEBUG      ?= 0
+ifeq ($(DEBUG),1)
+  OPTIMIZATION_FLAGS := -g -O0
+  BUILD_DIR          := build/debug
+else
+  OPTIMIZATION_FLAGS := -O2
+  BUILD_DIR          := build
+endif
+
 # Directories
-INC_DIR    := include
-SRC_DIR    := src
-BUILD_DIR  := build
+INC_DIR    := src
+SRC_DIR    := src/spikecorec
 TEST_DIR   := tests
 EX_DIR     := examples
 
 # Compiler flags
-CXXFLAGS   := -std=c++17 -O2 -Wall -Wextra -I$(INC_DIR)
-NVCCFLAGS  := -std=c++17 -O2 -I$(INC_DIR) --expt-relaxed-constexpr
+# -MMD -MP writes a .d file of header dependencies beside each .o (included at the bottom),
+# so editing a header rebuilds every object that uses it.
+# Headers sit beside their sources and are included by file name alone, so every source
+# directory is an include directory.
+INCLUDE_FLAGS := -I$(INC_DIR) $(addprefix -I$(SRC_DIR)/,core nml cuda metal)
+CXXFLAGS   := -std=c++17 $(OPTIMIZATION_FLAGS) -Wall -Wextra -MMD -MP $(INCLUDE_FLAGS)
+# The precompiled CUDA kernels (src/spikecorec/cuda/*.cu) are built for CUDA_ARCH, by default the
+# GPUs of the machine that builds them (for example sm_121 on a GB10). On a GPU they were not built
+# for they do not load, and the fits run their host versions.
+CUDA_ARCH  ?= native
+NVCCFLAGS  := -std=c++17 $(OPTIMIZATION_FLAGS) -MMD -MP $(INCLUDE_FLAGS) --expt-relaxed-constexpr -arch=$(CUDA_ARCH)
+ifeq ($(DEBUG),1)
+  NVCCFLAGS += -G
+endif
 ARFLAGS    := rcs
 
 # ── Platform detection ───────────────────────────────────────
@@ -40,10 +64,8 @@ CUDA_PATH  ?= /usr/local/cuda
 HAS_NVCC   := $(shell command -v nvcc 2>/dev/null && echo yes || echo no)
 
 # ── Compression library detection (.spire codec — gzip/xz/bz2) ───────────────
-# Mirrors the HAS_NVCC pattern: probe via pkg-config, define SPIKECOREC_HAVE_*
-# and append link flags only when found. Missing libraries degrade gracefully —
-# raw .spire always works; SpireWriter/Reader throw a clear runtime_error for
-# compressed variants whose library wasn't available at build time.
+# Optional: without a codec's library, raw .spire still works and that compressed format
+# throws at runtime.
 HAS_ZLIB   := $(shell pkg-config --exists zlib   && echo yes || echo no)
 HAS_LZMA   := $(shell pkg-config --exists liblzma && echo yes || echo no)
 HAS_BZ2    := $(shell pkg-config --exists bzip2  && echo yes || echo no)
@@ -63,9 +85,8 @@ ifeq ($(HAS_BZ2),yes)
   COMPRESSION_LIBS += $(shell pkg-config --libs bzip2)
 endif
 
-# ── XML parsing (libxml2 — NML/LEMS front-end, ticket #2 [A3]) ───────────────
-# Parse + XSD-validate NeuroML/LEMS XML (third_party/neuroml2/schema, std_lib).
-# Detected the same way as the compression codecs above, via pkg-config.
+# ── XML parsing (libxml2 — NML/LEMS front-end) ───────────────────────────────
+# Required: the NML sources use it to parse and XSD-validate NeuroML/LEMS documents.
 HAS_LIBXML2 := $(shell pkg-config --exists libxml-2.0 && echo yes || echo no)
 
 ifeq ($(HAS_LIBXML2),yes)
@@ -73,20 +94,23 @@ ifeq ($(HAS_LIBXML2),yes)
   LIBXML2_LIBS := $(shell pkg-config --libs libxml-2.0)
 endif
 
-# ── NeuroML/LEMS standard-library bundle path (vendored, ticket #3 [A1]) ─────
-# Baked in as an absolute path at compile time (via $(abspath), a GNU Make
-# built-in) so NML_StandardLibrary::STANDARD_LIBRARY_PATH resolves correctly
-# no matter what directory the binary is later run from.
+# ── NeuroML/LEMS standard-library bundle path (vendored) ─────────────────────
+# Absolute, so NML_Context::STANDARD_LIBRARY_PATH works from any working directory.
 NML_STD_LIB_DIR := $(abspath third_party/neuroml2/std_lib)
 CXXFLAGS        += -DSPIKECOREC_NML_STD_LIB_DIR=\"$(NML_STD_LIB_DIR)\"
 
-# ── NeuroML2 XSD schema path (vendored, ticket #8 [A2]) ──────────────────────
+# ── NeuroML2 XSD schema path (vendored) ──────────────────────────────────────
 NML_SCHEMA_PATH := $(abspath third_party/neuroml2/schema/NeuroML_v2.3.xsd)
 CXXFLAGS         += -DSPIKECOREC_NML_SCHEMA_PATH=\"$(NML_SCHEMA_PATH)\"
 
+# ── Device-code includes shared with runtime-compiled kernels ────────────────
+# A runtime-compiled Metal kernel has no include path, so the codegen reads
+# k2tree_device.metalinc from here and parses it into the kernel. Absolute, like the above.
+METAL_DEVICE_DIR := $(abspath $(SRC_DIR)/metal)
+CXXFLAGS         += -DSPIKECOREC_METAL_DEVICE_DIR=\"$(METAL_DEVICE_DIR)\"
+
 # ── Logging (spdlog, header-only, vendored submodule) ─────────────────────────
-# Header-only mode is spdlog's default (it self-defines SPDLOG_HEADER_ONLY
-# whenever SPDLOG_COMPILED_LIB isn't set) — only the active-level gate is ours to set.
+# spdlog is header-only by default; only the compile-time log level is set here.
 CXXFLAGS += -Ithird_party/spdlog/include -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
 
 # ── GoogleTest (compiled from submodule source) ───────────────────────────────
@@ -99,13 +123,12 @@ ifeq ($(UNAME_S),Darwin)
   CXX           := clang++
   METALC        := xcrun -sdk macosx metal
   METALLIB      := xcrun -sdk macosx metallib
-  METALFLAGS    := -O2
+  METALFLAGS    := $(if $(filter 1,$(DEBUG)),-gline-tables-only -frecord-sources,-O2)
   METAL_LDFLAGS := -framework Metal -framework Foundation -framework QuartzCore
   CXXFLAGS      += -Ithird_party/metal-cpp -DSPIKECOREC_METAL
 else
   HAS_METAL  := no
-  # Core .cpp files (compiled with g++) include <cuda_runtime.h>/<cuda.h>, so the
-  # CUDA headers must be on the include path for the host compiler too — not just nvcc.
+  # Host sources include the CUDA headers, so the host compiler needs CUDA's include path.
   CXXFLAGS   += -DSPIKECOREC_CUDA -I$(CUDA_PATH)/include
 endif
 
@@ -141,12 +164,15 @@ CUDA_LIB    := $(BUILD_DIR)/lib$(PROJECT)_cuda.a
 METAL_LIB   := $(BUILD_DIR)/lib$(PROJECT)_metal.a
 
 # ── Python toolchain ─────────────────────────────────────────
-PYTHON     ?= python3
-PY_INC     := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null)
-PYBIND_INC := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())" 2>/dev/null)
+# The extension builds into a uv-managed virtual environment, .venv, made on first use.
+UV              ?= uv
+VENV            := .venv
+PYTHON_VERSION  ?= 3.13
+PYTHON          := $(VENV)/bin/python
+PYTHON_PACKAGES := pybind11 numpy setuptools matplotlib
 
 # ── Top-level targets ────────────────────────────────────────
-.PHONY: all cuda metal python test examples clean info
+.PHONY: demos all cuda metal python test examples clean info cli metal-debug cuda-debug cli-debug
 
 all: $(BACKEND)
 
@@ -187,6 +213,7 @@ $(BUILD_DIR)/nml/%.o: $(SRC_DIR)/nml/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ── CUDA objects (.cu) ───────────────────────────────────────
+# The precompiled kernels Engine_Backend::load_precompiled_function finds by name.
 $(BUILD_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
@@ -197,25 +224,23 @@ $(BUILD_DIR)/metal/%.o: $(SRC_DIR)/metal/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ── Metal shaders (.metal → .air → .metallib) ────────────────
-$(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal
+$(BUILD_DIR)/metal/%.air: $(SRC_DIR)/metal/%.metal $(SRC_DIR)/metal/k2tree_device.metalinc
 	@mkdir -p $(@D)
-	$(METALC) $(METALFLAGS) -c $< -o $@
+	$(METALC) $(METALFLAGS) -I$(SRC_DIR)/metal -c $< -o $@
 
 $(BUILD_DIR)/default.metallib: $(AIR_FILES)
 	@mkdir -p $(@D)
 	$(METALLIB) $(AIR_FILES) -o $@
 
 # ── Python extension ─────────────────────────────────────────
-# Builds an editable install so `import spikecorec` works from the repo root.
-# pybind11 must be installed: pip install pybind11
+# An editable install into .venv; needs uv. The package is always rebuilt, since uv only
+# notices changes to pyproject.toml and setup.py.
 python:
-ifeq ($(PY_INC),)
-	$(error Python headers not found. Run: pip install pybind11)
-endif
-ifeq ($(PYBIND_INC),)
-	$(error pybind11 not found. Run: pip install pybind11)
-endif
-	SPIKECOREC_BACKEND=$(BACKEND) $(PYTHON) -m pip install -e . --no-build-isolation -q
+	@command -v $(UV) >/dev/null || { echo "uv not found: see https://docs.astral.sh/uv/"; exit 1; }
+	$(UV) venv --quiet --allow-existing --python $(PYTHON_VERSION) $(VENV)
+	$(UV) pip install --quiet --python $(PYTHON) $(PYTHON_PACKAGES)
+	SPIKECOREC_BACKEND=$(BACKEND) $(UV) pip install --quiet --python $(PYTHON) --no-build-isolation \
+	    --reinstall-package spikecorec -e .
 ifeq ($(BACKEND),metal)
 	$(MAKE) $(BUILD_DIR)/default.metallib
 	cp $(BUILD_DIR)/default.metallib python/spikecorec/default.metallib
@@ -223,7 +248,9 @@ endif
 	@echo "[spikecorec] Python extension installed (backend=$(BACKEND))"
 
 # ── Tests ────────────────────────────────────────────────────
-.PHONY: test test-cuda test-metal
+# `make test` builds every tests/*.cpp into one GoogleTest runner; `make test-python` runs
+# tests/python. TEST_ARGUMENTS passes through, e.g. TEST_ARGUMENTS=--gtest_filter='Units*'.
+.PHONY: test test-cuda test-metal test-python
 
 test: test-$(BACKEND)
 
@@ -233,31 +260,90 @@ $(GTEST_OBJ): $(GTEST_DIR)/src/gtest-all.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -I$(GTEST_DIR) -c $< -o $@
 
-test-cuda: check-cuda $(CUDA_LIB) $(GTEST_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
+# One object per test file. The fixture directory is absolute, so any working directory works.
+TEST_CXXFLAGS := $(CXXFLAGS) -I$(TEST_DIR) -DSPIKECOREC_TEST_FIXTURE_DIR=\"$(abspath $(TEST_DIR))/fixtures\"
+TEST_OBJS     := $(patsubst $(TEST_DIR)/%.cpp, $(BUILD_DIR)/tests/%.o, $(TEST_CORE_SRCS))
+
+$(BUILD_DIR)/tests/%.o: $(TEST_DIR)/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(TEST_CXXFLAGS) -c $< -o $@
+
+test-cuda: check-cuda $(CUDA_LIB) $(GTEST_OBJ) $(TEST_OBJS)
+	$(CXX) $(TEST_OBJS) $(GTEST_OBJ) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_cuda $(CUDA_LINK) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_cuda
-	$(BUILD_DIR)/test_runner_cuda
+	$(BUILD_DIR)/test_runner_cuda $(TEST_ARGUMENTS)
 
-test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_CORE_SRCS) $(GTEST_OBJ) \
+test-metal: check-metal $(METAL_LIB) $(BUILD_DIR)/default.metallib $(GTEST_OBJ) $(TEST_OBJS)
+	$(CXX) $(TEST_OBJS) $(GTEST_OBJ) \
 	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
 	    -o $(BUILD_DIR)/test_runner_metal
-	$(BUILD_DIR)/test_runner_metal
+	$(BUILD_DIR)/test_runner_metal $(TEST_ARGUMENTS)
+
+test-python: python
+	$(UV) pip install --quiet --python $(PYTHON) pytest
+	$(PYTHON) -m pytest $(TEST_DIR)/python $(TEST_ARGUMENTS)
+
+# ── Command-line program ─────────────────────────────────────
+# Builds CLI_SOURCE into $(BUILD_DIR)/cli, beside default.metallib, where the engine looks for it.
+CLI_SOURCE  ?= main.cpp
+CLI_PROGRAM := $(BUILD_DIR)/cli
+
+ifeq ($(BACKEND),metal)
+  CLI_LIBRARY := $(METAL_LIB) $(BUILD_DIR)/default.metallib
+  CLI_LINK    := -l$(PROJECT)_metal $(METAL_LDFLAGS)
+else
+  CLI_LIBRARY := $(CUDA_LIB)
+  CLI_LINK    := -l$(PROJECT)_cuda $(CUDA_LINK)
+endif
+
+cli: check-$(BACKEND) $(CLI_PROGRAM)
+	@echo "[spikecorec] command-line program built → $(CLI_PROGRAM)"
+
+$(CLI_PROGRAM): $(CLI_SOURCE) $(CLI_LIBRARY)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(CLI_SOURCE) \
+	    -L$(BUILD_DIR) $(CLI_LINK) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
+	    -o $@
+
+# ── Debug builds ─────────────────────────────────────────────
+# The optimised target of the same name, rebuilt with DEBUG=1 into build/debug.
+metal-debug cuda-debug cli-debug:
+	$(MAKE) DEBUG=1 $(@:-debug=)
 
 # ── Examples ─────────────────────────────────────────────────
 examples: examples-$(BACKEND)
 
 examples-cuda: check-cuda $(CUDA_LIB)
-	$(NVCC) $(NVCCFLAGS) $(EX_DIR)/cuda_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_cuda \
-	    -L$(CUDA_PATH)/lib64/stubs -lcudart -lcuda -lnvrtc $(COMPRESSION_LIBS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/cuda_example
+	@echo "[spikecorec] examples are Metal-only: the example build rule links the Metal library."
+	@false
 
-examples-metal: check-metal $(METAL_LIB)
-	$(CXX) $(CXXFLAGS) $(EX_DIR)/metal_example.cpp \
-	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(LIBXML2_LIBS) \
-	    -o $(BUILD_DIR)/metal_example
+# Every .cpp directly in examples/ is one example program.
+EX_PROGRAMS := $(patsubst $(EX_DIR)/%.cpp, $(BUILD_DIR)/examples/%, $(wildcard $(EX_DIR)/*.cpp))
+
+examples-metal: check-metal $(EX_PROGRAMS)
+	@echo "[spikecorec] examples built → $(BUILD_DIR)/examples/"
+
+# ── Demos ────────────────────────────────────────────────────
+# Runs every examples/demo_*.py with the .venv Python.
+PYTHON_DEMOS := $(sort $(wildcard $(EX_DIR)/demo_*.py))
+
+demos: python
+	@for demo in $(PYTHON_DEMOS); do \
+	    echo "[spikecorec] $$demo"; \
+	    $(PYTHON) $$demo || exit 1; \
+	done
+	@echo "[spikecorec] demos rendered → $(BUILD_DIR)/demos/"
+
+# `make build/examples/<name>` builds examples/<name>.cpp alone. Every examples/ header is a
+# dependency of every example, so no example runs stale header values.
+EX_HEADERS := $(wildcard $(EX_DIR)/*.h)
+
+$(BUILD_DIR)/examples/%: $(EX_DIR)/%.cpp $(EX_HEADERS) $(METAL_LIB) $(BUILD_DIR)/default.metallib
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $< \
+	    -L$(BUILD_DIR) -l$(PROJECT)_metal $(METAL_LDFLAGS) $(COMPRESSION_LIBS) $(LIBXML2_LIBS) -lpthread \
+	    -o $@
 
 # ── Utilities ────────────────────────────────────────────────
 info:
@@ -277,3 +363,9 @@ compdb:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# ── Header dependencies ──────────────────────────────────────
+# The .d files from -MMD -MP. `-include`, since a clean tree has none yet.
+DEPENDENCY_FILES := $(CORE_OBJS:.o=.d) $(NML_OBJS:.o=.d) $(METAL_OBJS:.o=.d) $(CUDA_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
+                    $(CLI_PROGRAM).d
+-include $(DEPENDENCY_FILES)
