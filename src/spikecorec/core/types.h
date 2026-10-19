@@ -50,6 +50,9 @@ namespace spikecorec {
     using u64 = uint64_t;
     using usize = size_t;
 
+    template <typename Type>
+    using Unordered_Set = std::unordered_set<Type>;
+
     template <typename Key_Type, typename Value_Type>
     using Unordered_Map = std::unordered_map<Key_Type, Value_Type>;
 

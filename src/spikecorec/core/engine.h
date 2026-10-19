@@ -75,7 +75,7 @@ namespace spikecorec {
         s32 run_count = 0;
 
         // The slab Codegen::allocate_cell_model_memory carves the model buffers from.
-        Engine_Pointer model_pointer;
+        Engine_Pointer base_pointer;
 
         // The slab holding the device copy of the runs, for the per-edge synapse prototype lookup.
         Engine_Pointer run_pointer;
@@ -83,15 +83,7 @@ namespace spikecorec {
         Engine_Pointer run_synapse_prototype;   // s32[run count]
 
         Engine_Pointer cell_state;
-
-        // Two rows alternating by tick parity: a neuron drains one row while this tick's scatters
-        // land in the other, so synaptic latency is exactly one tick whatever the thread order.
-        // With weighted arrivals (see Synapse_Delivery) or a tracked total (see Tracked_Total) three
-        // more: the increments arriving on a tick, by tick parity like the first two, and a running
-        // sum per neuron: of the arrivals, which its select reads with the tick's other input, or for
-        // a tracked total the total less its tracker. An arrival is sent the tick before it arrives,
-        // so it reaches its target exactly a delay after its spike.
-        Engine_Pointer network_inputs;     // [2 or 5][total_neuron_count]
+        Engine_Pointer network_inputs;     // [modulo][total_neuron_count]
 
         Engine_Pointer empty_edge_plane;
 
@@ -106,12 +98,13 @@ namespace spikecorec {
 
         // Seeded with simulation_seed; draws OnStart random() values, then random_values per tick.
         Random_Generator random_generator;
+
         // Slab for this tick's uniform draws: one per random() call per neuron or input entry.
         Engine_Pointer random_values_pointer;
         Engine_Pointer random_values;      // f32[max(1, random_values_count)]
         s64 random_values_count = 0;
 
-        // Kernel-run inputs, carved from model_pointer. An entry is one input on one target cell.
+        // Kernel-run inputs. An entry is one input on one target cell.
         Engine_Pointer input_row_start;        // s64[total_neuron_count + 1]: neuron n's first entry
         Engine_Pointer input_entry_prototype;  // s32[entries]: which input each entry runs
         Engine_Pointer input_values;           // f32[entries][input_value_stride]: weight, then state
@@ -179,6 +172,7 @@ namespace spikecorec {
         s64 minimum_ticks_between_refits = 1000;
         // The construction fit counts as a refit at tick 0.
         s64 last_refit_tick = 0;
+
         s64 plasticity_fold_every_n_ticks = 64;
         f32 plasticity_learning_rate = 0.01f;
         f32 plasticity_l2_regularization = 1e-6f;
@@ -245,14 +239,14 @@ namespace spikecorec {
         // Every connection as one entry of five arrays: source_neurons[index] -> target_neurons[index]
         // carries synapse synapse_indices[index] (an index into synapse_component_ids), weights[index]
         // and delays_seconds[index]. The entries may come in any order, and each ordered pair at most once.
-        struct Connection_Arrays {
-            s64 connection_count = 0;
-            const u32 *source_neurons = nullptr;
-            const u32 *target_neurons = nullptr;
-            const s32 *synapse_indices = nullptr;
-            const f32 *weights = nullptr;
-            const f32 *delays_seconds = nullptr;
-        };
+        // struct Connection_Arrays {
+        //     s64 connection_count = 0;
+        //     const u32 *source_neurons = nullptr;
+        //     const u32 *target_neurons = nullptr;
+        //     const s32 *synapse_indices = nullptr;
+        //     const f32 *weights = nullptr;
+        //     const f32 *delays_seconds = nullptr;
+        // };
 
         // The same, with the connections from `connections`, whose arrays are read during
         // construction only. Neurons are numbered across the document's populations in order.
@@ -268,52 +262,34 @@ namespace spikecorec {
 
         ~Spike_Engine();
 
-        // Steps every tick of the run not yet stepped, so it resumes a stopped run. after_each_tick,
-        // when given, is called with each tick once it is done; an exception it throws stops the
-        // run. Throws once every tick has run: the engine holds one run's state.
         void run(const Function<void(s64)> &after_each_tick = nullptr);
 
-        // Ticks run in order: tick must be ticks_stepped, below lifetime. The kernel's parity rows,
-        // rings and spike trains assume it. Throws otherwise, and after shutdown().
         void step_simulation(s64 tick);
 
         // Sets the refit threshold and resizes S to match, never below the updates it holds.
-        void set_refit_occupancy_threshold_fraction(f32 fraction);
+        void set_S_buffer_refit_threshold(f32 fraction);
 
-        // The state variable named `variable_name` for one neuron, read back from the GPU.
         [[nodiscard]] f32 read_state_variable(s64 neuron_index, const String &variable_name) const;
 
-        // The weight-matrix plane holding StateVariable `variable_name` of the named synapse. Throws
-        // for a synapse that keeps it in no plane: one that delivers weighted arrivals.
         [[nodiscard]] s64 synapse_state_variable_plane(const String &synapse_component_id,
                                                        const String &variable_name) const;
 
-        // Spikes per neuron per second over the ticks stepped so far, and the fraction of neurons
-        // that spiked at least once.
         [[nodiscard]] f64 mean_firing_rate_hertz() const;
         [[nodiscard]] f64 fraction_of_neurons_that_spiked() const;
 
-        // Writes every OutputFile and EventOutputFile the document declares, a relative fileName
-        // relative to the LEMS file. Throws when a file cannot be written.
         void write_recordings();
 
         void record_membrane_video(const String &path, s64 frame_stride = 1);
 
-        // Writes every spike as "time<tab>neuron" (an EventOutputFile's TIME_ID format) without
-        // needing one EventSelection per neuron. Call after run(). Throws when it cannot write.
+        // Writes every spike as "time<tab>neuron"
+        // Call after run()
         void write_spike_file(const String &path) const;
 
         void shutdown();
 
     private:
-        // The slab starts uninitialized: zeroes the accumulators and spike history, and marks
-        // every neuron as never spiked.
         void initialize_model_buffers();
 
-        // Builds the weight matrix from network_data, or from the adjacency topology when one was
-        // given: planes weight, delay, then the synapse state variables kept per connection, fitted
-        // from each run's starting values. Also copies the runs to the device, and starts each
-        // neuron's sum of weighted arrivals at its connections' starting values.
         void build_weight_matrix(const Codegen &compiler, s64 matrix_count, s64 updated_plane_count);
 
         // Per synapse id, the StateVariables kept per connection, in plane order from
@@ -329,36 +305,33 @@ namespace spikecorec {
         // Where one neuron's variable sits in cell_state.
         [[nodiscard]] s64 cell_memory_index_of(s64 neuron_index, const String &variable_name) const;
 
-        // Every public constructor runs this one. With connection_arrays set its connections are
-        // used; otherwise, with adjacency empty, the document's; otherwise adjacency's, with their
-        // values from connection_values when it is set, and from synapse_proportions,
-        // connection_weight and connection_delay_seconds when not.
+        // Every public constructor runs this one
         Spike_Engine(const String &lems_input_file,
-                    const Vector<Vector<s32>> &adjacency,
-                    const Vector<String> &synapse_component_ids,
-                    const Vector<f64> &synapse_proportions,
-                    f64 connection_weight,
-                    f64 connection_delay_seconds,
-                    const Connection_Values_Function &connection_values,
-                    const Connection_Arrays *connection_arrays,
-                    bool enable_hebbian_plasticity,
-                    f32 fit_tolerance,
-                    Weight_Matrix::Fit_Method fit_method,
-                    f32 expected_active_edge_fraction);
+                     const Vector<Vector<s32>> &adjacency,
+                     const Vector<String> &synapse_component_ids,
+                     const Vector<f64> &synapse_proportions,
+                     f64 connection_weight,
+                     f64 connection_delay_seconds,
+                     const Connection_Values_Function &connection_values,
+                     const Connection_Arrays *connection_arrays,
+                     bool enable_hebbian_plasticity,
+                     f32 fit_tolerance,
+                     Weight_Matrix::Fit_Method fit_method,
+                     f32 expected_active_edge_fraction);
 
         // A Connection_Arrays' connections by source, for apply_topology: adjacency[source] lists
         // source's targets ascending, and array_index[row_start[source] + position] is the index in
         // the arrays of the connection to adjacency[source][position]. Kept only during construction.
-        struct Connection_Rows {
-            Vector<Vector<s32>> adjacency;
-            Vector<s64> row_start;
-            Vector<u32> array_index;
-        };
-        Connection_Rows connection_rows;
+        // struct Connection_Rows {
+        //     Vector<Vector<s32>> adjacency;
+        //     Vector<s64> row_start;
+        //     Vector<u32> array_index;
+        // };
+        // Connection_Rows connection_rows;
 
         // Sorts `connections` into connection_rows, one row per neuron. Throws on a missing array,
         // a neuron outside the network, or an ordered pair given twice.
-        void sort_connection_arrays(const Connection_Arrays &connections, s64 neuron_count);
+        // void sort_connection_arrays(const Connection_Arrays &connections, s64 neuron_count);
 
         // Replaces the document's connections with `adjacency`: each connection's values come from
         // connection_values when it is set, and otherwise the connections are split across the
