@@ -276,8 +276,12 @@ spc.Spike_Engine("LEMS_refused.xml", [[1], []], "conductanceSynapse")
 
 ## Tutorial
 
-`examples/notebooks/01_tutorial_getting_started.py` is the tutorial in jupytext format:
-`jupytext --to ipynb 01_tutorial_getting_started.py`.
+Two tutorial notebooks (run `make python` first, then open them from `examples/notebooks/`):
+- `examples/notebooks/01_tutorial_getting_started.ipynb`: from one cell to a small E/I network,
+  recording, the tick loop, refusals and the parsed model.
+- `examples/notebooks/02_tutorial_large_networks.ipynb`: the Vogels-Abbott CUBA network from numpy
+  arrays, what the weight matrix holds and how much memory it takes, structured against random
+  weights, a membrane video and the generated code.
 
 ## Logging
 

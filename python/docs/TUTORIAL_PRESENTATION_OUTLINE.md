@@ -1,363 +1,526 @@
-# spikecorec: an introductory tutorial
+# spikecorec: lab presentation outline (draft)
 
-Slide outline for a lab presentation to computational neuroscience researchers who have not
-used spikecorec. It moves from the big picture to concepts, then what the engine
-supports, then the Python API from first run to advanced use, and ends with internals.
-Each slide only uses ideas introduced on earlier ones.
+Draft of 2026-10-19. The talk is for the lab: modelers and biologists, most of whom have not
+used spikecorec. Assume no GPU or compression background and explain each step. The PI's
+request (2026-10-16) was to "go back to the beginning and just explain the main ideas"; it
+does not need to be finished.
+
+**Format:** six parts, about 26 slides plus live demos, roughly 40 minutes. Each slide lists:
+- what it says;
+- the visual;
+- speaker notes, where the point is not obvious.
+
+`[TODO]` marks what only the presenter can supply. The numbers are measured; their sources are
+listed at the end.
+
+**The demos and their tutorials:**
+- `examples/notebooks/01_tutorial_getting_started.ipynb`: one cell to a small E/I network.
+- `examples/notebooks/02_tutorial_large_networks.ipynb`: the CUBA benchmark network from numpy
+  arrays, what the weight matrix holds and how much memory it takes, structured against random
+  weights, a membrane video, and the generated code.
+
+**Time budget:**
+
+| Part | Slides | Minutes |
+|---|---|---|
+| 1. Introduction | 1-3 | 3 |
+| 2. The olfactory bulb model | 4-7 | 6 |
+| 3. spikecorec | 8-15 | 10 |
+| 4. The weight matrix | 16-21 | 9 |
+| 5. Pros and cons | 22-23 | 4 |
+| 6. Usage and demos | 24-28 | 8 |
 
 ---
 
-## Part 1: The big picture
+## Part 1: Introduction
 
 ### Slide 1: Title
-- spikecorec: GPU spiking-network simulation from NeuroML
-- Tutorial for the lab: what it is, why it exists, and how to use it from Python
-- Presenter, date, link to the repository
+- spikecorec: large spiking networks on one GPU, from NeuroML
+- Presenter, lab, date, and a link to the repository
+- **Visual:** the CUBA network's membrane video looping (notebook 02, section 7)
 
-### Slide 2: Agenda
-- What spikecorec is, and why we built it
-- The few concepts you need: NeuroML/LEMS, ticks, how a run works
-- What the engine can simulate today, and what it refuses
-- The Python API, from a one-line run to inspecting the model and connectivity
-- Under the hood: how connectivity is compressed, and how accurate it is
-- Limitations, roadmap, resources
+### Slide 2: Where this talk goes
+- The olfactory bulb model we work with, and what made it hard to work with in NEURON
+- spikecorec: what it is and what it can simulate
+- The weight matrix: how it stores a network's connections, and what that costs
+- Using it from Python: demos
 
-### Slide 3: What is spikecorec?
-- A simulation engine for spiking neural networks that runs on the GPU
-- Input: a standard NeuroML/LEMS model description
-- Output: spikes, membrane traces and recordings, in Python as numpy arrays
-- It generates GPU code for your model's dynamics; nothing is hand-written per model
-- Used from Python (`import spikecorec`), built in C++ underneath
-
-### Slide 4: Why build it?
-- **Scale:** connectivity is the memory bottleneck. A dense weight matrix for 1 million
-  neurons is 10¹² entries, about 4 TB of float32
-- **Standard models:** describe a model once in NeuroML and simulate it; no simulator-specific
-  model code
-- **Any dynamics, no kernel writing:** cell and synapse equations come from the model's LEMS
-  definitions, and the GPU code is generated from them
-- **Speed:** the whole network advances in parallel on the GPU, every timestep
-- **Accessible:** a small Python API for researchers who don't write GPU code
-- Speaker prompt: where this fits next to the tools the lab already uses
-
-### Slide 5: The core ideas in one slide
-- **NeuroML in:** the model file defines cells, synapses, network, stimulus and run length
-- **Code generation:** the engine turns the model's equations into one GPU program, compiled
-  when the engine is built
-- **Clock-driven:** the network advances in fixed timesteps ("ticks")
-- **Compressed connectivity:** which neurons connect, and every per-connection value, are
-  stored compressed rather than as a dense matrix
-- **Python on top:** build, run and read results from a notebook
+### Slide 3: The goal
+- Simulate large networks of spiking neurons quickly, on hardware the lab has: a Mac, or one
+  machine with an NVIDIA GPU
+- The model is a standard document (NeuroML), not code written for one simulator
+- At scale the limit is memory for the connections, not the neurons. Take 1 million neurons
+  with 1,000 connections each, and a weight, a delay and one synapse variable per connection:
+  - 1 billion connections;
+  - about 32 GB as plain sparse lists in both directions;
+  - 4 TB per value as a dense matrix.
+- spikecorec stores connectivity compressed, so that networks like this fit on one GPU
+- **Say:** the engine is the means. The goal is to iterate on network models quickly.
 
 ---
 
-## Part 2: Concepts you need
+## Part 2: The olfactory bulb model
 
-### Slide 6: NeuroML and LEMS in two minutes
-- **NeuroML (.nml):** the model itself: cells, synapses, populations, projections and inputs
-- **LEMS (.xml):** the simulation settings: timestep, duration, which network, what to record
-- **ComponentTypes:** each cell or synapse type defines its own parameters and dynamics
-  (state variables, time derivatives, threshold conditions, spike events)
-- **Standard library:** the NeuroML core ComponentTypes are included, so a model only
-  declares its instances; your own custom ComponentTypes work the same way
-- Show: `examples/models/single_cell.nml` and `LEMS_single_cell.xml`
+### Slide 4: The OB model
+- Birgiolas (2019), ASU dissertation: *Towards Brains in the Cloud: A Biophysically Realistic
+  Computational Model of Olfactory Bulb*
+- **Cells:** mitral, tufted and granule cells, five variants of each, with reconstructed
+  morphologies (NeuroMorpho.org). They were fitted to and validated against experimental data
+  with NeuronUnit.
+- **Network:**
+  - cells are placed in the bulb's layers, as reconstructed in Blender;
+  - reciprocal dendrodendritic synapses (AMPA/NMDA onto granule cells, GABA back) form wherever
+    dendrites pass within 5 µm;
+  - gap junctions join the tufts within a glomerulus.
+- **Input and output:** odor input as glomerular activation patterns; output includes a
+  simulated LFP.
+- **Result:** reproduces the two-cluster gamma fingerprint (30-120 Hz) in the LFP
+- **Our use:** the ketamine / HFO question, and gamma-beta alternation
+- **Visual:**
+  - first `OlfactoryBulb/media/cell-gallery-start.jpg` and `reconstructed-bulb-layers.png`;
+  - then `gamma-fingerprint-simulation-output.png`.
+- **Say:** keep this short, since the lab knows the model. It sets up what follows.
 
-### Slide 7: How a run works: ticks
-- Time advances in steps of `dt`, which the LEMS file sets (e.g. 0.05 ms)
+### Slide 5: NEURON and NeuroML
+- **NEURON** is the standard simulator for biophysically detailed neurons:
+  - each cell is a tree of cable sections;
+  - ion channels and synapses are mechanisms written in NMODL (`.mod` files);
+  - models are built in hoc or Python;
+  - large networks run in parallel over MPI.
+- **The OB model is written for NEURON:**
+  - 13 `.mod` mechanisms;
+  - cells from NEURON's Cell Builder, wrapped in Python;
+  - the network built from slice files;
+  - parameter sets as Python classes.
+- **NeuroML** is a standard, simulator-independent description of a model in XML: cells,
+  channels, synapses, populations, projections and inputs.
+- **LEMS**, underneath NeuroML, defines each type's dynamics: state variables, equations and
+  events. One NeuroML model runs in NEURON, NEST, Brian and others through jNeuroML/pyNeuroML.
+- **The OB model has no NeuroML version.** What exists so far:
+  - the live NEURON model dumped to one flat hoc file (`export.py`);
+  - the slice's connectivity as an adjacency list (`parse_topology.py`).
+- **Visual:** a small integrate-and-fire cell as NeuroML (`examples/models/single_cell.nml`)
+
+### Slide 6: Challenges with NEURON
+- **BlenderNEURON:**
+  - The network's structure is built interactively: NEURON sends the cells to Blender, where
+    they are placed and bent into the bulb's layers.
+  - Rebuilding or changing the structure needs Blender, the add-on and the `.blend` files.
+  - It was one student's tool, it is limited, and much of it is visualization the simulation
+    doesn't need.
+- **Model control:**
+  - A model's settings live in many places: `.mod` files, hoc, Python parameter classes, an
+    SQLite database and the slice files.
+  - Some values are hard to justify; tufted cells have a specific capacitance of
+    7.9 µF/cm², for example.
+  - It is hard to isolate which mechanism produces an effect, such as what drives the HFO in
+    the LFP.
+  - It was built for one study, and is hard to iterate on.
+- **Performance:**
+  - The documented run is a 1.8 s simulation of a 193-cell slice (10 mitral, 24 tufted,
+    159 granule cells), on 16 MPI processes.
+  - The documentation plans for 96-core cloud machines.
+  - `[TODO: your own measured run time for one simulation]`
+  - Parameter sweeps and larger slices are out of reach on a workstation.
+- **Say:** none of this is a fault of NEURON for what it is built for, which is detailed
+  single-cell biophysics. It is what got in the way of network-level questions.
+
+### Slide 7: What we wanted instead
+- **The model as a document:** change a value in one place and rerun; the same file runs in
+  other simulators
+- **Network-level questions with point neurons:** many runs, each quick
+- **Scale:** from hundreds of cells to millions, on one machine
+- **Python first:** notebooks, with numpy in and out
+- **Visual:** the four points, leading into spikecorec
+
+---
+
+## Part 3: spikecorec
+
+### Slide 8: What spikecorec is
+- A simulator for networks of spiking point neurons
+- **In:** a NeuroML/LEMS model. **Out:** spikes and state traces, as numpy arrays
+- It generates GPU code from the model's own equations and compiles it when the engine is
+  built; nothing is written by hand for each model
+- **Clock-driven:** the whole network advances one timestep (a "tick") at a time, with every
+  neuron in parallel
+- A C++ engine with a Python package on top
+- **Visual:** the pipeline as a diagram:
+  - LEMS + NeuroML + the standard types;
+  - parse, validate, resolve units and paths;
+  - one GPU kernel, compiled;
+  - spikes and traces.
+
+### Slide 9: How a run works
 - Each tick, for every neuron in parallel:
-  - run the cell's inputs, which add to what the cell reads
-  - integrate the cell's equations one step (forward Euler)
-  - detect threshold crossings, emit spikes, reset
-  - deliver spikes along outgoing connections, after each connection's delay
-  - update synapse state and record
-- Events (thresholds, spike arrivals) are checks made every tick, not a separate event queue
-- A spike reaches its target at least one tick after it fires
+  - run its inputs;
+  - integrate its equations one `dt` (forward Euler);
+  - detect the threshold, spike and reset;
+  - deliver spikes along its outgoing connections, after each connection's delay;
+  - record.
+- Thresholds and arrivals are checks made every tick, not a queue of events
+- A spike reaches its target exactly its delay later, and at least one tick later
+- **Visual:** the nine stages as a ring: Deliver, Integrate, Detect, Emit, Reset, Propagate,
+  Plasticity, Record, Advance. Stages 2-5 are the model's own dynamics, which the generated
+  code fills in.
 
-### Slide 8: What happens when you create an engine
-- Parse the LEMS file, the NeuroML files it includes, and the standard library types they use
-- Allocate GPU memory for every cell's state
-- Build the compressed connectivity and fit every per-connection value; a short calibration
-  run, after which every state is restored, sizes the synapse-state planes
-- Generate the GPU program for this model and compile it
-- Construction is the expensive step; ticks after it are fast
-- Unsupported models fail here, with a message naming the component and the reason
+### Slide 10: Current-based synapses
+- A synapse adds a current to its target. The current depends on the synapse's own state and
+  its connection's weight, never on the target's voltage.
+- **For contrast:** a conductance-based synapse scales by (E_rev - V) of its target.
+  spikecorec refuses those when the engine is built, and says why.
+- **Why this design:**
+  - a synapse's update runs while its source's connections are walked, and needs nothing from
+    the target;
+  - every connection still keeps its own synapse state, for example its own exponential or
+    alpha current.
+- **Delta synapses** (each spike adds a fixed jump to the target) keep no state at all. A neuron
+  walks its connections only on the tick an arrival is due.
+- The standard large-network benchmarks are current-based: Brunel 2000, Vogels-Abbott CUBA and
+  Potjans-Diesmann 2014
+- **Say:** this is the main modelling restriction, and it is what makes per-connection state
+  cheap.
+
+### Slide 11: Arbitrary topologies
+- Any directed graph: recurrent or feedforward, any degree distribution, self-connections
+  included
+- Every connection has its own weight, delay and synapse type, with several synapse types in
+  one network
+- Repeated connections between one pair (multapses) become one connection whose synapse
+  carries the multiplicity
+- **Three ways in:**
+  - projections written in the NeuroML document;
+  - from Python: an adjacency list, or a function that gives each connection's values;
+  - five numpy arrays (source, target, synapse, weight, delay), for millions of connections.
+- Built-in generators: a torus grid, a small world, and a random graph with fixed out-degree
+- **Measured:** Brunel's model A (12,500 neurons, 14.9 million connections) builds in 4.4 s
+  from arrays
+- **Visual:** the same three-cell chain as XML connections, as an adjacency list, and as
+  arrays
+
+### Slide 12: NeuroML support
+- Reads standard LEMS/NeuroML with the NeuroML core types included; custom ComponentTypes work
+  the same way
+- **Cells:** any point-neuron type built from LEMS dynamics. That covers:
+  - state variables, derived variables and time derivatives;
+  - threshold conditions and spike handlers;
+  - an integrating/refractory regime pair;
+  - `random()`.
+  This includes GLIF1-5, the integrate-and-fire variants, Izhikevich, AdEx, the PyNN cells, and
+  your own types.
+- **Synapses:** current-based, with their own kinetics
+- **Inputs:** every NeuroML input (pulse, sine, ramp, Poisson, spike arrays, voltage clamps),
+  run on the GPU
+- **Recording:** the document's output files, plus every spike and membrane videos
+- Anything outside this is refused when the engine is built, naming the component and the
+  reason. It never runs silently wrong.
+- **Visual:** the CUBA demo's custom cell, side by side with its generated line:
+  - the cell is PyNN's `IF_curr_exp` plus a random starting voltage, about 25 lines of LEMS;
+  - its `TimeDerivative` becomes one line of generated code (notebook 02, section 8).
+
+### Slide 13: GPU accelerated by default
+- **Backends:**
+  - Metal on Apple silicon Macs;
+  - CUDA on NVIDIA GPUs, tested on an NVIDIA GB10 (DGX Spark) with CUDA 13.
+- The same model runs on either; the backend is chosen when spikecorec is built
+- One GPU thread per neuron. The model's kernel is compiled at run time for the device.
+- The weight-matrix fits also run on the GPU, with a CPU fallback
+- Both test suites pass on both backends: 238 C++ tests and 24 Python tests
+- **Speed** (M5 Max, Metal, a baseline from before any speed work; 20 connections per neuron,
+  alpha synapses):
+
+  | Neurons | Connections | ms per tick | Ticks per second |
+  |---|---|---|---|
+  | 1,024 | 20,480 | 1.25 | ~800 |
+  | 10,000 | 200,000 | 4.1 | ~247 |
+  | 99,856 | 2.0 M | 84 | ~12 |
+  | 10,000, no connections | 0 | 0.18 | ~5,500 |
+
+- **Say:** connections, not neurons, are what cost time.
+
+### Slide 14: The Python package
+- `import spikecorec as spc`, built with `make python`
+- **A complete run in three lines:**
+  - `engine = spc.Spike_Engine("LEMS_model.xml")`
+  - `engine.run()`
+  - `times, neurons = engine.recorded_spikes`
+- numpy in (connection arrays) and numpy out (spikes, state and recordings)
+- The API mirrors the C++ engine one to one. From Python you can inspect:
+  - the parsed model (`spc.nml`);
+  - the weight matrix;
+  - the generated GPU code.
+- **Docs:**
+  - `python/docs/README.md`, the guide;
+  - `python/docs/API_REFERENCE.md`, every name;
+  - the two tutorial notebooks.
+
+### Slide 15: Does it give the right answers?
+- **Method:** validated statistically against NEST (the reference) and Brian2 on standard
+  networks, 10 seeds each:
+  - statistics: firing rates, ISI CV, pairwise correlations and spectra;
+  - score: the KL divergence of each statistic's distribution, divided by NEST's own
+    seed-to-seed spread (pass ≤ 1, marginal 1-2, fail > 2);
+  - Brian2 is scored the same way, as a check on the scoring.
+- **Vogels-Abbott CUBA** (4,000 neurons): 5 of 6 pass, and the excitatory CV is marginal
+  (1.07). Rates are 5.69 / 5.62 Hz against NEST's 5.49 / 5.55.
+- **Brunel 2000 model A**, points A-D (12,500 neurons):
+  - A, B and C pass; A's correlation is marginal at 1.29 (Brian2: 1.23);
+  - D's rate is 3.4% low and fails, which we trace to forward Euler on the leak.
+- **Brunel phase diagram** (59 grid points): the same dynamical regime as NEST at 56 points
+  (Brian2: 54)
+- **Potjans-Diesmann microcircuit** (77,000 neurons, 299 million synapses): in progress
+- **Visual:** the scorecard, figure 6 `[TODO: make it]`. Until then use
+  `spikecore_runs/figures/output/m2_figure_3_verdicts.png` and `m2_figure_1_raster.png`.
+- **Say:** we don't compare spike times. In a chaotic network a 10⁻¹³ change in one voltage
+  diverges, so what must match is the statistics.
 
 ---
 
-## Part 3: What it simulates today
+## Part 4: The weight matrix
 
-### Slide 9: Kinds of SNN models supported today
-- **Networks:** networks of point neurons (single-compartment), clock-driven
-  - several cell types in one network, one per population
-  - excitatory and inhibitory populations, with several synapse types in one network
-  - any sparse connectivity, recurrent or feedforward: grids, small-world, random or
-    hand-specified, self-connections included, with a weight and delay on every connection
-  - driven by constant-current pulses (`pulseGenerator`), spike lists (`spikeArray`) and
-    populations of random spike sources (for example `spikeGeneratorPoisson`)
-- **Neurons:**
-  - leaky integrate-and-fire with threshold and reset
-  - with timed refractory periods
-  - with adaptation: after-spike currents and threshold adaptation
-  - nonlinear integrate-and-fire with a recovery variable, reset when the voltage peaks
-  - adaptive exponential integrate-and-fire (`adExIaFCell`), adapting through its refractory period
-  - spike sources with random intervals, such as Poisson generators
-  - custom point-neuron models written in LEMS from the same building blocks
-- **Synapses:**
-  - current-based, with their own LEMS kinetics (for example exponential or alpha-shaped
-    current), and separate state on every connection
-  - instantaneous (delta) synapses, whose state only an `OnEvent` increments by the weight:
-    each spike adds its jump to the target exactly one delay later, with no state kept per
-    connection
-- The next slides give the exact constraints a model has to fit
+### Slide 16: The storage problem
+- A network's connections dominate its memory: N neurons and E connections, each carrying P
+  values (weight, delay and each synapse state variable)
+- **Dense matrix:** N² × P floats, so 4 TB per value at 1 million neurons
+- **Sparse lists (CSR):** one index plus P values per connection. Walking outgoing connections
+  (spikes) and incoming ones (fits, inspection) needs two copies, CSR + CSC.
+- Real networks are built by rules (populations, probabilities, cell properties), so the
+  values have structure that plain lists don't use
+- spikecorec stores the two halves separately:
+  - which pairs connect (the topology);
+  - the values on them.
+- **Visual:** an adjacency matrix, mostly empty, with the connections coloured by weight
 
-### Slide 10: Cell models
-- Any point-neuron ComponentType, standard or custom, whose LEMS `<Dynamics>` is built from:
-  - state variables with starting values (`OnStart`)
-  - derived variables, including conditional ones
-  - time derivatives, integrated with forward Euler every tick
-  - threshold conditions (`OnCondition`) that assign state and emit spikes
-  - spike handlers (`OnEvent`) that run once for each spike reaching the cell
-  - optionally a refractory period: an integrating regime and a refractory regime that
-    transitions back to it. Either regime can have its own time derivatives, conditions and
-    `OnEntry`
-  - `random()`, a fresh draw for each neuron on every call, seeded by the simulation's seed
-- Every name in the equations has to be a state variable, parameter, constant or derived
-  variable
-- Each population can use a different cell type; one GPU program covers all of them
+### Slide 17: Topology: the k²-tree
+- **Structure:**
+  - Split the N × N adjacency matrix into 4 × 4 blocks (k = 4), recursively.
+  - Each block gets one bit: 1 if it holds any connection.
+  - Only blocks with a 1 are split further, and the last level holds the connection bits.
+- Empty regions cost one bit, at the highest level they appear. Clustered connectivity
+  compresses best.
+- It is stored as flat bit arrays plus rank tables. The GPU walks it directly:
+  - a row gives a neuron's targets;
+  - a column gives its sources;
+  - there are no pointers and no second copy.
+- **Measured:** on the CUBA network (4,000 neurons, 2% connectivity, 321,000 connections) it
+  takes 18.8 bits per connection, against 32 for one sparse index and 64 for CSR + CSC
+- **Visual:**
+  - an 8 × 8 matrix with k = 2 for legibility;
+  - its blocks, the tree with a bit on each node, and the two bit strings.
 
-### Slide 11: Synapses and connections
-- Any current-based synapse defined in LEMS: its equations can use its own state, its
-  parameters and the connection's weight, but not the target cell's variables
-- A synapse can have its own state and time derivatives, and react to each arriving spike
-  (`OnEvent`)
-- Every connection has its own synapse state: two connections of the same type evolve
-  independently (except delta synapses, which keep none)
-- Per-connection weight and delay; delays in whole ticks, at least one tick
-- Several synapse types in one network (e.g. excitatory and inhibitory)
-- Connectivity from the NeuroML document, or from Python as an adjacency list, a
-  per-connection function, or five numpy arrays
+### Slide 18: Values: planes and a shared low-rank basis
+- **Planes:** each kind of per-connection value is a plane. Plane 0 is the weight, plane 1
+  the delay, then the synapse's state variables.
+- **Factorization:** no plane is stored as one number per connection. The value on plane k
+  from source s to target t is
 
-### Slide 12: Stimulus and recording
-- Every NeuroML input, wired with `explicitInput` or `inputList`, compiled from its own
-  LEMS and run on the GPU in its target cell's thread:
-  - pulse, sine, ramp and compound currents (and their DL variants)
-  - voltage clamps, which read the target's membrane potential
-  - `timedSynapticInput` and the Poisson firing synapses, which drive their own synapse
-  - `spikeArray`: spikes at listed times, delivered as kicks into the target's input
-- Recording: the document's `OutputFile` (variable traces) and `EventOutputFile` (spikes)
-- Plus engine-side recordings: every spike, and every neuron's membrane potential as a
-  `.spire` file (optionally compressed) for video rendering
+      value_k(s, t) = Σ over lanes l of  U[s, l] · C[k, l] · V[t, l]
 
-### Slide 13: What it refuses, and why that is good
-- Synapses whose current depends on the target cell, such as conductance-based synapses,
-  which read its voltage
-- `random()` inside a synapse
+  that is, plane k = U · diag(C_k) · Vᵀ, read only where the tree has a connection.
+- **U, V and C:**
+  - U and V have one row per neuron and one column per lane;
+  - C has one row per plane, which selects and scales that plane's own lanes.
+- **Memory:** 2 × N × lanes floats for every plane together, instead of E floats per plane.
+  A plane with population structure needs a handful of lanes.
+- The fit uses only existing connections; everywhere else is unconstrained
+- **This is compression, not learning:** the lanes only store the network
+- **Visual:**
+  - U (N × L) times diag(C_k) times Vᵀ (L × N), masked by the tree's pattern;
+  - colour each plane's lanes.
+
+### Slide 19: Choosing the lanes
+- **Tolerance:** the worst error allowed on any value, relative to the larger of the value
+  and its plane's RMS. The default is 0.1%, with presets from 0.001% to 1%.
+- **Lane search, per plane:**
+  - fit at 1, 2, 4, ... lanes until the tolerance is met, then bisect to the fewest (L-BFGS, on
+    the GPU);
+  - doubling stops once it stops helping.
+- **Budgets:**
+  - each plane keeps that count plus 20% as a fixed budget for the run;
+  - the total never exceeds one float per connection per plane.
+- **Delays** are rounded to whole ticks when read, and stay exact up to 500 ticks at the
+  default tolerance
+- **Synapse-state planes** start at zero, so they are sized by a short calibration run: every
+  neuron spikes once, then every state is restored.
+
+### Slide 20: Values that change: S and refits
+- Synapse state changes every tick. The changes go into a sparse update buffer, **S**, which
+  every read adds in.
+- **Refits:**
+  - when S holds changes on 20% of the connections, and at least 1,000 ticks have passed, a
+    refit folds S into U, V and C and empties S;
+  - the refit is warm-started alternating least squares on the GPU;
+  - only the rows at either end of a changed connection move.
+- S grows rather than drop a change, and shrinks back after each refit
+- Delta synapses keep no state, so they need no plane, no S and no refits
+- **Visual:** a timeline: ticks pass, S fills, a refit runs, S is empty again
+
+### Slide 21: Measured on the CUBA network
+4,000 neurons, 321,000 connections and three planes (weight, delay, synapse current), with
+weights given three ways:
+- the benchmark's own two weights;
+- a structured ±10% spread (one factor per source cell and one per target cell);
+- a random ±10% spread on every connection.
+
+| | Benchmark weights | Structured spread | Random spread |
+|---|---|---|---|
+| Lanes: weight / delay / synapse current | 2 / 2 / 2 | 3 / 2 / 3 | 50 / 2 / 53 |
+| Worst fit error, weight plane | 0.08% | 0.10% | 0.10% |
+| Basis (U, V, C) | 0.26 MB | 0.26 MB | 3.46 MB |
+| Basis / raw values (3.85 MB) | 7% | 7% | 90% |
+| Whole weight matrix, as built | 2.1 MB | 2.1 MB | 5.4 MB |
+| As built, share of CSR + CSC (10.3 MB) | 21% | 21% | 52% |
+| Construction | 8.2 s | 8.8 s | 25 s |
+| ms per tick | 4.3 | 4.3 | 5.3 |
+
+- **During a run S grows.** Each synapse runs for 138 ms after its source spikes, so at
+  5.7 Hz most connections hold a change. Between refits S grows to room for 80% of the
+  connections. The whole matrix then comes to 3.7 MB, 36% of CSR + CSC, with the benchmark
+  weights.
+- **Visual:** the stacked bar chart from notebook 02, section 6: tree, basis, S and queue,
+  against the CSR + CSC and raw-value lines.
+
+---
+
+## Part 5: Pros and cons
+
+### Slide 22: Pros
+- **Memory:**
+  - the whole matrix is a fifth to a third of CSR + CSC on the CUBA network;
+  - a synapse variable kept on every connection costs a few lanes per neuron, not a float per
+    connection.
+- **Scales with structure, not with connection count:**
+  - the basis is lanes × neurons, not connections;
+  - denser networks gain more. CUBA has 80 connections per neuron and Brunel's model A 1,190;
+    Brunel holds its weights in 4 lanes at 0.08% worst error.
+- **One structure answers both directions** (targets and sources), where lists need two
+  copies
+- **GPU-native:** the kernel walks the tree and computes each value where it needs it
+- **Accuracy is a setting:** the tolerance trades memory against error
+
+### Slide 23: Cons
+- **Approximate:** every value is within the tolerance (0.1% by default), not bit-exact
+- **Unstructured values don't compress:**
+  - a random spread on every connection needed 50 lanes, 90% of the raw size;
+  - the cap keeps the basis below one float per connection per plane, so this worst case is
+    about raw size plus the tree;
+  - repeated pairs stored as doubled weights left 48% errors in Brunel's network, so the
+    multiplicity goes in the synapse instead.
+- **Construction cost:**
+  - the lane search takes 8-25 s at 321,000 connections;
+  - 3% of the Potjans-Diesmann network takes about 10 minutes;
+  - at full size (285 million connections) it had not finished after more than an hour, before
+    the latest speedups `[TODO: re-measure]`.
+- **Reads are computations:**
+  - each value is a dot product over lanes, plus a walk of the tree;
+  - walking connections dominates tick time: 10,000 neurons take 0.18 ms per tick with no
+    connections and 4.1 ms with 200,000.
+- **Changing values cost memory and time:**
+  - S and its queue are the largest part during a CUBA run;
+  - refits interrupt the run.
+- **Complexity:** harder to debug and to explain than arrays
+- **Say:** the design bets that real networks are built by rules. Where they are, it saves a
+  lot; where values are pure noise, it falls back to about raw size.
+
+---
+
+## Part 6: Usage and demos
+
+### Slide 24: Demo 1: one cell from NeuroML (notebook 01, sections 1-2)
+- `Spike_Engine` on `LEMS_single_cell.xml`: 50 spikes in 500 ms. That is a GLIF1 cell at 2.5×
+  rheobase, and it matches the analytic interspike interval.
+- Show `single_cell.nml`, change the drive, and plot the f-I curve: 250, 500 and 1000 pA
+  give 48, 100 and 140 Hz
+- **Say:** the document is the whole model; there are no hidden settings in Python.
+
+### Slide 25: Demo 2: a benchmark network from numpy arrays (notebook 02, sections 1-3)
+- **The model:** the Vogels-Abbott CUBA network, 3,200 excitatory and 800 inhibitory cells at
+  2% connectivity
+- **Building it:**
+  - the document declares the cells, synapses and populations, including a custom
+    ComponentType of about 25 lines;
+  - the connections are five numpy arrays;
+  - it builds in about 8 s.
+- **Result:** a raster and the population rates, about 5.7 Hz against NEST's 5.5 Hz
+
+### Slide 26: Demo 3: inside the weight matrix (notebook 02, sections 4-6)
+- Lanes per plane, worst fit errors, and weights read back against those given
+- The memory breakdown against CSR + CSC
+- Rebuild with structured and with random weights, and watch the lanes and the memory change
+
+### Slide 27: Demo 4: a membrane video (notebook 02, section 7)
+- **From a run to a video:**
+  - `record_membrane_video` before the run writes a `.spire` file;
+  - `render_membrane_video` draws it as a grid of all 4,000 cells, one excitatory and one
+    inhibitory trace in millivolts, and a spike raster.
+- Half a second of activity, with the spikes visible on the traces
+- **Then the generated code** (section 8): `master_kernel_source`, with each `TimeDerivative`
+  as one line of GPU code and its parameters baked in
+
+### Slide 28: Getting started, and questions
+- `make python`, then the two tutorial notebooks
+- `python/docs/README.md` and `API_REFERENCE.md`; small models in `examples/models/`
+- **Scope:** point neurons and current-based synapses
+- **What's next:**
+  - `[TODO: what you want to say is next, e.g. the Potjans-Diesmann validation, faster
+    construction for very large networks, and an OB-like network]`
+- Questions: what models from the lab's work should we try first?
+
+---
+
+## Backup slides
+
+### B1: What a cell model can contain
+- State variables with starting values (`OnStart`), derived variables (conditional ones
+  included), and time derivatives integrated with forward Euler every tick
+- Threshold conditions (`OnCondition`) that assign state and emit spikes, and spike handlers
+  (`OnEvent`) that run once for each spike that reaches the cell
+- An integrating regime and a refractory regime that returns to it; either can have its own
+  derivatives, conditions and `OnEntry`
+- `random()`: a fresh draw for each neuron on every call, seeded by the simulation's seed
+
+### B2: What gets refused, and why
+- Synapses whose current depends on the target cell, and `random()` inside a synapse
 - Regime structures other than the integrating/refractory pair
 - Ion channels, concentrations, multicompartment morphologies and kinetic schemes
-- A synapse or input that does not provide what its target cell reads, for example a current
-  into a cell whose input is dimensionless
-- A population of `spikeArray` cells: the engine runs a `spikeArray` only as an input
-- These are refused when the engine is created, with the component and the reason, so
-  they never run silently wrong
-- Plasticity: the flag exists, but nothing changes weights during a run yet
-- Platform: Metal on macOS and CUDA on Linux with NVIDIA GPUs; the weight-matrix fits run on
-  the GPU on both, with a host fallback
+- A synapse or input that does not provide what its target cell reads
+- Each is refused when the engine is built, with the component and the reason
+
+### B3: Fit and refit settings
+- `fit_tolerance`, with presets `FIT_TOLERANCE_PRECISE` (1e-5), `ACCURATE` (1e-4), `STANDARD`
+  (1e-3, the default) and `COMPACT` (1e-2)
+- `expected_active_edge_fraction` (0.2): the share added to each plane's lanes
+- `refit_occupancy_threshold_fraction` (0.2), `minimum_ticks_between_refits` (1000) and
+  `refit_every_n_ticks` (off)
+- What to watch:
+  - `weights.measured_fit_error`;
+  - `weights.sparse_delta_occupancy_fraction()`;
+  - `engine.last_refit_tick`.
+
+### B4: Python API in one slide
+- **Build:**
+  - `Spike_Engine(lems)`;
+  - `Spike_Engine(lems, adjacency, synapse_id, connection_weight=..., connection_delay_seconds=...)`;
+  - `Spike_Engine(lems, synapse_ids, source_neurons=..., target_neurons=..., synapse_indices=..., weights=..., delays_seconds=...)`.
+- **Run:** `run()`, `run(after_each_tick)`, or `step_simulation(tick)` one tick at a time
+- **Read:** `recorded_spikes`, `spike_counts_per_neuron`, `state_variable_array("v")`,
+  `recorded_traces`
+- **Record:** `record_membrane_video(path, stride)`, `write_recordings()`, `write_spike_file(path)`
+- **Inspect:** `engine.context` (the parsed model), `engine.weights` (planes, lanes, k²-tree),
+  `master_kernel_source`
 
 ---
 
-## Part 4: The Python API, step by step
+## Where the numbers come from
 
-### Slide 14: Installing
-- `make python` builds the extension into a uv-managed `.venv` (Metal on macOS, CUDA elsewhere)
-- Needs uv and libxml2; `make python` installs pybind11, numpy, setuptools and matplotlib into `.venv`;
-  ffmpeg for videos
-- `import spikecorec as spc`
-- Docs: `python/docs/README.md` (guide) and `python/docs/API_REFERENCE.md` (every name)
-
-### Slide 15: Your first simulation
-- `engine = spc.Spike_Engine("examples/models/LEMS_single_cell.xml")`
-- `engine.run()` runs every tick the document declares
-- `engine.mean_firing_rate_hertz()`, `engine.read_state_variable(0, "v")` (volts)
-- `engine.shutdown()` frees the GPU memory
-- Result: a GLIF1 cell at 2.5× rheobase fires 50 spikes in 500 ms (100 Hz), matching the
-  analytic interspike interval
-
-### Slide 16: Reading results
-- `engine.spike_counts_per_neuron`: spikes per neuron
-- `engine.recorded_spikes`: `(times_seconds, neuron_indices)` as two numpy arrays
-- `engine.state_variable_array("v")`: one variable for every neuron
-- `engine.fraction_of_neurons_that_spiked()`
-- `engine.recorded_traces` and `recorded_trace_times`: the document's recorded columns
-- Everything comes back as numpy copies, safe to keep after the engine is gone
-
-### Slide 17: Experimenting with a model
-- Change a parameter in the document and rebuild the engine
-- Example from the tutorial: an f–I curve. 250, 500 and 1000 pA give 48, 100 and 140 Hz
-- The document is the single source of truth: no hidden Python-side model settings
-
-### Slide 18: Networks from Python
-- Writing one XML element per connection does not scale; pass an adjacency list instead
-- `Spike_Engine(lems_file, adjacency, "chainSynapse", connection_weight=1.0, connection_delay_seconds=1e-3)`
-- `adjacency[source]` lists that neuron's targets; the document only declares cells, synapses
-  and stimulus
-- Three-cell chain A→B→C: first spikes at 20.0, 26.6 and 33.2 ms
-- Discussion point: the synapse's rise time, not the 1 ms wire delay, dominates the lag
-- Per-connection synapse, weight and delay: `Spike_Engine(lems_file, adjacency, synapse_ids,
-  connection_values)`, where `connection_values(source, target)` returns
-  `spc.Spike_Engine.Connection_Values(synapse_index, weight, delay_seconds)`
-- Large networks: five numpy arrays, `Spike_Engine(lems_file, synapse_ids, source_neurons=...,
-  target_neurons=..., synapse_indices=..., weights=..., delays_seconds=...)`, in any order,
-  read in place as uint32/uint32/int32/float32/float32
-
-### Slide 19: Topology generators
-- `spc.square_torus(side)`: a grid with 4 neighbours each, edges wrapped
-- `spc.small_world_torus(side, random_fanout, seed)`: the torus plus long-range shortcuts
-- `spc.random_fixed_outdegree(side, fanout, seed)`: a random graph with a fixed out-degree
-- Each returns a plain list of lists, so you can build your own too
-
-### Slide 20: Excitatory and inhibitory populations
-- Pass several synapses with a share for each:
-  `["excitatorySynapse", "inhibitorySynapse"], synapse_proportions=[0.8, 0.2]`
-- Connections are split in order into one contiguous share per synapse; nothing is random
-- Connections are ordered by source neuron, so roughly the first 80% of neurons are
-  excitatory; a neuron at the boundary can carry both
-- `engine.weights.get_edge_synapse_prototype(source, target)` says which synapse any
-  connection carries
-- Example: a 5×5 GLIF1 torus, 20 excitatory and 5 inhibitory cells, 55.9 Hz
-
-### Slide 21: Driving the clock yourself
-- `run()` steps every tick not yet stepped; `run(after_each_tick)` calls a function after each
-  tick, to sample state or stop early by raising
-- Or call `engine.step_simulation(tick)` yourself: ticks run one at a time from 0, and the tick
-  must be `engine.ticks_stepped` or it raises
-- Reading state copies from the GPU, so sample every Nth tick rather than every tick
-
-### Slide 22: Recording and visualization
-- `engine.record_membrane_video("out.spire", frame_stride)` must come **before** `run()`
-- `engine.write_recordings()` closes it and writes the document's output files
-- `engine.write_spike_file("spikes.dat")` writes `time<TAB>neuron` lines
-- `spc.read_spire_recording(path)` returns a `(frames, neurons)` array
-- `examples/video_utils.py`: `render_membrane_video(...)` makes an mp4 with traces
-- For custom loops: `spc.Simulation_Recorder`, `Spire_Writer` and `Spire_Reader`
-
-### Slide 23: Inspecting the model: `spikecorec.nml`
-- `engine.context` is the parsed model the engine was built from
-- `context = spc.nml.NML_Context(); context.parse(path)` inspects a model with no GPU at all
-- Populations and their cells: `nml.network_populations`, `nml.population_cell`
-- Types: `component_types[...]` with `state_variable_names` and `dynamics` (the LEMS
-  equations, as written)
-- Values in SI units: `nml.starting_values`, `nml.component_parameter_values`, `resolve_quantity`
-- Connectivity and inputs: `simulation.network_data.edge_arrays()` on a context you parsed
-  yourself (the engine's copy is released after construction), `simulation.input_profiles`
-- `spikecorec.units`: `parse_quantity("-60mV")`, `seconds_to_ticks(...)`
-
-### Slide 24: Looking at raw engine state
-- Copies of the GPU buffers: `engine.cell_state`, `last_spiked`, `network_inputs`,
-  `spike_history`, and each input's state in `input_values`
-- `context.resolve_path("pop[0]/v")` gives a variable's position in `cell_state`
-- `engine.master_kernel_source`: the exact GPU program generated for your model
-- Useful for debugging a model, and for seeing what "code generation" means
-
----
-
-## Part 5: Under the hood
-
-### Slide 25: Connectivity storage, part 1: which neurons connect
-- Most pairs of neurons are not connected, so a dense matrix wastes almost all its memory
-- spikecorec stores which pairs connect in a **k²-tree**: a compressed bitmap that skips
-  empty regions, and that the GPU walks directly
-- Reachable from Python: `engine.weights.k2tree` (`adjacent`, `get_neighbors`, ...)
-
-### Slide 26: Connectivity storage, part 2: every value on every connection
-- Each connection carries values: weight, delay and each synapse state variable kept per
-  connection (a delta synapse keeps none). Each kind of value is one **plane**
-- No plane is stored as one number per connection. Each is a low-rank factorization:
-  plane k = `U · diag(Ck) · Vᵀ`, where `U` and `V` hold every plane's lanes and each plane
-  reads only its own, through its coefficient row `Ck`
-- A read is a short computation, not a lookup
-
-### Slide 27: Reading connection values from Python
-- `w = engine.weights`
-- `w.get(source, target)`: one connection's weight
-- `w.neighbor_weights_for_matrix(plane)`: one plane for every connection
-- Planes: `w.WEIGHT_PLANE`, `w.DELAY_PLANE`, then the synapse's state variables
-- `engine.synapse_state_variable_plane("excitatorySynapse", "I")` finds a variable's plane
-- Basis inspection: `w.rank`, `w.U_matrix`, `w.V_matrix`, `w.coefficients`
-
-### Slide 28: How accurate is the compression?
-- The fit is made to a stated tolerance: the worst error allowed on any value, relative to the
-  larger of the value and its plane's RMS
-- Presets on `Spike_Engine`: `FIT_TOLERANCE_PRECISE` (1e-5), `ACCURATE` (1e-4), `STANDARD`
-  (1e-3, the default), `COMPACT` (1e-2)
-- Tighter means more memory and longer fitting
-- Delays stay on their exact tick while tolerance × delay is under half a tick: up to 500
-  ticks at the default
-- Each plane's lanes are searched at 1, 2, 4, ... then bisected to the fewest that meet the
-  tolerance; doubling stops once two doublings each cut the worst error by under 5%, and each
-  probe starts from the last fit that missed
-- Each plane keeps that count times 1 + `expected_active_edge_fraction` (0.2) as a fixed
-  budget; together the budgets keep the basis below one float per connection per plane
-- Synapse-state planes start at zero, so a short calibration, in which every neuron spikes
-  once, sizes their budgets; `w.measured_fit_error` reports what each plane got
-- Networks built from a few uniform projections need only a few lanes
-
-### Slide 29: Values that change during a run
-- Synapse state changes every tick; the changes go into a sparse update buffer **S**, which
-  every read includes
-- When S is full enough, the engine **refits**: it folds S into the factorization and empties S
-- Settings:
-  - `refit_occupancy_threshold_fraction`: 0.2 by default; also sets how large S is kept
-  - `minimum_ticks_between_refits`: 1000 by default
-  - `refit_every_n_ticks`: off by default
-  - `fit_tolerance`
-- Observable: `w.sparse_delta_entry_count`, `w.sparse_delta_occupancy_fraction()`,
-  `engine.last_refit_tick`
-
-### Slide 30: Built-in efficiency
-- Synapses only run while they can be active: from a presynaptic spike until the synapse has
-  settled back to rest (`engine.synapse_active_ticks`); quiet parts of the network cost little
-- Delta synapses do no work between spikes: a neuron walks its connections only on ticks an
-  arrival is due
-- Everything fixed for a run (neuron count, the connectivity tree's shape, the spike-history
-  length, the synapse activity window) is compiled into the GPU program as constants
-- Delays use a ring of recent spikes instead of a queue of events in flight
-- Practical tips:
-  - sample state rather than reading it every tick
-  - choose the loosest tolerance your analysis allows
-  - leave the refit defaults unless refits show up in timing
-
----
-
-## Part 6: Wrapping up
-
-### Slide 31: Current limitations
-- Metal (macOS) and CUDA (Linux, NVIDIA) both build and pass the test suite
-- Model constraints: point neurons, current-based synapses, at most an
-  integrating/refractory regime pair
-- No synaptic plasticity during a run yet
-- Fitting large networks at construction can take minutes; tuning is ongoing
-
-### Slide 32: Roadmap
-- Next: richer point-neuron dynamics (more regime shapes), synapses that read the target cell
-  (conductance-based), heterogeneous populations, plasticity
-- Later: biophysical models: ion channels, concentrations, multicompartment morphologies,
-  kinetic schemes, stiff integrators
-- Faster fitting and refitting for large, busy networks
-
-### Slide 33: Resources
-- `python/docs/README.md`: the guide
-- `python/docs/API_REFERENCE.md`: every class, method and setting
-- `examples/notebooks/01_tutorial_getting_started.py`: the hands-on tutorial (jupytext)
-- `examples/notebooks/demo.ipynb`: four models rendered as videos
-- `examples/models/`: small NeuroML models to start from
-
-### Slide 34: Hands-on exercises
-- Run the single cell, then change its drive and plot an f–I curve
-- Build a 10×10 torus with an 80/20 excitatory/inhibitory split and plot a raster
-- Find the excitatory synapse's `I` plane and plot it across connections after a run
-- Record a membrane video and render it
-- Open `engine.master_kernel_source` and find your cell's equations in it
-
-### Slide 35: Questions
-- Questions and discussion
-- What models from the lab's work should we try next?
+- **CUBA memory, lanes, construction and tick times:** measured 2026-10-19 on the M5 Max
+  (Metal, `a15a542`) with notebook 02. S's growth during a run was traced tick by tick in the
+  same session.
+- **Validation:** `~/Documents/neurocomputation/spikecore_runs/RESULTS_LOG.md` (M2, M1 point A).
+  M1 points B-D and the phase sweep are in spark's `~/neurocomputation_benchmarks/spikecore_M1/RESULTS.md`.
+- **Brunel construction (4.4 s, 4 lanes, 0.08%) and the 48% error of doubled weights:** RESULTS_LOG,
+  2026-10-16
+- **Speed table:** `docs/performance_review.md`, simulation speed (2026-10-07 baseline)
+- **Potjans-Diesmann construction times:** `docs/large_network_construction.md`
+- **The OB model:** the `OlfactoryBulb` repository (readme, `docs-source/`, `olfactorybulb/`) and
+  the lab meeting transcripts of 2026-06-19 to 2026-10-16

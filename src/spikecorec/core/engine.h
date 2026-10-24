@@ -307,7 +307,8 @@ namespace spikecorec {
 
     private:
         // The slab starts uninitialized: zeroes the accumulators and spike history, and marks
-        // every neuron as never spiked.
+        // every neuear
+        // on as never spiked.
         void initialize_model_buffers();
 
         // Builds the weight matrix from network_data, or from the adjacency topology when one was
