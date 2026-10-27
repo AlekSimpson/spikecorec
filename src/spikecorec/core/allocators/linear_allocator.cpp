@@ -16,8 +16,8 @@ Linear_Allocator::Linear_Allocator() {
 }
 
 
-Linear_Allocator::Linear_Allocator(usize max_size) : max_byte_size(max_size) {
-    memory = new u64[max_size];
+Linear_Allocator::Linear_Allocator(usize max_bytes) : max_byte_size(max_bytes) {
+    memory = new u8[max_bytes];
 }
 
 Linear_Allocator::~Linear_Allocator() {
@@ -26,13 +26,13 @@ Linear_Allocator::~Linear_Allocator() {
     }
 }
 
-u64 *Linear_Allocator::allocate(u64 bytesize) {
+u8 *Linear_Allocator::allocate(u64 bytesize) {
     if (offset + bytesize >= max_byte_size) {
         logger().critical("Linear Allocator: ran out of room, cannot allocate more than {} bytes.", max_byte_size);
         return nullptr;
     }
 
-    u64 *return_value = &memory[offset];
+    u8 *return_value = &memory[offset];
     offset += bytesize;
     return return_value;
 }

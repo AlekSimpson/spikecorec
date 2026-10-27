@@ -18,7 +18,7 @@
 
 #include "k2tree.h"
 #include "types.h"
-#include "backend.h"
+#include "backend/metal_backend.h"
 #include "log.h"
 
 using namespace std;

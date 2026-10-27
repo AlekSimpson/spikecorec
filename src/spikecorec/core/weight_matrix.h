@@ -6,7 +6,7 @@
 #include <optional>
 #include <vector>
 
-#include "backend.h"
+#include "backend/metal_backend.h"
 #include "k2tree.h"
 #include "types.h"
 

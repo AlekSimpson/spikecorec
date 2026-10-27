@@ -7,7 +7,6 @@
 #include "core/types.h"
 #include "core/log.h"
 #include "core/allocators/linear_allocator.h"
-#include "core/allocators/pool_allocator.h"
 
 using namespace spikecorec::log;
 
@@ -15,20 +14,22 @@ namespace spikecorec {
 
 namespace Program_Context {
 
+constexpr s64 NEVER_SPIKED_TICK = -1;
+static constexpr u64 PARTITION_ALIGNMENT = 256;
+
 inline constexpr u64 KB = 1000;
 inline constexpr u64 MB = 1000000;
 inline constexpr u64 GB = 1000000000;
 
-inline constexpr u64 SCRATCH_SIZE = 10 * MB;
-inline constexpr u64 POOL_COUNT = 10;
-inline constexpr u64 POOL_DEPTH_BYTESIZE = 10 * MB;
+inline constexpr u64 TRANSIENT_BUFFER_SIZE = 10 * MB;
+inline constexpr u64 PERSISTENT_BUFFER_SIZE = 50 * MB;
 
-inline Linear_Allocator scratch = Linear_Allocator(SCRATCH_SIZE);
-inline Pool_Allocator pool = Pool_Allocator(POOL_COUNT, POOL_DEPTH_BYTESIZE);
+inline Linear_Allocator transient = Linear_Allocator(TRANSIENT_BUFFER_SIZE);
+inline Linear_Allocator persistent = Linear_Allocator(PERSISTENT_BUFFER_SIZE);
 
 inline void panic(const String &message) {
-    scratch.clear();
-    pool.clear();
+    transient.clear();
+    persistent.clear();
 
     logger().critical(message);
 

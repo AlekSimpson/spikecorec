@@ -80,7 +80,7 @@ struct NML_Context {
     Unordered_Map<String, NML_Component_Type> component_types;
     Unordered_Map<String, NML_Component_Instance> component_instances;
 
-    Vector<NML_Node *> document_roots;
+    Vector<Node<NML_Tag> *> document_roots;
     Vector<String> document_filepaths;
 
     String target_component_id;

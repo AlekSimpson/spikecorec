@@ -4,7 +4,7 @@
 
 // First, so metal-cpp is parsed before any header's `using namespace spikecorec` brings
 // String into global lookup.
-#include "backend.h"
+#include "../core/backend/metal_backend.h"
 #include "units.h"
 #include "types.h"
 #include "node.h"

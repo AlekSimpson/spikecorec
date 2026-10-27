@@ -7,7 +7,7 @@
 #include <vector>
 #include <optional>
 
-#include "backend.h"
+#include "backend/metal_backend.h"
 #include "types.h"
 
 using namespace std;

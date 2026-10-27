@@ -15,17 +15,13 @@ Matrix_2D<Type>::Matrix_2D() {
     data = nullptr;
     rows = 0;
     columns = 0;
+    count = 0;
 }
 
 template<typename Type>
-Matrix_2D<Type>::Matrix_2D(s64 rows, s64 columns) : rows(rows), columns(columns) {
-    s64 count = rows * columns;
-    data = (Type *) pool.allocate(sizeof(Type), count);
-}
-
-template<typename Type>
-s64 Matrix_2D<Type>::count() const {
-    return rows * columns;
+Matrix_2D<Type>::Matrix_2D(Allocator &allocator, s64 rows, s64 columns)
+: rows(rows), columns(columns), count(rows * columns) {
+    data = (Type *) allocator.allocate(sizeof(Type) * count);
 }
 
 template<typename Type>
